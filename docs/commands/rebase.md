@@ -384,6 +384,14 @@ Rebase state is stored in a `rebase_state` SQLite table with the following field
 
 `.libra/rebase-aux.json` is an atomic, always-fsynced recovery sidecar containing repeatable exec commands and the pending command index, captured update-refs branches and rewrite mappings, and the held autostash object ID. It survives conflicts, exec failures, process restarts, and `maintenance gc` (which treats the held OID as a fail-closed reachability root). Final branch updates use one SQLite transaction and compare captured old tips before moving any branch; concurrent branch movement fails closed. Checked-out branches are never captured. The sidecar is removed only after refs, worktree/index, sequencer state, and autostash restoration have reached a terminal state. If autostash re-application conflicts, the object is first promoted to the normal stash list so the local changes remain recoverable.
 
+## Commit signing
+
+Replayed commits are signed through `libra commit`'s policy: an explicit
+`commit.gpgSign` wins (`true` forces a vault OpenPGP signature, `false` leaves
+the replay unsigned), otherwise `vault.signing=true` signs, and when neither is
+configured the replayed commit is unsigned. A signature failure aborts before any
+object is written. `--signoff` is independent of signing.
+
 ## Design Rationale
 
 ### Interactive rebase (`-i` / `--edit-todo`)

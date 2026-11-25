@@ -1979,7 +1979,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`format_cover_letter` 仅在系列任一提交的原始对象缓冲（headers+message）含非 ASCII 字节时输出 MIME 头（Git `make_cover_letter` 规则）；全 ASCII 系列不再输出 MIME 头。AC1/AC2 由 `format_patch_test::cover_letter_mime_on_demand` 覆盖（纯 ASCII 封面无 MIME；3 提交中仅第 2 提交 committer 为 `Cömmitter` 时输出 MIME）；`format_patch_test` 136/136、`compat_format_patch_mail_roundtrip` 14/14；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-30` 拆出的独立轴：`format_cover_letter` 不再无条件输出 MIME 头，仅当系列中任一提交的原始对象缓冲区（含 author/committer 头与提交说明）含非 ASCII 字节时输出（Git `make_cover_letter` 对 `repo_get_commit_buffer` 调用 `has_non_ascii`，`git show 6de20f6092:builtin/log.c` 第 1417–1425 行）；补丁邮件的判定仍按 `FPG-30`。
 
@@ -2045,7 +2045,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`529 FP-03` 已交付 `-k` 与 `--subject-prefix`/`--rfc` 的互斥拒绝；本卡补齐 #888 第 5 项的单独成功路径：`-k`、`--subject-prefix=X`、`--rfc` 各自成功且 `Subject:` 行恰为一行（`rename` / `[X] rename` / `[RFC PATCH] rename`），`--rfc= -k` 与 Git 一致（既有 `fp03_empty_rfc_with_k`）。AC1 由 `fp03_empty_rfc_with_k` 覆盖，AC2–AC4 由新增 `keep_subject_and_prefix_alone_succeed` 覆盖；`format_patch_test` 137/137。文档核对：EN/zh/开发 format-patch 文档与 `COMPATIBILITY.md` 已包含 `-k`/`--subject-prefix`/`--rfc` 互斥说明，本卡无新增标记。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** `#888` 第 1–4 项（`-k` 与 `--subject-prefix`/`--rfc` 互斥拒绝及诊断）由 `issues/529#FP-03` 的拒绝门族交付并在 529 计划内验收（其门族在本卡共享回归组中运行，不计本卡 AC）；本卡按 GC-01 核实 `--rfc= -k` 与 `git@6de20f6092` 一致，并为 #888 第 5 项补齐单独 `-k`、`--subject-prefix`、`--rfc` 的成功路径断言（既有用例在输出目录为空时也会通过，不足以证明）。
 
@@ -2117,7 +2117,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--from=<ident>` 严格校验——必须含成对 `<`/`>`（`Name <>` 空邮箱合法），否则 `invalid ident line: <input>` + `LBR-CLI-002`；校验在 revision 解析与空系列判定之前，`--from=foo HEAD..HEAD` 同样失败；裸 `--from` 改用执行时（`GIT_COMMITTER_*` 感知）提交者身份。AC1–AC6 由 `format_patch_test::from_invalid_ident_rejected` 覆盖（非法 ident 及空范围、合法身份改写与 in-body 原作者、裸 `--from` 的 C O Mitter 身份、`Name <>`）；`format_patch_test` 140/140、`compat_format_patch_mail_roundtrip` 15/15；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 校验 `--from=<ident>` 必须能按 Git 拆分为 ident：`<` 与其后的 `>` 成对即合法（`Name <>` 的空邮箱合法），对不含 `<…>` 的字符串（如 `--from=foo`）报 `invalid ident line: foo` 并失败，而非输出 `From: foo <>`；校验在修订解析与空系列判定之前进行（`git show 6de20f6092:builtin/log.c` 第 2195–2198 行先于 `setup_revisions`；现行 `resolve_from_identity` 在 `src/command/format_patch.rs:540` 调用，晚于区间解析与空系列返回）（自本卡拆出 `FPG-31` 处理 `--no-from` 与 `format.from`）。
 
@@ -2191,7 +2191,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`resolve_format_config` 读取 `format.from`——`true` 使用执行时提交者身份，`false`/空保持作者，其它值作为 ident 行；配置值仅在没有命令行 `--from` 时生效，非法配置值在解析后按 `FPG-10` 的 ident 校验以 `invalid ident line` + `LBR-CLI-002` 拒绝。AC1–AC4 由 `format_patch_test::format_from_and_no_from` 覆盖（true/false 与 Git 黄金 `From:` 逐字、ident 原样、非法值稳定码）；`format_patch_test` 141/141、`compat_format_patch_mail_roundtrip` 15/15；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`--no-from` 与命令行覆盖由 `FPG-46` 承接，本卡未新增该 flag。
 
 **Description:** 自 `FPG-10` 拆出的独立轴：读取 `format.from`（`true` 改写为提交者身份、`false` 不改写、`Name <email>` 使用该身份），非法取值不在读取时校验，而在命令行覆盖之后按 `FPG-10` 的 ident 校验以 `LBR-CLI-002` 拒绝（被 `--from`/`--no-from` 覆盖时不报错，`git show 6de20f6092:builtin/log.c` 第 1078–1086、2195–2198 行；覆盖场景由 `FPG-46` 验收）。`--no-from` 与命令行覆盖由自本卡拆出的 `FPG-46` 承接。
 
@@ -2261,7 +2261,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `--no-from`，与 `--from` 通过 clap `overrides_with` 双向最后者胜出；`--no-from` 使配置解析跳过 `format.from`，并使非法配置 ident 在命令行覆盖时不校验。AC1–AC7 由 `format_patch_test::from_and_no_from_override_config` 覆盖（`--no-from` 与 Git 黄金一致、显式 `--from` 覆盖、裸 `--from` 提交者身份、双向 last-wins、非法 `format.from` 被 `--no-from`/`--from` 覆盖后成功）；`format_patch_test` 142/142、`compat_format_patch_mail_roundtrip` 15/15；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-31` 拆出的独立轴：新增 `--no-from`，`--from[=<ident>]`/`--no-from` 按最后出现者生效并覆盖 `format.from`；裸 `--from` 始终使用提交者身份。 #915 Expected behavior 第 1 项与验收标准第 1 条称 `--no-from` 后 `From:` 为提交者身份；Git `from_callback` 在 `--no-from` 时清空发件人覆盖，`From:` 回到作者身份（`git show 6de20f6092:builtin/log.c` 第 1664–1677 行），t4014「--no-from overrides format.from」只断言不再是 `format.from`。本计划以上游为准（夹具中作者与提交者身份不同以区分），并在关闭 #915 时于 issue 中说明。
 
@@ -2337,7 +2337,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：实现 `--relative[=<path>]`、`diff.relative` 与 `--no-relative`（最后者胜出）；`<path>` 相对仓库根解析，裸 `--relative` 用当前目录；父提交经共享 diff 引擎（`run_diff_for_service` 新增 relative 剥离），根提交经 `CommitDiffOptions.relative` 过滤/重写；同时修正 diffstat 与 diff 之间、以及 `--stdout` 末补丁后的多余换行，与 Git 逐字一致。AC1–AC6 由 `format_patch_test::diff_relative_filters_paths` 覆盖（AC1/AC4/AC5 与 Git 黄金逐字，AC2/AC3/AC6 与 AC1 逐字节）；`format_patch_test` 143/143、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步，`--relative` 不再列为 unsupported。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 取消 `--relative` 的 `Unsupported` 拒绝，支持 `--relative[=<path>]`、`--no-relative` 与 `diff.relative` 配置：无值时以当前工作目录为前缀，`<path>` 按 Git 以仓库根为基准（不随当前目录解析，与 `libra diff --relative` 现行按当前目录解析不同），过滤变更并输出相对路径的 diffstat 与 diff。夹具（#890 最小复现改写为差异隔离夹具）：base 提交含 `sub/` 外的 `top/dir/file` 与 `sub/dir/file`（两路径等长，满足差异隔离；#890 原复现的根目录 `file` 改名以免 diffstat 对齐差异）；被测提交同时修改两者（各含新增与删除行）；各 AC 命令均为 `format-patch --stdout -1 --no-thread --no-signature`。
 
@@ -2413,7 +2413,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--relative` 前缀缺失或逃逸仓库时输出空补丁正文（无 `---`/diffstat/diff），逃逸前缀以内部哨兵拒绝调用 diff 引擎，不写任何文件且不打印仓库外路径；`---` 分隔符改为仅在确有 notes/stat/diff 且非 `--numstat` 时输出。AC1–AC4 由 `format_patch_test::relative_outside_and_missing_prefix` 覆盖（AC1/AC2 与 Git 空正文一致、AC3 仓库外哨兵文件内容与 mtime 不变、AC4 stdout/stderr 均无哨兵绝对路径）；`format_patch_test` 144/144、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-11` 拆出的独立轴：`--relative=<prefix>` 的前缀在仓库外或不存在时按 Git 行为输出（本机 Git 2.54 探针均 exit 0 且不输出 diff 段，开工时以 `git@6de20f6092` 重新生成黄金值为准），并保证不写入仓库外文件、不在输出中暴露仓库外绝对路径（GC-07）。
 
@@ -2484,7 +2484,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.coverLetter`（`true`/`false`/`auto`；`auto` 在 `total > 1` 生成），新增 `--no-cover-letter` 并与 `--cover-letter` 双向 last-wins、命令行覆盖配置；`--commit-list-format` 隐含封面信但可被 `--no-cover-letter` 抑制；`shortlog` 识别为 Git 默认作者分组列表。AC1–AC8 由 `format_patch_test::format_cover_letter_auto_config` 覆盖（true/auto 双补丁、auto 单补丁、--no-cover-letter、modern 隐含 `[1/1]`、shortlog 列表段与 Git 黄金逐字、--no-cover-letter 抑制隐含、false+--cover-letter）；`format_patch_test` 145/145、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；封面信 diffstat 仍由 `FPG-13` 承接。
 
 **Description:** 读取 `format.coverLetter`（`true`/`false`/`auto`，其中 `auto` 在 `total > 1` 时生成封面信），CLI `--cover-letter`/`--no-cover-letter` 覆盖配置；并按 GC-01 核实 `529 FP-13` 合入的 `--commit-list-format` 隐含启用封面信行为（自本卡拆出 `FPG-24` 处理 `branch.<name>.description`，其后 `FPG-24` 再拆出 `FPG-60` 处理封面信默认 `From:`）。
 
@@ -2562,7 +2562,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：封面信正文对齐 Git `prepare_cover_text`——标题占位符只写入 `Subject:` 头，正文以 `*** BLURB HERE ***` 开头。AC1/AC2 由 `format_patch_test::cover_letter_body_template_matches_git` 覆盖（正文以 BLURB 开头且不含标题占位符；Subject 行逐字 `[PATCH 0/2] *** SUBJECT HERE ***`）；`format_patch_test` 146/146、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；开发文档已记录核对结论（EN/zh 文档与 `COMPATIBILITY.md` 本卡无新增标记，核对无改动）。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；封面信 diffstat 仍由 `FPG-13` 承接。
 
 **Description:** 自 `FPG-13` 拆出的独立轴（先于 `FPG-13` 执行）：把封面信正文模板改为 Git `prepare_cover_text` 的形式——标题占位符 `*** SUBJECT HERE ***` 只写入 `Subject:` 头，正文以 `*** BLURB HERE ***` 开头（`git show 6de20f6092:builtin/log.c` 第 1288–1323 行）；现行 `format_cover_letter` 在正文先多写一行 `*** SUBJECT HERE ***`（`src/command/format_patch.rs:1422-1423`），使之后各卡的封面信正文、描述段黄金比较不受该差异影响。
 
@@ -2628,7 +2628,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：封面信在 commit list 后输出系列 diffstat——由唯一边界提交（最旧补丁父提交）到末个补丁，经共享 `libra diff --stat` 渲染；`--no-stat`/`-p` 仅影响补丁；无唯一边界（root 系列）省略，`--root` 与显式有界范围同用仍输出；diffstat 与签名/`--base` 间补空行。AC1–AC7 由 `format_patch_test::cover_letter_includes_diffstat` 覆盖（默认/`--no-stat`/`-p`/root/签名/root+范围与 Git 黄金逐字，重命名系列 stat 与 `libra diff --stat` 逐字节）；`format_patch_test` 147/147、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`--summary` 行与版式仍按 `DEFER-FPG-03`。
 
 **Description:** 在封面信 commit list 之后输出整套系列的汇总 diffstat：Git 只在存在唯一边界提交（origin）时输出，取 origin 的树到末个提交的树（`git show 6de20f6092:builtin/log.c` 第 1263–1279、1455–1457、2341–2346 行）；系列含根提交（如 `--root <rev>` 自根提交起格式化）或边界不唯一时不输出（`--root` 本身只置 `show_root_diff`，与有唯一边界的显式范围同用时仍输出，`git show 6de20f6092:revision.c` 第 2671–2672 行）；`--no-stat`/`-p` 只影响补丁，封面信仍输出（#905 Expected behavior 第 3 项与验收标准第 2 项称二者抑制 stat 块，与上游不符，本计划以上游为准并在关闭 #905 时于 issue 中说明）。diffstat 由 529 FP-05 起的共享 stat 渲染器产生并继承补丁的 diff 选项（重命名选项的继承由 `FPG-39` AC7/AC8 验收，#905 第 3 项），其版式与 `--summary` 行随 529 `DEFER-FP-02`（`DEFER-FPG-03`）。封面信正文模板（`*** SUBJECT HERE ***` 只在 `Subject:` 头）由自本卡拆出、先于本卡执行的 `FPG-58` 承接，本卡的封面信正文黄金比较以其为前提。AC1、AC3、AC4、AC6、AC7 的夹具为差异隔离夹具：至少 3 个提交，单文件 `f`，补丁 1 把第 2 行由 `a` 改为 `b`、补丁 2 再改为 `c`（系列 diffstat `f | 2 +-` 不同于逐补丁统计之和），命令为 `--cover-letter -2 --stdout`。（自本卡拆出 `FPG-25` 处理 `--cover-from-description`、`FPG-58` 处理正文模板。）
 
@@ -2704,7 +2704,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--commit-list-format` 支持 `%(count)`/`%(total)`（count 按总数位宽补零、自 1 起且不受 `--start-number` 影响）与 `log:` 前缀；识别顺序 `log:` → `shortlog`/`modern` → 其余必须含 `%`，否则 `'<fmt>' is not a valid format string` + `LBR-CLI-002`。AC1–AC7 由 `format_patch_test::commit_list_format_git_atoms` 覆盖（count/total/组合、`log:`、非法字面量、10 补丁补零、start-number 均与 Git 列表段逐字一致）；`format_patch_test` 156/156、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.commitListFormat`/`full` 由 `FPG-49` 承接。
 
 **Description:** 让 `render_pretty_format_commit` 接受 Git `--commit-list-format` 的 `%(count)`、`%(total)` 原子（与既有 `%s`/`%an` 等组合）与 `log:` 前缀，并按 Git 判据（依次识别 `log:` 前缀、`shortlog`、`modern`，其余串含 `%` 才接受，否则拒绝，`git show 6de20f6092:builtin/log.c` 第 1443–1453 行）拒绝如 `this should fail` 的串（`log:` 前缀后的字面量按 Git 接受）。`%(count)` 按总数位宽补零，计数自 1 起且不随 `--start-number` 变化（`git show 6de20f6092:pretty.c` 第 1551–1557 行、`builtin/log.c` 第 1368–1386 行）。Libra 保留的 `short` 别名见 `DEFER-FPG-04`。`log:` 按 Git 上游行为去掉前缀后渲染（`git@6de20f6092` `builtin/log.c` 与 t4014「cover letter with subject, author and count」期望 `[1/1] This is a subject (A U Thor)`）；#899 第 2 项文字称输出保留字面 `log:`，与上游不符，本计划以上游为准，并在关闭 #899 时于 issue 中说明。`format.commitListFormat`、`full` 取值（Git 基线无此关键字）与无封面信场景由自本卡拆出的 `FPG-49` 承接。本卡全部夹具不配置分支描述（列表段按「验证执行协议」第 3 项自 `*** BLURB HERE ***` 之后提取）。
 
@@ -2781,7 +2781,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.commitListFormat` 作为默认列表格式，命令行优先；仅命令行格式选项隐含封面信，配置不隐含；`full` 按 Git 基线以无效格式串拒绝；`--no-cover-letter` 与 CLI 格式组合成功且不写封面信。AC1–AC7 由 `format_patch_test::commit_list_format_config_and_full` 覆盖（配置 log/atoms、modern、shortlog、CLI 覆盖、配置不隐含封面、no-cover-letter 组合，列表段与 Git 逐字；`full` 稳定错误码）；`format_patch_test` 159/159、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-14` 拆出的独立轴：读取 `format.commitListFormat`（取值语法同命令行；命令行 `--commit-list-format` 优先；按 Git 只有命令行格式选项隐含封面信，配置不隐含），并保证 `--no-cover-letter` 与格式选项同用时成功且不写封面信。#899 第 4 项与 #909 第 4 项所称 `full` 关键字及上游「cover letter full format」用例在 `git@6de20f6092` 中不存在（`builtin/log.c` 只接受 `log:` 前缀、`shortlog`、`modern` 与含 `%` 的串，其余 `die`；该 revision 的 t4014 无此用例）；本计划以上游为准，`full` 按无效格式串拒绝（与 `FPG-14` 无原子字面量同一错误契约），并在关闭 #899、#909 时于 issue 中说明。
 
@@ -2858,7 +2858,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：位置参数改为 `Vec<String>`，支持多修订与 `^<rev>` 排除；单裸修订仍 `<rev>..HEAD`，`--root`/`-1`/`-<n>` 保留 newest-first 截断；多修订/范围按 Git 修订集合取并集、减去所有排除 tip 祖先，并按拓扑+提交时间排序。为满足 AC4，默认多补丁/带封面单补丁按 `format.numbered=auto` 输出 `[PATCH n/m]`。AC1–AC7 由 `format_patch_test::revision_range_caret_exclusion` 覆盖（`^main rebuild-1`、显式范围等价、两个正向修订、内部 `^r1`、单修订、`a~n..b`）；`format_patch_test` 160/160、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.numbered` 配置/CLI 覆盖仍由 `FPG-01`/`FPG-32` 承接（`FPG-01` 外部 `CLOSE-529` 门未解除）。
 
 **Description:** 将 `FormatPatchArgs::revision_range` 扩展为支持多个位置修订参数（`Vec<String>`），并解析 `^<rev>` 排除语义（如 `topic ^main` 等价于 `main..topic`）。 夹具（全部提交以逐个递增的固定 `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` 创建，标题互不相同）：`main` 上 `base` → `m1` → `m2`；`rebuild-1` 自 `base` 分出 `r1` → `r2`；各 AC 执行时 HEAD 位于 `main`（使 `^main rebuild-1` 不等于 `main..HEAD`）。各 AC 只比较补丁选择结果（`Subject:` 行序列或封面信列表段），不比较 diff 字节（AC4 含根提交，见「验证执行协议」第 3 项差异隔离）。
 
@@ -2934,7 +2934,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：普通补丁与封面信首行 mbox `From <oid> <date>` 的时间戳统一为 Git 固定 `Mon Sep 17 00:00:00 2001`；补丁用该提交完整 oid，封面信用系列末个提交 oid，`--zero-commit` 按哈希长度补零；补丁 `Date:` 仍取作者时间。AC1–AC4 由 `format_patch_test::mbox_envelope_fixed_2001_timestamp` 覆盖（固定信封、zero-commit、封面信封、`libra am` 拆分应用两封），AC5 由 `compat_format_patch_mail_roundtrip::fixed_envelope_mbox_applies_with_git_am` 覆盖（真实 `git am` 应用）；`format_patch_test` 138/138、`compat_format_patch_mail_roundtrip` 全绿；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 将普通补丁与封面信首行 mbox `"From <oid> ..."` 分隔符的时间戳统一为 Git 固定的 `Mon Sep 17 00:00:00 2001`（封面信信封按 Git 使用系列末个提交的 oid，`git show 6de20f6092:builtin/log.c` 第 1403、1416 行 `log_write_email_headers(rev, head, …)`；`--zero-commit` 时为全零）。#893 第 3 项（补丁 `Date:` 取作者时间与作者时区）由自本卡拆出的 `FPG-59` 承接。夹具为两补丁系列（标题互不相同）；AC4、AC5 对 AC1 的同一 `-2 --stdout` mbox 分别在独立的临时接收仓库中应用。
 
@@ -3008,7 +3008,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：补丁 `Date:` 改为作者时间+作者时区（RFC 2822；封面信仍为当前时间）；`libra am` 与 `git am` 均保留作者时间/偏移。AC1–AC3 由 `format_patch_test::patch_date_uses_author_time_and_zone` 覆盖（Date 行与 Git 逐字 `Thu, 7 Apr 2005 15:13:13 +0800`；两种 am 后 `%at %ai` 均为 `1112857993 2005-04-07 15:13:13 +0800`）；`format_patch_test` 157/157、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；libra am 对多封 mbox 的现有多邮件解析问题不在本卡范围，测试按单封应用同一 mbox 内容。
 
 **Description:** 自 `FPG-16` 拆出的独立轴：按 #893 第 3 项把补丁 `Date:` 头改为 Git 的作者时间与作者时区（Git 以 `DATE_RFC2822` 渲染作者签名）；现行 `timestamp_from_commit` 取提交者时间并以 UTC 渲染（`src/command/format_patch.rs:828-829,1837-1840`）；`libra am` 已保留 `Date:` 的时区（`src/command/mailinfo.rs:747-759`）。夹具：两补丁系列，两个提交的作者时间均为 `2005-04-07 15:13:13 +0800`、提交者时间均为 `2006-01-02 03:04:05 +0000`（作者 ≠ 提交者、作者时区非 UTC）；AC2、AC3 对 AC1 的同一 `-2 --stdout` mbox 分别在独立的临时接收仓库中应用。
 
@@ -3078,7 +3078,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：base 区块只放在第一封邮件——有封面信在封面信、否则第一封补丁（Git `print_bases` 只输出一次），不再放最后一封。AC1/AC2 由 `format_patch_test::base_block_rides_on_first_mail` 覆盖（无封面首补丁含 base-commit+prerequisite、次补丁为空；封面含区块且两补丁为空；逐封与 Git 黄金比较，独立夹具 OID 归一化）；`format_patch_test` 158/158、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`--base=auto` 由 `FPG-17` 承接。
 
 **Description:** 自 `FPG-17` 拆出的独立轴（先于 `FPG-17` 执行，`--base=auto` 直接继承该位置）：按 Git 把 base 区块（`base-commit:` 与 `prerequisite-patch-id:`）只放在第一封邮件——有封面信时在封面信，否则在第一封补丁（`git show 6de20f6092:builtin/log.c` 第 1894–1913、2534 行 `print_bases` 只输出一次）；现行无封面信时放在最后一封补丁（`src/command/format_patch.rs:532-533,569-574`）。既有显式 `--base` 用例均为单补丁，不受影响（#894 第 4 项）。
 
@@ -3145,7 +3145,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：实现 `--base=auto`——上游跟踪 ref 与每个正向修订的 merge base 归约后要求唯一；无上游/歧义/非祖先/base 在列表内分别以 `LBR-CLI-003`/128 失败；显式 `--base` 与首封邮件位置不变。AC1–AC7 由 `format_patch_test::base_auto_cli`（同源 Git 夹具逐字、无上游、criss-cross、whole-list 祖先、base 在列表内）与既有 `base_records_base_commit_and_prerequisite_patch_ids` 覆盖；`base_auto_is_rejected` 已迁移；`format_patch_test` 161/161、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.useAutoBase` 由 `FPG-43` 承接。
 
 **Description:** 实现 `--base=auto`：按 Git `get_base_commit`（`git show 6de20f6092:builtin/log.c` 第 1702 行起）取当前分支上游跟踪分支与**整个修订列表**的唯一 merge-base（不唯一即 `could not find exact merge base`），再要求修订列表两两求得的公共祖先唯一（否则 `failed to find exact merge base`）、base 是其祖先（否则 `base commit should be the ancestor of revision list`）且不在修订列表内（否则 `base commit shouldn't be in revision list`），输出 `base-commit:` / `prerequisite-patch-id:`；无上游时失败；显式 `--base=<commit>` 不变。多个正向 revision 由 `FPG-15` 先行支持。`format.useAutoBase` 由自本卡拆出的 `FPG-43` 承接。 base 区块只放在第一封邮件（对显式 `--base` 与 `--base=auto` 相同）由自本卡拆出、先于本卡执行的 `FPG-64` 承接。
 
@@ -3225,7 +3225,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.useAutoBase`——`true`=`--base=auto`、`false` 关闭、`whenAble` 自动基线失败时静默省略；`--no-base`/显式 `--base` 覆盖配置；本地覆盖全局。AC1–AC7 由 `format_patch_test::format_use_auto_base` 覆盖（base 区块与同源 Git 逐字、无上游 true 失败、whenAble 静默且 stderr 无额外诊断、--no-base、本地 false 覆盖全局 true）；`format_patch_test` 162/162、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-17` 拆出的独立轴：经 `read_format_config` 读取 `format.useAutoBase`（`false`/`true`/`whenAble`），`true` 等价 `--base=auto`，`whenAble` 无法确定基线时静默省略，`--no-base` 覆盖配置。
 
@@ -3301,7 +3301,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：封面信正文读取 `branch.<name>.description` 替换 `*** BLURB HERE ***`；无修订/单一裸修订取当前分支，范围/`^<rev>`/多修订取唯一正向分支，多条正向省略，空描述回退占位符。AC1–AC3 由 `format_patch_test::cover_letter_branch_description` 覆盖（当前 topic 描述、`^main rebuild-1` 选 rebuild 且不含 side、无修订 `-2` 用当前分支，均与 Git 描述段逐字）；`format_patch_test` 163/163、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；默认封面信 `From:` 由 `FPG-60`、`--cover-from-description` 由 `FPG-25` 承接。
 
 **Description:** 自 `FPG-12` 拆出的独立轴：封面信按 Git 选分支读取 `branch.<name>.description`：单一 revision（隐含 `..HEAD`）或无 revision 时取当前分支（`git show 6de20f6092:builtin/log.c` 第 2288–2320 行 `check_head`），其余写法（`^main rebuild-1`、`main..topic`，由 `FPG-15` 先行支持）按 `find_branch_name`（第 1233–1261 行）取唯一正向 revision 对应的分支（#892 第 4 项）。封面信默认 `From:` 身份由自本卡拆出的 `FPG-60` 承接。
 
@@ -3369,7 +3369,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：未传 `--from`/`format.from` 时封面信 `From:` 取执行时提交者身份（`GIT_COMMITTER_*` 优先，其次 `user.name`/`user.email`），补丁仍用作者。AC1/AC2 由 `format_patch_test::cover_letter_default_from_identity` 覆盖（环境身份覆盖、配置身份且与全部提交作者不同）；`format_patch_test` 164/164、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-24` 拆出的独立轴：未传 `--from` 时以执行时的提交者身份（Git `git_committer_info`，`git show 6de20f6092:builtin/log.c` 第 1411 行；`GIT_COMMITTER_*` 优先，其次 `user.name`/`user.email`）填入封面信 `From:`，而非现行的空值；补丁邮件的 `From:` 不变（仍为作者）。
 
@@ -3435,7 +3435,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `--cover-from-description` 五模式（空格/= 均可）：default/message 全描述入正文、none 占位符、subject 首段入标题余段入正文、auto 仅格式化首段 ≤100 字节用 subject；非法值无论是否启用封面信均 `invalid cover from description mode` + `LBR-CLI-002`。AC1–AC8 由 `format_patch_test::cover_from_description` 覆盖（Git 三模式逐字、default=message、空格形式、100/120 字节边界、无封面非法值）；`format_patch_test` 165/165、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过（含新 flag 必列）；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.coverFromDescription` 由 `FPG-33` 承接。
 
 **Description:** 自 `FPG-13` 拆出的独立轴：新增 `--cover-from-description=<mode>`（仅接受 `default`/`none`/`message`/`subject`/`auto`），按模式决定分支描述写入封面信标题还是正文；非法 CLI 值不论是否启用封面信均拒绝并报 `invalid cover from description mode`（`LBR-CLI-002`；由本卡的模式校验产生，不得在 clap 取值枚举阶段拒绝；Git `fatal:`/128 的差异见 `DEFER-FPG-04`）。`format.coverFromDescription` 由自本卡拆出的 `FPG-33` 承接。
 
@@ -3514,7 +3514,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：严格级联读取 `format.coverFromDescription`，配置回调阶段校验；非法值即使 CLI 合法/无封面信也报 `invalid cover from description mode` + `LBR-CLI-003`；合法配置作为默认模式，CLI 覆盖。AC1–AC8 由 `format_patch_test::format_cover_from_description_config` 覆盖（五模式与 CLI 逐字节、auto 阈值、CLI none 覆盖、无封面非法配置、合法 CLI 不掩盖非法配置）；`format_patch_test` 166/166、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-25` 拆出的独立轴：经 `read_format_config` 严格级联读取 `format.coverFromDescription`（与 CLI 同一取值集），非法值在读取配置时即拒绝并报 `invalid cover from description mode`（`LBR-CLI-003`；不论命令行是否给出合法 `--cover-from-description`、是否启用封面信，`git show 6de20f6092:builtin/log.c` 第 1101–1103 行在配置回调中 `die`，先于参数解析），CLI `--cover-from-description` 覆盖配置。
 
@@ -3592,7 +3592,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--attach`/`--inline` 改为可选 boundary（`require_equals`），自定义值为 `------------<BOUNDARY>`，无值默认既有 boundary；空格形式作为修订参数；base trailer 位于附件内、封面信非 multipart。AC1–AC7 由 `format_patch_test::attach_custom_boundary` 覆盖（boundary、inline disposition、base 与终止行、封面非 multipart、空格修订）；`format_patch_test` 167/167、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.attach`/`--no-attach` 由 `FPG-38` 承接。
 
 **Description:** 将 `--attach` 与 `--inline` 升级为可选值参数 `--attach[=<boundary>]`/`--inline[=<boundary>]`（Git 的 boundary 为 `------------<值>`），保持与 `--base` 组合时 trailer 在附件部分内、封面信仍为非 multipart；`format.attach` 配置与 `--no-attach` 由自本卡拆出的 `FPG-38` 承接。
 
@@ -3668,7 +3668,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.attach`——非空值（含字面 `true`）作为 boundary、空值关闭；本地空值覆盖全局；新增 `--no-attach` 覆盖配置与 `--attach`/`--inline`。AC1–AC5 由 `format_patch_test::format_attach_config` 覆盖（true 字面 boundary、自定义、空值关闭、全局+本地空值、--no-attach）；`format_patch_test` 168/168、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过（含新 flag）；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；无值配置形式仍未排期。
 
 **Description:** 自 `FPG-18` 拆出的独立轴：经 `read_format_config` 严格级联读取 `format.attach`，按 Git 语义：非空值（含字面 `true`）作为 boundary，空值关闭，本地空值覆盖全局值；新增 `--no-attach` 覆盖配置。Git 的无值形式（等价默认 boundary）在 Libra 配置中不可表达（尚未排期，重启条件：配置支持无值键）。
 
@@ -3740,7 +3740,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增多补丁 `--interdiff=<REV>`（空格形式亦可），封面信 diffstat 后输出 `Interdiff against v<n-1>:`（无 `-v` 为 `Interdiff:`）及 `<REV>` 树与末补丁树的统一 diff；未显式关闭封面信时隐含封面信；非法 revision `LBR-CLI-003`。AC1–AC6 由 `format_patch_test::interdiff_multi_patch_cover_letter` 覆盖（AC1–AC5 封面 diffstat 后段与同源 Git 逐字、AC6 非法 revision）；`format_patch_test` 169/169、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过（含新 flag）；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；单补丁位置由 `FPG-34` 承接。
 
 **Description:** 在 `529 FP-10` 已落地的封面信三态与前置诊断基础上，保留其 U 型拒绝（多补丁且封面信被显式禁用），把多补丁场景的 X 型「不支持」分类（`fp10_interdiff_implied_cover`、`fp10_interdiff_spaced_value`）替换为实际 series interdiff 输出：按 `git@6de20f6092` 语义直接对比 `<rev>` 的树与当前系列末个提交的树（`builtin/log.c` 令 `idiff_oid1 = <rev>`、`idiff_oid2` 为末个提交的树，`diff-lib.c` `show_interdiff` 以 `diff_tree_oid` 求差；R5 曾误改为两系列各自组合变更之差，R25 按上游源码更正），在封面信中输出 `Interdiff:` 区块（有 `-v` 时为 Git 的 `Interdiff against v<n-1>:`）。单补丁位置由自本卡拆出的 `FPG-34` 承接。 `#898` 第 3 项（`--no-cover-letter` 与 `format.coverLetter=no` 时拒绝）由 `issues/529#FP-10` 的 U 型门族交付并在 529 计划内验收，本卡不改变其契约，其门族在本卡共享回归组中运行（不计本卡 AC）；不带 `--stdout` 时 `v23-0000-cover-letter.patch` 的文件输出组合由 `FPG-20` 验收。 夹具为差异隔离夹具：被比较的文件在 `main` 上已存在，新旧系列只修改其既有行（使 interdiff 不含空旧侧 hunk，见「验证执行协议」第 3 项）。
 
@@ -3817,7 +3817,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：单补丁无封面信时 interdiff 位于补丁 diff 之后、签名之前（空行+标题+两空格缩进 diff）；有封面信时只在封面信、补丁不重复；单补丁不再隐含封面信。AC1–AC5 由 `format_patch_test::interdiff_single_patch_placement` 覆盖（补丁 diff 段与同源 Git 逐字、--no-cover-letter、config false、封面区块、补丁无重复）；`format_patch_test` 170/170、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-19` 拆出的独立轴：单补丁系列（`total = 1`）把 `529 FP-10` 的 X 型「不支持」分类（`fp10_interdiff_single_patch` 及单补丁显式启用封面信的组合）替换为实际输出：无封面信时（含被 `--no-cover-letter` 或 `format.coverLetter=false` 禁用）`Interdiff:` 区块位于补丁 diff 之后、签名分隔 `-- ` 之前——先输出一个空行，再输出标题行（整数 `-v` 时为 `Interdiff against v<n-1>:`），其后 interdiff 每行缩进两个空格（`git show 6de20f6092:log-tree.c` 第 695–711、1299–1300 行；t4014「interdiff: solo-patch」）；启用封面信时 interdiff 只出现在封面信、补丁中不重复（`git show 6de20f6092:builtin/log.c` 第 2465–2467 行；t4014「interdiff: cover-letter」）。夹具同 t4014「interdiff: setup」并改为差异隔离形式：`blorp` 在 `main` 上已存在，`boop` 分支依次提交 `fnorp`、`fleep`，均只修改 `blorp` 的既有行；参数 `--interdiff=boop~2 -1 boop`；夹具前置断言 interdiff 文本不同于补丁 diff 文本（不计 AC）。
 
@@ -3890,7 +3890,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--reroll-count` 为输出文件名加 `v<val>-` 前缀（含封面信），与 `Subject:` 的 `[PATCH v4 n/m]` 版本一致；文件输出携带完整 interdiff 区块。AC1–AC6 由 `format_patch_test::reroll_filename_prefix` 覆盖（v4 文件名集合、封面/补丁 Subject 版本、文件输出 interdiff 与同源 Git 逐字）；`format_patch_test` 171/171、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 在 `--reroll-count`（`-v`）时于输出文件名前添加 `v<val>-` 前缀，并保证每封邮件的 `Subject:` 版本与文件名前缀一致（自本卡拆出 `FPG-26` 处理非整数 `--reroll-count`、`FPG-45` 处理生成路径列表输出到 stdout）。
 
@@ -3964,7 +3964,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：非 `--stdout`/`--json`/全局 `--quiet` 时生成路径逐行写 stdout；绝对 `-o` 绝对路径、相对 `-o` 相对 cwd、无 `-o` 裸文件名；`--quiet`/`--json` 抑制。AC1–AC6 由 `format_patch_test::generated_paths_on_stdout` 覆盖（相对/绝对/裸文件名、stderr 无路径、quiet、JSON-only）；`format_patch_test` 172/172、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-20` 拆出的独立轴：非 `--stdout`、非 `--json`、非全局 `--quiet` 时把生成的文件路径逐行写到 stdout（不再写 stderr），`--quiet` 抑制，`--json` 只输出 JSON。 打印形式按 Git `set_outdir`/`outdir_offset`（`git show 6de20f6092:builtin/log.c` 第 1140–1158、1510–1527 行）：绝对 `-o` 打印绝对路径；相对 `-o` 打印相对当前工作目录的路径；未指定输出目录时只打印文件名；现行 `resolve_output_dir` 以 `current_dir()` 拼出绝对路径（`src/command/format_patch.rs:1772-1789`）。
 
@@ -4038,7 +4038,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`reroll_count` 改为字符串，非整数/非常规值按 Git 清洗文件名前缀（4.4、4rev2、异常分隔符），始终写输出目录；Subject 原样与 interdiff 标题由 `FPG-52` 承接。AC1–AC3 由 `format_patch_test::reroll_non_integer` 覆盖（4.4 封面集合、4rev2、异常值与 Git 文件名集合逐项相等）；`format_patch_test` 173/173、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-20` 拆出的独立轴：将 `FormatPatchArgs::reroll_count` 从 `Option<usize>` 改为字符串，按 Git 接受小数与非数字 reroll 标记（`--reroll-count=4.4`、`-v4rev2`、`-v4---..././../--1/.2//`），文件名前缀使用 Git 的清洗结果（路径分隔符等被替换，文件始终写在输出目录内）。`Subject:` 原样字符串与 interdiff 标题由自本卡拆出的 `FPG-52` 承接。
 
@@ -4106,7 +4106,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：核实 `Subject:` 保留命令行 reroll 原样字符串，非整数版本 interdiff 标题为通用 `Interdiff:`（不递减）；文件名前缀仍按 FPG-26 清洗。无代码改动，补验收门。AC1–AC6 由 `format_patch_test::reroll_non_integer_subjects` 覆盖（异常值/v4rev2 原样 Subject、v2.2 Interdiff、v4.4 封面/两补丁 Subject）；`format_patch_test` 174/174、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-26` 拆出的独立轴：`Subject:` 使用命令行给出的原样 reroll 字符串（不清洗、不补零），非整数版本的 interdiff 标题按 Git `diff_title` 为不带版本的 `Interdiff:`。 #898 Expected behavior 第 2 项称 `-v2.2` → `Interdiff against v1.2:`，与 `git show 6de20f6092:builtin/log.c` 第 1915–1928 行 `diff_title`（非整数版本输出 `Interdiff:`）不符；本计划以上游为准，并在关闭 #898 时于 issue 中说明。
 
@@ -4181,7 +4181,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：文件名 slug 改为 Git `format_sanitized_subject`——保留大小写、仅 ASCII 字母数字与 `.`/`_`、连续点压缩、其它连续字符转单个 `-`、去尾部 `.`/`-`、丢弃非 ASCII；长度上限仍由 `FPG-40` 承接。AC1–AC5 由 `format_patch_test::filename_git_sanitized_slug` 覆盖（Side changes #1、Mixed CASE、ALL CAPS、README..md/v1.2_x、café，均与同源 Git 文件名逐字）；`format_patch_test` 175/175、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 按 Git `format_sanitized_subject`（`git show 6de20f6092:pretty.c` 第 941–975 行）生成文件名 slug：保留大小写，只保留 ASCII 字母数字与 `.`、`_`（连续 `.` 压缩为一个），其余字符（含非 ASCII）视为分隔并以单个 `-` 连接，去掉首尾分隔与末尾 `.`/`-`；现行 `patch_slug` 转小写、把 `.`/`_` 换成 `-` 且保留 Unicode 字母数字（`src/command/format_patch.rs:1646-1667`）。#908 正文称「其余清洗一致」，与上游清洗规则不符，本计划以上游为准并在关闭 #908 时说明。文件名长度上限由自本卡拆出的 `FPG-40` 承接。
 
@@ -4253,7 +4253,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：移除 slug 52 字符硬截断，整文件名默认 64 字节预算（含编号/slug/后缀/`vN-` 前缀）；`--filename-max-length` 与 `format.filenameMaxLength` 按 Git 截断，flag 优先。AC1–AC8 由 `format_patch_test::filename_max_length_git_parity` 覆盖（100/default/64/15/25/35 与 Git 逐字、配置 40=CLI、-v4 前缀计入预算）；`format_patch_test` 176/176、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-21` 拆出的独立轴：移除 `truncate_slug` 的 52 字符硬编码截断，使默认上限（Git 64）、显式 `--filename-max-length` 与 `format.filenameMaxLength` 按 Git 规则截断整个文件名。
 
@@ -4332,7 +4332,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `-U<n>`/`--unified=<n>`；`FormatPatchArgs.unified` 经 `CommitDiffOptions.context_lines`（默认 3）与父提交路径的 `DiffArgs --unified=<n>` 透传到共享 diff 渲染引擎；`CommitDiffOptions::default()` 的 histogram/full_index/prefix 字段不变。AC1/AC2 由 `format_patch_test::unified_context_lines` 覆盖（`-U1`、`--unified=5` 与 Git 黄金 diff 段逐字且两两不同），AC3–AC7 由 `log::commit_diff_options_tests::defaults_keep_three_context_lines_and_prefixes` 覆盖；`format_patch_test` 134/134。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 在 `FormatPatchArgs` 新增 `-U<n>`/`--unified=<n>`，经 `log::CommitDiffOptions` 透传到 `src/command/diff/` 渲染引擎控制上下文行数。自本卡拆出 `FPG-27` 处理 `--diff-filter` 与重命名核验、`FPG-61` 处理 `--full-diff`。
 
@@ -4412,7 +4412,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增可见 `--full-diff`，`FormatPatchArgs.full_diff` 仅被接受；Libra `format-patch` 不接受 `-- <path>` pathspec，故无 pathspec 时输出与不带该 flag 逐字节相同（与 Git 同语义）。AC1 由 `format_patch_test::full_diff_accepted_without_pathspec` 覆盖，`compat_format_patch_flag_surface` 的 help 必列清单已加入 `--full-diff`；`format_patch_test` 135/135、`compat_format_patch_mail_roundtrip` 13/13。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-22` 拆出的独立轴：`FormatPatchArgs` 新增 `--full-diff` 并按 Git 接受（现行以 clap `unexpected argument` 拒绝）；Libra `format-patch` 不接受 `-- <path>` pathspec，Git 在无 pathspec 时该选项不改变输出，故接受后输出与不带该 flag 时相同；新增可见 flag 同卡加入 `tests/compat/format_patch_flag_surface.rs` 必列清单。
 
@@ -4476,7 +4476,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `--diff-filter=<FILTER>`；父提交路径经 `DiffArgs --diff-filter=<FILTER>` 与 `CommitDiffOptions.diff_filter` 透传到共享 diff 引擎，同时过滤补丁与 diffstat；非法字母由共享引擎以 `LBR-CLI-002` 拒绝且 stdout 为空；`CommitDiffOptions::default().diff_filter` 为空，log/show/stash 行为不变。AC1–AC3 由 `format_patch_test::diff_filter` 覆盖（同一提交新增/修改/删除，仅输出新增路径的补丁与统计；非法 `Q` 带 `Error-Code: LBR-CLI-002` 且 stderr 含 `diff-filter`），AC4 由 `log::tests::commit_diff_options_default_has_no_diff_filter` 覆盖；`format_patch_test` 139/139、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 全绿；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；root 提交路径仍走 `log::generate_diff_with_options`（其 diff_filter 字段已存在但本卡仅父提交路径接入共享引擎，root 全部为新增，卡内无需过滤场景）。
 
 **Description:** 自 `FPG-22` 拆出的独立轴：在 `FormatPatchArgs` 新增 `--diff-filter=<filter>`，经 `CommitDiffOptions` 透传到 `src/command/diff/`，同时过滤补丁 diff 与 diffstat；重命名选项核验与 #904 封面信相关验收由自本卡拆出的 `FPG-39` 承接。 AC1、AC2 夹具中新增与删除的文件内容互不相似（避免默认重命名检测把二者配对）。
 
@@ -4550,7 +4550,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：核实 `-M`/`--find-renames`/`--no-renames` 双向 last-wins；封面信系列 diffstat 继承补丁重命名选项；`--no-renames --cover-letter` 正常写出封面信与补丁，diff 段与 Git 一致（hunk 头按 `DEFER-FP-01`、rename summary 行按 `DEFER-FPG-03` 不在本卡范围）。AC1–AC7 由 `format_patch_test::rename_options_and_cover_inherit` 覆盖；`format_patch_test` 148/148（含 14 个 `fp06_*` 门）、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；封面信写入失败由 `FPG-62` 承接。
 
 **Description:** 自 `FPG-27` 拆出的独立轴：按 GC-01 核实 `issues/529#FP-06` 交付的 `-M`/`--find-renames`/`--no-renames` 与 Git 一致，并闭环 #904 重命名相关验收项：`--no-renames --cover-letter` 在可写路径成功、封面信继承 diff 选项；`0000-cover-letter.patch` 被目录占用时的写入失败与不留部分输出（#904 第 2 项）由自本卡拆出的 `FPG-62` 承接。 `issues/529#FP-06` 的 `fp06_*` 门族在本卡共享回归组中运行（不计本卡 AC）。
 
@@ -4627,7 +4627,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：核实封面信先于补丁写出且单文件原子写；`d/0000-cover-letter.patch` 被目录占用时以 `LBR-IO-002`/128 失败、stdout 为空、不留下补丁或临时文件，既有实现已满足，无需代码改动。AC1/AC2 由 `format_patch_test::cover_letter_write_failure_leaves_no_partial_output` 覆盖（稳定码与路径短语；全量目录快照前后相同）；`format_patch_test` 149/149、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；开发文档已记录核对结论。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；数值退出码仍按 `DEFER-FPG-04`。
 
 **Description:** 自 `FPG-39` 拆出的独立轴：按 GC-01 核实并补门：`-o d` 下 `d/0000-cover-letter.patch` 被目录占用时，`format-patch` 以写入失败（`LBR-IO-002`，而非 CLI 拒绝）退出，且不留下任何部分输出（Git t4014「failure to write cover-letter aborts gracefully」）；现行 `write_patch_file` 为单文件原子写、封面信先于补丁写出（`src/command/format_patch.rs:1795-1836`），开工按 GC-01 核实失败时后续补丁不再写出，不满足即在本卡修复。
 
@@ -4693,7 +4693,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：线程头 `Message-ID:`/`In-Reply-To:`/`References:` 移至信封行之后、`From:` 之前，补丁与封面信一致；仅改位置，取值仍由 `FPG-28` 承接。AC1 由 `format_patch_test::thread_headers_follow_envelope` 覆盖（4 封邮件逐封与 Git 头字段名序列逐字一致，含封面外部父邮件与补丁回复头）；`format_patch_test` 150/150、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；开发文档已记录核对结论。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-28` 拆出的独立轴（先于 `FPG-28` 执行，使其后的 `check_threading` 式黄金比较不因头区位置不同而失败）：把补丁与封面信的 `Message-ID:`/`In-Reply-To:`/`References:` 移到信封行之后、`From:` 之前（Git `log_write_email_headers`，`git show 6de20f6092:log-tree.c` 第 508–522 行；现行在 `Subject:` 之后输出，`src/command/format_patch.rs:866-879,1404-1413`）。本卡只改头的位置，不改 Message-ID 取值（由 `FPG-28` 承接）。
 
@@ -4758,7 +4758,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：Message-ID 改为系列 ID + 固定 8 位补丁序号（封面 `-cover`），任意两封互不为子串；无封面时后继补丁回复首补丁实际 ID，有封面时全部回复封面信。仅改 ID 生成，未改 `--thread` 默认值与 deep 链式结构。AC1–AC4 由 `format_patch_test::message_id_no_substring` 覆盖（3 封与 12 封两两无子串、封面回复关系、归一化父索引结构与 Git 一致）；`format_patch_test` 151/151、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；开发文档已记录核对结论。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-23` 拆出的独立轴：修改 `build_thread_id` / `push_threading_headers` 的 Message-ID 生成格式，使同系列任意两封邮件（含封面信与首个补丁）的 Message-ID 值（去掉尖括号后）互不为对方子串；当前首补丁值 `X` 是 `X-p2`、`X-cover` 的子串。 本卡先于 `FPG-35`、`FPG-23` 执行，使其后的 `check_threading` 式黄金比较在 ID 互不为子串的前提下成立；deep 链式结构由 `FPG-35` 验收。 线程头的位置（信封行之后、`From:` 之前）由自本卡拆出、先于本卡执行的 `FPG-63` 承接。
 
@@ -4828,7 +4828,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--thread` 支持 `shallow`/`deep` 可选值（`require_equals`，裸 `--thread`=shallow）；deep 逐封回复前一封、References 保持线程根；`--no-thread --in-reply-to` 为每封邮件保留外部父头但不生成 Message-ID。未改 `--thread` 默认值（由 `FPG-23` 承接）。AC1–AC7 由 `format_patch_test::thread_shallow_and_deep` 覆盖（7 个场景归一化线程结构与 Git 逐封一致，外部 ID 保留）；`format_patch_test` 152/152、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-23` 拆出的独立轴：`--thread` 接受可选值 `shallow`/`deep`（无值即 `shallow`），`deep` 时每封邮件回复上一封且 `References:` 依序列出外部父邮件、封面信与全部祖先；显式 `--no-thread` 时 `--in-reply-to` 按 Git 为每封邮件添加外部父邮件头（默认关闭由 `FPG-23` 承接，本卡以显式 `--no-thread` 验收）。默认值与 `format.thread` 由 `FPG-23` 承接。 浅线程在有封面信与 `--in-reply-to` 时，补丁 `References:` 依次列出外部父邮件与封面信（现行 `push_threading_headers` 只列外部父邮件，`src/command/format_patch.rs:1350`）。`--thread` 的值须以 `=` 紧贴（可选值参数），裸 `--thread` 之后的参数按修订解析。
 
@@ -4904,7 +4904,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--thread` 默认关闭；无 flag 时三补丁系列不输出线程头；单独 `--in-reply-to` 仅逐封添加外部父头、不生成 Message-ID。`format.thread` 取值仍由 `FPG-47` 承接。AC1/AC2 由 `format_patch_test::format_thread_default_off` 覆盖（默认无头与 Git 一致、外部父邮件逐封保留且与 Git 一致）；`format_patch_test` 153/153、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 将 `--thread` 默认行为对齐 Git：默认不输出系列线程头；`--in-reply-to` 单独使用时只为每封邮件添加外部父邮件头、不启用系列线程。`format.thread` 的全部取值（含 `false`/空值关闭，#917 第 2 项）由自本卡拆出的 `FPG-47` 承接——默认关闭之后 `false`/空值与未配置不可区分，须在启用取值已实现时以跨层与同层夹具验收；`--thread=shallow|deep` 与 deep 链式线程由 `FPG-35` 承接，Message-ID 去重由 `FPG-28` 承接。
 
@@ -4971,7 +4971,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.thread`——`deep`/`shallow` 不区分大小写，`true` 为 shallow，`false`/空值关闭；本地覆盖全局、同层后写者生效；命令行 flag 覆盖配置。AC1–AC6 由 `format_patch_test::format_thread_config_values` 覆盖（true/Shallow/deep、全局 deep+本地 false/空值、同层 `--add deep` 后 `false`，均与 Git 归一化结构一致）；`format_patch_test` 154/154、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；命令行覆盖配置由 `FPG-50` 承接。
 
 **Description:** 自 `FPG-23` 拆出的独立轴：读取 `format.thread`：`deep`（不区分大小写）为 deep，`shallow`（不区分大小写）与布尔真值（`true` 等）为 shallow，布尔假值与空值关闭（`git show 6de20f6092:builtin/log.c` 第 1030–1040 行，关键字以 `strcasecmp` 比较）；每个取值完全决定线程样式，按 Git 后出现者生效（跨层即 local 优先，同层取最后写入者，`read_format_config` 的单值严格级联即可表达）。关闭取值以「另一层或同层先前取值为启用」的夹具验收，使忽略配置的实现不能通过；全局层经临时 `LIBRA_CONFIG_GLOBAL_DB` 隔离（GC-13）。命令行覆盖由自本卡拆出的 `FPG-50` 承接。
 
@@ -5045,7 +5045,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：核实 clap 双向 `overrides_with` + CLI 存在即跳过配置，已满足 argv 顺序覆盖：裸 `--thread`=shallow、`--thread=<style>` 按样式、`--no-thread` 关闭，后出现者胜出；无代码改动，补验收门。AC1–AC6 由 `format_patch_test::thread_cli_overrides_config` 覆盖（deep+裸 `--thread`→shallow、deep+`--no-thread`→无头、shallow+`--thread=deep`、deep+`--thread=shallow`、`--thread=deep --no-thread`→无头、`--no-thread --thread=deep`→deep，均与 Git 归一化结构一致）；`format_patch_test` 155/155、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-47` 拆出的独立轴：命令行线程选项按出现顺序覆盖 `format.thread`：裸 `--thread` 为 shallow，`--thread=<style>` 为对应样式，`--no-thread` 关闭；后出现者覆盖先出现者与配置。
 

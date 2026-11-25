@@ -14,7 +14,7 @@ body-only message 和从 `---` 开始的 patch，供 shell script 与 `am` 共�
   `[PATCH ...]` cleanup；in-body `From:`；body/patch split；human、quiet、
   JSON/machine；无需 repo。
 - 明确延后：Git 的 `-k/-b/-m/-u/-n`、encoding/scissors/quoted-CR flags、
-  multipart/attachment、非 UTF-8 charset、多消息 mbox、binary/non-`diff --git`
+  multipart/attachment、UTF-8/US-ASCII/ISO-8859-1 之外的 charset、多消息 mbox、binary/non-`diff --git`
   patch。
 - 边界：stdin 64 MiB；两个目标必须是 existing parent 下的 distinct file
   names，拒绝 `-`、directory 及 `out`/`./out`、symlink-parent 等 alias。
@@ -58,7 +58,7 @@ body-only message 和从 `---` 开始的 patch，供 shell script 与 `am` 共�
 | 类别 | 未完成项 | 处理 |
 |---|---|---|
 | options | Git mailinfo 的 keep-subject、keep-non-patch-brackets、message-id、encoding、scissors 等 flags | P2 后续按真实互操作需求逐项加入。 |
-| MIME | multipart、attachment、非 UTF-8 charset | 明确错误，不 silent fallback。 |
+| MIME | multipart、attachment、UTF-8/US-ASCII/ISO-8859-1 之外的 charset | 明确错误，不 silent fallback。 |
 | stream | 多消息 mbox 与输出 stdout target | 延后；当前严格一封 stdin、两个 file target。 |
 | transaction | 两个路径的一次原子 commit | filesystem 不提供通用 cross-file transaction；保持 staged-before-persist + per-file atomic。 |
 
@@ -68,3 +68,5 @@ body-only message 和从 `---` 开始的 patch，供 shell script 与 `am` 共�
 - repo-independent parser 不得调用 `util::working_dir()` 或读取 index/worktree。
 - 新增 encoding/format 必须同时补 shared unit、mailinfo compat 与 am regression。
 - 输出 path 语义变化必须证明 invalid input/destination 不截断已有文件。
+
+- 2026-11-25（I672-01 / #672）：`mailinfo`/`am` 共享解析层新增 `ISO-8859-1`（latin1）→ UTF-8 无损转换：正文按传输编码取出原始字节后按 charset 转换（`quoted-printable`/`base64`/8bit 均适用），RFC 2047 B/Q encoded-word 同样按 charset 转换；其它 charset（如 `Shift_JIS`）保持 `unsupported text charset` 拒绝。正文解码后含 NUL 时 `am` 以退出码 129 报 `a NUL byte in commit log message not allowed`，Subject 含 NUL 时 `mailinfo`/`am` 均以 129 报 `a NUL byte in 'Subject' is not allowed`。回归：`compat_mailinfo_basic`（latin1 正文/Subject、NUL、UTF-8/us-ascii 基线、Shift_JIS 拒绝）与 `compat_mail_am_basic`（latin1 正文/Subject、NUL、基线、Shift_JIS 拒绝），两 target 59/59。

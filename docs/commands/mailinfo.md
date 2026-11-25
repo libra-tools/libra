@@ -66,5 +66,5 @@ libra --json mailinfo message.txt patch.diff < 0001-fix.patch
 
 The minimal P2-02 surface exposes no Git `mailinfo` options such as `-k`,
 `-b`, `-m`, `-u`, `--encoding`, `--scissors`, or `--quoted-cr`. MIME
-multipart messages, attachments, non-UTF-8 charsets, multi-message mboxes,
+multipart messages, attachments, charsets other than UTF-8/US-ASCII/ISO-8859-1, multi-message mboxes,
 binary patches, and patch text without a `diff --git` section are rejected.

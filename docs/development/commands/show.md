@@ -80,3 +80,5 @@ flowchart TD
 - 2026-11-23（LS-25 / #862）：新增 `show --textconv`/`--no-textconv`（默认启用 textconv）；无路径过滤时经 `run_diff_for_service`（argv 带 `--textconv`/`--no-textconv`）渲染，正文与 `libra diff` 同选项一致。回归：`show_textconv_and_no_textconv`（AC1–AC5）。
 
 - 2026-11-23（LS-34 / #973）：新增 `show --diff-filter`，复用 `DiffFilter::allows`；patch 经 `run_diff_for_service` 的 `--diff-filter` argv 过滤，全部文件被过滤时整条输出为空；name-status 逐条按状态过滤。回归：`show_diff_filter_selects_files`（AC1–AC4）。
+
+- 2026-11-23（SA-06 / #731）：`--pretty=format:`/`--format=format:` 采用 Git 的分隔语义——`--no-patch` 时不再无条件追加结尾换行（`format:` 模板结果即全部输出），有补丁/统计块时保留分隔换行；`tformat:`、隐式模板与命名预设保持终止换行（#731 之外的字节对照登记 `DEFER-SA-15`）。回归：`cherry_pick_empty_drop_show_message_matches_git`（AC1–AC3，`cherry-pick --empty=drop` 后 `show --no-patch --pretty=format:%B` 与 Git 字节一致）；`show_test` + `cherry_pick_test` 132/132。

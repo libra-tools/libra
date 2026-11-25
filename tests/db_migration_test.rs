@@ -4,6 +4,9 @@
 //! `tempfile::tempdir()` so the cases neither pollute each other nor
 //! depend on the embedded canonical bootstrap path.
 
+#[path = "helpers/workspace_sources.rs"]
+mod workspace_sources;
+
 use std::{
     ffi::OsStr,
     os::unix::fs::PermissionsExt,

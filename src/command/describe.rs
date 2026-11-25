@@ -30,7 +30,7 @@ mod describe_format;
 #[path = "describe_types.rs"]
 mod describe_types;
 use describe_format::{abbreviate_hash, describe_output};
-use describe_types::{DescribeError, DescribeOutput};
+use describe_types::{DescribeError, DescribeOutput, WorktreeCheck};
 
 const DESCRIBE_EXAMPLES: &str = "\
 EXAMPLES:
@@ -72,8 +72,12 @@ pub struct DescribeArgs {
     pub all: bool,
 
     /// Use N hex digits for the abbreviated commit hash (default: 7)
-    #[clap(long, value_name = "N")]
+    #[clap(long, value_name = "N", overrides_with = "no_abbrev")]
     pub abbrev: Option<usize>,
+
+    /// Show the full commit hash (Git's `--abbrev=0`; last one wins)
+    #[clap(long, overrides_with = "abbrev")]
+    pub no_abbrev: bool,
 
     /// Show an abbreviated commit hash when no tag can describe the target.
     #[clap(long)]
@@ -88,12 +92,21 @@ pub struct DescribeArgs {
     pub candidates: Option<usize>,
 
     /// Always output the long format when a tag describes the target.
-    #[clap(long)]
+    #[clap(long, overrides_with = "no_long")]
     pub long: bool,
+
+    /// Cancel an earlier `--long` (last one wins, like Git).
+    #[clap(long, overrides_with = "long")]
+    pub no_long: bool,
 
     /// Append MARK when tracked content differs from HEAD.
     #[clap(long, value_name = "MARK", num_args = 0..=1, require_equals = true, default_missing_value = "-dirty")]
     pub dirty: Option<String>,
+
+    /// Append MARK (default `-broken`) when the worktree check fails (Git's
+    /// `--broken`); the failure-mark path itself is delivered by DESC-08a.
+    #[clap(long = "broken", value_name = "MARK", num_args = 0..=1, require_equals = true, default_missing_value = "-broken")]
+    pub broken: Option<String>,
 
     /// Follow only the first parent of merge commits when walking history.
     #[clap(long = "first-parent")]
@@ -121,8 +134,13 @@ pub struct DescribeArgs {
 
 // Entry in tag lookup map
 struct TagInfo {
+    /// Name used in the rendered result (internal tag name unless `--all`).
     name: String,
+    /// Reference name the tag is known by (`refs/tags/<ref>` basename).
+    ref_name: String,
     is_annotated: bool,
+    /// The annotated tag object's `tag_name` differs from its ref name.
+    misnamed: bool,
 }
 
 pub async fn execute(args: DescribeArgs) {
@@ -166,10 +184,13 @@ pub(crate) async fn describe_commit_for_atom(
         tags,
         all: false,
         abbrev,
+        no_abbrev: false,
+        broken: None,
         always: false,
         exact_match: false,
         candidates: None,
         long: false,
+        no_long: false,
         dirty: None,
         first_parent: false,
         match_patterns,
@@ -192,12 +213,30 @@ pub(crate) async fn describe_commit_for_atom(
 }
 
 async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeError> {
-    let input = args.commit.unwrap_or_else(|| "HEAD".to_string());
+    // ADR-DESC-01/GAP-DESC-01: `--dirty` is only valid without a commit-ish;
+    // `--contains` is exempt (Git's contains branch never inspects the worktree).
+    if !args.contains && args.commit.is_some() {
+        for (present, option) in [
+            (args.broken.is_some(), "--broken"),
+            (args.dirty.is_some(), "--dirty"),
+        ] {
+            if present {
+                return Err(DescribeError::CommitishIncompatible {
+                    option: option.to_string(),
+                });
+            }
+        }
+    }
+    let input = args.commit.clone().unwrap_or_else(|| "HEAD".to_string());
     let start_hash = util::get_commit_base_typed(&input)
         .await
         .map_err(DescribeError::from)?;
     let resolved_commit = start_hash.to_string();
-    let abbrev = args.abbrev.unwrap_or(7);
+    let abbrev = if args.no_abbrev {
+        0
+    } else {
+        args.abbrev.unwrap_or(7)
+    };
     let long_format = args.long;
     if long_format && abbrev == 0 {
         return Err(DescribeError::LongWithAbbrevZero);
@@ -212,7 +251,13 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
     // `--exact-match` behavior (Git documents `--candidates 0` this way).
     let exact_match = args.exact_match || args.candidates == Some(0);
     let always = args.always;
-    let dirty_mark = args.dirty;
+    // `--broken` enables the suffix machinery with Git's default `-dirty` mark
+    // when `--dirty` gives no explicit one.
+    let dirty_mark = if args.dirty.is_some() || args.broken.is_some() {
+        Some(args.dirty.clone().unwrap_or_else(|| "-dirty".to_string()))
+    } else {
+        None
+    };
     let first_parent = args.first_parent;
     let shallow = ShallowSet::load()
         .map_err(|error| DescribeError::CorruptReference(format!("{error}; {}", error.hint())))?;
@@ -238,10 +283,25 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
             if !tag_passes_filters(&t.name, &matchers, &excluders) {
                 continue;
             }
+            let ref_name = t.name.clone();
+            // `--contains` and `--all` name tags by their reference; the plain
+            // path uses an annotated tag's internal name (Git `append_name`).
+            let mut misnamed = false;
+            let internal_name = match &t.object {
+                TagObject::Tag(tg) => Some(tg.tag_name.clone()),
+                _ => None,
+            };
             let tag_name = if include_all {
-                format!("tags/{}", t.name)
+                format!("tags/{ref_name}")
+            } else if args.contains {
+                ref_name.clone()
+            } else if let Some(internal) = &internal_name {
+                if *internal != ref_name {
+                    misnamed = true;
+                }
+                internal.clone()
             } else {
-                t.name
+                ref_name.clone()
             };
             let target_commit_hash = match t.object {
                 TagObject::Commit(c) => c.id,
@@ -257,7 +317,9 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
                     target_commit_hash,
                     TagInfo {
                         name: tag_name,
+                        ref_name,
                         is_annotated,
+                        misnamed,
                     },
                 );
             }
@@ -286,7 +348,9 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
             }
             tag_map.entry(branch.commit).or_insert_with(|| TagInfo {
                 name: format!("heads/{short}"),
+                ref_name: format!("heads/{short}"),
                 is_annotated: false,
+                misnamed: false,
             });
         }
 
@@ -308,7 +372,9 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
                 }
                 tag_map.entry(branch.commit).or_insert_with(|| TagInfo {
                     name: format!("remotes/{short}"),
+                    ref_name: format!("remotes/{short}"),
                     is_annotated: false,
+                    misnamed: false,
                 });
             }
         }
@@ -325,7 +391,6 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
             &tag_map,
             first_parent,
             exact_match,
-            dirty_mark,
         )
         .await;
     }
@@ -341,6 +406,12 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
     while let Some((curr_hash, dist)) = queue.pop_front() {
         // Check if current commit has a matching tag
         if let Some(tag_info) = tag_map.get(&curr_hash) {
+            if tag_info.misnamed && !include_all && !args.contains {
+                eprintln!(
+                    "warning: tag '{}' is externally known as '{}'",
+                    tag_info.ref_name, tag_info.name
+                );
+            }
             let output = describe_output(
                 input.clone(),
                 resolved_commit.clone(),
@@ -348,8 +419,9 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
                 dist,
                 abbrev,
                 long_format,
+                tag_info.misnamed && !include_all && !args.contains,
             );
-            return apply_dirty_mark(output, dirty_mark).await;
+            return apply_dirty_mark(output, dirty_mark.clone(), args.broken.clone()).await;
         }
 
         if exact_match {
@@ -400,7 +472,7 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
             dirty: false,
             dirty_mark: None,
         };
-        return apply_dirty_mark(output, dirty_mark).await;
+        return apply_dirty_mark(output, dirty_mark.clone(), args.broken.clone()).await;
     }
 
     Err(DescribeError::NoNamesFound)
@@ -425,7 +497,6 @@ async fn run_describe_contains(
     tag_map: &HashMap<ObjectHash, TagInfo>,
     first_parent: bool,
     exact_match_only: bool,
-    dirty_mark: Option<String>,
 ) -> Result<DescribeOutput, DescribeError> {
     // Under `--exact-match`/`--candidates 0` the only acceptable answer is a tag
     // that points directly at the target — a relative `<tag>~N`/`^M` name is not
@@ -459,7 +530,7 @@ async fn run_describe_contains(
                     dirty: false,
                     dirty_mark: None,
                 };
-                apply_dirty_mark(output, dirty_mark).await
+                Ok(output)
             }
             None => Err(DescribeError::NoExactMatch {
                 commit_id: resolved_commit,
@@ -530,7 +601,7 @@ async fn run_describe_contains(
                 dirty: false,
                 dirty_mark: None,
             };
-            return apply_dirty_mark(output, dirty_mark).await;
+            return Ok(output);
         }
 
         let commit_obj =
@@ -573,13 +644,40 @@ async fn run_describe_contains(
     })
 }
 
+/// Map a worktree check result to the suffix to append (DESC-08).
+fn worktree_suffix(
+    dirty_mark: Option<&str>,
+    broken_mark: Option<&str>,
+    check: WorktreeCheck,
+) -> Option<String> {
+    match check {
+        WorktreeCheck::Clean => None,
+        WorktreeCheck::Dirty => Some(dirty_mark.unwrap_or("-dirty").to_string()),
+        WorktreeCheck::Failed => Some(broken_mark.unwrap_or("-broken").to_string()),
+    }
+}
+
 async fn apply_dirty_mark(
     mut output: DescribeOutput,
     dirty_mark: Option<String>,
+    broken_mark: Option<String>,
 ) -> Result<DescribeOutput, DescribeError> {
-    if let Some(mark) = dirty_mark
-        && has_tracked_dirty_changes().await?
-    {
+    if dirty_mark.is_none() && broken_mark.is_none() {
+        return Ok(output);
+    }
+    let check = match has_tracked_dirty_changes().await {
+        Ok(true) => WorktreeCheck::Dirty,
+        Ok(false) => WorktreeCheck::Clean,
+        Err(error) => {
+            // `--broken` turns a failed check into a suffix; without it the
+            // failure is still fatal (Git's `--dirty` alone).
+            if broken_mark.is_none() {
+                return Err(error);
+            }
+            WorktreeCheck::Failed
+        }
+    };
+    if let Some(mark) = worktree_suffix(dirty_mark.as_deref(), broken_mark.as_deref(), check) {
         output.result.push_str(&mark);
         output.dirty = true;
         output.dirty_mark = Some(mark);
@@ -704,6 +802,11 @@ fn describe_cli_error(error: DescribeError) -> CliError {
         DescribeError::InvalidArgument(message) => CliError::command_usage(message)
             .with_stable_code(StableErrorCode::CliInvalidArguments)
             .with_hint("check the --match/--exclude glob syntax."),
+        DescribeError::CommitishIncompatible { option } => CliError::command_usage(format!(
+            "option '{option}' and commit-ishes cannot be used together"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint(format!("omit '{option}' or the commit-ish.")),
         DescribeError::LoadCommit { commit_id, detail } => {
             CliError::fatal(format!("failed to load commit '{commit_id}': {detail}"))
                 .with_stable_code(StableErrorCode::RepoCorrupt)

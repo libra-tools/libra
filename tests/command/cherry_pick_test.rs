@@ -5119,7 +5119,7 @@ fn rerere_range_fixture() -> (tempfile::TempDir, String, String, String) {
         &run_libra_command(&["commit", "-m", "foo", "--no-verify"], p),
         "foo",
     );
-    let foo = cp_rev_parse(p, "HEAD");
+    let foo_oid = cp_rev_parse(p, "HEAD");
     std::fs::write(p.join("foo"), "foo-main\n").unwrap();
     assert_cli_success(&run_libra_command(&["add", "foo"], p), "add foo-main");
     assert_cli_success(
@@ -5134,7 +5134,10 @@ fn rerere_range_fixture() -> (tempfile::TempDir, String, String, String) {
         "bar-main",
     );
     let bar_main = cp_rev_parse(p, "HEAD");
-    assert_cli_success(&run_libra_command(&["switch", "-c", "dev", &foo], p), "dev");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "dev", &foo_oid], p),
+        "dev",
+    );
     std::fs::write(p.join("foo"), "foo-dev\n").unwrap();
     assert_cli_success(&run_libra_command(&["add", "foo"], p), "add foo-dev");
     assert_cli_success(
@@ -5155,7 +5158,7 @@ fn rerere_range_fixture() -> (tempfile::TempDir, String, String, String) {
         &run_libra_command(&["cherry-pick", "--abort"], p),
         "abort recording",
     );
-    (repo, foo, foo_main, bar_main)
+    (repo, foo_oid, foo_main, bar_main)
 }
 
 /// SA-03 AC1–AC3: `--rerere-autoupdate` applies and stages the recorded
@@ -5363,7 +5366,7 @@ fn cherry_pick_ff_root_commit_matches_git_oid_tc0512() {
         assert!(out.status.success(), "git {args:?}: {out:?}");
         out
     };
-    git(&["init", "-q", "."]);
+    git(&["init", "-q", "-b", "main", "."]);
     std::fs::write(git_repo.join("a"), "a\n").unwrap();
     git(&["add", "a"]);
     git(&["commit", "-q", "-m", "first"]);
@@ -5581,4 +5584,320 @@ fn cherry_pick_unborn_ff_refuses_staged_entries() {
         vec!["Hint: nothing was written; the index must be empty before 'libra cherry-pick --ff' can fast-forward an unborn branch".to_string()],
         "AC6 hint sequence"
     );
+}
+
+fn unborn_ff_fixture() -> (tempfile::TempDir, String) {
+    let repo = tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    std::fs::write(repo.path().join("file1"), "one\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file1"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "first", "--no-verify"], repo.path()),
+        "commit",
+    );
+    let first = cp_rev_parse(repo.path(), "HEAD");
+    assert_cli_success(
+        &run_libra_command(&["switch", "--orphan", "unborn"], repo.path()),
+        "orphan",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rm", "--cached", "-r", "."], repo.path()),
+        "unstage",
+    );
+    let _ = std::fs::remove_file(repo.path().join("file1"));
+    (repo, first)
+}
+
+fn worktree_hashes(repo: &std::path::Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(repo).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".libra" || name == ".libra-test-home" || !entry.path().is_file() {
+            continue;
+        }
+        let oid = String::from_utf8_lossy(&run_libra_command(&["hash-object", &name], repo).stdout)
+            .trim()
+            .to_string();
+        out.push((name, oid));
+    }
+    out.sort();
+    out
+}
+
+/// SA-05: `--ff` on an unborn branch fast-forwards to a root commit.
+#[test]
+fn cherry_pick_unborn_ff_root_commit_tc0513() {
+    let (repo, first) = unborn_ff_fixture();
+    let p = repo.path();
+    let out = run_libra_command(&["cherry-pick", "--ff", &first], p);
+    assert_cli_success(&out, "AC1 cherry-pick --ff root");
+    assert_eq!(cp_rev_parse(p, "HEAD"), first, "AC2 no new commit");
+    let symbolic = String::from_utf8_lossy(&run_libra_command(&["symbolic-ref", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(symbolic, "refs/heads/unborn", "AC3 attached branch");
+    let stage =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "--stage"], p).stdout).to_string();
+    let tree = String::from_utf8_lossy(&run_libra_command(&["ls-tree", "-r", &first], p).stdout)
+        .to_string();
+    let mut expected_stage = String::new();
+    for line in tree.lines() {
+        let (meta, path) = line.split_once('\t').expect("ls-tree entry");
+        let mut fields = meta.split_whitespace();
+        let mode = fields.next().unwrap();
+        let oid = fields.nth(1).unwrap();
+        expected_stage.push_str(&format!("{mode} {oid} 0\t{path}\n"));
+    }
+    assert_eq!(stage, expected_stage, "AC4 index matches first tree");
+    let mut expected_files: Vec<(String, String)> = tree
+        .lines()
+        .map(|line| {
+            let (meta, path) = line.split_once('\t').unwrap();
+            let oid = meta.split_whitespace().nth(2).unwrap().to_string();
+            (path.to_string(), oid)
+        })
+        .collect();
+    expected_files.sort();
+    assert_eq!(worktree_hashes(p), expected_files, "AC5 worktree checkout");
+}
+
+/// SA-05: the unborn fast-forward refuses to overwrite an untracked file.
+#[test]
+fn cherry_pick_unborn_ff_refuses_untracked_overwrite() {
+    let (repo, first) = unborn_ff_fixture();
+    let p = repo.path();
+    std::fs::write(p.join("file1"), "untracked-diff\n").unwrap();
+    let before = worktree_hashes(p);
+    let out = run_libra_command(&["cherry-pick", "--ff", &first], p);
+    assert!(!out.status.success(), "AC6 must reject");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC6 code");
+    assert_eq!(worktree_hashes(p), before, "AC7 untracked file intact");
+    assert!(
+        !run_libra_command(&["rev-parse", "HEAD"], p)
+            .status
+            .success(),
+        "AC8 branch stays unborn"
+    );
+}
+
+/// SA-06: `show --pretty=format:%B` after `cherry-pick --empty=drop` matches
+/// Git byte-for-byte (no extra trailing newline).
+#[test]
+fn cherry_pick_empty_drop_show_message_matches_git() {
+    use std::process::Command;
+
+    let libra_repo = tempdir().expect("libra repo");
+    let p = libra_repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("tracked.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "base commit",
+    );
+    std::fs::write(p.join("tracked.txt"), "changed\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add change");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main change", "--no-verify"], p),
+        "main change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "fork", "HEAD~1"], p),
+        "fork branch",
+    );
+    std::fs::write(p.join("tracked.txt"), "changed\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add fork");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "fork change", "--no-verify"], p),
+        "fork commit",
+    );
+    let before = cp_rev_parse(p, "HEAD");
+    let out = run_libra_command(&["cherry-pick", "--empty=drop", "main"], p);
+    assert_cli_success(&out, "AC1 cherry-pick --empty=drop");
+    assert_eq!(cp_rev_parse(p, "HEAD"), before, "AC2 HEAD unchanged");
+    let libra_show = run_libra_command(&["show", "--no-patch", "--pretty=format:%B", "HEAD"], p);
+
+    // Git reference fixture built from the same commits/settings.
+    let git_repo = tempdir().expect("git repo");
+    let g = git_repo.path();
+    let envs = [
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+        ("GIT_COMMITTER_NAME", "t"),
+        ("GIT_COMMITTER_EMAIL", "t@t"),
+        ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+        ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+        ("HOME", g.to_str().unwrap()),
+    ];
+    let git = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(g);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    std::fs::write(g.join("tracked.txt"), "base\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "base"]);
+    std::fs::write(g.join("tracked.txt"), "changed\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "main change"]);
+    git(&["checkout", "-q", "-b", "fork", "HEAD~1"]);
+    std::fs::write(g.join("tracked.txt"), "changed\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "fork change"]);
+    git(&["cherry-pick", "--empty=drop", "main"]);
+    let git_show = git(&["show", "--no-patch", "--pretty=format:%B", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&libra_show.stdout),
+        String::from_utf8_lossy(&git_show.stdout),
+        "AC3 show --pretty=format:%B parity"
+    );
+}
+
+/// SA-07c: `cherry-pick -` resolves the previous checkout target.
+#[test]
+fn cherry_pick_previous_branch_shorthand() {
+    let repo = tempdir().expect("repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("base.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "base.txt"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "side"], p),
+        "branch side",
+    );
+    std::fs::write(p.join("side.txt"), "side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "side.txt"], p), "add side");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "side change", "--no-verify"], p),
+        "commit side",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "back to main");
+    std::fs::write(p.join("main.txt"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "main.txt"], p), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main change", "--no-verify"], p),
+        "commit main",
+    );
+    let mine = cp_rev_parse(p, "HEAD");
+
+    // AC1: `-` (previous checkout = side) produces the same tree as naming side.
+    let picked = run_libra_command(&["cherry-pick", "-"], p);
+    assert_cli_success(&picked, "AC1 cherry-pick -");
+    let dash_tree = cp_rev_parse(p, "HEAD^{tree}");
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", &mine], p),
+        "reset to main",
+    );
+    let named = run_libra_command(&["cherry-pick", "side"], p);
+    assert_cli_success(&named, "AC1 cherry-pick side");
+    assert_eq!(cp_rev_parse(p, "HEAD^{tree}"), dash_tree, "AC1 tree parity");
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", &mine], p),
+        "reset again",
+    );
+
+    // AC6: a non-first `-` is an ordinary (invalid) revision.
+    let late = run_libra_command(&["cherry-pick", "side", "-"], p);
+    assert!(!late.status.success(), "AC6 must fail");
+    let (_human, report) = parse_cli_error_stderr(&late.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-003", "AC6 code");
+
+    // AC3: no previous checkout navigation record.
+    let fresh = tempdir().expect("fresh");
+    init_repo_via_cli(fresh.path());
+    configure_identity_via_cli(fresh.path());
+    std::fs::write(fresh.path().join("only.txt"), "only\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "only.txt"], fresh.path()),
+        "add only",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "only", "--no-verify"], fresh.path()),
+        "commit only",
+    );
+    let missing = run_libra_command(&["cherry-pick", "-"], fresh.path());
+    assert!(!missing.status.success(), "AC3 must fail");
+    let (_human, report) = parse_cli_error_stderr(&missing.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-003", "AC3 code");
+}
+
+/// SA-07c: `cherry-pick -s -` after `checkout -b` matches Git (t3501#12).
+#[test]
+fn cherry_pick_t3501_12_signoff_dash_tc0484() {
+    use std::process::Command;
+
+    let script = |libra: bool, root: &std::path::Path| -> (String, String) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_libra"));
+                cmd.args(args).current_dir(root);
+                cmd.env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t");
+                cmd.output().expect("libra")
+            } else {
+                let mut cmd = Command::new("git");
+                cmd.args(args).current_dir(root);
+                cmd.env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .env("HOME", root);
+                cmd.output().expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            out
+        };
+        run(&["init", "-q", "-b", "main", "."]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@t"]);
+        std::fs::write(root.join("f"), "1\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["switch", "-q", "-c", "side"]);
+        std::fs::write(root.join("s.txt"), "side\n").unwrap();
+        run(&["add", "s.txt"]);
+        run(&["commit", "-q", "-m", "side change"]);
+        run(&["switch", "-q", "main"]);
+        std::fs::write(root.join("f"), "2\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-q", "-m", "main change"]);
+        run(&["switch", "-q", "side"]);
+        // AC4: creating the branch must succeed. Branch from the commit before
+        // side's change so picking the previous checkout (side) is non-empty.
+        run(&["checkout", "-b", "side-branch", "HEAD~1"]);
+        run(&["cherry-pick", "-s", "-"]);
+        let file = String::from_utf8_lossy(&std::fs::read(root.join("f")).unwrap()).to_string();
+        let message =
+            String::from_utf8_lossy(&run(&["show", "--no-patch", "--pretty=%B", "HEAD"]).stdout)
+                .to_string();
+        (file, message)
+    };
+
+    let libra_root = tempdir().expect("libra root");
+    let (libra_file, libra_message) = script(true, libra_root.path());
+    let git_root = tempdir().expect("git root");
+    let (git_file, git_message) = script(false, git_root.path());
+    assert_eq!(
+        libra_message, git_message,
+        "AC5 signoff message matches Git"
+    );
+    assert_eq!(libra_file, git_file, "AC5 result file matches Git");
+    assert_eq!(libra_file, "1\n", "AC5 base content preserved");
 }

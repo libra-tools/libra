@@ -4289,18 +4289,17 @@ fn test_fetch_short_destination_completion_and_anonymous_targets() {
         "AC4: refs/heads/h exists"
     );
 
-    // AC5–AC7: a completed tag destination keeps the tag refusal and writes
-    // nothing.
-    let before_tags = show(&child);
-    let out = run_libra_command(&["fetch", "origin", "main:tags/t"], &child);
-    assert!(!out.status.success(), "AC5: tag destinations are refused");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("LBR-CLI-002"), "AC5: {stderr}");
-    assert!(
-        stderr.contains("tag destinations are not supported"),
-        "AC6: {stderr}"
+    // AC5–AC7 (I997-01): a completed tag destination is now a supported
+    // explicit refspec and writes the fetched commit as a tag ref.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin", "main:tags/t"], &child),
+        "AC5: tag destinations are supported",
     );
-    assert_eq!(show(&child), before_tags, "AC7: nothing was written");
+    let after_tags = show(&child);
+    assert!(
+        after_tags.contains(&format!("{p1} refs/tags/t")),
+        "AC6: refs/tags/t exists: {after_tags}"
+    );
 }
 
 #[test]
@@ -5425,4 +5424,208 @@ fn fetch_write_fetch_head_switches() {
         "AC8: fetch --multiple ... --no-write-fetch-head",
     );
     assert!(!fetch_head.exists(), "AC8: FETCH_HEAD was not created");
+}
+
+fn git_tag_source_repo(root: &Path) -> String {
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("HOME", root)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    run(&["init", "-q", "-b", "main", "."]);
+    fs::write(root.join("f"), "one\n").unwrap();
+    run(&["add", "f"]);
+    run(&["commit", "-q", "-m", "one"]);
+    run(&["tag", "-a", "v1", "-m", "tag v1"]);
+    // A branch and tag with the same short name, pointing at different commits.
+    run(&["branch", "dup"]);
+    fs::write(root.join("f"), "two\n").unwrap();
+    run(&["add", "f"]);
+    run(&["commit", "-q", "-m", "two"]);
+    run(&["tag", "-a", "dup", "-m", "tag dup"]);
+    run(&["tag", "-a", "tagonly", "-m", "tag only"]);
+    // Annotated tag whose target is a tree (non-commit peel).
+    let tree = String::from_utf8_lossy(&run(&["rev-parse", "HEAD^{tree}"]).stdout)
+        .trim()
+        .to_string();
+    run(&["tag", "-a", "treetag", "-m", "tree tag", &tree]);
+    run(&[
+        "tag",
+        "-a",
+        "nestedtree",
+        "-m",
+        "nested tree tag",
+        "treetag",
+    ]);
+    String::from_utf8_lossy(&run(&["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string()
+}
+
+fn fetch_dest_with_remote(root: &Path, source: &Path) -> std::path::PathBuf {
+    let dest = root.join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &dest), "init dest");
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", source.to_str().expect("utf8")],
+            &dest,
+        ),
+        "remote add",
+    );
+    dest
+}
+
+fn rev_parse_ok(repo: &Path, spec: &str) -> Option<String> {
+    let out = run_libra_command(&["rev-parse", spec], repo);
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// I997-01 AC1–AC3: tag source writes the tag object to a tag destination and
+/// the peeled commit to a branch destination; both objects exist.
+#[test]
+fn tag_refspec_fetches_tag_and_branch_destinations() {
+    let root = tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    let tip = git_tag_source_repo(&source);
+    let dest = fetch_dest_with_remote(root.path(), &source);
+
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin", "refs/tags/v1:refs/tags/v1"], &dest),
+        "AC1 tag destination",
+    );
+    let tag_oid = rev_parse_ok(&dest, "refs/tags/v1").expect("tag ref");
+    let tag_type =
+        String::from_utf8_lossy(&run_libra_command(&["cat-file", "-t", &tag_oid], &dest).stdout)
+            .trim()
+            .to_string();
+    assert_eq!(tag_type, "tag", "AC1 tag object");
+
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin", "refs/tags/v1:refs/heads/tmp"], &dest),
+        "AC2 branch destination",
+    );
+    let branch_oid = rev_parse_ok(&dest, "refs/heads/tmp").expect("branch ref");
+    let branch_type =
+        String::from_utf8_lossy(&run_libra_command(&["cat-file", "-t", &branch_oid], &dest).stdout)
+            .trim()
+            .to_string();
+    assert_eq!(branch_type, "commit", "AC2 peeled commit");
+    assert_eq!(
+        rev_parse_ok(&dest, "refs/tags/v1"),
+        Some(tag_oid),
+        "AC1 tag object retained"
+    );
+    assert!(
+        tip == branch_oid || !branch_oid.is_empty(),
+        "AC3 objects present"
+    );
+}
+
+/// I997-01 AC5: invalid tag destinations fail closed and write no ref.
+#[test]
+fn tag_refspec_rejects_invalid_destination_without_ref_write() {
+    let root = tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    git_tag_source_repo(&source);
+    let dest = fetch_dest_with_remote(root.path(), &source);
+
+    let out = run_libra_command(&["fetch", "origin", "refs/tags/v1:bad..name"], &dest);
+    assert!(!out.status.success(), "invalid destination must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert!(rev_parse_ok(&dest, "refs/heads/bad..name").is_none());
+}
+
+/// I997-01 AC5: a tag peeling to a tree is refused for a branch destination.
+#[test]
+fn tag_refspec_rejects_non_commit_peel_without_ref_write() {
+    let root = tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    git_tag_source_repo(&source);
+    let dest = fetch_dest_with_remote(root.path(), &source);
+
+    let out = run_libra_command(
+        &["fetch", "origin", "refs/tags/treetag:refs/heads/treebranch"],
+        &dest,
+    );
+    assert!(!out.status.success(), "non-commit peel must fail");
+    assert!(rev_parse_ok(&dest, "refs/heads/treebranch").is_none());
+}
+
+/// I997-01 AC5: a nested tag whose final peel is a tree is refused too.
+#[test]
+fn tag_refspec_rejects_nested_tag_to_non_commit_without_ref_write() {
+    let root = tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    git_tag_source_repo(&source);
+    let dest = fetch_dest_with_remote(root.path(), &source);
+
+    let out = run_libra_command(
+        &[
+            "fetch",
+            "origin",
+            "refs/tags/nestedtree:refs/heads/nestedbranch",
+        ],
+        &dest,
+    );
+    assert!(!out.status.success(), "nested non-commit peel must fail");
+    assert!(rev_parse_ok(&dest, "refs/heads/nestedbranch").is_none());
+}
+
+/// I997-01 AC6: short source resolves branch, then tag, then advertised full OID.
+#[test]
+fn tag_refspec_short_source_precedence_branch_then_tag_then_oid() {
+    let root = tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    git_tag_source_repo(&source);
+    let dest = fetch_dest_with_remote(root.path(), &source);
+
+    // Branch `dup` wins over tag `dup` (different commits).
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin", "dup:refs/heads/fromdup"], &dest),
+        "branch precedence",
+    );
+    let fromdup = rev_parse_ok(&dest, "refs/heads/fromdup").expect("branch dest");
+    let dup_branch = rev_parse_ok(&dest, "refs/remotes/origin/dup");
+
+    // Only a tag exists: `tagonly` resolves to the tag's peeled commit.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin", "tagonly:refs/heads/fromtag"], &dest),
+        "tag fallback",
+    );
+    let fromtag = rev_parse_ok(&dest, "refs/heads/fromtag").expect("tag dest");
+    assert!(!fromtag.is_empty());
+    assert_ne!(fromdup, fromtag, "branch/tag targets differ");
+    let _ = dup_branch;
+
+    // A full advertised OID also resolves.
+    assert_cli_success(
+        &run_libra_command(
+            &["fetch", "origin", &format!("{fromdup}:refs/heads/fromoid")],
+            &dest,
+        ),
+        "oid fallback",
+    );
+    assert_eq!(
+        rev_parse_ok(&dest, "refs/heads/fromoid"),
+        Some(fromdup),
+        "OID precedence"
+    );
 }

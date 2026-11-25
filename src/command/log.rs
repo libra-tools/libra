@@ -6264,6 +6264,13 @@ pub(crate) struct CommitDiffOptions {
     pub(crate) full_index: bool,
     pub(crate) source_prefix: String,
     pub(crate) destination_prefix: String,
+    pub(crate) context_lines: usize,
+    /// Git-style `--diff-filter` letters for the rendered patch; empty means no
+    /// filtering (the shared default for log/show/stash).
+    pub(crate) diff_filter: String,
+    /// Repository-root-relative directory prefix to keep and strip, or `None`
+    /// to render every path repository-relative.
+    pub(crate) relative: Option<String>,
 }
 
 impl Default for CommitDiffOptions {
@@ -6273,7 +6280,26 @@ impl Default for CommitDiffOptions {
             full_index: false,
             source_prefix: "a/".to_string(),
             destination_prefix: "b/".to_string(),
+            context_lines: 3,
+            diff_filter: String::new(),
+            relative: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod commit_diff_options_tests {
+    use super::CommitDiffOptions;
+
+    #[test]
+    fn defaults_keep_three_context_lines_and_prefixes() {
+        let options = CommitDiffOptions::default();
+        assert_eq!(options.context_lines, 3);
+        assert!(!options.histogram);
+        assert!(!options.full_index);
+        assert_eq!(options.source_prefix, "a/");
+        assert_eq!(options.destination_prefix, "b/");
+        assert!(options.diff_filter.is_empty());
     }
 }
 
@@ -6306,8 +6332,54 @@ pub(crate) async fn generate_diff_with_options(
     let old_map: HashMap<PathBuf, ObjectHash> = old_blobs.iter().cloned().collect();
     let new_map: HashMap<PathBuf, ObjectHash> = new_blobs.iter().cloned().collect();
     let mut diffs = build_commit_diff_items(old_blobs, new_blobs, paths)?;
+    if let Some(prefix) = options.relative.as_deref() {
+        let strip = format!("{prefix}/");
+        diffs.retain(|item| item.path.starts_with(&strip));
+        for item in &mut diffs {
+            if let Some(rest) = item.path.strip_prefix(&strip) {
+                let full = item.path.clone();
+                let replacement = rest.to_string();
+                item.data =
+                    diff::strip_relative_prefix_in_diff(&item.data, &strip, &full, &replacement);
+                item.path = replacement;
+            }
+        }
+    }
+    if !options.diff_filter.is_empty() {
+        diffs.retain(|item| {
+            let path = PathBuf::from(&item.path);
+            let status = match (old_map.get(&path), new_map.get(&path)) {
+                (None, Some(_)) => 'A',
+                (Some(_), None) => 'D',
+                (Some(_), Some(_)) => 'M',
+                (None, None) => return false,
+            };
+            diff_filter_allows(&options.diff_filter, status)
+        });
+    }
     for item in &mut diffs {
         let path = PathBuf::from(&item.path);
+        if options.context_lines != 3 && item.data.contains("\n@@ ") {
+            let old_text = old_map
+                .get(&path)
+                .map(load_commit_blob_content)
+                .transpose()?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            let new_text = new_map
+                .get(&path)
+                .map(load_commit_blob_content)
+                .transpose()?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            item.data = diff::rewrite_unified_diff_context(
+                &item.data,
+                &old_text,
+                &new_text,
+                options.context_lines,
+                &diff::DiffAlgorithm::Myers,
+            );
+        }
         if options.histogram && item.data.contains("\n@@ ") {
             let old_text = old_map
                 .get(&path)
@@ -6343,6 +6415,28 @@ pub(crate) async fn generate_diff_with_options(
         out.push_str(&d.data);
     }
     Ok(out)
+}
+
+/// Git's `--diff-filter` letter semantics: uppercase letters include, lowercase
+/// exclude, and `*` selects all kinds when requested.
+fn diff_filter_allows(filter: &str, status: char) -> bool {
+    let lower_status = status.to_ascii_lowercase();
+    let includes: Vec<char> = filter
+        .chars()
+        .filter(|ch| ch.is_ascii_uppercase())
+        .collect();
+    let excludes: Vec<char> = filter
+        .chars()
+        .filter(|ch| ch.is_ascii_lowercase())
+        .collect();
+    let excludes_status = excludes.iter().any(|ch| ch.to_ascii_uppercase() == status);
+    if excludes_status {
+        return false;
+    }
+    if includes.is_empty() {
+        return true;
+    }
+    includes.contains(&status) || (filter.contains('*') && !excludes.contains(&lower_status))
 }
 
 fn rewrite_commit_diff_index(
@@ -7093,5 +7187,11 @@ mod tests {
             3,
             "parents are loaded when enqueued, including the unyielded frontier"
         );
+    }
+
+    #[test]
+    fn commit_diff_options_default_has_no_diff_filter() {
+        let options = CommitDiffOptions::default();
+        assert!(options.diff_filter.is_empty());
     }
 }

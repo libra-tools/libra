@@ -6,6 +6,9 @@
 //! adapter, external agents cannot enter the static roster, and the SQL
 //! CHECK constraint / doc roster / Rust enum stay in sync.
 
+#[path = "../helpers/workspace_sources.rs"]
+mod workspace_sources;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -341,6 +344,8 @@ fn private_capture_identity_has_no_source_opener() {
     // serializer region: catalog reads go through `local_capture_catalog`
     // (`capture.db` after the split) and the traces head through the paired
     // `libra.db`; row shapes and the serialized bytes are unchanged.
+    // RG-05 review of c66cbac35: the serializer region now formats the
+    // ObjectFormatMismatch error. Snapshot and proof bytes are unchanged.
     let (_, cloud) = parse_rust_source("src/command/cloud/agent_capture.rs");
     assert!(matches!(&cloud.items[0], syn::Item::Use(item)
         if matches!(&item.tree, syn::UseTree::Path(path) if path.ident == "super")));
@@ -372,7 +377,7 @@ fn private_capture_identity_has_no_source_opener() {
     let remainder = format!("const AGENT_CAPTURE_LOCAL_PAGE_SIZE{remainder}");
     assert_eq!(
         hex::encode(Sha256::digest(remainder.as_bytes())),
-        "fcb3e5bda4018ebf3ca7e1341b1a7754da4c2c88ca44d1048bff49b4abdf75d6",
+        "0affed3032a44437b966804226b0e9db3d6ffcdb117e9edcee9abe871b307b53",
         "RG-05 cloud serializer edit requires scope and Claude review"
     );
 }
@@ -601,26 +606,13 @@ fn capture_private_key_has_single_owner() {
     }));
     let windows_owner_path = repo_root().join("src/internal/ai/capture/key_windows.rs");
 
-    // Walk every production source, not only the AI subtree: a doctor,
-    // import, or cloud command must not grow a second key reader either.
-    let mut paths = Vec::new();
-    let mut directories = vec![repo_root().join("src")];
+    // Walk every production source across the workspace, not only the AI subtree:
+    // a doctor, import, or cloud command must not grow a second key reader either.
     let owner_path = repo_root().join("src/internal/ai/capture/key.rs");
-    while let Some(directory) = directories.pop() {
-        for entry in fs::read_dir(directory).expect("read capture owner directory") {
-            let entry = entry.expect("read capture owner entry");
-            let path = entry.path();
-            let kind = entry.file_type().expect("classify capture owner entry");
-            if kind.is_dir() {
-                directories.push(path);
-            } else if kind.is_file()
-                && path.extension().is_some_and(|extension| extension == "rs")
-                && path != owner_path
-            {
-                paths.push(path);
-            }
-        }
-    }
+    let paths: Vec<_> = workspace_sources::collect_workspace_rust_files(repo_root())
+        .into_iter()
+        .filter(|path| path != &owner_path)
+        .collect();
     for expected in [
         "src/command/agent/import.rs",
         "src/internal/ai/hooks/runtime.rs",
@@ -2179,8 +2171,20 @@ fn live_coverage_reservation_propagates_deadline_and_never_acknowledges_late_ter
 }
 
 /// Repository-relative paths of every Rust source under `relative_dir`,
-/// sorted so guard diagnostics are deterministic.
+/// sorted so guard diagnostics are deterministic. When `relative_dir == "src"`,
+/// walks every workspace crate source root (`src/` + `crates/*/src/`).
 fn rust_sources_under(relative_dir: &str) -> Vec<String> {
+    if relative_dir == "src" {
+        return workspace_sources::collect_workspace_rust_files(repo_root())
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(repo_root())
+                    .expect("source path must stay inside repository root")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+    }
     let mut stack = vec![repo_root().join(relative_dir)];
     let mut sources = Vec::new();
     while let Some(directory) = stack.pop() {
@@ -8554,33 +8558,23 @@ fn grok_parser_delegates_without_observer_side_effects() {
             "observer guard rejected {source}"
         );
     }
-    let mut pending = vec![repo_root().join("src")];
-    while let Some(dir) = pending.pop() {
-        for entry in fs::read_dir(dir).expect("source directory") {
-            let path = entry.expect("source entry").path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if path.extension().is_none_or(|extension| extension != "rs")
-                || path.ends_with("hooks/providers/grok/session_files.rs")
-            {
-                continue;
-            }
-            let text = fs::read_to_string(&path).expect("Rust source");
-            let ast = syn::parse_file(&text).expect("valid Rust source");
-            let mut calls = ObserverCalls {
-                violations: Vec::new(),
-                compatibility_exports: path.ends_with("hooks/providers/grok/mod.rs"),
-            };
-            calls.visit_file(&ast);
-            assert!(
-                calls.violations.is_empty(),
-                "production must not use the legacy Grok observer ({}): {:?}",
-                path.display(),
-                calls.violations
-            );
+    for path in workspace_sources::collect_workspace_rust_files(repo_root()) {
+        if path.ends_with("hooks/providers/grok/session_files.rs") {
+            continue;
         }
+        let text = fs::read_to_string(&path).expect("Rust source");
+        let ast = syn::parse_file(&text).expect("valid Rust source");
+        let mut calls = ObserverCalls {
+            violations: Vec::new(),
+            compatibility_exports: path.ends_with("hooks/providers/grok/mod.rs"),
+        };
+        calls.visit_file(&ast);
+        assert!(
+            calls.violations.is_empty(),
+            "production must not use the legacy Grok observer ({}): {:?}",
+            path.display(),
+            calls.violations
+        );
     }
 }
 
@@ -8816,20 +8810,7 @@ fn terminal_ui_dependencies_and_production_symbols_remain_retired() {
         );
     }
 
-    fn visit_source_tree(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
-        for entry in fs::read_dir(dir).expect("read production source directory") {
-            let entry = entry.expect("read production source entry");
-            let path = entry.path();
-            if path.is_dir() {
-                visit_source_tree(&path, files);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                files.push(path);
-            }
-        }
-    }
-
-    let mut sources = Vec::new();
-    visit_source_tree(&repo_root().join("src"), &mut sources);
+    let sources = workspace_sources::collect_workspace_rust_files(repo_root());
     let library_root = fs::read_to_string(repo_root().join("src/lib.rs")).expect("read lib.rs");
     assert!(
         library_root.contains("supported, patch-compatible embedding API")
@@ -9951,13 +9932,8 @@ fn og26_sealed_candidate_callers_are_closed() {
         opencode.references.get("with_opencode_candidates"),
         Some(&vec!["prepare_ordinary_authorized_source".to_owned()])
     );
-    for entry in walkdir::WalkDir::new(repo_root().join("src")) {
-        let entry = entry.expect("walk production source");
-        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        let relative = entry
-            .path()
+    for path in workspace_sources::collect_workspace_rust_files(repo_root()) {
+        let relative = path
             .strip_prefix(repo_root())
             .expect("source path under repo");
         if matches!(
@@ -9969,7 +9945,7 @@ fn og26_sealed_candidate_callers_are_closed() {
         ) {
             continue;
         }
-        let source = fs::read_to_string(entry.path()).expect("read production source");
+        let source = fs::read_to_string(&path).expect("read production source");
         if !guarded.iter().any(|name| source.contains(name))
             && !source.contains("with_opencode_candidates")
             && ![
@@ -10056,12 +10032,8 @@ fn reasoning_bound_identity_accessor_has_closed_adapter_caller() {
         ),
     ];
     let mut actual = std::collections::BTreeMap::<String, Vec<(String, String)>>::new();
-    for entry in walkdir::WalkDir::new(repo_root().join("src")) {
-        let entry = entry.unwrap();
-        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|e| e != "rs") {
-            continue;
-        }
-        let source = fs::read_to_string(entry.path()).unwrap();
+    for entry_path in workspace_sources::collect_workspace_rust_files(repo_root()) {
+        let source = fs::read_to_string(&entry_path).unwrap();
         if !expected.iter().any(|(name, _)| source.contains(name)) {
             continue;
         }
@@ -10073,8 +10045,7 @@ fn reasoning_bound_identity_accessor_has_closed_adapter_caller() {
                     .or_default()
                     .extend(owners.into_iter().map(|owner| {
                         (
-                            entry
-                                .path()
+                            entry_path
                                 .strip_prefix(repo_root())
                                 .unwrap()
                                 .display()
@@ -10084,7 +10055,7 @@ fn reasoning_bound_identity_accessor_has_closed_adapter_caller() {
                     }));
             }
         }
-        if !entry.path().ends_with("observed_agents/reasoning.rs") {
+        if !entry_path.ends_with("observed_agents/reasoning.rs") {
             assert!(
                 !scan.constructors.iter().any(|(t, _)| [
                     "NativeReasoningProof",
@@ -10094,7 +10065,7 @@ fn reasoning_bound_identity_accessor_has_closed_adapter_caller() {
                 ]
                 .contains(&t.as_str())),
                 "{} cannot construct sealed reasoning authority",
-                entry.path().display()
+                entry_path.display()
             );
         }
     }
@@ -10251,20 +10222,15 @@ fn import_reasoning_production_references(name: &str) -> BTreeSet<(String, Strin
     use syn::visit::Visit;
 
     let mut references = BTreeSet::new();
-    for entry in walkdir::WalkDir::new(repo_root().join("src")) {
-        let entry = entry.expect("walk production Rust source");
-        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        let source = fs::read_to_string(entry.path()).expect("read production Rust source");
+    for entry_path in workspace_sources::collect_workspace_rust_files(repo_root()) {
+        let source = fs::read_to_string(&entry_path).expect("read production Rust source");
         if !source.contains(name) {
             continue;
         }
         let ast = syn::parse_file(&source).expect("parse production Rust source");
         let mut scan = ReasoningPortScan::default();
         scan.visit_file(&ast);
-        let path = entry
-            .path()
+        let path = entry_path
             .strip_prefix(repo_root())
             .expect("source under repository")
             .display()
@@ -10395,20 +10361,15 @@ fn import_key_factory_production_references(name: &str) -> BTreeSet<(String, Str
     use syn::visit::Visit;
 
     let mut references = BTreeSet::new();
-    for entry in walkdir::WalkDir::new(repo_root().join("src")) {
-        let entry = entry.expect("walk production Rust source");
-        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        let source = fs::read_to_string(entry.path()).expect("read production Rust source");
+    for entry_path in workspace_sources::collect_workspace_rust_files(repo_root()) {
+        let source = fs::read_to_string(&entry_path).expect("read production Rust source");
         if !source.contains(name) {
             continue;
         }
         let ast = syn::parse_file(&source).expect("parse production Rust source");
         let mut scan = ImportTransportKeyCallScan::default();
         scan.visit_file(&ast);
-        let path = entry
-            .path()
+        let path = entry_path
             .strip_prefix(repo_root())
             .expect("source under repository")
             .display()
@@ -11476,18 +11437,13 @@ fn opencode_verified_partial_live_permit_and_provenance_have_closed_owners() {
     let mut actual_constructors =
         std::collections::BTreeMap::<String, Vec<(String, String)>>::new();
     let mut partial_provenance_owners = BTreeSet::new();
-    for entry in walkdir::WalkDir::new(repo_root().join("src")) {
-        let entry = entry.expect("walk production partial capability sources");
-        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        let path = entry
-            .path()
+    for entry_path in workspace_sources::collect_workspace_rust_files(repo_root()) {
+        let path = entry_path
             .strip_prefix(repo_root())
             .unwrap()
             .display()
             .to_string();
-        let source = fs::read_to_string(entry.path()).expect("read partial capability source");
+        let source = fs::read_to_string(&entry_path).expect("read partial capability source");
         let scan = reasoning_scan(&source);
         for (name, _, _) in calls {
             for owner in scan.references.get(name).into_iter().flatten() {
@@ -11792,19 +11748,15 @@ fn cov2_visible_text_cannot_mint_native_or_opaque() {
             .iter()
             .all(|path| ["Vec", "u8", "bool"].contains(&path.as_str()))
     );
-    for entry in walkdir::WalkDir::new(repo_root().join("src")) {
-        let entry = entry.expect("source entry");
-        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|e| e != "rs") {
-            continue;
-        }
-        let source = fs::read_to_string(entry.path()).expect("source text");
+    for entry_path in workspace_sources::collect_workspace_rust_files(repo_root()) {
+        let source = fs::read_to_string(&entry_path).expect("source text");
         let scan = reasoning_scan(&source);
         if let Some(owners) = scan
             .references
             .get("discard_prepared_authority_for_coverage_preview")
         {
             assert_eq!(
-                entry.path(),
+                entry_path,
                 repo_root().join("src/internal/ai/observed_agents/coverage.rs")
             );
             assert_eq!(owners, &["prepare_coverage_preview".to_owned()]);
@@ -11898,17 +11850,12 @@ fn cov2_runtime_data_transport_has_closed_callers() {
         ),
     ];
     let mut actual = BTreeMap::<String, Vec<(String, String)>>::new();
-    for entry in walkdir::WalkDir::new(repo_root().join("src")) {
-        let entry = entry.expect("production source entry");
-        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|e| e != "rs") {
-            continue;
-        }
-        let source = fs::read_to_string(entry.path()).expect("production source text");
+    for entry_path in workspace_sources::collect_workspace_rust_files(repo_root()) {
+        let source = fs::read_to_string(&entry_path).expect("production source text");
         if !expected.iter().any(|(name, _)| source.contains(name)) {
             continue;
         }
-        let relative = entry
-            .path()
+        let relative = entry_path
             .strip_prefix(repo_root())
             .expect("source root")
             .to_string_lossy()

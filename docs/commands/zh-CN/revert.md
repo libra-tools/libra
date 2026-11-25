@@ -29,13 +29,15 @@ revert 提交使用当前 author 与 committer 身份/日期，并在创建提�
 
 回滚 root 提交（没有父提交的提交）会产生空树，实际效果是撤销初始提交的更改。
 
-该命令要求处于活动分支（不是 detached HEAD）。它接受一个或多个提交引用，按给定顺序依次回滚（每个各自生成一个 revert commit）；冲突会停止该序列，用 `libra revert --continue` 收尾、`libra revert --skip` 跳过当前提交，或 `libra revert --abort` 撤销。当冲突中断多提交回滚时，其后仍待处理的提交会被记住，并在 `--continue`/`--skip` 续作序列时自动回滚。`-n/--no-commit` 与 `-m/--mainline` 仅适用于单个提交。
+该命令可在分支或 detached HEAD 上运行（revert 提交写到 detached HEAD 本身）。它接受一个或多个提交引用，按给定顺序依次回滚（每个各自生成一个 revert commit）；冲突会停止该序列，用 `libra revert --continue` 收尾、`libra revert --skip` 跳过当前提交，或 `libra revert --abort` 撤销。当冲突中断多提交回滚时，其后仍待处理的提交会被记住，并在 `--continue`/`--skip` 续作序列时自动回滚。`-n/--no-commit` 与 `-m/--mainline` 仅适用于单个提交。
 
 新的 revert 在索引存在未合并条目时拒绝开始：在解析任何目标、写入索引、工作树、引用或 `revert-state.json` 之前，以 exit 128 与 `LBR-CONFLICT-001` 退出，并列出最多 10 条未合并路径（Git 以 `your index file is unmerged` 拒绝）。逐条解决后 `libra add`，或用 `libra reset --hard` 放弃冲突，然后重新执行 revert；该拒绝不写 revert state，`--continue`、`--skip`、`--abort` 对它不适用。
 
 已停止的 revert 不会比它所在的工作树活得更久：之后的 reset 会结束已停止的单提交 revert（在清除索引冲突阶段后），下一次 revert 可以正常开始。解决冲突后再执行一次之后的 commit 会结束已停止的单提交 revert。多提交序列保留剩余提交并记录被停提交已结束：`--continue` 不会重新提交已在序列外结束的停止项，而是继续 revert 剩余提交。`libra revert --abort` 仍会将 HEAD、索引和已跟踪文件恢复到 revert 前的状态，丢弃之后的已跟踪改动（包括 reset 选择的目标）。
 
 工作树物化按条目 mode 语义执行（plan issues/470 FM-02）：文件按条目权限位创建（`100755`→`0777`、`100644`→`0666`）并受进程 `umask` 约束，经同目录临时文件原子替换；索引/树条目保留 mode（`100755`/`100644`/`120000`）。
+
+不带 `-n`/`--no-commit` 时，若索引与 `HEAD` 的树不同（已暂存的新增、修改或删除），`revert` 会在任何写入前拒绝：退出码 128、`LBR-CONFLICT-001`，人读信息为 `your local changes would be overwritten by revert`，且不写入 revert 状态。`-n`/`--no-commit` 不受此限制，可从这样的索引开始。
 
 ## 选项
 
@@ -217,7 +219,6 @@ Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时
 | 代码 | 条件 | 提示 |
 |------|-----------|------|
 | `LBR-REPO-001` | 不在 libra 仓库内 | 使用 `libra init` 初始化或进入仓库 |
-| `LBR-REPO-003` | HEAD detached（不在分支上） | 使用 `libra switch <branch>` 切换到分支 |
 | `LBR-REPO-003` | `--continue` 时之后的 reset 已结束该停止的 revert | 用 `libra revert --skip` 消化剩余提交，或用 `libra revert --abort` 恢复 revert 前状态（丢弃之后的已跟踪改动） |
 | `LBR-CLI-003` | 无法解析提交引用 | 使用 `libra log` 查找有效提交引用 |
 | `LBR-CLI-002` | 合并提交缺 `-m`、对非合并提交传 `-m`、父编号越界、非法 `--cleanup`，或 `-e`/`--edit` 下未配置编辑器、编辑器中止或消息为空 | 合并提交传有效 `-m <父编号>`；cleanup 使用 `strip`/`whitespace`/`verbatim`/`scissors`/`default`；`--edit` 需配置编辑器并保存非空消息 |

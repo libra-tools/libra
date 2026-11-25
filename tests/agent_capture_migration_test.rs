@@ -1072,8 +1072,8 @@ const PI_ROLE_ORACLE_SHA256: [(&str, &str, &str); 4] = [
     ),
 ];
 
-/// A real repository (made by `libra init`) taken back to the hermes tip,
-/// with a session of every earlier kind, every table that references
+/// A real repository (made by `libra init`) with the pre-Pi session CHECK,
+/// a session of every earlier kind, every table that references
 /// `agent_session` populated, and views and triggers that depend on it.
 struct PiRoleRepo {
     root: TempDir,
@@ -1253,10 +1253,11 @@ impl PiRoleRepo {
 async fn pi_role_repository() -> PiRoleRepo {
     let repo = PiRoleRepo::init();
     let conn = connect(&repo.url()).await;
+    rollback_after_pi(&conn).await;
     let rolled_back = hermes_runner()
         .rollback_to(&conn, HERMES_KIND_VERSION)
         .await
-        .expect("take the repository back to the hermes tip");
+        .expect("undo Pi");
     assert_eq!(rolled_back, vec![PI_KIND_VERSION]);
     for kind in KINDS_BEFORE_PI {
         pi_role_insert(&conn, &format!("sess-{kind}"), kind).await;
@@ -1328,7 +1329,37 @@ impl PiRoleDigest {
 }
 
 async fn pi_role_digest(repo: &PiRoleRepo) -> PiRoleDigest {
+    digest_database(connect(&repo.url()).await).await
+}
+
+// A successful CLI open also applies migrations after Pi. Compare the exact
+// Pi-era rows and dependents on a disposable copy, keeping the real database
+// intact for crash recovery and repeat-open assertions.
+async fn pi_role_digest_at_pi(repo: &PiRoleRepo) -> PiRoleDigest {
+    let snapshot = tempfile::tempdir().expect("snapshot directory");
+    let path = snapshot.path().join("snapshot.db");
     let conn = connect(&repo.url()).await;
+    conn.execute_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "VACUUM INTO ?",
+        [path.to_str().expect("snapshot path").into()],
+    ))
+    .await
+    .expect("snapshot database");
+    conn.close().await.expect("close");
+    let copy = connect(&format!("sqlite://{}", path.display())).await;
+    if hermes_runner()
+        .current_version(&copy)
+        .await
+        .expect("read schema version")
+        .is_some_and(|version| version > PI_KIND_VERSION)
+    {
+        rollback_after_pi(&copy).await;
+    }
+    digest_database(copy).await
+}
+
+async fn digest_database(conn: DatabaseConnection) -> PiRoleDigest {
     let mut rows = std::collections::BTreeMap::new();
     for table in pi_role_texts(
         &conn,
@@ -1422,7 +1453,7 @@ async fn assert_pi_rebuilt(repo: &PiRoleRepo, before: &PiRoleDigest) {
         .collect();
     expected.push("pi".to_string());
     assert_eq!(pi_role_check_values(repo).await, expected);
-    let after = pi_role_digest(repo).await;
+    let after = pi_role_digest_at_pi(repo).await;
     assert_eq!(
         after.data(),
         before.data(),
@@ -1460,7 +1491,10 @@ async fn pi_role_check_adds_only_pi_above_the_tip() {
         versions.windows(2).all(|pair| pair[0] < pair[1]),
         "migration IDs are unique and increasing: {versions:?}"
     );
-    let pi = migrations.last().expect("the registry has a tip");
+    let pi = migrations
+        .iter()
+        .find(|m| m.version == PI_KIND_VERSION)
+        .expect("Pi migration");
     assert_eq!((pi.version, pi.name), (PI_KIND_VERSION, "agent_kind_pi"));
     assert!(pi.version > HERMES_KIND_VERSION);
     assert!(pi.up.contains("RAISE(ABORT"));
@@ -2047,7 +2081,7 @@ async fn pi_role_rebuild_survives_a_crash_at_every_stage() {
             String::from_utf8_lossy(&opened.stderr)
         );
         assert_eq!(
-            pi_role_digest(&repo).await,
+            pi_role_digest_at_pi(&repo).await,
             committed,
             "{abort_at}: the open after the crash finds the rebuild done"
         );
@@ -2304,6 +2338,7 @@ async fn pi_role_oracle_refuses_the_migrated_repository_without_writes() {
         String::from_utf8_lossy(&opened.stderr)
     );
     let conn = connect(&repo.url()).await;
+    rollback_after_pi(&conn).await;
     pi_role_insert(&conn, "sess-pi", "pi").await;
     conn.close().await.expect("close");
     assert_eq!(pi_role_receipts(&repo).await.len(), 1);
@@ -2468,6 +2503,26 @@ async fn pi_role_cloud_sync_refuses_a_migrated_pi_session() {
     );
 }
 
+/// Exercise Pi down against its historical schema. Roll back the physical
+/// effects and receipts of later migrations before taking the test snapshot.
+async fn rollback_after_pi(conn: &DatabaseConnection) {
+    let versions: Vec<_> = builtin_migrations()
+        .into_iter()
+        .rev()
+        .map(|m| m.version)
+        .take_while(|v| *v > PI_KIND_VERSION)
+        .collect();
+    if !versions.is_empty() {
+        assert_eq!(
+            hermes_runner()
+                .rollback_to(conn, PI_KIND_VERSION)
+                .await
+                .expect("undo migrations after Pi"),
+            versions
+        );
+    }
+}
+
 /// PI-01 AC12: down refuses while a `pi` row exists, keeps it with its child,
 /// the receipt and the CHECK, and points at a forward fix rather than at
 /// deleting captured sessions.
@@ -2481,6 +2536,7 @@ async fn pi_role_down_refuses_while_pi_rows_exist() {
         String::from_utf8_lossy(&opened.stderr)
     );
     let conn = connect(&repo.url()).await;
+    rollback_after_pi(&conn).await;
     pi_role_insert(&conn, "sess-pi", "pi").await;
     pi_role_exec(
         &conn,
@@ -2516,15 +2572,14 @@ async fn pi_role_down_refuses_while_pi_rows_exist() {
 #[tokio::test]
 async fn pi_role_down_restores_the_nine_kind_check() {
     let repo = pi_role_repository().await;
-    let fixture = pi_role_digest(&repo).await;
-    let opened = repo.status(&[]);
-    assert!(
-        opened.status.success(),
-        "{}",
-        String::from_utf8_lossy(&opened.stderr)
-    );
-    assert_pi_rebuilt(&repo, &fixture).await;
     let conn = connect(&repo.url()).await;
+    let fixture = pi_role_digest(&repo).await;
+    let applied = hermes_runner()
+        .run_pending_up_to(&conn, PI_KIND_VERSION)
+        .await
+        .expect("apply Pi at the hermes tip");
+    assert_eq!(applied, vec![PI_KIND_VERSION]);
+    assert_pi_rebuilt(&repo, &fixture).await;
     let rolled = hermes_runner()
         .rollback_to(&conn, HERMES_KIND_VERSION)
         .await

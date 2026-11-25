@@ -127,6 +127,7 @@ fn test_describe_abbrev_zero_keeps_git_tag_only_output() {
     assert_cli_success(&output, "describe --abbrev=0 --json should succeed");
 
     let json = parse_json_stdout(&output);
+    // Git's `--abbrev=0` omits the `-<n>-g<oid>` suffix for an ordinary tag.
     assert_eq!(json["data"]["result"], "v1.0");
     assert_eq!(json["data"]["tag"], "v1.0");
     assert_eq!(json["data"]["distance"], 1);
@@ -1310,4 +1311,371 @@ fn test_describe_all_filters_branch_candidates() {
         "AC8: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Shared FX-DESC-MN fixture: an annotated tag object whose internal name is
+/// `A`, published only as `refs/tags/Q`, plus one detached child commit `c`.
+fn misnamed_tag_repo() -> (tempfile::TempDir, String, String) {
+    let repo = tempdir().expect("repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("a"), "a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "Ca", "--no-verify"], p),
+        "Ca",
+    );
+    let ca = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["tag", "-a", "A", "-m", "msg", &ca], p),
+        "tag A",
+    );
+    let tag_oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "A"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["tag", "Q", &tag_oid], p), "tag Q");
+    assert_cli_success(&run_libra_command(&["tag", "-d", "A"], p), "drop A ref");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--detach", &ca], p),
+        "detach at Ca",
+    );
+    std::fs::write(p.join("a"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a"], p), "add c");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "C", "--no-verify"], p),
+        "C",
+    );
+    let c = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    (repo, ca, c)
+}
+
+/// DESC-05: a misnamed annotated tag renders its internal name, announces the
+/// mismatch once, and `--abbrev=0` still forces the `-<n>-g<oid>` suffix.
+#[test]
+fn misnamed_annotated_tag_uses_internal_name() {
+    let (repo, ca, c) = misnamed_tag_repo();
+    let p = repo.path();
+    let short = &c[..7];
+
+    let plain = run_libra_command(&["describe", &c], p);
+    assert_cli_success(&plain, "AC1 describe");
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout).trim(),
+        format!("A-1-g{short}"),
+        "AC1 internal name"
+    );
+    let warnings: Vec<String> = String::from_utf8_lossy(&plain.stderr)
+        .lines()
+        .filter(|line| line.contains("externally known as"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        warnings,
+        vec!["warning: tag 'Q' is externally known as 'A'".to_string()],
+        "AC2 one warning for the selected tag"
+    );
+
+    let abbrev0 = run_libra_command(&["describe", "--abbrev=0", &c], p);
+    assert_cli_success(&abbrev0, "AC3 describe --abbrev=0");
+    assert_eq!(
+        String::from_utf8_lossy(&abbrev0.stdout).trim(),
+        format!("A-1-g{c}"),
+        "AC3 forced suffix with full oid"
+    );
+
+    let json = run_libra_command(&["describe", "--abbrev=0", "--json", &c], p);
+    assert_cli_success(&json, "AC4/AC5 describe --json");
+    let parsed = parse_json_stdout(&json);
+    assert_eq!(parsed["data"]["tag"], "A", "AC4 tag");
+    assert_eq!(parsed["data"]["abbreviated_commit"], c, "AC5 full oid");
+
+    let all = run_libra_command(&["describe", "--all", &c], p);
+    assert_cli_success(&all, "AC6 describe --all");
+    assert_eq!(
+        String::from_utf8_lossy(&all.stdout).trim(),
+        format!("tags/Q-1-g{short}"),
+        "AC6 --all keeps the reference name"
+    );
+
+    let contains = run_libra_command(&["describe", "--contains", &ca], p);
+    assert_cli_success(&contains, "AC7 describe --contains");
+    assert_eq!(
+        String::from_utf8_lossy(&contains.stdout).trim(),
+        "Q^0",
+        "AC7 --contains reference name"
+    );
+    assert!(
+        !String::from_utf8_lossy(&contains.stderr).contains("externally known as"),
+        "AC8 no warning under --contains"
+    );
+}
+
+/// DESC-04 AC6/AC7: `--no-long` on a misnamed tag keeps the forced suffix, and
+/// the rendered name resolves back to the tagged commit.
+#[test]
+fn misnamed_annotated_tag_no_long_keeps_suffix() {
+    let (repo, ca, _c) = misnamed_tag_repo();
+    let p = repo.path();
+    let out = run_libra_command(&["describe", "--no-long", &ca], p);
+    assert_cli_success(&out, "AC6 describe --no-long");
+    let rendered = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(rendered, format!("A-0-g{}", &ca[..7]), "AC6 forced suffix");
+    let resolved = run_libra_command(&["rev-parse", &rendered], p);
+    assert_cli_success(&resolved, "AC7 rev-parse");
+    assert_eq!(
+        String::from_utf8_lossy(&resolved.stdout).trim(),
+        ca,
+        "AC7 resolves to the tagged commit"
+    );
+}
+
+/// DESC-06 AC1–AC4, AC6, AC7: `--no-abbrev` equals `--abbrev=0`, is last-wins
+/// with `--abbrev`, falls back to the full HEAD hash under `--always`, and is
+/// rejected with `--long`.
+#[test]
+fn no_abbrev_last_wins_and_always() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("n.txt"), "n1\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "n.txt"], p), "add n1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "c1",
+    );
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
+    std::fs::write(p.join("n.txt"), "n2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "n.txt"], p), "add n2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "c2",
+    );
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    // The 5-hex prefix is unique in this fixture (STOP condition from the card).
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", &head[..5]], p).stdout).trim(),
+        head,
+        "5-hex prefix is unique"
+    );
+
+    let out = run_libra_command(
+        &["describe", "--no-abbrev", "--always", "--match=no-such-tag"],
+        p,
+    );
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        head,
+        "AC1 full HEAD"
+    );
+
+    let out = run_libra_command(
+        &[
+            "describe",
+            "--no-abbrev",
+            "--always",
+            "--match=no-such-tag",
+            "--json",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC2/AC3");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["used_always"], true, "AC2");
+    assert_eq!(json["data"]["abbreviated_commit"], head, "AC3");
+
+    let out = run_libra_command(&["describe", "--no-abbrev"], p);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0", "AC4");
+
+    let out = run_libra_command(&["describe", "--no-abbrev", "--abbrev=5"], p);
+    assert_cli_success(&out, "AC6");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("v1.0-1-g{}", &head[..5]),
+        "AC6 last-wins"
+    );
+
+    let out = run_libra_command(&["describe", "--long", "--no-abbrev"], p);
+    assert!(!out.status.success(), "AC7 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "AC7 code");
+}
+
+/// DESC-06 AC8: `--no-abbrev` on a misnamed tag keeps the forced full suffix.
+#[test]
+fn misnamed_annotated_tag_no_abbrev_keeps_full_suffix() {
+    let (repo, _ca, c) = misnamed_tag_repo();
+    let p = repo.path();
+    let out = run_libra_command(&["describe", "--no-abbrev", &c], p);
+    assert_cli_success(&out, "AC8 describe --no-abbrev");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("A-1-g{c}"),
+        "AC8 forced full suffix"
+    );
+}
+
+/// DESC-07: `--dirty` rejects a commit-ish outside `--contains` and is ignored
+/// (never reads the index) under `--contains`.
+#[test]
+fn dirty_scope_with_commit_and_contains() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("f.txt"), "A\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "C1", "--no-verify"], p),
+        "C1",
+    );
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
+
+    let out = run_libra_command(&["describe", "--dirty", "HEAD"], p);
+    assert!(!out.status.success(), "AC1 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "AC1");
+
+    let out = run_libra_command(&["describe", "--dirty", "HEAD", "--json"], p);
+    assert!(!out.status.success(), "AC3 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "AC3");
+
+    std::fs::write(p.join("f.txt"), "B\n").unwrap();
+    let out = run_libra_command(&["describe", "--contains", "--dirty", "HEAD"], p);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC4");
+
+    let out = run_libra_command(&["describe", "--contains", "--dirty"], p);
+    assert_cli_success(&out, "AC5");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC5");
+
+    let out = run_libra_command(&["describe", "--dirty"], p);
+    assert_cli_success(&out, "AC8");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-dirty",
+        "AC8"
+    );
+
+    // AC6/AC7: a corrupt index must not affect the `--contains` path.
+    let index_backup = std::fs::read(p.join(".libra/index")).unwrap();
+    std::fs::write(p.join(".libra/index"), "garbage\n").unwrap();
+    let out = run_libra_command(&["describe", "--contains", "--dirty", "HEAD"], p);
+    assert_cli_success(&out, "AC6");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC6");
+    let out = run_libra_command(&["describe", "--contains", "--dirty"], p);
+    assert_cli_success(&out, "AC7");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC7");
+    std::fs::write(p.join(".libra/index"), index_backup).unwrap();
+}
+
+/// DESC-08 AC1–AC6: `--broken` composes with `--dirty`, is refused with a
+/// commit-ish, and is ignored by `--contains`.
+#[test]
+fn broken_marks_and_scope() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("f.txt"), "A\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], p),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
+
+    // AC1: only the stat changes (same content) -> no suffix after the refresh.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(p.join("f.txt"))
+        .unwrap();
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+    )
+    .unwrap();
+    drop(file);
+    let out = run_libra_command(&["describe", "--dirty", "--broken"], p);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0", "AC1");
+
+    std::fs::write(p.join("f.txt"), "B\n").unwrap();
+    let out = run_libra_command(&["describe", "--broken"], p);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-dirty",
+        "AC2"
+    );
+
+    let out = run_libra_command(&["describe", "--dirty=-dm", "--broken"], p);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-dm",
+        "AC3"
+    );
+
+    let out = run_libra_command(&["describe", "--broken", "HEAD"], p);
+    assert!(!out.status.success(), "AC4 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "AC4");
+
+    let index = p.join(".libra/index");
+    let backup = std::fs::read(&index).unwrap();
+    std::fs::write(&index, "garbage\n").unwrap();
+    let out = run_libra_command(&["describe", "--contains", "--broken", "HEAD"], p);
+    assert_cli_success(&out, "AC5");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC5");
+    let out = run_libra_command(&["describe", "--contains", "--broken"], p);
+    assert_cli_success(&out, "AC6");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC6");
+    std::fs::write(&index, backup).unwrap();
+}
+
+/// DESC-08a AC1–AC4: a failed dirty check appends the `--broken` mark.
+#[test]
+fn broken_check_failure_marks() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("f.txt"), "A\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], p),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
+    let index = p.join(".libra/index");
+    std::fs::write(&index, "garbage\n").unwrap();
+
+    // Precondition: `--dirty` alone still fails on the corrupt index.
+    let dirty = run_libra_command(&["describe", "--dirty"], p);
+    assert!(!dirty.status.success(), "precondition: --dirty fails");
+
+    let out = run_libra_command(&["describe", "--broken"], p);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-broken",
+        "AC1"
+    );
+
+    let out = run_libra_command(&["describe", "--broken=-bk"], p);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-bk",
+        "AC2"
+    );
+
+    let out = run_libra_command(&["describe", "--broken", "--json"], p);
+    assert_cli_success(&out, "AC3/AC4");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["dirty_mark"], "-broken", "AC3");
+    assert_eq!(json["data"]["result"], "v1.0-broken", "AC4");
 }

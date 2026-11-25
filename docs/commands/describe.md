@@ -39,6 +39,13 @@ commit. If no exact tag exists, it fails even when `--always` is also present.
 therefore print `v1.2.3-0-gabc1234` instead of `v1.2.3`. Like Git,
 `--long --abbrev=0` is rejected because the long form requires a hash suffix.
 
+A misnamed annotated tag (its embedded `tag_name` differs from the ref that
+points at it) is rendered by the embedded name, and the mismatch is announced
+once on stderr (`warning: tag '<ref>' is externally known as '<name>'`) only
+when that tag is selected; `--all` and `--contains` keep the reference name.
+For an ordinary tag `--abbrev=0` still omits the suffix (Git); a misnamed tag
+is the exception and forces `<name>-<distance>-g<full oid>`.
+
 `--dirty[=<mark>]` appends a suffix when tracked content differs from `HEAD`.
 The default suffix is `-dirty`; custom marks are accepted with
 `--dirty=<mark>`. Untracked files are ignored, matching Git's dirty check for
@@ -52,11 +59,25 @@ this command.
 | `--tags` | Include lightweight tags in the search (not just annotated tags). | Off |
 | `--all` | Consider any ref (local branches, remote-tracking branches, and tags, including lightweight ones), not just tags. Names are shown with their `heads/`, `remotes/`, or `tags/` prefix; at a shared commit tags win, then heads, then remotes. | Off |
 | `--abbrev <N>` | Number of hex digits for the abbreviated commit hash in the output. | `7` |
+| `--no-abbrev` | Git's `--abbrev=0`: omit the `-<n>-g<oid>` suffix for ordinary tags (misnamed tags keep the forced full suffix); last one wins with `--abbrev`. | Off |
 | `--always` | When no tag can describe the target, fall back to the abbreviated commit hash instead of failing. | Off |
 | `--exact-match` | Only succeed when the target commit exactly matches a tag. | Off |
 | `--candidates <N>` | `N=0` requires an exact tag match (equivalent to `--exact-match`); `N>=1` keeps Libra's deterministic nearest-tag search (the positive bound is not enforced). | — |
 | `--long` | Force `tag-N-gHASH` output when a tag describes the target, including `tag-0-gHASH` for exact matches. | Off |
+| `--no-long` | Cancel an earlier `--long` (last one wins). | Off |
 | `--dirty[=<mark>]` | Append a dirty mark when tracked content differs from `HEAD`. | Off, default mark `-dirty` when enabled |
+
+`--broken[=<mark>]` (default `-broken`) is accepted alongside `--dirty`: when the
+worktree differs from HEAD the `--dirty` mark (default `-dirty`) is appended, and
+a stat-only change is refreshed away first. `--broken` cannot be combined with a
+`<commit>` argument outside `--contains` (`LBR-CLI-002`) and is ignored by
+`--contains`. If the worktree check itself fails (for example a corrupt
+index), `--broken` appends its mark (default `-broken`, or the `--broken=<mark>`
+value) and exits 0 instead.
+
+`--dirty` cannot be combined with a `<commit>` argument (exit 129,
+`LBR-CLI-002`). `--contains` accepts `--dirty` but ignores it: the worktree is
+never inspected, so a dirty tree or a corrupt index cannot change its output.
 | `--first-parent` | Follow only the first parent of merge commits when walking history. | Off |
 | `--match <pattern>` | Only consider tags whose name matches the glob (repeatable; OR semantics, wax globs ≤256 chars). | None |
 | `--no-match` | Clear every `--match` given so far; a later `--match` still applies and `--exclude` is unaffected. | Off |

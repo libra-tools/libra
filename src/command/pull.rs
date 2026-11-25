@@ -711,8 +711,35 @@ async fn resolve_pull_target(
 ) -> Result<ResolvedPullTarget, PullError> {
     match (&args.repository, &args.refspec) {
         (Some(remote), Some(refspec)) => {
-            let remote_branch = normalize_remote_branch_name(refspec);
             let (remote_config, _is_anonymous) = resolve_remote_config(remote).await?;
+            // `pull <remote> <tag>:<dest>` (`ADR-I997-02`): the fetch handles the
+            // tag refspec and writes the peeled commit to `<dest>`; merge that
+            // destination directly instead of deriving a branch tracking ref.
+            let tag_refspec_source = refspec
+                .strip_prefix('+')
+                .unwrap_or(refspec)
+                .split_once(':')
+                .map(|(source, _)| source.starts_with("refs/tags/"))
+                .unwrap_or(false);
+            if tag_refspec_source {
+                let destination = refspec
+                    .split_once(':')
+                    .map(|(_, destination)| destination)
+                    .unwrap_or_default();
+                let merge_target = if destination.starts_with("refs/") {
+                    destination.to_string()
+                } else {
+                    format!("refs/tags/{destination}")
+                };
+                return Ok(ResolvedPullTarget {
+                    branch,
+                    upstream: format!("{remote}/{refspec}"),
+                    merge_target,
+                    remote_branch: refspec.to_string(),
+                    remote_config,
+                });
+            }
+            let remote_branch = normalize_remote_branch_name(refspec);
             // Anonymous pulls still write a tracking ref under the sanitized
             // single-component name; the plan's FETCH_HEAD semantic is equivalent
             // to merging that ref (issues/480 HP-06).

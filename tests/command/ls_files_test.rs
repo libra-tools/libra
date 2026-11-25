@@ -295,8 +295,8 @@ fn ls_files_pathspec_is_resolved_from_nested_current_dir() {
     assert_eq!(
         stdout_lines(&output),
         vec![
-            "tracked-dir/alpha.txt".to_string(),
-            "tracked-dir/bravo.txt".to_string(),
+            "../tracked-dir/alpha.txt".to_string(),
+            "../tracked-dir/bravo.txt".to_string(),
         ]
     );
 }
@@ -1620,4 +1620,211 @@ fn ls_files_lists_each_unmerged_stage() {
     let out = run_libra_command(&["ls-files"], p);
     assert_cli_success(&out, "AC4");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "b\nb\nk\n", "AC4");
+}
+
+fn ls_cwd_fixture() -> tempfile::TempDir {
+    let repo = tempdir().expect("repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::create_dir_all(p.join("sub")).unwrap();
+    std::fs::write(p.join("root.txt"), "root").unwrap();
+    std::fs::write(p.join("sub/foo1"), "a").unwrap();
+    std::fs::write(p.join("sub/foo2"), "b").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add all");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    repo
+}
+
+fn ls_lines(repo: &std::path::Path, args: &[&str]) -> Vec<String> {
+    let out = run_libra_command(args, &repo.join("sub"));
+    assert_cli_success(&out, "ls-files");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn subdir_default_uses_cwd_relative_paths() {
+    let repo = ls_cwd_fixture();
+    assert_eq!(ls_lines(repo.path(), &["ls-files"]), ["foo1", "foo2"]);
+}
+
+#[test]
+fn subdir_default_excludes_root_siblings() {
+    let repo = ls_cwd_fixture();
+    let lines = ls_lines(repo.path(), &["ls-files"]);
+    assert!(!lines.iter().any(|line| line.contains("root.txt")));
+}
+
+#[test]
+fn root_default_remains_repo_relative() {
+    let repo = ls_cwd_fixture();
+    let out = run_libra_command(&["ls-files"], repo.path());
+    assert_cli_success(&out, "root ls-files");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let lines: Vec<&str> = stdout.lines().collect();
+    for expected in ["root.txt", "sub/foo1", "sub/foo2"] {
+        assert!(
+            lines.contains(&expected),
+            "root listing has {expected}: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn subdir_full_name_uses_repo_relative_paths() {
+    let repo = ls_cwd_fixture();
+    assert_eq!(
+        ls_lines(repo.path(), &["ls-files", "--full-name"]),
+        ["sub/foo1", "sub/foo2"]
+    );
+}
+
+#[test]
+fn subdir_full_name_keeps_implicit_scope() {
+    let repo = ls_cwd_fixture();
+    let lines = ls_lines(repo.path(), &["ls-files", "--full-name"]);
+    assert!(!lines.iter().any(|line| line.contains("root.txt")));
+}
+
+#[test]
+fn subdir_short_projects_only_path() {
+    let repo = ls_cwd_fixture();
+    let lines = ls_lines(repo.path(), &["ls-files", "-s"]);
+    assert!(lines.iter().all(|line| line.contains("\tfoo")));
+}
+
+#[test]
+fn subdir_stage_alias_matches_short() {
+    let repo = ls_cwd_fixture();
+    let short = ls_lines(repo.path(), &["ls-files", "-s"]);
+    let stage = ls_lines(repo.path(), &["ls-files", "--stage"]);
+    assert_eq!(stage, short);
+}
+
+#[test]
+fn subdir_tag_projects_only_path() {
+    let repo = ls_cwd_fixture();
+    let lines = ls_lines(repo.path(), &["ls-files", "-t"]);
+    assert_eq!(lines, ["H foo1", "H foo2"]);
+}
+
+#[test]
+fn subdir_debug_projects_only_record_path() {
+    let repo = ls_cwd_fixture();
+    let lines = ls_lines(repo.path(), &["ls-files", "--debug"]);
+    assert_eq!(lines.first().map(String::as_str), Some("foo1"));
+    assert!(lines.iter().any(|line| line.contains("ctime:")));
+}
+
+#[test]
+fn subdir_others_respects_scope() {
+    let repo = ls_cwd_fixture();
+    std::fs::write(repo.path().join("sub/untracked"), "u").unwrap();
+    assert_eq!(ls_lines(repo.path(), &["ls-files", "-o"]), ["untracked"]);
+}
+
+#[test]
+fn subdir_cached_respects_scope() {
+    let repo = ls_cwd_fixture();
+    assert_eq!(ls_lines(repo.path(), &["ls-files", "-c"]), ["foo1", "foo2"]);
+}
+
+#[test]
+fn subdir_ignored_others_respects_scope() {
+    let repo = ls_cwd_fixture();
+    std::fs::write(repo.path().join(".gitignore"), "sub/ignored.txt\n").unwrap();
+    std::fs::write(repo.path().join("sub/ignored.txt"), "i").unwrap();
+    assert_eq!(
+        ls_lines(repo.path(), &["ls-files", "-i", "-o", "--exclude-standard"]),
+        ["ignored.txt"]
+    );
+}
+
+#[test]
+fn subdir_ignored_cached_respects_scope() {
+    let repo = ls_cwd_fixture();
+    std::fs::write(repo.path().join(".gitignore"), "sub/tracked_ignored\n").unwrap();
+    std::fs::write(repo.path().join("sub/tracked_ignored"), "t").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "-f", "sub/tracked_ignored"], repo.path()),
+        "force add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ignored", "--no-verify"], repo.path()),
+        "commit ignored",
+    );
+    assert_eq!(
+        ls_lines(repo.path(), &["ls-files", "-i", "-c", "--exclude-standard"]),
+        ["tracked_ignored"]
+    );
+}
+
+#[test]
+fn subdir_error_unmatch_resolves_plain_spec_from_cwd() {
+    let repo = ls_cwd_fixture();
+    assert_eq!(
+        ls_lines(repo.path(), &["ls-files", "--error-unmatch", "foo1"]),
+        ["foo1"]
+    );
+}
+
+#[test]
+fn subdir_error_unmatch_rejects_redundant_sub_prefix() {
+    let repo = ls_cwd_fixture();
+    let out = run_libra_command(
+        &["ls-files", "--error-unmatch", "sub/foo1"],
+        &repo.path().join("sub"),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"));
+}
+
+#[test]
+fn subdir_parent_pathspec_selects_root_file() {
+    let repo = ls_cwd_fixture();
+    assert_eq!(
+        ls_lines(repo.path(), &["ls-files", "../root.txt"]),
+        ["../root.txt"]
+    );
+}
+
+#[test]
+fn subdir_top_pathspec_selects_root_file() {
+    let repo = ls_cwd_fixture();
+    assert_eq!(
+        ls_lines(repo.path(), &["ls-files", ":(top)root.txt"]),
+        ["../root.txt"]
+    );
+}
+
+#[test]
+fn subdir_json_keeps_root_relative_paths_with_scoped_set() {
+    let repo = ls_cwd_fixture();
+    let out = run_libra_command(&["--json", "ls-files"], &repo.path().join("sub"));
+    assert_cli_success(&out, "json ls-files");
+    let json = parse_json_stdout(&out);
+    let paths: Vec<&str> = json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["sub/foo1", "sub/foo2"]);
+}
+
+#[test]
+fn subdir_machine_keeps_root_relative_paths_with_scoped_set() {
+    let repo = ls_cwd_fixture();
+    let out = run_libra_command(&["--machine", "ls-files"], &repo.path().join("sub"));
+    assert_cli_success(&out, "machine ls-files");
+    let machine = String::from_utf8_lossy(&out.stdout);
+    assert!(machine.contains("\"path\":\"sub/foo1\""), "{machine}");
+    assert!(machine.contains("\"path\":\"sub/foo2\""), "{machine}");
+    assert!(!machine.contains("root.txt"));
 }

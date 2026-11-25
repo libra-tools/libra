@@ -223,7 +223,7 @@ formats.
 Custom templates support `%H` / `%h` (full / abbreviated commit hash), `%P` /
 `%p` (full / abbreviated parent hashes), `%s` / `%f` (subject / sanitized
 subject), `%b` / `%B` (body / raw subject+body), `%n`, ASCII/control `%xNN`, `%%`, `%an` / `%ae` /
-`%ad` / `%aI` / `%at` (author), `%cn` / `%ce` / `%cd` / `%cI` / `%ct`
+`%ad` / `%as` / `%ai` / `%ah` / `%aI` / `%at` (author), `%cn` / `%ce` / `%cd` / `%cs` / `%ci` / `%ch` / `%cI` / `%ct`
 (committer), `%d` / `%D` (decorations), `%m`, and common color placeholders
 such as `%Cred`, `%C(red)`, `%C(always,red)`, and `%Creset`. Unknown
 placeholders stay literal, matching Git's pretty-format behavior.
@@ -259,7 +259,7 @@ the indented message.
 ### `--date=<format>`
 
 Select the human-readable author/committer date mode. Supported modes are
-`default`, `short`, `iso`/`iso8601`, `iso-strict`/`iso8601-strict`,
+`default`, `short`, `iso`/`iso8601`, `iso-strict`/`iso8601-strict`, `human`,
 `rfc`/`rfc2822`, `unix`, `raw`, and `format:<strftime>` (the spec passes through
 verbatim, case-sensitively). `log.date` supplies the default for human `log` and
 `show` output; an explicit `--date` wins. Valid Git modes that this renderer does
@@ -583,6 +583,8 @@ libra log --until 2026-03-01
 ### `--pretty <FORMAT>`
 
 Custom pretty-print format string. Supports the same placeholder set described
+Fixed signature-date placeholders `%as`/`%ai`/`%ah` and `%cs`/`%ci`/`%ch` render the author/committer's own timezone (short/ISO/human) and ignore `--date`; `%ad`/`%cd` keep following `--date` (now timezone-aware, including `--date=human`).
+
 above, including `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, strict ISO dates `%aI` / `%cI`, raw
 timestamps `%at` / `%ct`, raw decorations `%D`, `%m`, and color placeholders.
 

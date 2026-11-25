@@ -100,7 +100,7 @@ pub(crate) async fn configured_date() -> CliResult<Option<String>> {
         return Err(invalid_config(
             "log.date",
             &value,
-            "supported modes: default, short, iso, iso-strict, rfc, unix, raw, format:<strftime>",
+            "supported modes: default, short, iso, iso-strict, rfc, unix, raw, human, format:<strftime>",
         ));
     };
     Ok(Some(normalized))
@@ -130,6 +130,7 @@ fn supported_date_mode(value: &str) -> Option<String> {
             | "rfc2822"
             | "unix"
             | "raw"
+            | "human"
     )
     .then_some(normalized)
 }
@@ -138,7 +139,7 @@ pub(crate) fn resolve_cli_date(value: &str) -> CliResult<String> {
     supported_date_mode(value).ok_or_else(|| {
         CliError::command_usage(format!("invalid --date option: '{value}'"))
             .with_stable_code(StableErrorCode::CliInvalidArguments)
-            .with_hint("supported modes: default, short, iso, iso-strict, rfc, unix, raw, format:<strftime>")
+            .with_hint("supported modes: default, short, iso, iso-strict, rfc, unix, raw, human, format:<strftime>")
     })
 }
 

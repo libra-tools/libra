@@ -1,16 +1,20 @@
 //! `tests/agent_bridge_checkpoint_test.rs` — bridge checkpoint create then
 //! list/show round-trip (plan-20260818 LB-05).
 
-use libra::internal::{
-    ai::agent_bridge::{
-        ingress::{BridgeContext, dispatch as ingress_dispatch},
-        methods::dispatch as read_dispatch,
-        mutations::dispatch as mutation_dispatch,
-        protocol::{BridgeRequest, parse_request_line},
+use libra::{
+    internal::{
+        ai::agent_bridge::{
+            ingress::{BridgeContext, dispatch as ingress_dispatch},
+            methods::dispatch as read_dispatch,
+            mutations::dispatch as mutation_dispatch,
+            protocol::{BridgeRequest, parse_request_line},
+        },
+        db::migration::run_builtin_migrations,
     },
-    db::migration::run_builtin_migrations,
+    utils::test::{ChangeDirGuard, setup_with_new_libra_in},
 };
 use sea_orm::Database;
+use serial_test::serial;
 
 async fn ctx() -> BridgeContext {
     let conn = Database::connect("sqlite::memory:").await.expect("connect");
@@ -30,7 +34,11 @@ fn request(line: &str) -> BridgeRequest {
 }
 
 #[tokio::test]
+#[serial(cwd)]
 async fn checkpoint_create_list_show_round_trip() {
+    let repo = tempfile::tempdir().expect("checkpoint repository");
+    setup_with_new_libra_in(repo.path()).await;
+    let _cwd = ChangeDirGuard::new(repo.path());
     let c = ctx().await;
     ingress_dispatch(
         &c,
@@ -101,7 +109,11 @@ async fn checkpoint_create_requires_open_session_in_repo() {
 /// repository identity is invisible to a query scoped to a different
 /// repository on the same database (GC-LB-06 / R3-P1-2 regression guard).
 #[tokio::test]
+#[serial(cwd)]
 async fn checkpoint_reads_are_repository_scoped() {
+    let repo = tempfile::tempdir().expect("checkpoint repository");
+    setup_with_new_libra_in(repo.path()).await;
+    let _cwd = ChangeDirGuard::new(repo.path());
     let conn = Database::connect("sqlite::memory:").await.expect("connect");
     run_builtin_migrations(&conn)
         .await

@@ -19,7 +19,7 @@ refs、索引、工作区或对象存储。未提供状态筛选时，默认使�
 的过滤、通过 `-i` / `--ignored` 只列出被忽略的集合（`-i -o` 列出被忽略的未跟踪文件、
 `-i -c` 列出匹配 exclude 模式的已跟踪文件）、仓库内 pathspec 过滤、`--error-unmatch`、通过 `-z`
 输出 NUL 分隔文本记录、通过 `-t` 输出状态标签，以及通过 `-u` / `--unmerged`
-只列出冲突条目。`--full-name` 作为 no-op 接受（Libra 始终输出仓库根相对路径）。
+只列出冲突条目。无显式 pathspec 时只列出当前目录子树，并按 cwd 相对路径输出；`--full-name` 改为输出仓库根相对路径，但不扩大该隐式作用域。显式选中的 cwd 外条目输出为 `../…`。
 
 intent-to-add 条目（`libra add -N`）在列表层面就是普通 stage-0 索引条目：
 `ls-files -s` 输出 mode `100644`、规范空 blob
@@ -50,7 +50,7 @@ skip-worktree 条目（见 [`update-index`](update-index.md)）会出现在普�
 | `-t` | 在每行路径前加状态标签：`H`（cached）、`R`（removed/deleted）、`C`（modified/changed）、`?`（other/untracked）、`M`（unmerged）、`S`（skip-worktree）。未合并路径不会被隐藏；stage 1/2/3 每个条目都会按 `M <path>` 输出，与 Git 的冲突可见性一致。skip-worktree 条目始终标 `S`，且永远不会被报为 deleted/modified。 |
 | `-v` | 与 `-t` 相同：在每行路径前加状态标签。Git 的 `-v` 会用小写字母标记 assume-unchanged 文件，Libra 不支持该语义，因此 `-v` 输出与 `-t` 相同。  无标志 `ls-files`、`-c`、`-z` 与 `--json` 都遍历全部索引 stage，未合并路径按每个冲突 stage（1/2/3）各输出一行（与 Git `show_files` 一致）；`-v` 对这些行标 `M`。 |
 | `-u`, `--unmerged` | 只列出未合并（冲突）条目——索引 stage 1/2/3——以 stage 样式输出。 |
-| `--full-name` | 为 Git 兼容而接受。Libra 始终输出仓库根相对路径（即 `git --full-name` 形式），因此该标志为 no-op。 |
+| `--full-name` | 改为输出仓库根相对路径（隐式 cwd 作用域不变）。 |
 | `--others`、`-o` | 显示未跟踪的工作区文件。索引中**任一 stage**（含未合并冲突 stage）存在的路径都视为已跟踪、绝不是 "other"（Git 的 `index_name_is_other`），因此冲突路径在合并未解决时也不会列出。 |
 | `--cached`、`-c` | 显示索引中已暂存的文件。 |
 | `-i`、`--ignored` | 只显示被忽略的集合：`-i -o` 列出被忽略的未跟踪文件（`-o` 的反集），`-i -c` 列出匹配 exclude 模式的已跟踪文件。须配合 `-o`/`-c` 且需要 exclude 源——`--exclude-standard` 或显式 `-x`/`-X` pattern（否则退出码 128），与 git 一致。 |
@@ -166,4 +166,4 @@ tracked-dir/alpha.txt\0tracked-dir/bravo.txt\0
 | NUL 输出 | `-z`（仅文本模式） | `-z` | 模型不同 |
 | 状态标签 | `-t` / `-v`（H/R/C/?/M/S） | `-t` / `-v`（H/S/M/R/C/K/?） | 模型不同（`-v` 的小写 assume-unchanged 不支持；`K`/`U` 不支持） |
 | 未合并条目 | `-u` / `--unmerged` | `-u` / `--unmerged` | 模型不同 |
-| 根相对路径 | `--full-name`（始终；no-op 标志） | `--full-name`（按需） | 模型不同 |
+| 路径基 | 默认 cwd 相对；`--full-name` 按需 | `--full-name` | 一致 |

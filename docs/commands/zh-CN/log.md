@@ -155,7 +155,7 @@ libra log --no-abbrev-commit
 
 预设继承 `libra log` 既有惯例（时间戳渲染为 UTC `+0000`；除默认 `medium` 外，显式 `--pretty` 使用缩写哈希；存储消息中 subject/body 间空行已折叠），故与 Git 预设**结构**一致而非逐字节相同。`libra show --pretty=<preset>` 使用相同格式。
 
-自定义模板支持 `%H` / `%h`（完整 / 缩写提交哈希）、`%P` / `%p`（完整 / 缩写父提交哈希列表）、`%s` / `%f`（主题 / 清理后的主题）、`%b` / `%B`（正文 / 原始 subject+body）、`%n`、ASCII/control `%xNN`、`%%`、`%an` / `%ae` / `%ad` / `%aI` / `%at`（作者）、`%cn` / `%ce` / `%cd` / `%cI` / `%ct`（提交者）、`%d` / `%D`（装饰）、`%m`，以及 `%Cred`、`%C(red)`、`%C(always,red)`、`%Creset` 等常见颜色占位符。未知占位符会按 Git pretty-format 规则原样保留。颜色复位遵循 Git 策略：`%C(always,...)` 即使普通颜色关闭也会强制输出 ANSI，而 `%Creset` 只在颜色输出启用时复位；强制颜色模板若也要强制复位，请使用 `%C(always,reset)`。
+自定义模板支持 `%H` / `%h`（完整 / 缩写提交哈希）、`%P` / `%p`（完整 / 缩写父提交哈希列表）、`%s` / `%f`（主题 / 清理后的主题）、`%b` / `%B`（正文 / 原始 subject+body）、`%n`、ASCII/control `%xNN`、`%%`、`%an` / `%ae` / `%ad` / `%as` / `%ai` / `%ah` / `%aI` / `%at`（作者）、`%cn` / `%ce` / `%cd` / `%cs` / `%ci` / `%ch` / `%cI` / `%ct`（提交者）、`%d` / `%D`（装饰）、`%m`，以及 `%Cred`、`%C(red)`、`%C(always,red)`、`%Creset` 等常见颜色占位符。未知占位符会按 Git pretty-format 规则原样保留。颜色复位遵循 Git 策略：`%C(always,...)` 即使普通颜色关闭也会强制输出 ANSI，而 `%Creset` 只在颜色输出启用时复位；强制颜色模板若也要强制复位，请使用 `%C(always,reset)`。
 
 ```bash
 libra log --pretty=short
@@ -179,7 +179,9 @@ libra log --pretty=reference
 ### `--date=<format>`
 
 选择人类输出中的作者/提交者日期格式。支持 `default`、`short`、
-`iso`/`iso8601`、`iso-strict`/`iso8601-strict`、`rfc`/`rfc2822`、`unix`
+`iso`/`iso8601`、`iso-strict`/`iso8601-strict`、`human`、`rfc`/`rfc2822`、`unix`
+固定签名日期占位符 `%as`/`%ai`/`%ah`/`%cs`/`%ci`/`%ch` 按作者/提交者自带时区输出，且不受 `--date` 影响；`%ad`/`%cd` 继续遵循 `--date`（现已时区感知并支持 `--date=human`）。
+
 与 `raw`，以及 `format:<strftime>`（按 `strftime` 格式渲染日期）。
 `log.date` 为人类 `log`/`show` 输出提供默认值，显式 `--date`
 优先。当前 renderer 尚未实现的合法 Git 模式（`relative`、`human`、

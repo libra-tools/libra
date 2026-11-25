@@ -196,22 +196,11 @@ pub fn sole_writer() {
             syn::visit::visit_expr_field(self, field);
         }
     }
-    fn walk(path: &std::path::Path, calls: &mut Calls) {
-        for entry in std::fs::read_dir(path).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(&path, calls);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                calls
-                    .visit_file(&syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap());
-            }
-        }
-    }
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut calls = Calls::default();
-    walk(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut calls,
-    );
+    for path in crate::workspace_sources::collect_workspace_rust_files(repo_root) {
+        calls.visit_file(&syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap());
+    }
     calls.writer_calls.sort();
     assert_eq!(
         calls.writer_calls,

@@ -17,6 +17,15 @@ pub(super) struct DescribeOutput {
     pub(super) dirty_mark: Option<String>,
 }
 
+/// Result of the worktree dirty check, feeding the `--dirty`/`--broken` suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorktreeCheck {
+    Clean,
+    Dirty,
+    /// The dirty check itself failed (e.g. a corrupt index).
+    Failed,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum DescribeError {
     #[error("HEAD does not point to a commit")]
@@ -39,6 +48,8 @@ pub(super) enum DescribeError {
     LongWithAbbrevZero,
     #[error("{0}")]
     InvalidArgument(String),
+    #[error("option '{option}' and commit-ishes cannot be used together")]
+    CommitishIncompatible { option: String },
 }
 
 impl From<CommitBaseError> for DescribeError {

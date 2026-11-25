@@ -422,3 +422,35 @@ fn show_and_shortlog_reuse_pretty_placeholder_renderer() {
         "shortlog must not leak supported placeholders literally: {shortlog_text}"
     );
 }
+
+/// I957-01: fixed signature date placeholders match Git in log/show/shortlog and
+/// bypass `--date`, while `%ad`/`%cd` still honor it.
+#[test]
+fn fixed_signature_date_tokens_match_git() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let fixed = "%as|%ai|%ah|%cs|%ci|%ch";
+    let fixed_arg = format!("--format={fixed}");
+    for args in [
+        vec!["log", "-1", "--date=raw", fixed_arg.as_str()],
+        vec!["show", "--no-patch", "--date=raw", fixed_arg.as_str()],
+        vec!["shortlog", "HEAD", "--date=raw", fixed_arg.as_str()],
+    ] {
+        let git = fixture.git_success(&fixture.git_repo, &args);
+        let libra = fixture.libra_success(&fixture.libra_repo, &args);
+        assert_bytes_eq(
+            &format!("fixed date placeholders must match Git for {args:?}"),
+            &libra.stdout,
+            &git.stdout,
+        );
+    }
+
+    // `%ad`/`%cd` keep obeying `--date=format:`.
+    let date_arg = "--date=format:%Y/%m/%d";
+    let date_format_arg = "--format=%ad|%cd";
+    let args = vec!["log", "-1", date_arg, date_format_arg];
+    let git = fixture.git_success(&fixture.git_repo, &args);
+    let libra = fixture.libra_success(&fixture.libra_repo, &args);
+    assert_bytes_eq("%ad/%cd must honor --date", &libra.stdout, &git.stdout);
+}

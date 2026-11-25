@@ -19,28 +19,21 @@ use sha1::{Digest, Sha1};
 
 use crate::{
     command::index_pack_support::{
-        PackCommitEdges, index_write_error, lock_state, record_first_pack_error, take_arc_mutex,
+        PackCommitEdges, ReceivedObjects, index_write_error, lock_state, record_first_pack_error,
+        take_arc_mutex,
     },
     utils::client_storage::parse_commit_header_refs,
 };
 
 pub fn build_index_v1(pack_file: &str, index_file: &str) -> Result<(), GitError> {
-    build_index_v1_inner(pack_file, index_file, false).map(|_| ())
+    build_index_v1_inner(pack_file, index_file, false, None).map(|_| ())
 }
 
-/// Build the index and spool commit parent edges from the same pack decode.
-pub(crate) fn build_index_v1_with_commit_edges(
-    pack_file: &str,
-    index_file: &str,
-) -> Result<PackCommitEdges, GitError> {
-    build_index_v1_inner(pack_file, index_file, true)?
-        .ok_or_else(|| GitError::PackEncodeError("commit edge spool was not created".to_string()))
-}
-
-fn build_index_v1_inner(
+pub(crate) fn build_index_v1_inner(
     pack_file: &str,
     index_file: &str,
     collect_edges: bool,
+    received: Option<Arc<ReceivedObjects>>,
 ) -> Result<Option<PackCommitEdges>, GitError> {
     if git_internal::hash::get_hash_kind() != HashKind::Sha1 {
         return Err(GitError::InvalidPackFile(
@@ -78,6 +71,12 @@ fn build_index_v1_inner(
         &mut pack_reader,
         move |meta_entry: MetaAttached<Entry, EntryMeta>| {
             let entry = &meta_entry.inner;
+            if let Some(received) = &received
+                && let Err(error) = received.record(entry)
+            {
+                record_first_pack_error(&err_c, error);
+                return;
+            }
             let hash_key = entry.hash;
             if let Some(spool) = commit_edges_c.as_ref()
                 && entry.obj_type == ObjectType::Commit

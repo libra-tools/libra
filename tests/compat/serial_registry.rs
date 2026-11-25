@@ -11,6 +11,9 @@
 //! with what the classifier derives from the source. Re-running the classifier
 //! is what stops someone writing themselves a row by hand.
 
+#[path = "../helpers/workspace_sources.rs"]
+mod workspace_sources;
+
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
 fn repo_root() -> PathBuf {
@@ -2222,22 +2225,15 @@ fn src_process_global_tests_hold_matching_lanes() {
 #[test]
 fn no_full_universe_expansion_remains_in_src() {
     let mut offenders = Vec::new();
-    let mut stack = vec![repo_root().join("src")];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read src/ dir") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).expect("read src");
-                for (n, line) in text.lines().enumerate() {
-                    if let Some(keys) = serial_keys_of(line)
-                        && keys.iter().any(|k| k == "cloud_live")
-                        && keys.iter().any(|k| k == "workspace_failpoints")
-                    {
-                        offenders.push(format!("{}:{}", path.display(), n + 1));
-                    }
-                }
+    let root = repo_root();
+    for path in workspace_sources::collect_workspace_rust_files(&root) {
+        let text = std::fs::read_to_string(&path).expect("read src");
+        for (n, line) in text.lines().enumerate() {
+            if let Some(keys) = serial_keys_of(line)
+                && keys.iter().any(|k| k == "cloud_live")
+                && keys.iter().any(|k| k == "workspace_failpoints")
+            {
+                offenders.push(format!("{}:{}", path.display(), n + 1));
             }
         }
     }
@@ -2297,6 +2293,64 @@ fn src_serial_registry_matches_src_classifier() {
     assert!(
         missing.is_empty(),
         "SRC_SERIAL_REGISTRY fns missing from TREE=src classify: {missing:?}"
+    );
+
+    // WSM-02 workspace-aware classifier fixture: verify `SERIAL_CLASSIFY_TREE=src`
+    // classifies both plain files and intra-crate `include!` targets under
+    // `crates/<fixture>/src/` without marking the include unresolved.
+    let fixture_dir = tempfile::tempdir().expect("create classifier fixture dir");
+    let fixture_root = fixture_dir.path();
+    std::fs::write(fixture_root.join("COMPATIBILITY.md"), "# fixture\n")
+        .expect("write fixture COMPATIBILITY.md");
+    std::fs::create_dir_all(fixture_root.join(".libra")).expect("create fixture .libra");
+    std::fs::create_dir_all(fixture_root.join("src")).expect("create fixture src");
+    std::fs::create_dir_all(fixture_root.join("tests")).expect("create fixture tests");
+    std::fs::copy(
+        repo_root().join("tests/SERIAL_CLASSIFY.sh"),
+        fixture_root.join("tests/SERIAL_CLASSIFY.sh"),
+    )
+    .expect("copy SERIAL_CLASSIFY.sh into fixture");
+    let crate_src = fixture_root.join("crates/fixture_crate/src");
+    std::fs::create_dir_all(&crate_src).expect("create fixture crate src");
+    std::fs::write(
+        crate_src.join("helper.rs"),
+        "fn touch_env() { unsafe { std::env::set_var(\"LIBRA_FIXTURE_ENV\", \"1\"); } }\n",
+    )
+    .expect("write fixture helper.rs");
+    std::fs::write(
+        crate_src.join("plain.rs"),
+        "#[serial]\n#[test]\nfn fixture_crate_plain_test() {}\n",
+    )
+    .expect("write fixture plain.rs");
+    std::fs::write(
+        crate_src.join("lib.rs"),
+        concat!(
+            "include!(\"helper.rs\");\n",
+            "#[serial_test::serial(env)]\n",
+            "#[test]\n",
+            "fn fixture_crate_include_test() { touch_env(); }\n",
+        ),
+    )
+    .expect("write fixture lib.rs");
+    let fixture_out = Command::new("sh")
+        .arg(fixture_root.join("tests/SERIAL_CLASSIFY.sh"))
+        .current_dir(fixture_root)
+        .env("SERIAL_CLASSIFY_TREE", "src")
+        .output()
+        .expect("run SERIAL_CLASSIFY.sh on workspace fixture");
+    assert!(
+        fixture_out.status.success(),
+        "fixture SERIAL_CLASSIFY.sh failed: {}",
+        String::from_utf8_lossy(&fixture_out.stderr),
+    );
+    let fixture_stdout = String::from_utf8_lossy(&fixture_out.stdout);
+    assert!(
+        fixture_stdout.contains("fixture_crate_plain_test\tnone"),
+        "expected plain crate test to be classified cleanly, got:\n{fixture_stdout}"
+    );
+    assert!(
+        fixture_stdout.contains("fixture_crate_include_test\tlane:env"),
+        "expected intra-crate include! test to classify lane:env (not unresolved/global), got:\n{fixture_stdout}"
     );
 }
 
@@ -2366,7 +2420,9 @@ fn stacked_serial_attributes_lock_in_one_global_order() {
     assert_eq!(lock_attribute_keys("#[file_serial(env)]"), None);
 
     let mut offenders = Vec::new();
-    let mut stack = vec![repo_root().join("src"), repo_root().join("tests")];
+    let root = repo_root();
+    let mut paths = workspace_sources::collect_workspace_rust_files(&root);
+    let mut stack = vec![root.join("tests")];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("read source dir") {
             let path = entry.expect("dir entry").path();
@@ -2374,32 +2430,34 @@ fn stacked_serial_attributes_lock_in_one_global_order() {
                 stack.push(path);
                 continue;
             }
-            if path.extension().is_none_or(|ext| ext != "rs") {
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                paths.push(path);
+            }
+        }
+    }
+    for path in paths {
+        let text = std::fs::read_to_string(&path).expect("read source");
+        let lines: Vec<&str> = text.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if !(trimmed.starts_with("fn ") || trimmed.starts_with("async fn ")) {
                 continue;
             }
-            let text = std::fs::read_to_string(&path).expect("read source");
-            let lines: Vec<&str> = text.lines().collect();
-            for (idx, line) in lines.iter().enumerate() {
-                let trimmed = line.trim_start();
-                if !(trimmed.starts_with("fn ") || trimmed.starts_with("async fn ")) {
+            let mut attributes = Vec::new();
+            for prev in lines[..idx].iter().rev() {
+                let prev = prev.trim();
+                if prev.is_empty() || prev.starts_with("//") {
                     continue;
                 }
-                let mut attributes = Vec::new();
-                for prev in lines[..idx].iter().rev() {
-                    let prev = prev.trim();
-                    if prev.is_empty() || prev.starts_with("//") {
-                        continue;
-                    }
-                    if !prev.starts_with("#[") {
-                        break;
-                    }
-                    attributes.push(prev);
+                if !prev.starts_with("#[") {
+                    break;
                 }
-                attributes.reverse();
-                let order = stacked_lock_order(&attributes);
-                if !sorted(&order) {
-                    offenders.push(format!("{}:{} locks {order:?}", path.display(), idx + 1));
-                }
+                attributes.push(prev);
+            }
+            attributes.reverse();
+            let order = stacked_lock_order(&attributes);
+            if !sorted(&order) {
+                offenders.push(format!("{}:{} locks {order:?}", path.display(), idx + 1));
             }
         }
     }

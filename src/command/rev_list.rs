@@ -263,9 +263,19 @@ pub struct RevListArgs {
     pub specs: Vec<String>,
 
     /// Print only the named tips without walking their ancestors (Git's
-    /// `--no-walk`).
-    #[clap(long = "no-walk")]
-    pub no_walk: bool,
+    /// `--no-walk[=sorted|unsorted]`).
+    #[clap(
+        long = "no-walk",
+        value_name = "ORDER",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "sorted"
+    )]
+    pub no_walk: Option<String>,
+
+    /// Undo `--no-walk`, restoring the normal ancestor walk.
+    #[clap(long = "do-walk", overrides_with = "no_walk")]
+    pub do_walk: bool,
 
     /// Print the disk usage of the reachable objects instead of the commit list.
     /// Value is `human` (default) or `raw` bytes.
@@ -277,48 +287,82 @@ pub struct RevListArgs {
     pub pathspecs: Vec<String>,
 }
 
-/// Total on-disk size of the commits and their reachable trees/blobs.
-async fn disk_usage_bytes(commit_ids: &[String]) -> CliResult<u64> {
-    let storage = ClientStorage::try_init(path::objects())?;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut total = 0u64;
+/// Total on-disk size of the selected objects: loose objects use their
+/// compressed file size, packed objects their entry size in the pack (no
+/// decompression needed).
+async fn disk_usage_bytes(commit_ids: &[String], include_objects: bool) -> CliResult<u64> {
+    let pack_sizes = pack_disk_sizes();
+    let mut seen: HashSet<ObjectHash> = HashSet::new();
     for id in commit_ids {
         let hash = crate::internal::object_format::parse_repo_oid(id)
             .map_err(|error| CliError::fatal(format!("bad object id '{id}': {error}")))?;
-        if !seen.insert(hash.to_string()) {
+        if !seen.insert(hash) {
             continue;
         }
-        if let Ok(data) = storage.get(&hash) {
-            total += data.len() as u64;
+        if include_objects {
+            let commit = load_object::<Commit>(&hash)
+                .map_err(|error| CliError::fatal(format!("failed to load commit {id}: {error}")))?;
+            collect_tree_ids(&commit.tree_id, &mut seen)?;
         }
-        let commit = load_object::<Commit>(&hash)
-            .map_err(|error| CliError::fatal(format!("failed to load commit {id}: {error}")))?;
-        collect_tree_bytes(&storage, &commit.tree_id, &mut seen, &mut total)?;
     }
-    Ok(total)
+    Ok(seen
+        .into_iter()
+        .map(|hash| object_disk_size(&hash, &pack_sizes))
+        .sum())
 }
 
-fn collect_tree_bytes(
-    storage: &ClientStorage,
-    tree_id: &ObjectHash,
-    seen: &mut HashSet<String>,
-    total: &mut u64,
-) -> CliResult<()> {
-    if !seen.insert(tree_id.to_string()) {
-        return Ok(());
+fn pack_disk_sizes() -> HashMap<ObjectHash, u64> {
+    let mut sizes = HashMap::new();
+    let pack_dir = path::objects().join("pack");
+    let Ok(entries) = std::fs::read_dir(pack_dir) else {
+        return sizes;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(index) = super::verify_pack_index_v2::parse_idx_v2(&bytes) else {
+            continue;
+        };
+        let pack_path = path.with_extension("pack");
+        let Ok(metadata) = std::fs::metadata(&pack_path) else {
+            continue;
+        };
+        let Ok(entry_sizes) = super::verify_pack_decode::pack_entry_sizes(&index, metadata.len())
+        else {
+            continue;
+        };
+        sizes.extend(entry_sizes);
     }
-    if let Ok(data) = storage.get(tree_id) {
-        *total += data.len() as u64;
+    sizes
+}
+
+fn object_disk_size(hash: &ObjectHash, pack_sizes: &HashMap<ObjectHash, u64>) -> u64 {
+    if let Some(size) = pack_sizes.get(hash) {
+        return *size;
+    }
+    let text = hash.to_string();
+    let (dir, rest) = text.split_at(2);
+    std::fs::metadata(path::objects().join(dir).join(rest))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn collect_tree_ids(tree_id: &ObjectHash, seen: &mut HashSet<ObjectHash>) -> CliResult<()> {
+    if !seen.insert(*tree_id) {
+        return Ok(());
     }
     let tree = load_object::<Tree>(tree_id)
         .map_err(|error| CliError::fatal(format!("failed to load tree {tree_id}: {error}")))?;
     for item in &tree.tree_items {
         if item.mode == TreeItemMode::Tree {
-            collect_tree_bytes(storage, &item.id, seen, total)?;
-        } else if seen.insert(item.id.to_string())
-            && let Ok(data) = storage.get(&item.id)
-        {
-            *total += data.len() as u64;
+            collect_tree_ids(&item.id, seen)?;
+        } else {
+            seen.insert(item.id);
         }
     }
     Ok(())
@@ -348,6 +392,14 @@ pub async fn execute(args: RevListArgs) -> Result<(), String> {
 
 pub async fn execute_safe(args: RevListArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
+    if let Some(order) = args.no_walk.as_deref()
+        && !matches!(order, "sorted" | "unsorted")
+    {
+        return Err(CliError::command_usage(format!(
+            "invalid --no-walk order '{order}'; use 'sorted' or 'unsorted'"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
 
     // `--count --objects` adds the enumerated objects to a single total, which has
     // no meaning alongside the per-side / cherry-equivalence count buckets of
@@ -366,7 +418,7 @@ pub async fn execute_safe(args: RevListArgs, output: &OutputConfig) -> CliResult
     let result = resolve_rev_list(&args).await?;
 
     if let Some(format) = &args.disk_usage {
-        let bytes = disk_usage_bytes(&result.commits).await?;
+        let bytes = disk_usage_bytes(&result.commits, args.objects).await?;
         let rendered = match format.as_str() {
             "raw" => bytes.to_string(),
             "human" => human_bytes(bytes),
@@ -412,12 +464,16 @@ async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
     // {max_count/-n, skip, first_parent, date_order} uses the date-priority
     // walker. Everything else stays on the full collect + `sort_rev_list_commits`
     // path so filters cannot early-stop before matching `max_count` results.
+    let no_walk = !args.do_walk && args.no_walk.is_some();
+    let unsorted = !args.do_walk && args.no_walk.as_deref() == Some("unsorted");
     let selection = if let Some(tip) = date_priority_walker_tip(args) {
         collect_date_priority_selection(&tip, args.first_parent, args.skip, args.max_count).await?
     } else {
         let mut selection =
-            resolve_revision_selection(&specs, args.first_parent, !args.all, args.no_walk).await?;
-        sort_rev_list_commits(&mut selection.commits);
+            resolve_revision_selection(&specs, args.first_parent, !args.all, no_walk).await?;
+        if !unsorted {
+            sort_rev_list_commits(&mut selection.commits);
+        }
         selection
     };
     let commits = selection.commits;
@@ -612,6 +668,7 @@ async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
         total,
         count_fields,
         count_only: args.count,
+        objects_edge: args.objects_edge || args.objects_edge_aggressive,
         parents: args.parents,
         children: args.children,
         timestamp: args.timestamp,

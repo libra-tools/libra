@@ -21,6 +21,8 @@ libra describe [OPTIONS] [COMMIT]
 - 回退（`--always`）：`abc1234`
 
 默认只考虑附注标签。传递 `--tags` 可同时匹配轻量标签。当多个标签以相同距离可达时，优先选择附注标签；仍相同时按字典序打破平局。
+名称不一致的附注标签（标签对象内部 `tag_name` 与其引用名不同）按内部名渲染，且仅在该标签被选中时向 stderr 打印一次 `warning: tag '<ref>' is externally known as '<name>'`；`--all` 与 `--contains` 保持引用名。`--abbrev=0` 仍输出强制的 `<name>-<distance>-g<oid>` 后缀，并使用完整对象 id。
+
 
 当找不到标签且未使用 `--always` 时，命令会失败，并给出建议使用 `--tags` 或 `--always` 的可操作提示。
 
@@ -36,11 +38,17 @@ libra describe [OPTIONS] [COMMIT]
 | `--tags` | 在搜索中包含轻量标签（而不只是附注标签）。 | 关闭 |
 | `--all` | 考虑任意 ref（本地分支、远程跟踪分支与标签，含轻量标签），而不仅是标签。名称带 `heads/`、`remotes/` 或 `tags/` 前缀；同一提交上标签优先，其次 heads，再次 remotes。 | 关闭 |
 | `--abbrev <N>` | 输出中缩写提交哈希的十六进制位数。 | `7` |
+| `--no-abbrev` | 等价 `--abbrev=0`：普通 tag 省略 `-<n>-g<oid>` 后缀（misnamed tag 仍强制完整后缀）；与 `--abbrev` 后者生效。 | 关闭 |
 | `--always` | 当没有标签可描述目标时，回退到缩写提交哈希，而不是失败。 | 关闭 |
 | `--exact-match` | 仅在目标提交精确匹配某个标签时成功。 | 关闭 |
 | `--candidates <N>` | `N=0` 仅接受精确标签匹配（等价于 `--exact-match`）；`N≥1` 维持 Libra 确定性的最近-tag BFS（不强制正数上界）。 | — |
 | `--long` | 即使在精确匹配时也强制 `tag-N-gHASH` 输出（精确匹配输出 `tag-0-gHASH`）。 | 关闭 |
+| `--no-long` | 取消先前的 `--long`（后者生效）。 | 关闭 |
 | `--dirty[=<mark>]` | 当跟踪内容偏离 `HEAD` 时追加 dirty 标记。 | 关闭；启用时默认标记为 `-dirty` |
+
+`--broken[=<mark>]`（默认 `-broken`）可与 `--dirty` 一起使用：工作区与 HEAD 不同时追加 `--dirty` 的标记（默认 `-dirty`），仅 stat 变化会先被刷新。非 `--contains` 路径与 `<commit>` 共用时拒绝（`LBR-CLI-002`），`--contains` 忽略它。检查本身失败（例如索引损坏）时，`--broken` 追加其标记（默认 `-broken`，或 `--broken=<mark>` 的值）并退出 0。
+
+`--dirty` 不能与 `<commit>` 参数同时使用（退出码 129、`LBR-CLI-002`）。`--contains` 接受 `--dirty` 但忽略它：不读取工作区，因此脏工作区或损坏的索引都不会改变其输出。
 | `--first-parent` | 遍历历史时只跟随合并提交的第一个父。 | 关闭 |
 | `--match <pattern>` | 仅考虑名称匹配该 glob 的标签（可重复；OR 语义，wax glob ≤256 字符）。 | 无 |
 | `--no-match` | 清除此前给出的全部 `--match`；其后新给的 `--match` 仍生效，`--exclude` 不受影响。 | 关闭 |

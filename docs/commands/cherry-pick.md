@@ -60,10 +60,17 @@ positive flag re-enables it). They select the rerere staging policy for every pi
 replayed and (with autoupdate) staged automatically. Neither toggle can be
 combined with `--continue` (`LBR-CLI-002`, naming both options).
 
+On an unborn branch, `--ff` with a parentless (root) target fast-forwards the
+branch to that commit: the branch ref is created at the target, HEAD stays a
+symbolic ref to it, and the index/worktree are checked out without creating a
+new commit. Non-fast-forward picks on an unborn branch are still unsupported.
 On an unborn branch, `--ff` refuses while the index still has staged entries:
 nothing is written (no sequencer state, index and worktree unchanged) and the
 command fails with `LBR-CONFLICT-001` plus a hint that the index must be empty
-before fast-forwarding. A picked commit stores Git's trailing-newline message form, so with the same
+before fast-forwarding. `cherry-pick -` (only when `-` is the first revision argument) picks the
+previous checkout target, like Git's `@{-1}`; other positions treat `-` as an
+ordinary revision. `-s`/`--signoff` composes with it (`cherry-pick -s -`).
+A picked commit stores Git's trailing-newline message form, so with the same
 tree, parent, author/committer identity and dates (and no signing) a
 cherry-pick commit's object id equals Git's. `--ff` only fast-forwards when HEAD
 is the target's direct single parent; a target root commit (or any other

@@ -285,3 +285,113 @@ fn help_documents_the_minimal_stdin_contract() {
         "{stdout}"
     );
 }
+
+fn latin1_mail(subject: &str, body: &str) -> String {
+    format!(
+        "From 0123456789 Mon Sep 17 00:00:00 2001\n\
+From: Alice Example <alice@example.com>\n\
+Date: Tue, 14 Jul 2026 10:00:00 +0800\n\
+Subject: {subject}\n\
+Content-Type: text/plain; charset=ISO-8859-1\n\
+Content-Transfer-Encoding: quoted-printable\n\
+\n\
+{body}\n\
+\n\
+---\n\
+ file.txt | 1 +\n\
+ 1 file changed, 1 insertion(+)\n\
+\n\
+diff --git a/file.txt b/file.txt\n\
+new file mode 100644\n\
+index 0000000..e69de29\n\
+--- /dev/null\n\
++++ b/file.txt\n\
+@@ -0,0 +1 @@\n\
++hello\n"
+    )
+}
+
+/// I672-01 AC1/AC2: ISO-8859-1 quoted-printable body is accepted and transcoded.
+#[test]
+fn mailinfo_accepts_latin1_body() {
+    let temp = tempdir().expect("tempdir");
+    let message = temp.path().join("message");
+    let out = run_mailinfo(
+        temp.path(),
+        &["mailinfo", "message", "patch"],
+        latin1_mail("[PATCH] latin1", "caf=E9 body").as_bytes(),
+    );
+    assert_success(&out);
+    assert!(
+        fs::read_to_string(&message)
+            .expect("read message")
+            .contains("café body"),
+        "AC2 latin1 body transcoded to UTF-8"
+    );
+}
+
+/// I672-01 AC5/AC6: ISO-8859-1 RFC 2047 Subject is accepted and transcoded.
+#[test]
+fn mailinfo_accepts_latin1_subject() {
+    let temp = tempdir().expect("tempdir");
+    let out = run_mailinfo(
+        temp.path(),
+        &["mailinfo", "message", "patch"],
+        latin1_mail("=?ISO-8859-1?Q?caf=E9?=", "plain body").as_bytes(),
+    );
+    assert_success(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Subject: café\n"),
+        "AC6 subject transcoded"
+    );
+}
+
+/// I672-01 AC11/AC12: a NUL in the decoded Subject is rejected with Git's text.
+#[test]
+fn mailinfo_rejects_nul_in_subject() {
+    let temp = tempdir().expect("tempdir");
+    let out = run_mailinfo(
+        temp.path(),
+        &["mailinfo", "message", "patch"],
+        latin1_mail("=?ISO-8859-1?Q?caf=E9=00?=", "plain body").as_bytes(),
+    );
+    assert_failure(&out, "a NUL byte in 'Subject' is not allowed");
+    assert_eq!(out.status.code(), Some(129), "NUL Subject exit code");
+}
+
+/// I672-01 AC15/AC17: UTF-8 and us-ascii baselines keep their exact output.
+#[test]
+fn mailinfo_utf8_and_us_ascii_baselines_unchanged() {
+    for charset in ["UTF-8", "us-ascii"] {
+        let temp = tempdir().expect("tempdir");
+        let message = temp.path().join("message");
+        let mail = latin1_mail("[PATCH] baseline", "plain body")
+            .replace("charset=ISO-8859-1", &format!("charset={charset}"));
+        let out = run_mailinfo(
+            temp.path(),
+            &["mailinfo", "message", "patch"],
+            mail.as_bytes(),
+        );
+        assert_success(&out);
+        assert_eq!(
+            fs::read_to_string(&message).expect("read message"),
+            "plain body\n",
+            "{charset} baseline"
+        );
+    }
+}
+
+/// I672-01 AC19/AC20: Shift_JIS remains rejected with the existing diagnostic.
+#[test]
+fn mailinfo_rejects_shift_jis_charset() {
+    let temp = tempdir().expect("tempdir");
+    let mail = latin1_mail("[PATCH] sjis", "plain body")
+        .replace("charset=ISO-8859-1", "charset=Shift_JIS");
+    let out = run_mailinfo(
+        temp.path(),
+        &["mailinfo", "message", "patch"],
+        mail.as_bytes(),
+    );
+    assert_failure(&out, "unsupported text charset 'Shift_JIS'");
+    assert_eq!(out.status.code(), Some(129), "Shift_JIS exit code");
+}

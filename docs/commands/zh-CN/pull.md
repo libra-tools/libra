@@ -61,7 +61,7 @@ fast-forward 与 already-up-to-date 不读取该配置。任意 clean/smudge fil
 | 标志 / 参数 | 说明 | 示例 |
 |-----------------|-------------|---------|
 | `<repository>` | 要从中 pull 的远程名称。省略时使用当前分支已配置的 upstream。 | `libra pull origin` |
-| `<refspec>` | 远程上的分支名。需要 `<repository>`。省略时使用当前分支名。 | `libra pull origin main` |
+| `<refspec>` | 远程上的分支名或显式 refspec（含 `refs/tags/<tag>:<branch>` / `<tag>:<branch>`）。需要 `<repository>`。省略时使用当前分支名。 | `libra pull origin main` / `libra pull origin v1:refs/heads/from-tag` |
 | `--ff-only` | 拒绝创建合并提交；仅允许 fast-forward 或 already-up-to-date 集成；未解决的索引仍会拒绝 merge 阶段。与 `--rebase`、`--ff` 和 `--no-ff` 冲突。 | `libra pull --ff-only` |
 | `--ff` | 显式允许快进合并，覆盖 `pull.ff=false|only`。与 `--no-ff`、`--ff-only` 和 `--rebase` 冲突。 | `libra pull --ff` |
 | `--no-ff` | 即使可以快进也总是创建 merge commit。与 `--ff`、`--ff-only` 和 `--rebase` 冲突。 | `libra pull --no-ff` |

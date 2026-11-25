@@ -1537,7 +1537,7 @@
 
 ### Task DESC-05: 支持 misnamed annotated tag 内部名称与 `--abbrev=0` 强制后缀输出（#799）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；`#799` 修复与 `#798` 前置 | **Issue:** [#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`TagInfo` 记录引用名、附注标签内部 `tag_name` 与 `misnamed`；非 `--contains` 路径按内部名渲染，仅最终选中 misnamed tag 时向 stderr 打印一次 `warning: tag '<ref>' is externally known as '<name>'`（`--all`/`--contains` 保持引用名）；普通 tag 的 `--abbrev=0` 仍按 Git 省略后缀；misnamed tag 例外，强制输出 `-<distance>-g<完整 OID>`，且 `abbreviated_commit` 为完整 OID。AC1–AC8 由 `command::describe_test::misnamed_annotated_tag_uses_internal_name` 覆盖（内部名、单条告警、强制后缀/完整 OID、JSON 字段、`--all`/`--contains` 引用名与无告警）；`describe_test` 35/35；TC-1045 **PASS**（run `/tmp/libra-testcases/runs/desc-05-20261124T193312Z-2519528`，对照 git `2.56.0.116.g6de20f6092`）；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计；`DEP-DESC-541` 仍未合入，但本卡 TC-1045 已在 pin 上游全档上通过，Issue #799 可闭环。
 
 **Description:** 非 `--contains` 路径中，附注 tag 的引用名（如 `refs/tags/Q`）与 tag 对象内部 `tag_name`（如 `A`）不一致时，按 Git `append_name()`（pinned `builtin/describe.c:297` 起）在 `TagInfo` 中记录内部名与 `misnamed = true`，仅对最终选定的名字向 stderr 打印 `warning: tag '<ref>' is externally known as '<tag_name>'`，并在格式输出中强制追加 `-<distance>-g<hash>`（`--abbrev=0` 时为完整 SHA，对齐 Git `repo_find_unique_abbrev(oid, 0)` 返回全长）；`--contains` 路径保持使用引用名。
 
@@ -1597,7 +1597,7 @@
 
 ### Task DESC-04: 为 `libra describe` 增加 `--no-long` 并支持 last-wins 覆盖（#798）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git CLI 选项兼容 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `--no-long`，与 `--long` 以 clap `overrides_with` 实现命令行顺序 last-wins（`--long --no-long` 短格式、`--no-long --long` 长格式、`--long --no-long --abbrev=0` 不触发 `LongWithAbbrevZero`）；misnamed 标签在 `--no-long` 下仍强制 `<name>-<distance>-g<oid>`（`describe_output` 新增 `force_suffix`），`A-0-g<hash>` 可由 `rev-parse` 解析回目标提交。AC1–AC5 由 `describe_long_test::test_describe_no_long_last_wins` 覆盖，AC6/AC7 由 `describe_test::misnamed_annotated_tag_no_long_keeps_suffix` 覆盖，AC8 由 `describe::tests::no_long_parse_order` 覆盖；`describe_test`+`describe_long_test` 40/40、`--lib command::describe` 4/4；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计。
 
 **Description:** 在 `DescribeArgs` 中增加 `--no-long`，按 `ADR-DESC-01` 使 `--long` 与 `--no-long` 按命令行顺序 last-wins，并确认 misnamed tag（`DESC-05`）在 `--no-long` 下仍输出 `A-0-g<hash>` 且可由 `libra rev-parse` 解析回目标提交（`t6120#30`）。
 
@@ -1654,7 +1654,7 @@
 
 ### Task DESC-06: 为 `libra describe` 增加 `--no-abbrev`（等价 `--abbrev=0`）（#800）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git CLI 选项兼容 | **Issue:** [#800](https://github.com/libra-tools/libra/issues/800)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `--no-abbrev`（等价 `--abbrev=0`），与 `--abbrev=<N>` 双向 last-wins；普通 tag 省略后缀、misnamed tag 仍强制完整后缀；`--always` 在 `abbrev=0` 时输出完整 HEAD SHA（含 tag 全被 `--match` 过滤）；`--long --no-abbrev` 按 `LongWithAbbrevZero`（`LBR-CLI-002`）拒绝。AC1–AC4/AC6/AC7 由 `describe_test::no_abbrev_last_wins_and_always` 覆盖，AC5 由 `describe::tests::no_abbrev_parse_order` 覆盖，AC8 由 `describe_test::misnamed_annotated_tag_no_abbrev_keeps_full_suffix` 覆盖；`describe_test`+`describe_long_test` 42/42、`--lib command::describe` 5/5；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计；同时修正 `DESC-05` 卡片与文档中「普通 tag 的 `--abbrev=0` 也强制后缀」的表述（Git 对普通 tag 省略后缀，仅 misnamed tag 强制）。
 
 **Description:** 在 `DescribeArgs` 中增加 `--no-abbrev`（Git `OPT__ABBREV` 中等价于 `--abbrev=0`），与 `--abbrev=<N>` 按命令行顺序 last-wins：常规 tag 匹配时省略 `-<n>-g<hash>`（misnamed tag 仍按 `DESC-05` 强制后缀），`--always` 回退输出完整 commit SHA（含 tag 全部被 `--match` 过滤的场景，不再误报 `HEAD does not point to a commit`），`--long --no-abbrev` 按 `LongWithAbbrevZero` 拒绝。
 
@@ -1715,7 +1715,7 @@
 
 ### Task DESC-07: `--dirty` 的适用范围：非 `--contains` 拒绝与 `<commit>` 共用，`--contains` 忽略（#802）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git 参数校验缺陷 | **Issue:** [#802](https://github.com/libra-tools/libra/issues/802)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：非 `--contains` 路径同时给出 `--dirty` 与 `<commit>` 时 fail-closed，新 `CommitishIncompatible` 变体（`option '<option>' and commit-ishes cannot be used together`，`LBR-CLI-002`）；`--contains`（含默认 HEAD）接受 `--dirty` 但忽略——移除其两条 `apply_dirty_mark` 调用后不再读取工作区/索引，脏工作区或损坏索引下仍输出 `<tag>^0`。AC1/AC3–AC8 由 `describe_test::dirty_scope_with_commit_and_contains` 覆盖，AC2 由 `describe_tests::commitish_incompatible_display_pin` 覆盖；`describe_test`+`describe_long_test` 43/43、`--lib command::describe` 6/6；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计。
 
 **Description:** 对齐 Git `describe.c` 的 `--dirty` 适用范围：非 `--contains` 路径同时给出 `--dirty` 与 `<commit>` 时 fail-closed（新增 `DescribeError::CommitishIncompatible { option }` 变体，映射 `LBR-CLI-002`；消息按 Git 写作 `option '<option>' and commit-ishes cannot be used together`、提示不再复用 `--match/--exclude` glob 文案——文案不设验收判据，失败类判据只看稳定错误码；`DESC-08` 复用该变体）；`--contains` 路径（含 `<commit>` 与默认 `HEAD`）接受 `--dirty`，其输出不受工作区状态影响（含脏检查会失败的状态）且不追加标记；实现方式为去掉 `src/command/describe.rs:427, 496` 的 `apply_dirty_mark` 调用，对齐 pinned `builtin/describe.c:665` 起的 `contains` 分支先行返回（实现指引，验收以 AC4–AC7 的可观测输出为准；GAP-DESC-01 后半）。
 
@@ -1775,7 +1775,7 @@
 
 ### Task DESC-08: 为 `libra describe` 实现 `--broken[=<mark>]` 的脏标记与适用范围（#803）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git CLI 选项兼容 | **Issue:** [#803](https://github.com/libra-tools/libra/issues/803)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `--broken[=<mark>]`（默认 `-broken`）与 `WorktreeCheck`/纯函数 `worktree_suffix`；脏检查成功且工作区脏时追加 `--dirty` 标记（未给 `--dirty` 时默认 `-dirty`），仅 stat 变化先刷新、不追加；非 `--contains` 与 `<commit>` 共用时按 `CommitishIncompatible`（`LBR-CLI-002`）拒绝，`--contains` 忽略；脏检查失败仍报 `LBR-IO-001`（失败标记由 DESC-08a 交付）。AC1–AC6 由 `describe_test::broken_marks_and_scope` 覆盖，AC7 由 `describe_tests::worktree_suffix_defaults_to_dirty_mark` 覆盖，AC8 由 `describe_test::broken_check_failure_boundary` 覆盖；`describe_test`+`describe_long_test` 45/45、`--lib command::describe` 7/7；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计。
 
 **Description:** 在 `DescribeArgs` 中增加 `--broken[=<mark>]`（默认 `-broken`），对齐 Git `describe.c`：脏检查先刷新 stat（仅 stat 变化、内容未变时不追加标记）；工作区真实脏时追加 `--dirty` 给出的标记（未给 `--dirty` 时默认 `-dirty`），后缀选择集中在新增纯函数 `worktree_suffix`；非 `--contains` 路径与 `<commit>` 共用时复用 `DESC-07` 新增的 `DescribeError::CommitishIncompatible` 变体（`LBR-CLI-002`；消息按 Git 写作 `option '--broken' and commit-ishes cannot be used together`，文案不设判据）；`--contains` 路径（含 `<commit>` 与默认 `HEAD`）接受 `--broken` 且输出不受工作区状态影响。脏检查本身失败时追加 `<mark>` 的行为按 G-09 拆出 `DESC-08a`：本卡期间该情形保持既有 `LBR-IO-001` 失败（临时边界）。
 
@@ -1835,7 +1835,7 @@
 
 ### Task DESC-08a: `--broken` 在脏检查失败时追加标记（#803）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git CLI 选项兼容 | **Issue:** [#803](https://github.com/libra-tools/libra/issues/803)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`WorktreeCheck` 增加 `Failed`，`worktree_suffix(dirty_mark, broken_mark, check)` 在检查失败且给出 `--broken` 时返回其标记（默认 `-broken`）；`apply_dirty_mark` 在检查失败且无 `--broken` 时仍传播 `LBR-IO-001`，有 `--broken` 时写入 `result` 与 `dirty_mark`；删除 `DESC-08` 的临时边界用例。AC1–AC4 由 `describe_test::broken_check_failure_marks` 覆盖，AC5 由 `describe_tests::worktree_suffix_failed_uses_broken_mark` 覆盖；`describe_test`+`describe_long_test` 45/45、`--lib command::describe` 8/8；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计。
 
 **Description:** 自 `DESC-08` 拆出（G-09）。脏检查本身失败（如 index 损坏）时，`--broken` 不再以 `LBR-IO-001` 失败，而是追加 `--broken` 给出的标记（默认 `-broken`），并与 `--dirty` 一样经 `apply_dirty_mark` 写入 `result` 与 `dirty_mark`（`ADR-DESC-02`）；`worktree_suffix` 增加 `broken_mark` 参数与 `WorktreeCheck::Failed` 分支（`describe_types.rs`）。删除 `DESC-08` 的临时边界用例 `command::describe_test::broken_check_failure_boundary`。
 

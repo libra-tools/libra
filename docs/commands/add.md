@@ -247,6 +247,11 @@ mode the refusals appear as `chmod_rejected: [{"path", "flip"}]` on the envelope
 instead, with the same exit 1. (Git exits 255 here; Libra uses the process-level
 exit 1 model shared with the ignored-path report.)
 
+A matched stage-0 skip-worktree (sparse) entry is NOT mutated by `--chmod` unless
+`--sparse` is given: the normal sparse-path report is printed and `add` exits 1
+with the index entry's mode, blob, stage and skip-worktree bit unchanged (and the
+worktree mode untouched). `add --sparse --chmod=+x <path>` is the explicit opt-out.
+
 An invalid value (anything other than `+x` / `-x`) is a usage error.
 
 With no pathspec (and none of `-A`, `-u`, `--refresh`, `--renormalize`,

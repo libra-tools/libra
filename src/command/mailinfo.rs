@@ -268,7 +268,10 @@ pub(crate) fn parse_mail(source: &str, raw: &str) -> CliResult<ParsedMail> {
     let body = extract_text_body(content_type, transfer, encoded_body, 0)
         .map_err(|detail| invalid_mail(source, &detail))?;
     if body.contains('\0') {
-        return Err(invalid_mail(source, "decoded mail body contains NUL"));
+        return Err(invalid_mail(
+            source,
+            "a NUL byte in commit log message not allowed",
+        ));
     }
 
     let author = decode_encoded_words(required_header(&headers, "from", source)?)
@@ -387,7 +390,8 @@ fn extract_text_body(
     let media = media_type_of(content_type);
     if !media.starts_with("multipart/") {
         validate_content_type(content_type)?;
-        return decode_transfer(encoded, transfer);
+        let charset = text_charset(content_type);
+        return decode_transfer(encoded, transfer, &charset);
     }
     // RFC 2045: a multipart container itself must use an identity
     // transfer encoding.
@@ -439,7 +443,8 @@ fn extract_text_body(
             continue;
         }
         validate_text_charset(part_type)?;
-        let decoded = decode_transfer(part_body, part_transfer)?;
+        let charset = text_charset(part_type);
+        let decoded = decode_transfer(part_body, part_transfer, &charset)?;
         push_text_part(&mut collected, &decoded);
     }
     if collected.trim().is_empty() {
@@ -571,7 +576,7 @@ fn validate_text_charset(value: &str) -> Result<(), String> {
         };
         if name.trim().eq_ignore_ascii_case("charset") {
             let charset = parameter_value.trim().trim_matches('"');
-            if !matches!(charset.to_ascii_lowercase().as_str(), "utf-8" | "us-ascii") {
+            if !is_supported_charset(charset) {
                 return Err(format!("unsupported text charset '{charset}'"));
             }
         }
@@ -580,12 +585,23 @@ fn validate_text_charset(value: &str) -> Result<(), String> {
 }
 
 fn validate_decoded_header(name: &str, value: &str) -> Result<(), String> {
+    if value.contains('\0') {
+        return Err(format!("a NUL byte in '{name}' is not allowed"));
+    }
     if value.chars().any(char::is_control) {
         return Err(format!(
             "decoded {name} header contains a control character"
         ));
     }
     Ok(())
+}
+
+/// Charset parameter for a single-part Content-Type (UTF-8 when absent).
+fn text_charset(content_type: &str) -> String {
+    content_type_parameter(content_type, "charset")
+        .map(|charset| charset.trim().trim_matches('"').to_string())
+        .filter(|charset| !charset.is_empty())
+        .unwrap_or_else(|| "utf-8".to_string())
 }
 
 fn split_author(author: &str) -> Result<(String, String), String> {
@@ -631,25 +647,56 @@ fn required_header<'a>(
         .ok_or_else(|| invalid_mail(source, &format!("missing required {name} header")))
 }
 
-fn decode_transfer(body: &str, encoding: &str) -> Result<String, String> {
+/// True for the charsets `mailinfo`/`am` can decode without iconv.
+fn is_supported_charset(charset: &str) -> bool {
+    matches!(
+        charset.to_ascii_lowercase().as_str(),
+        "utf-8" | "us-ascii" | "iso-8859-1" | "latin1" | "latin-1"
+    )
+}
+
+/// Decode transfer encoding to raw bytes, then transcoding `charset` to UTF-8.
+fn decode_transfer(body: &str, encoding: &str, charset: &str) -> Result<String, String> {
+    let bytes = decode_transfer_bytes(body, encoding)?;
+    charset_bytes_to_utf8(bytes, charset)
+}
+
+fn decode_transfer_bytes(body: &str, encoding: &str) -> Result<Vec<u8>, String> {
     match encoding.trim().to_ascii_lowercase().as_str() {
-        "" | "7bit" | "8bit" | "binary" => Ok(body.to_string()),
+        "" | "7bit" | "8bit" | "binary" => Ok(body.as_bytes().to_vec()),
         "base64" => {
             let compact: String = body
                 .chars()
                 .filter(|ch| !ch.is_ascii_whitespace())
                 .collect();
-            let bytes = base64::engine::general_purpose::STANDARD
+            base64::engine::general_purpose::STANDARD
                 .decode(compact)
-                .map_err(|error| format!("invalid base64 mail body: {error}"))?;
-            String::from_utf8(bytes).map_err(|_| "decoded mail body is not UTF-8".to_string())
+                .map_err(|error| format!("invalid base64 mail body: {error}"))
         }
         "quoted-printable" => decode_quoted_printable(body),
         other => Err(format!("unsupported Content-Transfer-Encoding '{other}'")),
     }
 }
 
-fn decode_quoted_printable(input: &str) -> Result<String, String> {
+/// Transcode a single-part byte sequence from `charset` to UTF-8.
+fn charset_bytes_to_utf8(bytes: Vec<u8>, charset: &str) -> Result<String, String> {
+    match charset.to_ascii_lowercase().as_str() {
+        "utf-8" => {
+            String::from_utf8(bytes).map_err(|_| "decoded mail body is not UTF-8".to_string())
+        }
+        "us-ascii" => {
+            if bytes.iter().all(u8::is_ascii) {
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            } else {
+                Err("decoded us-ascii mail body contains non-ASCII bytes".to_string())
+            }
+        }
+        "iso-8859-1" | "latin1" | "latin-1" => Ok(bytes.into_iter().map(char::from).collect()),
+        other => Err(format!("unsupported text charset '{other}'")),
+    }
+}
+
+fn decode_quoted_printable(input: &str) -> Result<Vec<u8>, String> {
     let bytes = input.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0usize;
@@ -674,7 +721,7 @@ fn decode_quoted_printable(input: &str) -> Result<String, String> {
         decoded.push((high << 4) | low);
         index += 3;
     }
-    String::from_utf8(decoded).map_err(|_| "decoded mail body is not UTF-8".to_string())
+    Ok(decoded)
 }
 
 fn decode_encoded_words(input: &str) -> Result<String, String> {
@@ -696,20 +743,17 @@ fn decode_encoded_words(input: &str) -> Result<String, String> {
         let (encoded, after_word) = after_encoding
             .split_once("?=")
             .ok_or_else(|| "malformed RFC 2047 encoded word".to_string())?;
-        if !matches!(charset.to_ascii_lowercase().as_str(), "utf-8" | "us-ascii") {
+        if !is_supported_charset(charset) {
             return Err(format!("unsupported RFC 2047 charset '{charset}'"));
         }
-        let decoded = match encoding.to_ascii_lowercase().as_str() {
-            "b" => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(encoded)
-                    .map_err(|error| format!("invalid RFC 2047 base64 word: {error}"))?;
-                String::from_utf8(bytes)
-                    .map_err(|_| "decoded RFC 2047 word is not UTF-8".to_string())?
-            }
+        let bytes = match encoding.to_ascii_lowercase().as_str() {
+            "b" => base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| format!("invalid RFC 2047 base64 word: {error}"))?,
             "q" => decode_quoted_printable(&encoded.replace('_', " "))?,
             other => return Err(format!("unsupported RFC 2047 encoding '{other}'")),
         };
+        let decoded = charset_bytes_to_utf8(bytes, charset)?;
         output.push_str(&decoded);
         rest = after_word;
         previous_was_encoded = true;
@@ -804,7 +848,7 @@ libra 0.18.84\n";
     fn decodes_quoted_printable_and_encoded_subject() {
         assert_eq!(
             decode_quoted_printable("hello=20world=0A").expect("decode"),
-            "hello world\n"
+            b"hello world\n".to_vec()
         );
         assert_eq!(
             decode_encoded_words("=?UTF-8?Q?fix=3A_caf=C3=A9?=").expect("decode"),

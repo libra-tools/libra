@@ -145,10 +145,10 @@ fn ls_files_honors_shared_pathspec_magic() {
 
     let src_dir = fixture.repo.join("src");
     let top = fixture.stdout(&src_dir, &["ls-files", ":(top)README.md"]);
-    assert_eq!(top, "README.md\n");
+    assert_eq!(top, "../README.md\n");
 
     let relative = fixture.stdout(&src_dir, &["ls-files", "*.rs"]);
-    assert_eq!(relative, "src/generated.rs\nsrc/main.rs\n");
+    assert_eq!(relative, "generated.rs\nmain.rs\n");
 }
 
 #[test]

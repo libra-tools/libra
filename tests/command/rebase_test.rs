@@ -7842,3 +7842,418 @@ fn eol_consumer_rebase_accepts_clean_representation_and_preserves_real_edits(aut
         }
     }
 }
+
+fn rebase_signing_env(home: &std::path::Path) -> Vec<(String, String)> {
+    vec![
+        ("HOME".to_string(), home.display().to_string()),
+        (
+            "LIBRA_CONFIG_GLOBAL_DB".to_string(),
+            home.join("global.db").display().to_string(),
+        ),
+        (
+            "LIBRA_CONFIG_SYSTEM_DB".to_string(),
+            home.join("system.db").display().to_string(),
+        ),
+        ("GIT_AUTHOR_NAME".to_string(), "t".to_string()),
+        ("GIT_AUTHOR_EMAIL".to_string(), "t@t".to_string()),
+        ("GIT_COMMITTER_NAME".to_string(), "t".to_string()),
+        ("GIT_COMMITTER_EMAIL".to_string(), "t@t".to_string()),
+    ]
+}
+
+fn run_with_env(repo: &std::path::Path, args: &[&str], env: &[(String, String)]) -> Output {
+    let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    run_libra_command_with_env(args, repo, &pairs)
+}
+
+fn signing_rebase_fixture(
+    default_vault: bool,
+    signed_before: bool,
+    env: &[(String, String)],
+) -> (tempfile::TempDir, String) {
+    let repo = tempdir().expect("repo");
+    let p = repo.path();
+    let init = if default_vault {
+        vec!["init", "-q", "."]
+    } else {
+        vec!["init", "-q", "--vault", "false", "."]
+    };
+    assert_cli_success(&run_with_env(p, &init, env), "init");
+    assert_cli_success(&run_with_env(p, &["config", "user.name", "t"], env), "name");
+    assert_cli_success(
+        &run_with_env(p, &["config", "user.email", "t@t"], env),
+        "email",
+    );
+    let signing = if signed_before { "true" } else { "false" };
+    assert_cli_success(
+        &run_with_env(p, &["config", "commit.gpgSign", signing], env),
+        "gpgSign",
+    );
+    for (name, body) in [("f.txt", "f\n"), ("g.txt", "g\n"), ("h.txt", "h\n")] {
+        std::fs::write(p.join(name), body).unwrap();
+    }
+    assert_cli_success(&run_with_env(p, &["add", "."], env), "add base");
+    assert_cli_success(
+        &run_with_env(p, &["commit", "-m", "B", "--no-verify"], env),
+        "base",
+    );
+    assert_cli_success(&run_with_env(p, &["switch", "-c", "topic"], env), "topic");
+    std::fs::write(p.join("f.txt"), "f2\n").unwrap();
+    assert_cli_success(&run_with_env(p, &["add", "f.txt"], env), "add T");
+    assert_cli_success(
+        &run_with_env(p, &["commit", "-m", "T", "--no-verify"], env),
+        "T",
+    );
+    assert_cli_success(&run_with_env(p, &["switch", "main"], env), "main");
+    std::fs::write(p.join("u.txt"), "u\n").unwrap();
+    assert_cli_success(&run_with_env(p, &["add", "u.txt"], env), "add U");
+    assert_cli_success(
+        &run_with_env(p, &["commit", "-m", "U", "--no-verify"], env),
+        "U",
+    );
+    assert_cli_success(&run_with_env(p, &["switch", "topic"], env), "back");
+    (repo, "main".to_string())
+}
+
+fn rebased_has_gpgsig(repo: &std::path::Path, env: &[(String, String)]) -> bool {
+    let out = run_with_env(repo, &["cat-file", "-p", "HEAD"], env);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.starts_with("gpgsig"))
+}
+
+/// SA-08a AC1: `commit.gpgSign=false` keeps a replayed pick unsigned.
+#[test]
+fn rebase_pick_signing_disabled_drops_gpgsig() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    let (repo, upstream) = signing_rebase_fixture(false, false, &env);
+    let p = repo.path();
+    assert_cli_success(
+        &run_with_env(p, &["config", "commit.gpgSign", "false"], &env),
+        "off",
+    );
+    assert_cli_success(&run_with_env(p, &["rebase", &upstream], &env), "rebase");
+    assert!(!rebased_has_gpgsig(p, &env), "AC1 unsigned replay");
+}
+
+/// SA-08a AC2: a vault-signed replay verifies with `--verify-signatures`.
+#[test]
+fn rebase_pick_vault_signing_verifies() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    let (repo, upstream) = signing_rebase_fixture(true, true, &env);
+    let p = repo.path();
+    assert_cli_success(&run_with_env(p, &["rebase", &upstream], &env), "rebase");
+    assert!(rebased_has_gpgsig(p, &env), "AC2 replay is signed");
+    assert_cli_success(
+        &run_with_env(p, &["switch", "-c", "verify", &upstream], &env),
+        "verify branch",
+    );
+    let merged = run_with_env(
+        p,
+        &["merge", "--ff-only", "--verify-signatures", "topic"],
+        &env,
+    );
+    assert_cli_success(&merged, "AC2 verify-signatures merge");
+}
+
+/// SA-08a AC5: with neither setting, the replay is unsigned.
+#[test]
+fn rebase_pick_default_no_signing() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    let (repo, upstream) = signing_rebase_fixture(true, true, &env);
+    let p = repo.path();
+    // DEP-SA-01 (`REL-CS-00`) is not merged yet, so `libra init` still writes
+    // `vault.signing=true`; clear both keys to exercise the intended default.
+    for key in ["commit.gpgSign", "vault.signing"] {
+        let _ = run_with_env(p, &["config", "unset", key], &env);
+    }
+    // Neither `commit.gpgSign` nor `vault.signing` is configured.
+    for key in ["commit.gpgSign", "vault.signing"] {
+        let out = run_with_env(p, &["config", "get", key], &env);
+        assert!(!out.status.success(), "AC5 {key} unset");
+    }
+    assert_cli_success(&run_with_env(p, &["rebase", &upstream], &env), "rebase");
+    assert!(!rebased_has_gpgsig(p, &env), "AC5 unsigned");
+}
+
+/// SA-08a AC6: unset `commit.gpgSign` + `vault.signing=true` signs the replay.
+#[test]
+fn rebase_pick_inherit_vault_signing_verifies() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    let (repo, upstream) = signing_rebase_fixture(true, false, &env);
+    let p = repo.path();
+    assert_cli_success(
+        &run_with_env(p, &["config", "unset", "commit.gpgSign"], &env),
+        "unset gpgSign",
+    );
+    assert_cli_success(
+        &run_with_env(p, &["config", "vault.signing", "true"], &env),
+        "vault signing",
+    );
+    assert_cli_success(&run_with_env(p, &["rebase", &upstream], &env), "rebase");
+    assert!(rebased_has_gpgsig(p, &env), "AC6 signed");
+    assert_cli_success(
+        &run_with_env(p, &["switch", "-c", "verify", &upstream], &env),
+        "verify branch",
+    );
+    let merged = run_with_env(
+        p,
+        &["merge", "--ff-only", "--verify-signatures", "topic"],
+        &env,
+    );
+    assert_cli_success(&merged, "AC6 verify-signatures merge");
+}
+
+/// SA-08a AC7: `commit.gpgSign=false` wins over `vault.signing=true`.
+#[test]
+fn rebase_pick_commit_config_wins_over_vault() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    let (repo, upstream) = signing_rebase_fixture(true, false, &env);
+    let p = repo.path();
+    assert_cli_success(
+        &run_with_env(p, &["config", "vault.signing", "true"], &env),
+        "vault signing",
+    );
+    assert_cli_success(
+        &run_with_env(p, &["config", "commit.gpgSign", "false"], &env),
+        "off",
+    );
+    assert_cli_success(&run_with_env(p, &["rebase", &upstream], &env), "rebase");
+    assert!(!rebased_has_gpgsig(p, &env), "AC7 unsigned");
+}
+
+fn signing_action_repo(
+    env: &[(String, String)],
+    fold: Option<&str>,
+) -> (tempfile::TempDir, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = tempdir().expect("repo");
+    let p = repo.path();
+    assert_cli_success(&run_with_env(p, &["init", "-q", "."], env), "init");
+    assert_cli_success(&run_with_env(p, &["config", "user.name", "t"], env), "name");
+    assert_cli_success(
+        &run_with_env(p, &["config", "user.email", "t@t"], env),
+        "email",
+    );
+    assert_cli_success(
+        &run_with_env(p, &["config", "commit.gpgSign", "true"], env),
+        "sign",
+    );
+    for (name, body) in [("f.txt", "f\n"), ("g.txt", "g\n"), ("h.txt", "h\n")] {
+        std::fs::write(p.join(name), body).unwrap();
+    }
+    assert_cli_success(&run_with_env(p, &["add", "."], env), "add base");
+    assert_cli_success(
+        &run_with_env(p, &["commit", "-m", "B", "--no-verify"], env),
+        "B",
+    );
+    assert_cli_success(&run_with_env(p, &["switch", "-c", "topic"], env), "topic");
+    std::fs::write(p.join("f.txt"), "f2\n").unwrap();
+    assert_cli_success(&run_with_env(p, &["add", "f.txt"], env), "add T");
+    assert_cli_success(
+        &run_with_env(p, &["commit", "-m", "T", "--no-verify"], env),
+        "T",
+    );
+    if let Some(prefix) = fold {
+        std::fs::write(p.join("f.txt"), "f3\n").unwrap();
+        assert_cli_success(&run_with_env(p, &["add", "f.txt"], env), "add F");
+        assert_cli_success(
+            &run_with_env(
+                p,
+                &["commit", "-m", &format!("{prefix} T"), "--no-verify"],
+                env,
+            ),
+            "F",
+        );
+    }
+    assert_cli_success(&run_with_env(p, &["switch", "main"], env), "main");
+    std::fs::write(p.join("u.txt"), "u\n").unwrap();
+    assert_cli_success(&run_with_env(p, &["add", "u.txt"], env), "add U");
+    assert_cli_success(
+        &run_with_env(p, &["commit", "-m", "U", "--no-verify"], env),
+        "U",
+    );
+    assert_cli_success(&run_with_env(p, &["switch", "topic"], env), "back");
+    let script = p.join(".editor.sh");
+    std::fs::write(&script, "#!/bin/sh\nsed -i 's/^pick /reword /' \"$1\"\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (repo, "main".to_string())
+}
+
+fn run_replay_action(
+    repo: &std::path::Path,
+    action: &str,
+    upstream: &str,
+    env: &[(String, String)],
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut all = env.to_vec();
+    match action {
+        "reword" | "edit" | "fixup -C" | "fixup -c" => {
+            let verb = action;
+            let script = repo.join(format!(".{}-todo.sh", action.replace(' ', "_")));
+            let sed = if action.starts_with("fixup") {
+                format!("2s/^pick /{verb} /")
+            } else {
+                format!("s/^pick /{verb} /")
+            };
+            std::fs::write(&script, format!("#!/bin/sh\nsed -i '{sed}' \"$1\"\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            all.push((
+                "GIT_SEQUENCE_EDITOR".to_string(),
+                script.display().to_string(),
+            ));
+            all.push(("GIT_EDITOR".to_string(), "true".to_string()));
+            let out = run_with_env(repo, &["rebase", "-i", upstream], &all);
+            assert_cli_success(&out, action);
+            if action == "edit" {
+                let cont = run_with_env(repo, &["rebase", "--continue"], &all);
+                let stderr = String::from_utf8_lossy(&cont.stderr);
+                // A trailing `edit` may already have concluded; only an actual
+                // stop needs `--continue`.
+                if !stderr.contains("no rebase in progress") {
+                    assert_cli_success(&cont, "edit continue");
+                }
+            }
+        }
+        _ => {
+            let out = run_with_env(repo, &["rebase", "--autosquash", upstream], &all);
+            assert_cli_success(&out, "autosquash");
+        }
+    }
+}
+
+fn assert_signed_tip(repo: &std::path::Path, upstream: &str, env: &[(String, String)]) {
+    assert_cli_success(
+        &run_with_env(repo, &["switch", "-c", "verify", upstream], env),
+        "verify branch",
+    );
+    assert_cli_success(
+        &run_with_env(
+            repo,
+            &["merge", "--ff-only", "--verify-signatures", "topic"],
+            env,
+        ),
+        "verify signatures",
+    );
+}
+
+/// SA-08b AC1/AC2: unsigned `reword`/`edit` replays drop stale signatures.
+#[test]
+fn rebase_replay_reword_edit_unsigned_strip_stale_gpgsig() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    for action in ["reword", "edit"] {
+        let (repo, upstream) = signing_action_repo(&env, None);
+        let p = repo.path();
+        assert_cli_success(
+            &run_with_env(p, &["config", "commit.gpgSign", "false"], &env),
+            "off",
+        );
+        run_replay_action(p, action, &upstream, &env);
+        assert!(!rebased_has_gpgsig(p, &env), "AC unsigned {action}");
+    }
+}
+
+/// SA-08b AC3/AC4: unsigned `fixup`/`squash` folds drop stale signatures.
+#[test]
+fn rebase_replay_fixup_squash_unsigned_strip_stale_gpgsig() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    for (action, prefix) in [("fixup", "fixup!"), ("squash", "squash!")] {
+        let (repo, upstream) = signing_action_repo(&env, Some(prefix));
+        let p = repo.path();
+        assert_cli_success(
+            &run_with_env(p, &["config", "commit.gpgSign", "false"], &env),
+            "off",
+        );
+        run_replay_action(p, action, &upstream, &env);
+        assert!(!rebased_has_gpgsig(p, &env), "AC unsigned {action}");
+    }
+}
+
+/// SA-08b AC5/AC6: signed `reword`/`edit` replays carry a valid signature.
+#[test]
+fn rebase_replay_reword_edit_signs_openpgp() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    for action in ["reword", "edit"] {
+        let (repo, upstream) = signing_action_repo(&env, None);
+        let p = repo.path();
+        assert_cli_success(
+            &run_with_env(p, &["config", "commit.gpgSign", "true"], &env),
+            "on",
+        );
+        run_replay_action(p, action, &upstream, &env);
+        assert!(rebased_has_gpgsig(p, &env), "AC signed {action}");
+        assert_signed_tip(p, &upstream, &env);
+    }
+}
+
+/// SA-08b AC7/AC8: signed `fixup`/`squash` folds carry a valid signature.
+#[test]
+fn rebase_replay_fixup_squash_signs_openpgp() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    for (action, prefix) in [("fixup", "fixup!"), ("squash", "squash!")] {
+        let (repo, upstream) = signing_action_repo(&env, Some(prefix));
+        let p = repo.path();
+        assert_cli_success(
+            &run_with_env(p, &["config", "commit.gpgSign", "true"], &env),
+            "on",
+        );
+        run_replay_action(p, action, &upstream, &env);
+        assert!(rebased_has_gpgsig(p, &env), "AC signed {action}");
+        assert_signed_tip(p, &upstream, &env);
+    }
+}
+
+/// SA-08m AC1–AC3: unsigned `amend!`/`fixup -C`/`fixup -c` folds drop stale
+/// signatures.
+#[test]
+fn rebase_replay_amend_fixup_keep_unsigned_strip_stale_gpgsig() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    for (action, spec) in [
+        ("amend", Some("amend! T\n\nA amended")),
+        ("fixup -C", Some("fixup! T")),
+        ("fixup -c", Some("fixup! T")),
+    ] {
+        let (repo, upstream) = signing_action_repo(&env, spec);
+        let p = repo.path();
+        assert_cli_success(
+            &run_with_env(p, &["config", "commit.gpgSign", "false"], &env),
+            "off",
+        );
+        run_replay_action(p, action, &upstream, &env);
+        assert!(!rebased_has_gpgsig(p, &env), "AC unsigned {action}");
+    }
+}
+
+/// SA-08m AC4–AC6: signed `amend!`/`fixup -C`/`fixup -c` folds carry a valid
+/// signature.
+#[test]
+fn rebase_replay_amend_fixup_keep_signs_openpgp() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    for (action, spec) in [
+        ("amend", Some("amend! T\n\nA amended")),
+        ("fixup -C", Some("fixup! T")),
+        ("fixup -c", Some("fixup! T")),
+    ] {
+        let (repo, upstream) = signing_action_repo(&env, spec);
+        let p = repo.path();
+        assert_cli_success(
+            &run_with_env(p, &["config", "commit.gpgSign", "true"], &env),
+            "on",
+        );
+        run_replay_action(p, action, &upstream, &env);
+        assert!(rebased_has_gpgsig(p, &env), "AC signed {action}");
+        assert_signed_tip(p, &upstream, &env);
+    }
+}

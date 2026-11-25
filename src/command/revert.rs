@@ -62,8 +62,9 @@ enum RevertError {
     #[error("not a libra repository")]
     NotInRepo,
 
-    #[error("you are in a 'detached HEAD' state; reverting is not allowed")]
-    DetachedHead,
+    /// SA-07a: a revert would check out the reversed tree over staged entries.
+    #[error("your local changes would be overwritten by revert")]
+    LocalChangesWouldBeOverwritten,
 
     #[error("failed to resolve commit reference '{0}'")]
     InvalidCommit(String),
@@ -220,7 +221,7 @@ impl RevertError {
     fn stable_code(&self) -> StableErrorCode {
         match self {
             Self::NotInRepo => StableErrorCode::RepoNotFound,
-            Self::DetachedHead => StableErrorCode::RepoStateInvalid,
+            Self::LocalChangesWouldBeOverwritten => StableErrorCode::ConflictUnresolved,
             Self::InvalidCommit(_) => StableErrorCode::CliInvalidTarget,
             Self::MainlineRequired(_)
             | Self::MainlineForNonMerge(_)
@@ -262,9 +263,9 @@ impl From<RevertError> for CliError {
         let message = error.to_string();
         match error {
             RevertError::NotInRepo => CliError::repo_not_found(),
-            RevertError::DetachedHead => CliError::fatal(message)
+            RevertError::LocalChangesWouldBeOverwritten => CliError::failure(message)
                 .with_stable_code(stable_code)
-                .with_hint("switch to a branch first with 'libra switch <branch>'"),
+                .with_hint("commit or stash the staged changes before reverting"),
             RevertError::InvalidCommit(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("use 'libra log' to find valid commit references"),
@@ -451,10 +452,6 @@ async fn run_revert(args: RevertArgs) -> Result<RevertOutput, RevertError> {
         return Err(RevertError::RevertInProgress);
     }
 
-    if let Head::Detached(_) = Head::current().await {
-        return Err(RevertError::DetachedHead);
-    }
-
     // ADR-HF-04: refuse before resolving targets or writing anything while the
     // index still has unmerged entries (Git: "your index file is unmerged.").
     let unmerged =
@@ -490,6 +487,23 @@ async fn run_revert(args: RevertArgs) -> Result<RevertOutput, RevertError> {
             .await
             .map_err(|_| RevertError::InvalidCommit(spec.clone()))?;
         resolved.push(id);
+    }
+
+    // SA-07a: without `--no-commit` the reversal is committed, so refuse before
+    // any write when the index differs from HEAD's tree (staged add/modify/delete).
+    if !args.no_commit {
+        let index =
+            Index::load(path::index()).map_err(|e| RevertError::IndexLoad(e.to_string()))?;
+        let index_tree = crate::utils::tree::create_tree_from_index(&index)
+            .map_err(|e| RevertError::LoadObject(e.to_string()))?;
+        let head = Head::current_commit()
+            .await
+            .ok_or_else(|| RevertError::InvalidCommit("HEAD".to_string()))?;
+        let head_commit: Commit =
+            load_object(&head).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+        if index_tree.id != head_commit.tree_id {
+            return Err(RevertError::LocalChangesWouldBeOverwritten);
+        }
     }
 
     // Revert each commit in order; each revert is applied relative to (and
@@ -1997,10 +2011,19 @@ async fn resolve_commit(reference: &str) -> Result<ObjectHash, String> {
 }
 
 async fn update_head(commit_id: &str) -> Result<(), RevertError> {
-    if let Head::Branch(name) = Head::current().await {
-        Branch::update_branch(&name, commit_id, None)
+    match Head::current().await {
+        Head::Branch(name) => Branch::update_branch(&name, commit_id, None)
             .await
-            .map_err(|e| RevertError::UpdateHead(e.to_string()))?;
+            .map_err(|e| RevertError::UpdateHead(e.to_string()))?,
+        // SA-07: a detached HEAD commits onto the detached ref itself.
+        Head::Detached(_) => {
+            let oid: ObjectHash = commit_id
+                .parse()
+                .map_err(|e: String| RevertError::UpdateHead(e))?;
+            Head::update_result(Head::Detached(oid), None)
+                .await
+                .map_err(|e| RevertError::UpdateHead(e.to_string()))?;
+        }
     }
     Ok(())
 }
@@ -2077,10 +2100,6 @@ mod tests {
             "revert is not possible because the index has unmerged entries",
         );
         assert_eq!(
-            RevertError::DetachedHead.to_string(),
-            "you are in a 'detached HEAD' state; reverting is not allowed",
-        );
-        assert_eq!(
             RevertError::InvalidCommit("deadbeef".to_string()).to_string(),
             "failed to resolve commit reference 'deadbeef'",
         );
@@ -2155,10 +2174,6 @@ mod tests {
         assert_eq!(
             RevertError::NotInRepo.stable_code(),
             StableErrorCode::RepoNotFound,
-        );
-        assert_eq!(
-            RevertError::DetachedHead.stable_code(),
-            StableErrorCode::RepoStateInvalid,
         );
         assert_eq!(
             RevertError::InvalidCommit("deadbeef".to_string()).stable_code(),

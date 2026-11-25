@@ -108,3 +108,5 @@ branch -d 三类拒绝以 exit 1 结束（稳定错误码不变）
 
 
 **`--separate-git-dir` 指针布局（2026-11-20，CL-23）：** `<worktree>/.libra` 为 `gitdir: <dir>` 指针文件时，`util::resolve_dot_libra_pointer` 解析真实元数据目录，仓库发现（`try_get_paths_full_with_storage_lookup`）、`info/*` 候选与 `alternates` 的 objects 解析都改读 `<dir>`。会写 ref 的子命令仍由 `CL-28` 默认拒绝。
+
+- 2026-11-25（I698-01 / #698）：`format_branch_columns` 改为 Git 语义——槽宽 = 最宽渲染条目显示宽度 + 1（`unicode-width`，CJK/组合字符按终端宽度对齐），列数 = `COLUMNS / 槽宽`（默认 80，且不超过条目数），单条目宽于 `COLUMNS` 时单列完整输出；`--no-column`/`--column=never`/默认单列保持不变。回归：`branch_test::column_golden_16_branch_columns_81`（t3200#52 金样逐字）、`column_git_parity_16_branches_columns_81`、`column_slot_width_is_max_render_plus_one`、`column_overflow_degrades_to_single_full_column`、`column_cjk_display_width_alignment`、`column_disabled_modes_keep_single_column`；`branch_test` 58/58。TC-0294 复跑为 FAIL，但差异来自上游 t3200 前序子用例在 Libra 中遗留的分支集合不同（actual 含 `baz/topic/o/q/r/q`、缺 `foo/l/m/m/mb/o/o`），与列布局无关：以金样同名 16 分支复测输出与 `git branch --column=column` 逐字一致。

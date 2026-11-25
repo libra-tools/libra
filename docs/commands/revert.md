@@ -36,7 +36,8 @@ Reverting a root commit (one with no parent) produces an empty tree, effectively
 
 To revert a **merge commit** (one with more than one parent), pass `-m <parent-number>` to choose which parent is the mainline; the merge's changes are then computed relative to that parent. See [`-m`, `--mainline`](#-m---mainline-parent-number) below.
 
-The command requires an active branch (not detached HEAD). It accepts one or more
+The command works on a branch or a detached HEAD (the revert commit is written to
+the detached HEAD). It accepts one or more
 commit references, reverting them in order (each as its own revert commit); a
 conflict stops the sequence, to be finished with `libra revert --continue`,
 skipped with `libra revert --skip`, or undone with `libra revert --abort`. When a
@@ -49,6 +50,12 @@ A new revert refuses to start while the index has unmerged entries: before resol
 A stopped revert does not outlive the working tree it stopped in: a later reset ends the stopped single-commit revert once it clears unresolved index stages, so the next revert starts cleanly. Resolving the conflict and running a later commit ends the stopped single-commit revert the same way. A multi-commit sequence keeps its remaining commits and records that the stopped commit was concluded: `--continue` does not re-commit a stop that was concluded outside the sequence, and instead reverts the remaining commits. `libra revert --abort` still restores HEAD, index, and tracked files to the pre-revert state, discarding later tracked changes (including the reset target).
 
 Worktree materialization is mode-aware (plan issues/470 FM-02): files are created with the entry mode's permission bits (`100755` -> `0777`, `100644` -> `0666`) under the process `umask`, replaced atomically through a same-directory temp file, and the index/tree entries keep the mode (`100755`/`100644`/`120000`).
+
+Without `-n`/`--no-commit`, `revert` refuses before writing anything when the
+index differs from `HEAD`'s tree (staged additions, modifications or deletions).
+The command then exits 128 with `LBR-CONFLICT-001` and
+`your local changes would be overwritten by revert`; no revert state is written.
+`-n`/`--no-commit` is exempt and may start from such an index.
 
 ## Options
 
@@ -296,7 +303,6 @@ three-way merge while preserving every clean inverse hunk.
 | Code | Condition | Hint |
 |------|-----------|------|
 | `LBR-REPO-001` | Not inside a libra repository | Initialize with `libra init` or navigate to a repo |
-| `LBR-REPO-003` | HEAD is detached (not on a branch) | Switch to a branch with `libra switch <branch>` |
 | `LBR-REPO-003` | `--continue` on a stop a later reset already concluded the stopped revert | Drain the rest with `libra revert --skip`, or restore the pre-revert state with `libra revert --abort` (discards later tracked changes) |
 | `LBR-CLI-003` | Cannot resolve the commit reference | Use `libra log` to find valid commit references |
 | `LBR-CLI-002` | Merge commit without `-m`, invalid mainline, invalid `--cleanup`, or an editor/empty-message failure | Pass a valid mainline/cleanup mode; for `--edit`, configure an editor and save a non-empty message |

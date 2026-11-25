@@ -402,7 +402,14 @@ fn compatibility_governance_roadmap_marks_current_surfaces_without_batch_status(
         );
     }
 
-    for removed in ["批次状态", "C7", "C8", "C9", "C7-C9 后续补录"] {
+    // Match batch IDs as tokens, including in C7-C9 ranges. AC7 is an acceptance criterion.
+    for token in governance.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        assert!(
+            !matches!(token, "C7" | "C8" | "C9"),
+            "governance roadmap must not retain batch status marker: {token}"
+        );
+    }
+    for removed in ["批次状态", "C7-C9 后续补录"] {
         assert!(
             !governance.contains(removed),
             "governance roadmap must not retain batch status marker: {removed}"

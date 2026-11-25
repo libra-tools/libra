@@ -3965,10 +3965,13 @@ mod tests {
 
         let parent_dir = obj_path.parent().unwrap();
         let dir_mode = fs::metadata(parent_dir).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(
-            dir_mode, 0o2775,
-            "fanout directory mode must be 2775 in shared repo"
-        );
+        // Group sharing adds group access and setgid. Other-user permissions
+        // depend on the mode of newly created directories under this umask.
+        let probe = objects_dir.join("mode-probe");
+        fs::create_dir(&probe).unwrap();
+        let others = fs::metadata(probe).unwrap().permissions().mode() & 0o007;
+        let expected = 0o2770 | others | ((others & 0o004) >> 2);
+        assert_eq!(dir_mode, expected, "shared fanout directory permissions");
 
         clear_cached_repo_shared_mode(Some(&storage_root));
     }

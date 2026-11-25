@@ -76,3 +76,40 @@ fn test_describe_long_rejects_abbrev_zero_like_git() {
         "invalid argument error should name both conflicting options: {human}"
     );
 }
+
+/// DESC-04 AC1–AC5: `--no-long` and last-one-wins with `--long`.
+#[test]
+fn test_describe_no_long_last_wins() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let ab7 = &head[..7];
+
+    let out = run_libra_command(&["describe", "--no-long"], p);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0", "AC1");
+
+    let out = run_libra_command(&["describe", "--long", "--no-long"], p);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0", "AC2");
+
+    let out = run_libra_command(&["describe", "--long", "--no-long", "--json"], p);
+    assert_cli_success(&out, "AC3");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["long_format"], false, "AC3");
+
+    let out = run_libra_command(&["describe", "--no-long", "--long"], p);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("v1.0-0-g{ab7}"),
+        "AC4"
+    );
+
+    let out = run_libra_command(&["describe", "--long", "--no-long", "--abbrev=0"], p);
+    assert_cli_success(&out, "AC5");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0", "AC5");
+}

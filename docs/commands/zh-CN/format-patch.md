@@ -5,12 +5,18 @@
 ## 概要
 
 ```bash
-libra format-patch [OPTIONS] [revision-range]
+libra format-patch [OPTIONS] [<revision>...]
 ```
 
 ## 说明
 
-`libra format-patch` 遍历 revision range（`A..B`，或把单个提交视为 `<commit>..HEAD`）；`-1 [commit]` 精确选择一个 commit，`--root [commit]` 则包含 root 及所有可达的非 merge ancestors。命令为每个非 merge commit 生成一个 patch 文件（默认以 `--suffix` 命名，默认 `.patch`，除非设置 `--numbered-files`，此时使用裸序号）。除 `--numbered-files` 外，文件名始终带有补零序号前缀，不受 `-n` 或 `-N` 影响。每个 patch 格式化为 mbox message，包含 RFC 2822 headers、plain-text diffstat 和 unified diff。输出兼容 `git am`。
+每封补丁的 mbox 分隔行为 `From <提交 oid> Mon Sep 17 00:00:00 2001`（Git 固定信封时间戳）；`--zero-commit` 时哈希全零。封面信分隔行使用系列末个提交 oid 与同一固定时间戳。
+
+封面信仅当系列中任一提交的原始对象缓冲含非 ASCII 字节时才输出 `MIME-Version`/`Content-Type`/`Content-Transfer-Encoding` 头（Git `make_cover_letter` 规则）；全 ASCII 系列不输出 MIME 头。
+
+封面信还会输出系列 diffstat（从唯一边界提交——最旧补丁的父提交——到末个补丁的树差异）；`--no-stat`/`-p` 只抑制逐补丁 diffstat，系列自根提交开始（无唯一边界）时省略封面信 diffstat；封面信 diffstat 继承补丁的重命名选项（`-M`/`--find-renames`/`--no-renames`，以最后者为准）。
+
+`libra format-patch` 遍历 revision range（`A..B`，或把单个提交视为 `<commit>..HEAD`）；`-1 [commit]` 精确选择一个 commit，`--root [commit]` 则包含 root 及所有可达的非 merge ancestors。多个位置修订取并集，`^<rev>` 排除其可达提交，`A..B` 排除 `A` 并包含 `B`。命令为每个非 merge commit 生成一个 patch 文件（默认以 `--suffix` 命名，默认 `.patch`，除非设置 `--numbered-files`，此时使用裸序号）。除 `--numbered-files` 外，文件名始终带有补零序号前缀，不受 `-n` 或 `-N` 影响。使用 `-v <N>` 时所有生成文件再加 `v<N>-` 前缀（`v4-0000-cover-letter.patch`、`v4-0001-…`）。非整数/非字母数字取值在文件名中按 Git 清洗、`Subject:` 保留原样（分数版本的 interdiff 标题为不带版本的 `Interdiff:`）（`--reroll-count=4.4` → `v4.4-…`，`4---..././../--1/.2//` → `v4-.-.-.-1-.2-…`），始终限制在输出目录内。每个 patch 格式化为 mbox message，包含 RFC 2822 headers、plain-text diffstat 和 unified diff。未使用 `--stdout` 时生成路径逐行输出到 stdout（无 `-o` 时为裸文件名，相对/绝对 `-o` 按给定路径）；`--quiet` 与 `--json` 抑制路径列表。输出兼容 `git am`。
 
 Merge commits 默认跳过。当 revision range 解析为零个提交时，命令以退出码 0 成功结束，不生成 patch。普通模式不输出内容；使用 `--json` 时，payload 中包含 `"patches": []`。仓库没有任何 commit 或 revision 无法解析时仍会报错。若所有 commit 都已在 upstream 中，`--ignore-if-in-upstream` 也会成功返回空 series。
 
@@ -18,38 +24,53 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 
 | 标志 | 短参数 | 说明 | 默认值 |
 |------|--------|------|--------|
-| `[revision-range]` | | `A..B` range 或单个 commit；单个 commit 表示 `<commit>..HEAD` | `HEAD` |
+| `[<revision>...]` | | 一个或多个修订：单个提交等价 `<commit>..HEAD`；`A..B` 排除 `A`；`^<rev>` 排除其可达提交；多个正向修订取并集 | `HEAD` |
 | `-1` | `-1` | 只生成指定 commit；未给 revision 时生成 `HEAD` | false |
 | `--root` | | 包含 root commit 和所有可达的非 merge ancestors | false |
 | `--output-directory <DIR>` | `-o` | 将 patch 文件写入 `DIR` | 当前目录 |
 | `--stdout` | | 将所有 patches 打印到 stdout | false |
-| `--numbered` | `-n` | 在 commit patch 的 Subject 行中加入 `[PATCH n/m]` 计数 | false |
+| `--numbered` | `-n` | 在 commit patch 的 Subject 行中加入 `[PATCH n/m]` 计数 | auto（多补丁或封面信） |
 | `--no-numbered` | `-N` | 不在 commit patch 或 cover-letter 的 Subject 行中加入 `[PATCH n/m]` 计数 | 关闭 |
 | `--rfc[=<text>]` | | 在主题前缀中加入 `RFC`（`[RFC PATCH]`）；给出值时用该文本替代（`--rfc=WIP` → `[WIP PATCH]`）。值必须用 `=` 紧跟，避免吞掉版本参数 | 关闭 |
 | `--no-rfc` | | 取消此前的 `--rfc`（后写者生效） | 关闭 |
 | `--filename-max-length <N>` | | 将输出文件名截断到最多 `N` 字节（包含 `0001-` 前缀与后缀）；必要时可只保留序号，截断点与 Git 一致 | 不限制 |
-| `--commit-list-format <FMT>` | | 封面信的提交列表。默认（或 `short`）为 Git 的按作者分组 shortlog（`Name (N):` 加 72 列换行的主题）；`modern` 渲染 `[i/N] subject`；其他值按 pretty-format 解析，支持 `%h`、`%H`、`%s`、`%an`、`%ae`、`%n`、`%%`（不支持的转换会报 `'<fmt>' is not a valid format string`） | `short` |
-| `--relative[=<path>]`（不支持） | | 仅为明确缺口而接受：Libra 没有针对导出补丁的相对路径过滤，命令以 128 退出并返回 `LBR-UNSUPPORTED-001` | — |
+| `--commit-list-format <FMT>` | | 封面信的提交列表。默认（或 `short`）为 Git 的按作者分组 shortlog（`Name (N):` 加 72 列换行的主题）；`modern` 渲染 `[i/N] subject`；其他值按 pretty-format 解析（可带 `log:` 前缀），支持 `%h`、`%H`、`%s`、`%an`、`%ae`、`%n`、`%%`、`%(count)`/`%(total)`（`%(count)` 按 `%(total)` 位宽补零、自 1 起且不受 `--start-number` 影响）；不含 `%` 且无 `log:` 的字面量以 `'<fmt>' is not a valid format string` 拒绝 | `short` |
+| `--relative[=<path>]` | | 将系列限制到某个目录，并从 diffstat 与补丁路径中剥离该前缀。带值时 `<path>` 相对仓库根解析（与 `libra diff --relative` 相对当前目录不同）；裸 `--relative` 使用当前目录。未给 flag 时 `diff.relative=true` 同样生效；`--no-relative` 恢复仓库相对路径（两者以最后者为准）。前缀在仓库内不存在或逃逸仓库（`../outside`）时按 Git 输出空补丁正文（仅头区与提交说明，无 `---`/diffstat/diff），不写任何文件，也不打印仓库外路径 | 关闭 |
 | `--all`（不支持） | | 仅为明确缺口而接受：Libra 的版本语法没有 all-refs 选择器，请显式写分支范围（如 `main..topic`） | — |
 | `--no-base` | | 不输出 `base-commit:` 尾注，覆盖 `--base`（Libra 没有 `format.useAutoBase` 配置可重置） | 关闭 |
 | `--start-number <N>` | | 从 `N` 开始编号 | 1 |
 | `--subject-prefix <PREFIX>` | | 在 Subject: 行使用 `PREFIX` 而不是 `PATCH` | `PATCH` |
-| `--cover-letter` | | 生成 cover-letter 模板（`0000-cover-letter<suffix>`，或 `--numbered-files` 下的 `0`） | false |
-| `--thread` | | 添加 `In-Reply-To` 和 `References` headers（默认开启） | true |
-| `--no-thread` | | 禁用 threading headers | false |
+| `--interdiff <REV>` | | 在封面信输出 `Interdiff against v<n-1>:`（无 `-v` 时为 `Interdiff:`），直接比较 `<REV>` 的树与末个补丁的树；多补丁系列会隐含封面信；单补丁且无封面信时区块位于补丁 diff 之后、签名之前并缩进两空格，有封面信时补丁不重复输出 | 关闭 |
+| `--cover-from-description <MODE>` | | 分支描述如何进入封面信：`default`/`message` 整段写入正文，`subject` 把首段（空格拼接）写入 `Subject:`、其余写入正文，`none` 保留占位符，`auto` 仅在格式化首段不超过 100 字节时用 subject；非法模式即使没有 `--cover-letter` 也拒绝 | `default` |
+| `--cover-letter` | | 生成 cover-letter 模板（`0000-cover-letter<suffix>`，或 `--numbered-files` 下的 `0`） | false  覆盖 `format.coverLetter=false`；未给 `--from`/`format.from` 时，封面信 `From:` 默认取执行时提交者身份（`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`，否则 `user.name`/`user.email`）；补丁仍用提交作者。 `format.coverLetter=true|false|auto` 提供默认值（`auto` 仅在多补丁系列生成），`--commit-list-format` 隐含封面信（`--no-cover-letter` 可关闭）。 |
+| `--no-cover-letter` | | 不生成封面信；覆盖 `format.coverLetter` 以及 `--commit-list-format` 隐含的封面信（与 `--cover-letter` 以最后者为准） | — |
+| `--thread[=<STYLE>]` | | 添加生成的 `Message-ID`/`In-Reply-To`/`References` headers（默认关闭）。裸 `--thread` 或 `--thread=shallow` 使每封补丁回复封面信/首补丁；`--thread=deep` 使每封补丁回复前一封，`References` 指向线程根 | false |
+| `--no-thread` | | 禁用生成的 threading headers；显式 `--in-reply-to` 仍会为每封邮件添加外部父邮件头 | false |
+| `format.filenameMaxLength`（配置） | | 文件名整体字节预算默认值（Git 默认 64，含 `NNNN-` 前缀、slug、后缀与 `v<N>-` reroll 前缀）；`--filename-max-length` 优先 | `64` |
+| `format.attach`（配置） | | 非空值作为 multipart boundary（字面 `true` 即 boundary `true`），空值关闭；本地空值覆盖全局值，`--no-attach` 优先 | — |
+| `format.coverFromDescription`（配置） | | 封面信描述默认模式（取值同 `--cover-from-description`，CLI 优先）。配置值非法时即使 CLI 给出合法模式、即使未启用封面信，也以 `invalid cover from description mode` 拒绝 | `default` |
+| `branch.<name>.description`（配置） | | 用该分支描述替换封面信正文的 `*** BLURB HERE ***`。分支选择遵循 Git：无修订或单一裸修订取当前分支，否则取唯一正向修订对应的分支 | — |
+| `format.useAutoBase`（配置） | | `true` 等价 `--base=auto`；`whenAble` 仅在能确定唯一上游 merge base 时自动取基线、否则静默省略 base 区块；`false` 关闭。`--no-base` 与显式 `--base` 覆盖配置 | — |
+| `format.commitListFormat`（配置） | | 封面信列表默认格式（语法同 `--commit-list-format`，含 `log:`/原子）；命令行选项优先，且与命令行不同，配置本身不隐含封面信；`full` 按无效格式串拒绝 | — |
+| `format.thread`（配置） | | `true`/`shallow`（不区分大小写）为浅线程，`deep` 为深线程，`false`/空值关闭；本地层覆盖全局层，同层后写者生效；命令行 flag 覆盖配置，且 `--thread`/`--thread=<style>`/`--no-thread` 以最后者为准 | — |
 | `--in-reply-to <MESSAGE_ID>` | | 让第一封邮件回复给定 Message-ID | 无 |
 | `--to <ADDRESS>` | | 添加 `To:` header（可重复；多个地址像 git 一样折叠）。放在 MIME headers 之后，应用于每个 patch 和 cover letter | 无 |
 | `--cc <ADDRESS>` | | 添加 `Cc:` header（可重复；像 git 一样折叠） | 无 |
 | `--no-to` / `--no-cc` | | 抑制 `To:` / `Cc:` headers（Libra 没有可重置的 `format.to`/`format.cc` config） | false |
-| `--from[=<IDENT>]` | | 在 `From:` header 中使用 `<IDENT>` 而不是 commit author（裸 `--from` 使用 committer 配置身份）。当它不同于 author 时，原 author 会作为正文内 `From:` 行保留，便于 `git am` 还原 | author |
+| `--from[=<IDENT>]` | | 在 `From:` header 中使用 `<IDENT>` 而不是 commit author（裸 `--from` 使用 committer 配置身份）。当它不同于 author 时，原 author 会作为正文内 `From:` 行保留，便于 `git am` 还原 | author  `<IDENT>` 必须是合法 ident 行（`<` 与其后的 `>` 成对；`Name <>` 合法），并在 revision 解析前校验，因此空范围下 `--from=foo` 仍失败；裸 `--from` 使用执行时提交者身份（含 `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`）。 未给 CLI flag 时由 `format.from` 提供同值（`true`=提交者身份，`false`=保持作者，其它值=ident 行）。 |
+| `--no-from` | | 不改写 `From:` 头；覆盖 `format.from`。`--from` 与 `--no-from` 同时出现时以最后者为准 | 作者 |
 | `--reroll-count <N>` | `-v` | 标记为版本 `N`（把 `[PATCH]` 改为 `[PATCH vN]`） | 无 |
 | `--signoff` | `-s` | 向每个 commit message 追加 `Signed-off-by` trailer | false |
 | `--no-signoff` | | 禁用 signoff，并覆盖 `format.signOff` | false |
 | `--notes[=<REF>]` | | 将每个 commit 的 notes 追加到 `---` 行之后、diffstat 之前。裸 `--notes` 使用默认 ref（`refs/notes/commits`）；`--notes=<ref>` 读取 `<ref>`。渲染为 `Notes:`（默认 ref）或 `Notes (<ref>):`，每行缩进四个空格；没有 note 的 commit 保持不变 | off |
-| `--attach` | | 将每个 patch 作为 `multipart/mixed` MIME message 发出：log message + diffstat 位于 `text/plain` part，diff 位于 `text/x-patch` part 且 `Content-Disposition: attachment`。与 `--inline` 互斥 | off |
-| `--inline` | | 类似 `--attach`，但 patch part 使用 `Content-Disposition: inline` | off |
+| `--attach[=<BOUNDARY>]` | | 生成 multipart/mixed，提交日志在正文、补丁作为独立 `attachment` 部分；可选 boundary 变为 `------------<BOUNDARY>`（空格形式会被当作修订参数，boundary 须用 `=`） | 关闭 |
+| `--no-attach` | | 不生成 multipart；覆盖 `format.attach` 与 `--attach`/`--inline` | 关闭 |
+| `--inline[=<BOUNDARY>]` | | 同 `--attach`，但补丁部分使用 `Content-Disposition: inline`；可选 boundary 规则相同 | 关闭 |
 | `--base <COMMIT>` | | 记录 `base-commit:` trailer（以及 base 与 series 之间每个非 merge commit 的 `prerequisite-patch-id:` 行，按 oldest-first），使 `git am --base` 可验证 series 可应用。Trailer 位于最后一个 patch，或 `--cover-letter` 下位于 cover letter。Base 必须是 series 的祖先（否则退出 128）。不支持 `--base=auto`（退出 129）。文本 diff 的 patch-id 匹配 `git patch-id --stable`；**binary-file prerequisites 不保证匹配 Git** | off |
 | `--full-index` | | 在 diff index header 行中显示完整 object IDs | false |
+| `-U <N>`, `--unified=<N>` | | 生成 hunk 时使用 `N` 行上下文（Git `-U<n>` / `--unified=<n>`）；默认 3 | 3 |
+| `--diff-filter=<FILTER>` | | 仅包含匹配 Git diff-filter 字母的变更路径（如 `A` 表示新增）；同时过滤补丁与 diffstat | 全部 |
+| `--full-diff` | | 为 Git 兼容而接受；Libra 此处不接受 `-- <path>` pathspec，因此无 pathspec 时输出不变 | false |
 | `--minimal` | | 请求最小 Myers edit script；Libra 默认 Myers backend 已保证最短脚本，因此输出与默认相同 | false |
 | `--histogram` | | 使用 Histogram diff algorithm 生成文本 hunks | false |
 | `--ignore-if-in-upstream` | | 抑制 stable patch-id 已出现在 range 排除侧的 commits | false |
@@ -123,7 +144,7 @@ libra format-patch --ignore-if-in-upstream --src-prefix=old/ --dst-prefix=new/ o
 ```
 From <commit-oid> <unix-mbox-date>
 From: Author Name <email>
-Date: <RFC 2822 date>
+Date: <RFC 2822 作者时间与作者时区>
 Subject: [PATCH n/m] commit subject
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

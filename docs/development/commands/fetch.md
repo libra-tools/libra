@@ -438,3 +438,5 @@ See the user-facing `fetch` page for the local-path Git `objectformat=sha256` re
 
 
 **无参 `fetch` 的默认远程（2026-11-20，FP-07）：** `ConfigKv::get_current_remote()` 之后新增 `default_fetch_remote()` 回退——唯一 remote 或 `origin`；双非 origin remote 保持 `LBR-REPO-003`。用例 `command::fetch_test::fetch_without_repository_uses_git_default_remote` 覆盖 AC1–AC8。
+
+- 2026-11-25（I997-01 / #997）：显式 tag source 支持——`refs/tags/<name>`（或短名 DWIM：同名分支优先，其次 tag，最后广告的完整 OID）可映射到 tag 目的地（写 tag object）或 branch/其它 refs 目的地（写 peeled commit，且 tag object 与目标对象一并下载）；短目的地按 tag source 补全到 `refs/tags/*`；peel 最终非 commit 的 tag 在 branch 目的地 fail-closed 且不写 ref；`pull <tag>:<branch>` 以 peeled commit 进入既有 ff/merge。回归：`fetch_test::tag_refspec_*`（5 条）与 `pull_test::tag_refspec_*`（2 条），`fetch_test`+`pull_test` 135/135。

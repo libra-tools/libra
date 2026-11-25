@@ -14,11 +14,9 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use git_internal::hash::ObjectHash;
-#[cfg(test)]
-use sea_orm::TransactionTrait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Schema, Set,
-    sea_query::Expr,
+    TransactionTrait, sea_query::Expr,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -46,7 +44,10 @@ use crate::{
     },
 };
 
+// The proof and serializer regions on either side of the tests are hash-pinned.
+#[allow(clippy::items_after_test_module)]
 mod agent_capture;
+mod coverage;
 mod metadata;
 mod object_format;
 mod restore;
@@ -1471,25 +1472,47 @@ async fn run_cloud_status(args: StatusArgs) -> CliResult<CloudStatusOutput> {
         .map(|e| e.value)
         .unwrap_or_else(|| "unknown-repo".to_string());
 
-    let all_objects = object_index::Entity::find()
+    let status_error = |e| {
+        CliError::fatal(format!("failed to read cloud status: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    };
+    let view = db_conn.begin().await.map_err(status_error)?;
+    let indexed = object_index::Entity::find()
         .filter(object_index::Column::RepoId.eq(&repo_id))
-        .all(&db_conn)
+        .all(&view)
         .await
         .map_err(|e| {
             CliError::fatal(format!("failed to query cloud object index: {e}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)
         })?;
 
-    let synced_count = all_objects.iter().filter(|o| o.is_synced == 1).count();
-    let unsynced_count = all_objects.len() - synced_count;
-
-    // Group by type
+    let missing = coverage::missing_rows(&view, &repo_id)
+        .await
+        .map_err(|e| cloud_cli_error_typed("status", e))?;
+    view.commit().await.map_err(status_error)?;
+    let total_objects = indexed.len() + missing.len();
+    let mut synced_count = 0usize;
+    let mut unsynced_objects = Vec::new();
     let mut by_type: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for obj in &all_objects {
-        let entry = by_type.entry(obj.o_type.clone()).or_insert((0, 0));
+    let indexed = indexed
+        .into_iter()
+        .map(|row| (row.o_id, row.o_type, row.o_size, row.is_synced == 1));
+    for (oid, object_type, size, synced) in indexed.chain(
+        missing
+            .into_iter()
+            .map(|(id, kind, size)| (id, kind, size, false)),
+    ) {
+        let entry = by_type.entry(object_type.clone()).or_default();
         entry.0 += 1;
-        if obj.is_synced == 1 {
+        if synced {
             entry.1 += 1;
+            synced_count += 1;
+        } else if args.verbose && unsynced_objects.len() < 20 {
+            unsynced_objects.push(CloudStatusObjectOutput {
+                oid,
+                object_type,
+                size,
+            });
         }
     }
     let by_type = by_type
@@ -1501,31 +1524,12 @@ async fn run_cloud_status(args: StatusArgs) -> CliResult<CloudStatusOutput> {
             pending: total - synced,
         })
         .collect();
-    let unsynced_objects = if args.verbose {
-        all_objects
-            .iter()
-            .filter(|o| o.is_synced == 0)
-            .take(20)
-            .map(|obj| CloudStatusObjectOutput {
-                oid: obj.o_id.clone(),
-                object_type: obj.o_type.clone(),
-                size: obj.o_size,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
     Ok(CloudStatusOutput {
         repo_id,
-        total_objects: all_objects.len(),
+        total_objects,
         synced: synced_count,
-        pending: unsynced_count,
-        synced_percent: if all_objects.is_empty() {
-            0
-        } else {
-            synced_count * 100 / all_objects.len()
-        },
+        pending: total_objects - synced_count,
+        synced_percent: (synced_count * 100).checked_div(total_objects).unwrap_or(0),
         by_type,
         unsynced_objects,
     })
@@ -3723,6 +3727,237 @@ mod tests {
         assert!(r2_object_count(&r2).await >= expected.len());
     }
 
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn incomplete_cloud_index_roundtrips_both_ref_histories() {
+        use crate::internal::model::reference::ConfigKind;
+
+        for force in [false, true] {
+            let (_source, _home, _home_env, _test_home_env, source_cwd) =
+                enter_isolated_libra_repo().await;
+            let conn = db::get_db_conn_instance().await;
+            let repo_id = ensure_repo_id().await;
+            // Let Git build real history directly in the source object store, bypassing
+            // Libra's index writer just as a legacy packed clone did.
+            let fixture = tempdir().unwrap();
+            let git = |args: &[&str]| {
+                let result = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.org",
+                        "-c",
+                        "commit.gpgSign=false",
+                    ])
+                    .args(args)
+                    .current_dir(fixture.path())
+                    .env("GIT_OBJECT_DIRECTORY", path::objects())
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{args:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                String::from_utf8(result.stdout).unwrap().trim().to_owned()
+            };
+            git(&["init", "-b", "main", "--object-format=sha1"]);
+            fs::write(fixture.path().join("shared"), b"inherited\n").unwrap();
+            git(&["add", "shared"]);
+            git(&["commit", "-m", "base"]);
+            git(&["branch", "side"]);
+            for branch in ["main", "side"] {
+                git(&["checkout", branch]);
+                fs::write(fixture.path().join(branch), branch).unwrap();
+                git(&["add", branch]);
+                git(&["commit", "-m", branch]);
+            }
+            git(&["repack", "-ad"]);
+            let ids: HashSet<String> = git(&["rev-list", "--objects", "--all"])
+                .lines()
+                .map(|line| line.split_whitespace().next().unwrap().to_owned())
+                .collect();
+            let local = LocalStorage::try_new(path::objects()).unwrap();
+            let private = ObjectHash::from_type_and_data(ObjectType::Blob, b"private");
+            local
+                .put(&private, b"private", ObjectType::Blob)
+                .await
+                .unwrap();
+            let inherited = git(&["rev-parse", "main:shared"]);
+            let row = object_index::ActiveModel {
+                o_id: Set(inherited.clone()),
+                o_type: Set("agent_blob".into()),
+                o_size: Set(10),
+                repo_id: Set(repo_id.clone()),
+                created_at: Set(123),
+                is_synced: Set(0),
+                ..Default::default()
+            }
+            .insert(&conn)
+            .await
+            .unwrap();
+            let mock = crate::utils::d1_client::test_support::MockD1::spawn().await;
+            let r2 = Arc::new(InMemory::new());
+            let sync = |force| {
+                super::sync::run_cloud_sync_with_clients(
+                    CloudSyncContext {
+                        batch_size: 2,
+                        force,
+                    },
+                    &SilentCloudSyncProgress,
+                    mock.client(),
+                    Some(RemoteStorage::new(r2.clone())),
+                )
+            };
+            sync(false).await.unwrap();
+            let refs = [
+                ("local-tip", git(&["rev-parse", "main"])),
+                ("remote-tip", git(&["rev-parse", "side"])),
+            ];
+            for (name, tip) in &refs {
+                reference::ActiveModel {
+                    name: Set(Some((*name).into())),
+                    kind: Set(ConfigKind::Branch),
+                    commit: Set(Some(tip.clone())),
+                    remote: Set((*name == "remote-tip").then(|| "origin".into())),
+                    worktree_id: Set(None),
+                    ..Default::default()
+                }
+                .insert(&conn)
+                .await
+                .unwrap();
+            }
+            let status = run_cloud_status(StatusArgs { verbose: false })
+                .await
+                .unwrap();
+            assert_eq!((status.total_objects, status.synced), (ids.len(), 1));
+            let report = sync(force).await.unwrap();
+            assert_eq!(report.synced_count, ids.len() - usize::from(!force));
+            assert_eq!(
+                run_cloud_status(StatusArgs { verbose: false })
+                    .await
+                    .unwrap()
+                    .pending,
+                0
+            );
+            let preserved = object_index::Entity::find_by_id(row.id)
+                .one(&conn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (
+                    preserved.o_type.as_str(),
+                    preserved.created_at,
+                    preserved.is_synced
+                ),
+                ("agent_blob", 123, 1)
+            );
+            let objects = mock.client().get_object_indexes(&repo_id).await.unwrap();
+            assert_eq!(
+                objects
+                    .iter()
+                    .map(|row| row.o_id.clone())
+                    .collect::<HashSet<_>>(),
+                ids
+            );
+            drop(source_cwd);
+            let _restored = enter_isolated_libra_repo().await;
+            let target = LocalStorage::try_new(path::objects()).unwrap();
+            let remote = RemoteStorage::new(r2);
+            let restored = restore_indexed_objects_from_remote(
+                &objects,
+                &remote,
+                &target,
+                git_internal::hash::HashKind::Sha1,
+            )
+            .await
+            .unwrap();
+            assert_eq!((restored.downloaded, restored.failed), (ids.len(), 0));
+            let target_db = db::get_db_conn_instance().await;
+            restore_metadata_with_output(&target_db, &remote, false)
+                .await
+                .unwrap();
+            for (name, tip) in refs {
+                assert_eq!(
+                    reference::Entity::find()
+                        .filter(reference::Column::Name.eq(name))
+                        .one(&target_db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .commit,
+                    Some(tip)
+                );
+            }
+            for oid in ids {
+                let hash = crate::internal::object_format::parse_repo_oid(&oid).unwrap();
+                let restored = target.get(&hash).await.unwrap();
+                assert_eq!(restored, local.get(&hash).await.unwrap());
+                if oid == inherited {
+                    assert_eq!(restored.0, b"inherited\n");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn cloud_coverage_rechecks_a_ref_pruned_during_backfill() {
+        use crate::internal::model::reference::ConfigKind;
+
+        let _repo = enter_isolated_libra_repo().await;
+        let local = LocalStorage::try_new(path::objects()).unwrap();
+        let hash = ObjectHash::from_type_and_data(ObjectType::Blob, b"private after prune");
+        local
+            .put(&hash, b"private after prune", ObjectType::Blob)
+            .await
+            .unwrap();
+        let conn = db::get_db_conn_instance().await;
+        let tag = reference::ActiveModel {
+            name: Set(Some("temporary".into())),
+            kind: Set(ConfigKind::Tag),
+            commit: Set(Some(hash.to_string())),
+            ..Default::default()
+        }
+        .insert(&conn)
+        .await
+        .unwrap();
+        let tuning = snapshot::SnapshotTuning {
+            before_backfill: Some(Arc::new(move |attempt| {
+                Box::pin(async move {
+                    assert_eq!(attempt, 1);
+                    reference::Entity::delete_by_id(tag.id)
+                        .exec(&db::get_db_conn_instance().await)
+                        .await
+                        .unwrap();
+                })
+            })),
+            ..Default::default()
+        };
+        let mock = crate::utils::d1_client::test_support::MockD1::spawn().await;
+        let report = sync_with_tuning(&mock, &Arc::new(InMemory::new()), &tuning)
+            .await
+            .unwrap();
+        assert_eq!(report.total_unsynced, 0);
+        assert!(
+            object_index::Entity::find()
+                .filter(object_index::Column::OId.eq(hash.to_string()))
+                .one(&conn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mock.client()
+                .get_object_indexes(&report.repo_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     // ---- PI-09: frozen snapshot spool --------------------------------------
 
     async fn insert_branch_ref(name: &str) {
@@ -3731,7 +3966,7 @@ mod tests {
         reference::ActiveModel {
             name: Set(Some(name.to_owned())),
             kind: Set(ConfigKind::Branch),
-            commit: Set(Some("a".repeat(40))),
+            commit: Set(None),
             remote: Set(None),
             worktree_id: Set(None),
             ..Default::default()
@@ -5205,7 +5440,7 @@ mod tests {
                     let result = reference::ActiveModel {
                         name: Set(Some(name.clone())),
                         kind: Set(ConfigKind::Branch),
-                        commit: Set(Some("b".repeat(40))),
+                        commit: Set(None),
                         remote: Set(None),
                         worktree_id: Set(None),
                         ..Default::default()
@@ -5332,7 +5567,7 @@ mod tests {
         reference::ActiveModel {
             name: Set(name.map(str::to_owned)),
             kind: Set(kind),
-            commit: Set(Some("c".repeat(40))),
+            commit: Set(None),
             remote: Set(remote.map(str::to_owned)),
             worktree_id: Set(worktree_id.map(str::to_owned)),
             ..Default::default()
@@ -8229,8 +8464,8 @@ mod tests {
             );
             assert_no_remote_catalog("unrelated unsynced object", &mock).await;
         }
-        // A required object marked synced but missing locally: the
-        // reachability and durability check refuses.
+        // A missing traces tip is detected while freezing ref coverage, even
+        // when its index row says synced. Nothing reaches either remote.
         {
             let _repo = enter_isolated_libra_repo().await;
             let (commit, _, _) = seed_agent_capture_checkpoint(1).await;
@@ -8243,14 +8478,16 @@ mod tests {
             )
             .expect("lose the traces commit");
             let mock = crate::utils::d1_client::test_support::MockD1::spawn().await;
-            let report = sync_with_tuning(
-                &mock,
-                &Arc::new(InMemory::new()),
-                &super::snapshot::SnapshotTuning::default(),
-            )
-            .await
-            .expect("sync");
-            refused_with("missing object", &report, "not fully reachable and durable");
+            let r2 = Arc::new(InMemory::new());
+            let error = sync_with_tuning(&mock, &r2, &Default::default())
+                .await
+                .expect_err("cannot back up a missing traces tip");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("reachable object {id} is missing"))
+            );
+            assert_eq!(r2_object_count(&r2).await, 0);
             assert_no_remote_catalog("missing object", &mock).await;
         }
     }

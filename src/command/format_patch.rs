@@ -8,7 +8,7 @@
 //! email-based patch review and is compatible with `git am`.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use git_internal::{
     hash::{HashKind, ObjectHash},
-    internal::object::commit::Commit,
+    internal::object::{ObjectTrait, commit::Commit},
 };
 use serde::Serialize;
 
@@ -105,8 +105,8 @@ pub struct FormatPatchArgs {
         not(doc),
         doc = " from that commit are included (equivalent to <commit>..HEAD)."
     )]
-    #[arg(value_name = "revision-range")]
-    pub revision_range: Option<String>,
+    #[arg(value_name = "revision-range", num_args = 0..)]
+    pub revisions: Vec<String>,
 
     /// Generate only the named commit, or HEAD when no revision is given.
     #[arg(short = '1')]
@@ -175,15 +175,38 @@ pub struct FormatPatchArgs {
 
     /// Generate a cover-letter template before the actual patches (named
     /// `0000-cover-letter<suffix>`, or `0` under `--numbered-files`).
-    #[arg(long = "cover-letter")]
+    #[arg(long = "cover-letter", overrides_with = "no_cover_letter")]
     pub cover_letter: bool,
 
-    /// Add In-Reply-To and References headers so mailers thread the series
-    /// (default on).
-    #[arg(long = "thread", default_value_t = true)]
-    pub thread: bool,
+    /// Do not generate a cover letter (overrides `format.coverLetter` and the
+    /// implicit cover letter requested by `--commit-list-format`).
+    #[arg(long = "no-cover-letter", overrides_with = "cover_letter")]
+    pub no_cover_letter: bool,
 
-    /// Disable threading headers.
+    /// Cover-letter description mode: default, none, message, subject, or auto.
+    #[arg(long = "cover-from-description", value_name = "MODE")]
+    pub cover_from_description: Option<String>,
+
+    /// Show the difference between REV's tree and the last patch's tree in the
+    /// cover letter (`--interdiff`).
+    #[arg(long = "interdiff", value_name = "REV")]
+    pub interdiff: Option<String>,
+
+    /// Thread the series: bare `--thread` (or `--thread=shallow`) makes every
+    /// patch a reply to the cover letter/first patch; `--thread=deep` chains
+    /// each patch as a reply to its predecessor.
+    #[arg(
+        long = "thread",
+        value_name = "STYLE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "shallow",
+        overrides_with = "no_thread"
+    )]
+    pub thread: Option<String>,
+
+    /// Disable generated threading headers (an explicit `--in-reply-to` still
+    /// adds the external parent to every mail).
     #[arg(long = "no-thread", overrides_with = "thread")]
     pub no_thread: bool,
 
@@ -213,8 +236,19 @@ pub struct FormatPatchArgs {
     /// value, the committer's configured identity is used. When the identity
     /// differs from the commit author, the original author is preserved as an
     /// in-body `From:` line so `git am` can restore it.
-    #[arg(long = "from", value_name = "IDENT", num_args = 0..=1, require_equals = true)]
+    #[arg(
+        long = "from",
+        value_name = "IDENT",
+        num_args = 0..=1,
+        require_equals = true,
+        overrides_with = "no_from"
+    )]
     pub from: Option<Option<String>>,
+
+    /// Do not rewrite the `From:` header (overrides `format.from`; last of
+    /// `--from`/`--no-from` wins).
+    #[arg(long = "no-from", overrides_with = "from")]
+    pub no_from: bool,
 
     /// Mark the patch series as version N (changes `[PATCH]` to `[PATCH vN]`).
     #[arg(
@@ -223,7 +257,7 @@ pub struct FormatPatchArgs {
         value_name = "N",
         help = "Mark the patch series as version N (changes \"[PATCH]\" to \"[PATCH vN]\")"
     )]
-    pub reroll_count: Option<usize>,
+    pub reroll_count: Option<String>,
 
     /// Append a Signed-off-by trailer to each commit message.
     #[arg(short = 's', long = "signoff")]
@@ -246,18 +280,53 @@ pub struct FormatPatchArgs {
     #[arg(long = "base", value_name = "COMMIT")]
     pub base: Option<String>,
 
+    /// Internal: `format.useAutoBase=whenAble` (not a CLI flag). Auto-base
+    /// failures are silently ignored instead of aborting.
+    #[arg(skip)]
+    pub base_when_able: bool,
+
     /// Create multipart/mixed messages with the commit log in the body and the
     /// patch itself as a separate `attachment` part.
-    #[arg(long = "attach", conflicts_with = "inline")]
-    pub attach: bool,
+    #[arg(
+        long = "attach",
+        value_name = "BOUNDARY",
+        num_args = 0..=1,
+        require_equals = true,
+        conflicts_with = "inline"
+    )]
+    pub attach: Option<Option<String>>,
+
+    /// Do not create a multipart message, overriding `format.attach` and
+    /// `--attach`/`--inline`.
+    #[arg(long = "no-attach", overrides_with_all = ["attach", "inline"])]
+    pub no_attach: bool,
 
     /// Like `--attach`, but the patch part uses `Content-Disposition: inline`.
-    #[arg(long = "inline")]
-    pub inline: bool,
+    #[arg(
+        long = "inline",
+        value_name = "BOUNDARY",
+        num_args = 0..=1,
+        require_equals = true
+    )]
+    pub inline: Option<Option<String>>,
 
     /// Show full object IDs in diff index header lines.
     #[arg(long = "full-index")]
     pub full_index: bool,
+
+    /// Generate hunks with N lines of context (Git's `-U<n>` / `--unified=<n>`).
+    #[arg(short = 'U', long = "unified", value_name = "N")]
+    pub unified: Option<usize>,
+
+    /// Show the full diff of each commit (accepted; without a pathspec Git's
+    /// output is unchanged, and Libra accepts no `-- <path>` pathspec here).
+    #[arg(long = "full-diff")]
+    pub full_diff: bool,
+
+    /// Only include changed paths matching this diff-filter (Git's
+    /// `--diff-filter=<letters>`, e.g. `A` for added paths).
+    #[arg(long = "diff-filter", value_name = "FILTER")]
+    pub diff_filter: Option<String>,
 
     /// Spend extra time finding the smallest Myers diff. Libra's default Myers
     /// backend already guarantees a shortest edit script, so this is output-
@@ -304,11 +373,21 @@ pub struct FormatPatchArgs {
     #[arg(long = "dst-prefix", value_name = "PREFIX")]
     pub dst_prefix: Option<String>,
 
-    /// Git's `--relative[=<path>]` is not implemented for `format-patch`;
-    /// accepted so the refusal names the missing feature instead of looking
-    /// like a typo.
-    #[arg(long = "relative", value_name = "PATH", num_args = 0..=1, require_equals = true, hide = true)]
+    /// Restrict the patch to a directory and show paths relative to it. With a
+    /// value, `<path>` is resolved from the repository root (not the current
+    /// directory); bare `--relative` uses the current directory.
+    #[arg(
+        long = "relative",
+        value_name = "PATH",
+        num_args = 0..=1,
+        require_equals = true,
+        overrides_with = "no_relative"
+    )]
     pub relative: Option<Option<String>>,
+
+    /// Keep repository-relative paths even when `diff.relative` is set.
+    #[arg(long = "no-relative", overrides_with = "relative")]
+    pub no_relative: bool,
 
     /// Git's revision-set `--all` selector is not implemented here; accepted
     /// so the refusal names the missing feature.
@@ -400,6 +479,12 @@ enum FormatPatchError {
     #[error("identity unknown: {0}")]
     IdentityMissing(String),
 
+    #[error("invalid ident line: {0}")]
+    InvalidFromIdent(String),
+
+    #[error("invalid cover from description mode '{0}'")]
+    InvalidCoverMode(String),
+
     #[error("failed to write patch file '{}': {detail}", .path.display())]
     OutputWrite { path: PathBuf, detail: String },
 
@@ -423,6 +508,11 @@ impl From<FormatPatchError> for CliError {
             FormatPatchError::NotInRepo => CliError::repo_not_found(),
             FormatPatchError::InvalidTarget(_) => CliError::failure(err.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget),
+            FormatPatchError::InvalidFromIdent(_) => CliError::failure(err.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+            FormatPatchError::InvalidCoverMode(_) => {
+                CliError::fatal(err.to_string()).with_stable_code(StableErrorCode::CliInvalidTarget)
+            }
             FormatPatchError::IdentityMissing(_) => CliError::fatal(err.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint(
@@ -457,6 +547,15 @@ pub async fn execute(args: FormatPatchArgs) {
 
 /// Reject CLI-only conflicts before repository preflight can write repair state.
 pub(crate) fn validate_cli_args(args: &FormatPatchArgs) -> CliResult<()> {
+    if let Some(mode) = args.cover_from_description.as_deref()
+        && !matches!(mode, "default" | "none" | "message" | "subject" | "auto")
+    {
+        return Err(
+            CliError::failure(format!("invalid cover from description mode '{mode}'"))
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+
     // Check CLI-only conflicts before config fills subject_prefix. A configured
     // prefix is harmless under -k; an explicit (even empty) CLI prefix is not.
     if args.keep_subject {
@@ -500,6 +599,21 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     }
 
     validate_cli_args(&args)?;
+    // CLI `--cover-letter`/`--no-cover-letter` override both the config and the
+    // implicit cover letter requested by `--commit-list-format`.
+    let cover_cli = args.cover_letter;
+    let no_cover_cli = args.no_cover_letter;
+    let commit_list_cli = args.commit_list_format.is_some();
+    // Git validates `--from=<ident>` before revision parsing and the empty-series
+    // check, so a malformed identity wins over an empty range.
+    if let Some(Some(ident)) = args.from.as_ref()
+        && !ident.trim().is_empty()
+        && parse_from_ident(ident).is_err()
+    {
+        return Err(CliError::from(FormatPatchError::InvalidFromIdent(
+            ident.clone(),
+        )));
+    }
     // A malformed `-M` threshold is a usage error before any patch is written.
     if let Some(raw) = args.find_renames.as_deref()
         && crate::command::diff::options::parse_rename_score(raw).is_err()
@@ -510,7 +624,17 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
         );
     }
 
+    let from_from_cli = args.from.is_some() || args.no_from;
     resolve_format_config(&mut args).await?;
+    if !from_from_cli
+        && let Some(Some(ident)) = args.from.as_ref()
+        && !ident.trim().is_empty()
+        && parse_from_ident(ident).is_err()
+    {
+        return Err(CliError::from(FormatPatchError::InvalidFromIdent(
+            ident.clone(),
+        )));
+    }
 
     // `--signature-file` reads the footer text from a file; resolve it into the
     // same slot `--signature` uses (the two are mutually exclusive). Trailing
@@ -528,12 +652,26 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
 
     // 2. Resolve revision range
     let commits = resolve_range_commits(&args).await?;
-    if args.relative.is_some() {
-        return Err(CliError::failure(
-            "format-patch --relative is not supported: Libra has no per-command relative-path filter for exported patches",
-        )
-        .with_stable_code(StableErrorCode::Unsupported)
-        .with_hint("export the series for the whole repository, or run the command from the repository root"));
+    if !cover_cli
+        && !no_cover_cli
+        && let Some(value) = read_format_config("format.coverLetter").await?
+    {
+        let trimmed = value.trim();
+        args.cover_letter = if trimmed.eq_ignore_ascii_case("auto") {
+            commits.len() > 1
+        } else {
+            crate::internal::config::parse_git_config_bool(trimmed).ok_or(
+                FormatPatchError::InvalidConfig {
+                    key: "format.coverLetter",
+                    value,
+                    expected: "true, false, or auto",
+                },
+            )?
+        };
+    }
+    if !no_cover_cli && (commit_list_cli || (args.interdiff.is_some() && commits.len() > 1)) {
+        // `--commit-list-format` implies a cover letter (Git's `#909`).
+        args.cover_letter = true;
     }
     if args.all_refs {
         return Err(CliError::failure(
@@ -565,7 +703,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     let base_block = build_base_block(&args, &commits).await?;
 
     // 3. Build thread Message-ID (used for --thread / --in-reply-to)
-    let thread_id = build_thread_id(&args, &commits);
+    let thread_id = build_thread_id(&args, &commits)?;
 
     // Resolve the `--from` identity once (shared across all patches).
     let from_identity = resolve_from_identity(&args).await?;
@@ -576,14 +714,41 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
 
     // 5. Render the complete series before creating any patch file. A later
     // object/config error therefore cannot leave a partially generated series.
+    let interdiff = if let Some(spec) = args.interdiff.as_deref() {
+        let last = commits
+            .last()
+            .ok_or_else(|| CliError::fatal("no commits to interdiff"))?;
+        Some(interdiff_block(&args, spec, &last.id).await?)
+    } else {
+        None
+    };
     let mut rendered = Vec::with_capacity(total + usize::from(args.cover_letter));
     if args.cover_letter {
+        let series_stat = cover_letter_series_stat(&args, &commits).await?;
+        let description = cover_letter_description(&args).await?;
+        let description_mode = args.cover_from_description.as_deref().unwrap_or("default");
+        // Git's cover letter defaults `From:` to the execution-time committer
+        // identity when no `--from`/`format.from` overrides it; patches keep
+        // their author.
+        let cover_committer = if from_identity.is_none() {
+            let (_, identity) = crate::command::commit::create_committer_signature()
+                .await
+                .map_err(|error| FormatPatchError::IdentityMissing(error.to_string()))?;
+            Some((identity.name, identity.email))
+        } else {
+            None
+        };
+        let cover_from = from_identity.as_ref().or(cover_committer.as_ref());
         let cover_body = format_cover_letter(
             &args,
             &commits,
             &thread_id,
-            from_identity.as_ref(),
+            cover_from,
             base_block.as_deref(),
+            series_stat.as_deref(),
+            interdiff.as_deref(),
+            description_mode,
+            description.as_deref(),
         )?;
         rendered.push(RenderedPatch {
             number: 0,
@@ -598,7 +763,9 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     for (idx, commit) in commits.iter().enumerate() {
         let patch_num = start_num + idx;
         // Without a cover letter, the base trailer rides on the last patch.
-        let patch_base_block = if !args.cover_letter && idx == total - 1 {
+        // Git's `print_bases` emits the base block once, on the first mail
+        // (the first patch when there is no cover letter).
+        let patch_base_block = if !args.cover_letter && idx == 0 {
             base_block.as_deref()
         } else {
             None
@@ -612,6 +779,11 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             &thread_id,
             from_identity.as_ref(),
             patch_base_block,
+            if !args.cover_letter && total == 1 {
+                interdiff.as_deref()
+            } else {
+                None
+            },
         )
         .await?;
         let slug = patch_slug(commit, &args);
@@ -638,8 +810,19 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             &patch.slug,
             &patch.body,
         )?;
-        if !output.quiet {
-            eprintln!("{}", path.display());
+        if !output.quiet && !output.is_json() && !args.stdout {
+            // Git prints generated paths to stdout; without an explicit output
+            // directory only the bare file name is printed.
+            let shown = if args.output_directory.is_some() {
+                path.display().to_string()
+            } else {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            };
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{shown}")
+                .map_err(|error| stdout_write_error("write generated path", error))?;
         }
         records.push(PatchRecord {
             number: patch.number,
@@ -692,84 +875,174 @@ struct RenderedPatch {
 /// from the included side (`B`); commits equal to or reachable from `A` are
 /// stripped.
 async fn resolve_range_commits(args: &FormatPatchArgs) -> Result<Vec<Commit>, CliError> {
-    let spec = args.revision_range.as_deref().unwrap_or("HEAD");
-
-    // Parse A..B notation
-    let (exclude_tip_opt, include_tip) = if let Some((left, right)) = spec.split_once("..") {
-        // Both empty sides default to HEAD (Git-compatible: ..HEAD equals
-        // HEAD..HEAD producing zero patches).
-        let left_spec = if left.is_empty() { "HEAD" } else { left };
-        let right_spec = if right.is_empty() { "HEAD" } else { right };
-        (
-            Some(resolve_single_rev(left_spec).await?),
-            resolve_single_rev(right_spec).await?,
-        )
-    } else if args.root || args.last_one || args.last_n.is_some() {
-        // `--root [REV]` walks from REV through the root. `-1 [REV]` names the
-        // one commit to emit rather than retaining the usual `<REV>..HEAD`
-        // single-revision interpretation.
-        (None, resolve_single_rev(spec).await?)
+    let mut specs: Vec<String> = if args.revisions.is_empty() {
+        vec!["HEAD".to_string()]
     } else {
-        // Single revision: range is <spec>..HEAD
-        let head = resolve_current_head().await?;
-        (Some(resolve_single_rev(spec).await?), head)
+        args.revisions.clone()
     };
+    let mut includes: Vec<String> = Vec::new();
+    let mut excludes: Vec<String> = Vec::new();
+    let mut range_mode = false;
+    for spec in specs.drain(..) {
+        if let Some(rest) = spec.strip_prefix('^') {
+            excludes.push(if rest.is_empty() {
+                "HEAD".to_string()
+            } else {
+                rest.to_string()
+            });
+            range_mode = true;
+        } else if let Some((left, right)) = spec.split_once("..") {
+            includes.push(if right.is_empty() {
+                "HEAD".to_string()
+            } else {
+                right.to_string()
+            });
+            excludes.push(if left.is_empty() {
+                "HEAD".to_string()
+            } else {
+                left.to_string()
+            });
+            range_mode = true;
+        } else {
+            includes.push(spec);
+        }
+    }
 
-    // Collect the set of excluded OIDs (the exclude tip and all its ancestors)
-    let (excluded, upstream_commits): (HashSet<ObjectHash>, Vec<Commit>) =
-        if let Some(exclude_tip) = exclude_tip_opt {
-            let ancestors = log::get_reachable_commits(exclude_tip.to_string(), None)
+    // Preserve the classic single-revision semantics (`<rev>..HEAD`) unless a
+    // range, caret exclusion, root walk, or `-<n>` changes the selector.
+    if !range_mode && includes.len() == 1 && !args.root && !args.last_one && args.last_n.is_none() {
+        let spec = &includes[0];
+        excludes.push(spec.clone());
+        includes[0] = "HEAD".to_string();
+    }
+
+    // `--root`/`-<n>` with a single revision keep the classic newest-first
+    // walk and truncation order; only range/multi-revision selectors need the
+    // union + timestamp sort below.
+    if !range_mode && includes.len() == 1 && (args.root || args.last_one || args.last_n.is_some()) {
+        let spec = &includes[0];
+        let tip = resolve_single_rev(spec).await?;
+        let mut commits: Vec<Commit> = log::get_reachable_commits(tip.to_string(), None)
+            .await
+            .map_err(|error| {
+                FormatPatchError::InvalidTarget(format!(
+                    "failed to walk commits from '{spec}': {error}"
+                ))
+            })?
+            .into_iter()
+            .filter(|commit| commit.parent_commit_ids.len() <= 1)
+            .collect();
+        if args.last_one {
+            commits.truncate(1);
+        } else if let Some(limit) = args.last_n {
+            commits.truncate(limit);
+        }
+        commits.reverse();
+        return Ok(commits);
+    }
+
+    let excluded: HashSet<ObjectHash> = {
+        let mut set = HashSet::new();
+        for spec in &excludes {
+            let tip = resolve_single_rev(spec).await?;
+            set.insert(tip);
+            let ancestors = log::get_reachable_commits(tip.to_string(), None)
                 .await
                 .map_err(|error| {
                     FormatPatchError::InvalidTarget(format!(
                         "failed to walk excluded commits from '{spec}': {error}"
                     ))
                 })?;
-            let mut s = HashSet::new();
-            s.insert(exclude_tip);
-            for commit in &ancestors {
-                s.insert(commit.id);
+            set.extend(ancestors.into_iter().map(|commit| commit.id));
+        }
+        set
+    };
+
+    let mut by_id: HashMap<ObjectHash, Commit> = HashMap::new();
+    for spec in &includes {
+        let tip = resolve_single_rev(spec).await?;
+        let reachable = log::get_reachable_commits(tip.to_string(), None)
+            .await
+            .map_err(|error| {
+                FormatPatchError::InvalidTarget(format!(
+                    "failed to walk commits from '{spec}': {error}"
+                ))
+            })?;
+        for commit in reachable {
+            if excluded.contains(&commit.id) || commit.parent_commit_ids.len() > 1 {
+                continue;
             }
-            (s, ancestors)
-        } else {
-            (HashSet::new(), Vec::new())
+            by_id.entry(commit.id).or_insert(commit);
+        }
+    }
+    let mut commits: Vec<Commit> = by_id.into_values().collect();
+    // Emit parents before children, breaking ties by commit timestamp (Git's
+    // revision walk order for the linear fixtures). A plain timestamp sort is
+    // non-deterministic when commits share a timestamp and can reverse a
+    // two-commit range.
+    let mut remaining: Vec<Commit> = std::mem::take(&mut commits);
+    let mut remaining_ids: HashSet<ObjectHash> = remaining.iter().map(|commit| commit.id).collect();
+    while !remaining.is_empty() {
+        let mut best: Option<usize> = None;
+        for (index, commit) in remaining.iter().enumerate() {
+            if commit
+                .parent_commit_ids
+                .iter()
+                .any(|parent| remaining_ids.contains(parent))
+            {
+                continue;
+            }
+            best = match best {
+                None => Some(index),
+                Some(current) => {
+                    let candidate = &remaining[index];
+                    let incumbent = &remaining[current];
+                    let candidate_key = (candidate.committer.timestamp, candidate.id.to_string());
+                    let incumbent_key = (incumbent.committer.timestamp, incumbent.id.to_string());
+                    if candidate_key < incumbent_key {
+                        Some(index)
+                    } else {
+                        Some(current)
+                    }
+                }
+            };
+        }
+        let Some(index) = best else {
+            // Defensive: a cycle cannot occur in commit ancestry, but keep a
+            // deterministic fallback instead of looping forever.
+            break;
         };
-
-    // Walk from the included tip.  get_reachable_commits performs a BFS
-    // traversal, returning commits in newest-first order (tip, then
-    // parents, then grandparents, …).
-    let all_reachable = log::get_reachable_commits(include_tip.to_string(), None)
-        .await
-        .map_err(|e| {
-            FormatPatchError::InvalidTarget(format!("failed to walk commits from '{spec}': {e}"))
-        })?;
-
-    // Filter, deduplicate, then reverse so patches are numbered oldest-first.
-    let mut commits: Vec<Commit> = all_reachable
-        .into_iter()
-        .filter(|c| !excluded.contains(&c.id))
-        .filter(|c| c.parent_commit_ids.len() <= 1) // skip merge commits
-        .collect();
-
-    // Deduplicate (reachable set may already include the tip).
-    let mut seen = HashSet::new();
-    commits.retain(|c| seen.insert(c.id));
-
-    // `-1` / `-<n>` limit the newest-first walk before output ordering is
-    // reversed (`-<n>` is Git's "last n commits" shorthand).
+        let commit = remaining.remove(index);
+        remaining_ids.remove(&commit.id);
+        commits.push(commit);
+    }
+    commits.extend(remaining);
     if args.last_one {
-        commits.truncate(1);
-    } else if let Some(limit) = args.last_n {
-        commits.truncate(limit);
+        let keep = commits.len().saturating_sub(1);
+        commits = commits.split_off(keep);
+    } else if let Some(limit) = args.last_n
+        && commits.len() > limit
+    {
+        commits = commits.split_off(commits.len() - limit);
     }
 
-    if args.ignore_if_in_upstream && !upstream_commits.is_empty() {
+    if args.ignore_if_in_upstream && !excludes.is_empty() {
         let mut upstream_patch_ids = HashSet::new();
-        for commit in upstream_commits
-            .iter()
-            .filter(|commit| commit.parent_commit_ids.len() <= 1)
-        {
-            upstream_patch_ids.insert(git_patch_id_for_commit(commit).await?);
+        for spec in &excludes {
+            let tip = resolve_single_rev(spec).await?;
+            let reachable = log::get_reachable_commits(tip.to_string(), None)
+                .await
+                .map_err(|error| {
+                    FormatPatchError::InvalidTarget(format!(
+                        "failed to walk upstream commits from '{spec}': {error}"
+                    ))
+                })?;
+            for commit in reachable
+                .iter()
+                .filter(|commit| commit.parent_commit_ids.len() <= 1)
+            {
+                upstream_patch_ids.insert(git_patch_id_for_commit(commit).await?);
+            }
         }
         let mut retained = Vec::with_capacity(commits.len());
         for commit in commits {
@@ -780,9 +1053,6 @@ async fn resolve_range_commits(args: &FormatPatchArgs) -> Result<Vec<Commit>, Cl
         commits = retained;
     }
 
-    // BFS returns newest-first; reverse gives oldest-first for linear history.
-    commits.reverse();
-
     Ok(commits)
 }
 
@@ -790,17 +1060,6 @@ async fn resolve_range_commits(args: &FormatPatchArgs) -> Result<Vec<Commit>, Cl
 async fn resolve_single_rev(spec: &str) -> Result<ObjectHash, CliError> {
     util::get_commit_base_typed(spec).await.map_err(|e| {
         FormatPatchError::InvalidTarget(format!("cannot resolve '{spec}': {e}")).into()
-    })
-}
-
-/// Return the OID of `HEAD`.
-async fn resolve_current_head() -> Result<ObjectHash, CliError> {
-    use crate::internal::head::Head;
-    Head::current_commit().await.ok_or_else(|| {
-        FormatPatchError::InvalidTarget(
-            "HEAD does not point to a commit (unborn branch?)".to_string(),
-        )
-        .into()
     })
 }
 
@@ -819,11 +1078,13 @@ async fn format_patch_body(
     threading: &Option<Threading>,
     from_identity: Option<&(String, String)>,
     base_block: Option<&str>,
+    single_interdiff: Option<&str>,
 ) -> Result<String, CliError> {
     let mut out = String::new();
 
     // ---- "From " mbox envelope ----
-    let ts = timestamp_from_commit(commit);
+    // Git's fixed mbox separator timestamp (`builtin/log.c`).
+    const MBOX_FIXED_DATE: &str = "Mon Sep 17 00:00:00 2001";
     // `--zero-commit` zeroes only this envelope hash (matching its hex length),
     // leaving the rest of the patch untouched, like `git format-patch`.
     let envelope_hash = if args.zero_commit {
@@ -831,11 +1092,17 @@ async fn format_patch_body(
     } else {
         commit.id.to_string()
     };
-    out.push_str(&format!(
-        "From {} {}\n",
-        envelope_hash,
-        ts.format("%a %b %e %H:%M:%S %Y")
-    ));
+    out.push_str(&format!("From {} {MBOX_FIXED_DATE}\n", envelope_hash));
+
+    // ---- Threading headers (Git emits them before `From:`) ----
+    push_threading_headers(
+        &mut out,
+        threading,
+        patch_num,
+        start_num,
+        total,
+        args.cover_letter,
+    );
 
     // ---- From: ----
     // The header shows the `--from` identity when given (else the commit
@@ -857,7 +1124,7 @@ async fn format_patch_body(
     out.push_str(&format!("From: {header_name_enc} <{header_email}>\n"));
 
     // ---- Date: (RFC 2822) ----
-    out.push_str(&format!("Date: {}\n", ts.to_rfc2822()));
+    out.push_str(&format!("Date: {}\n", patch_date_header(commit)));
 
     // ---- Subject: ----
     let (raw_msg, _sig) = parse_commit_msg(&commit.message);
@@ -867,6 +1134,7 @@ async fn format_patch_body(
 
     let version = args
         .reroll_count
+        .as_deref()
         .map(|v| format!(" v{v}"))
         .unwrap_or_default();
     // `--rfc[=<text>]` prepends the RFC marker to the subject prefix
@@ -883,7 +1151,9 @@ async fn format_patch_body(
     );
 
     let numbering_enabled = !args.no_numbered;
-    let num_str = if numbering_enabled && (args.numbered || args.cover_letter) {
+    // Git's `format.numbered=auto`: number multi-patch series and any series
+    // with a cover letter, but a lone patch stays `[PATCH]`.
+    let num_str = if numbering_enabled && (args.numbered || args.cover_letter || total > 1) {
         let displayed_total = total + start_num - 1;
         let width = subject_counter_width(displayed_total);
         format!(" {:0width$}/{displayed_total}", patch_num)
@@ -899,27 +1169,24 @@ async fn format_patch_body(
         out.push_str(&format!("Subject: [{prefix}{num_str}] {subject}\n"));
     }
 
-    // ---- Threading headers ----
-    push_threading_headers(
-        &mut out,
-        threading,
-        patch_num,
-        start_num,
-        total,
-        args.cover_letter,
-    );
-
     // `--attach`/`--inline` wrap the patch in a MIME multipart: the log message
     // + diffstat go in a `text/plain` part, the diff in a `text/x-patch` part.
-    let attach_disposition = if args.attach {
+    let attach_disposition = if args.attach.is_some() {
         Some("attachment")
-    } else if args.inline {
+    } else if args.inline.is_some() {
         Some("inline")
     } else {
         None
     };
-    // Boundary mirrors Git's: twelve dashes + the tool version string.
-    let boundary = format!("------------libra {}", env!("CARGO_PKG_VERSION"));
+    // A custom `--attach=<boundary>`/`--inline=<boundary>` becomes
+    // `------------<value>`; the default still mirrors the tool version.
+    let boundary = args
+        .attach
+        .as_ref()
+        .and_then(|value| value.as_deref())
+        .or(args.inline.as_ref().and_then(|value| value.as_deref()))
+        .map(|value| format!("------------{value}"))
+        .unwrap_or_else(|| format!("------------libra {}", env!("CARGO_PKG_VERSION")));
 
     // ---- MIME headers ----
     // Git puts only the `Content-Type` at the multipart envelope level; the
@@ -963,22 +1230,33 @@ async fn format_patch_body(
         let (name, email) = resolve_signoff_identity().await?;
         message_section.push_str(&format!("Signed-off-by: {name} <{email}>\n"));
     }
-    message_section.push_str("---\n");
-    if let Some(block) = render_notes_block(&args.notes, &commit.id.to_string()).await? {
-        message_section.push_str(&block);
-    }
+    let notes_block = render_notes_block(&args.notes, &commit.id.to_string()).await?;
     // The body and diffstat come from the shared `libra diff` engine so rename
     // detection (and `diff.renames`) applies by default (ADR-FP-03).
     let (stat_text, numstat_text, diff) = diff_engine_patch_parts(commit, args).await?;
-    if args.numstat && !numstat_text.is_empty() {
+    let has_numstat = args.numstat && !numstat_text.is_empty();
+    let has_stat = !args.no_stat && !stat_text.is_empty();
+    let has_diff = !diff.is_empty();
+    // Git emits the `---` separator only when there is something after it; an
+    // empty view (`--relative` with no matching files) ends after the message.
+    if notes_block.is_some() || (!has_numstat && (has_stat || has_diff)) {
+        message_section.push_str("---\n");
+        if let Some(block) = notes_block {
+            message_section.push_str(&block);
+        }
+    }
+    if has_numstat {
         // `--numstat` replaces the stat block, drops the `---` separator, and is
         // not suppressed by `-p`/`--no-stat` (its own flag is the only switch).
-        message_section = message_section.trim_end_matches("---\n").to_string();
         message_section.push_str(&numstat_text);
         message_section.push('\n');
-    } else if !args.no_stat && !stat_text.is_empty() {
+    } else if has_stat {
         message_section.push_str(&stat_text);
         message_section.push('\n');
+        // Git separates the diffstat from the unified diff with a blank line.
+        if has_diff {
+            message_section.push('\n');
+        }
     }
 
     if let Some(disposition) = attach_disposition {
@@ -992,6 +1270,7 @@ async fn format_patch_body(
             suffix: suffix(args),
             numbered_files: args.numbered_files,
             max_length: args.filename_max_length,
+            reroll: args.reroll_count.clone(),
         });
         out.push_str("This is a multi-part message in MIME format.\n");
         out.push_str(&format!("--{boundary}\n"));
@@ -1027,7 +1306,28 @@ async fn format_patch_body(
             out.push('\n');
             out.push_str(block);
         }
+        if let Some(block) = single_interdiff {
+            out.push('\n');
+            let mut lines = block.lines();
+            if let Some(title) = lines.next() {
+                out.push_str(title);
+                out.push('\n');
+            }
+            for line in lines {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
         push_signature(&mut out, args);
+        // Git ends a patch message with exactly one newline; the diff engine's
+        // trailing blank line is not part of the mailable patch.
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
     }
 
     Ok(out)
@@ -1243,6 +1543,133 @@ async fn git_patch_id_for_commit(commit: &Commit) -> Result<String, CliError> {
 /// between the base and the parent of the first patch, oldest-first — each
 /// rendered as its Git patch-id. Returns a usage/fatal error for a non-ancestor
 /// base or the unsupported `auto` form, matching Git's diagnostics.
+/// Resolve `--base=auto`: the unique merge base between the current branch's
+/// upstream and every positive revision. Each revision's own merge base with
+/// the upstream is reduced so that criss-cross/ambiguous lists fail instead of
+/// silently picking a less specific ancestor.
+async fn auto_base_commit(
+    args: &FormatPatchArgs,
+    commits: &[Commit],
+) -> Result<ObjectHash, CliError> {
+    use crate::internal::{branch::Branch, config::ConfigKv, head::Head};
+
+    let branch_name = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => {
+            return Err(CliError::fatal(
+                "failed to get upstream, please specify the base commit with --base=<commit>",
+            )
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::CliInvalidTarget));
+        }
+    };
+    let Some(branch_config) = ConfigKv::branch_config(&branch_name)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to read branch config: {error}")))?
+    else {
+        return Err(CliError::fatal(
+            "failed to get upstream, please specify the base commit with --base=<commit>",
+        )
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::CliInvalidTarget));
+    };
+    let tracking = if branch_config.remote == "." {
+        Branch::find_branch_result(&branch_config.merge, None)
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to resolve upstream: {error}")))?
+    } else {
+        let full = format!(
+            "refs/remotes/{}/{}",
+            branch_config.remote, branch_config.merge
+        );
+        Branch::find_branch_result(&full, Some(&branch_config.remote))
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to resolve upstream: {error}")))?
+    };
+    let Some(tracking) = tracking else {
+        return Err(CliError::fatal(
+            "failed to get upstream, please specify the base commit with --base=<commit>",
+        )
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::CliInvalidTarget));
+    };
+    let upstream = tracking.commit;
+
+    let mut tips = Vec::new();
+    for spec in &args.revisions {
+        if let Some(rest) = spec.strip_prefix('^') {
+            let _ = rest;
+            continue;
+        }
+        let positive = spec
+            .split_once("..")
+            .map_or(spec.as_str(), |(_, right)| right);
+        let positive = if positive.is_empty() {
+            "HEAD"
+        } else {
+            positive
+        };
+        tips.push(resolve_single_rev(positive).await?);
+    }
+    if tips.is_empty() {
+        tips.push(resolve_single_rev("HEAD").await?);
+    }
+
+    let mut bases = Vec::new();
+    for tip in &tips {
+        let pair = crate::internal::merge_base::merge_bases(&upstream, tip)
+            .map_err(|error| CliError::fatal(format!("failed to find merge base: {error}")))?;
+        if pair.len() != 1 {
+            return Err(CliError::fatal("could not find exact merge base")
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::CliInvalidTarget));
+        }
+        bases.push(pair[0]);
+    }
+    // Keep only the most specific bases: drop any base that is an ancestor of
+    // another candidate. More than one survivor means the list is ambiguous.
+    bases.sort_by_key(|id| id.to_string());
+    bases.dedup();
+    let mut reduced = Vec::new();
+    for candidate in &bases {
+        let mut dominated = false;
+        for other in &bases {
+            if candidate != other
+                && crate::internal::merge_base::is_ancestor(candidate, other).unwrap_or(false)
+            {
+                dominated = true;
+                break;
+            }
+        }
+        if !dominated {
+            reduced.push(*candidate);
+        }
+    }
+    if reduced.len() != 1 {
+        return Err(CliError::fatal("could not find exact merge base")
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::CliInvalidTarget));
+    }
+    let base = reduced[0];
+    for tip in &tips {
+        if !crate::internal::merge_base::is_ancestor(&base, tip)
+            .map_err(|error| CliError::fatal(format!("failed to check merge base: {error}")))?
+        {
+            return Err(
+                CliError::fatal("base commit should be the ancestor of revision list")
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::CliInvalidTarget),
+            );
+        }
+    }
+    if commits.iter().any(|commit| commit.id == base) {
+        return Err(CliError::fatal("base commit shouldn't be in revision list")
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::CliInvalidTarget));
+    }
+    Ok(base)
+}
+
 async fn build_base_block(
     args: &FormatPatchArgs,
     commits: &[Commit],
@@ -1254,17 +1681,15 @@ async fn build_base_block(
         return Ok(None);
     };
 
-    // `--base=auto` infers the base from the upstream of the range; that requires
-    // upstream tracking Libra does not resolve here, so it is rejected (matching
-    // Git, which also fails when it cannot determine the upstream).
-    if base_spec == "auto" {
-        return Err(CliError::command_usage(
-            "--base=auto is not supported; specify the base commit explicitly with \
-             --base=<commit>",
-        ));
-    }
-
-    let base = resolve_single_rev(base_spec).await?;
+    let base = if base_spec == "auto" {
+        match auto_base_commit(args, commits).await {
+            Ok(base) => base,
+            Err(_) if args.base_when_able => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    } else {
+        resolve_single_rev(base_spec).await?
+    };
 
     // The series applies on top of the first patch's parent.
     let Some(series_parent) = commits[0].parent_commit_ids.first().copied() else {
@@ -1313,30 +1738,58 @@ async fn build_base_block(
 // Threading helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadMode {
+    /// No generated Message-ID/threading; only an external parent may be added.
+    None,
+    Shallow,
+    Deep,
+}
+
 #[derive(Clone, Debug)]
 struct Threading {
     series_id: String,
     external_reply_to: Option<String>,
+    mode: ThreadMode,
 }
 
 /// Build deterministic message IDs for the series and retain an optional
 /// external parent separately. `--in-reply-to` is never reused as a generated
 /// Message-ID, which avoids duplicate IDs and accidental `<<id>>` headers.
-fn build_thread_id(args: &FormatPatchArgs, commits: &[Commit]) -> Option<Threading> {
-    if !args.thread || args.no_thread {
-        return None;
+fn build_thread_id(
+    args: &FormatPatchArgs,
+    commits: &[Commit],
+) -> Result<Option<Threading>, CliError> {
+    let mode = if args.no_thread {
+        ThreadMode::None
+    } else {
+        match args.thread.as_deref() {
+            None => ThreadMode::None,
+            Some("shallow") => ThreadMode::Shallow,
+            Some("deep") => ThreadMode::Deep,
+            Some(other) => {
+                return Err(CliError::failure(format!(
+                    "invalid --thread value '{other}' (expected shallow or deep)"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+        }
+    };
+    let external_reply_to = args.in_reply_to.as_deref().map(normalize_message_id);
+    if mode == ThreadMode::None && external_reply_to.is_none() {
+        return Ok(None);
     }
-    commits.first().map(|c| {
+    Ok(commits.first().map(|c| {
         let ts = c.committer.timestamp;
         let id = c.id.to_string();
         let short = &id[..8.min(id.len())];
         let series_id = format!("{short}-{ts}@libra");
-        let external_reply_to = args.in_reply_to.as_deref().map(normalize_message_id);
         Threading {
             series_id,
             external_reply_to,
+            mode,
         }
-    })
+    }))
 }
 
 fn normalize_message_id(value: &str) -> String {
@@ -1359,28 +1812,71 @@ fn push_threading_headers(
     let Some(threading) = threading else {
         return;
     };
+    if threading.mode == ThreadMode::None {
+        // `--no-thread` keeps only the external parent, on every mail.
+        if let Some(external) = threading.external_reply_to.as_deref() {
+            out.push_str(&format!("In-Reply-To: <{external}>\n"));
+            out.push_str(&format!("References: <{external}>\n"));
+        }
+        return;
+    }
     let is_first = patch_num == start_num;
-    let message_id = if is_first {
-        threading.series_id.clone()
-    } else {
-        format!("{}-p{patch_num}", threading.series_id)
-    };
+    // Every patch ID carries a fixed-width numeric suffix, and the cover uses
+    // `-cover`, so no generated value is a substring of another (the old bare
+    // series id was a prefix of `-p2`/`-cover`).
+    let message_id = format!("{}-p{patch_num:08}", threading.series_id);
+    let first_id = format!("{}-p{start_num:08}", threading.series_id);
     out.push_str(&format!("Message-ID: <{message_id}>\n"));
 
     let cover_id = format!("{}-cover", threading.series_id);
-    let reply_to = if has_cover_letter {
-        Some(cover_id.as_str())
-    } else if let Some(external) = threading.external_reply_to.as_deref() {
-        Some(external)
-    } else if total > 1 && !is_first {
-        Some(threading.series_id.as_str())
-    } else {
-        None
+    let external = threading.external_reply_to.as_deref();
+    let (reply_to, reference) = match threading.mode {
+        ThreadMode::None => (None, None),
+        ThreadMode::Shallow => {
+            let reply_to = if has_cover_letter {
+                Some(cover_id.clone())
+            } else if let Some(external) = external {
+                Some(external.to_string())
+            } else if total > 1 && !is_first {
+                Some(first_id.clone())
+            } else {
+                None
+            };
+            let reference = external
+                .map(str::to_string)
+                .or(if has_cover_letter {
+                    Some(cover_id.clone())
+                } else {
+                    None
+                })
+                .or_else(|| reply_to.clone());
+            (reply_to, reference)
+        }
+        ThreadMode::Deep => {
+            let reply_to = if patch_num == start_num {
+                if has_cover_letter {
+                    Some(cover_id.clone())
+                } else {
+                    external.map(str::to_string)
+                }
+            } else {
+                Some(format!("{}-p{:08}", threading.series_id, patch_num - 1))
+            };
+            // Git's deep mode chains In-Reply-To but keeps References at the
+            // thread root (external parent, cover, or first patch).
+            let root = external.map(str::to_string).or(if has_cover_letter {
+                Some(cover_id)
+            } else {
+                Some(first_id)
+            });
+            (reply_to, root)
+        }
     };
     if let Some(reply_to) = reply_to {
         out.push_str(&format!("In-Reply-To: <{reply_to}>\n"));
-        let reference = threading.external_reply_to.as_deref().unwrap_or(reply_to);
-        out.push_str(&format!("References: <{reference}>\n"));
+        if let Some(reference) = reference {
+            out.push_str(&format!("References: <{reference}>\n"));
+        }
     }
 }
 
@@ -1388,27 +1884,167 @@ fn push_threading_headers(
 // Cover letter
 // ---------------------------------------------------------------------------
 
+/// Read `branch.<name>.description` for the branch Git would use: the current
+/// branch for an empty selector or a single bare revision (which implies
+/// `<rev>..HEAD`), otherwise the unique positive revision's branch.
+async fn cover_letter_description(args: &FormatPatchArgs) -> Result<Option<String>, CliError> {
+    use crate::internal::{branch::Branch, config::ConfigKv, head::Head};
+
+    let mut positive: Vec<&str> = Vec::new();
+    let mut special = false;
+    for spec in &args.revisions {
+        if let Some(rest) = spec.strip_prefix('^') {
+            let _ = rest;
+            special = true;
+        } else if let Some((_, right)) = spec.split_once("..") {
+            let right = if right.is_empty() { "HEAD" } else { right };
+            positive.push(right);
+            special = true;
+        } else {
+            positive.push(spec);
+        }
+    }
+    let branch_name = if args.revisions.is_empty() || (!special && positive.len() == 1) {
+        match Head::current().await {
+            Head::Branch(name) => Some(name),
+            Head::Detached(_) => None,
+        }
+    } else if positive.len() == 1 {
+        let spec = positive[0];
+        Branch::find_branch_result(spec, None)
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to resolve branch: {error}")))?
+            .map(|_| spec.to_string())
+    } else {
+        None
+    };
+    let Some(branch_name) = branch_name else {
+        return Ok(None);
+    };
+    let key = format!("branch.{branch_name}.description");
+    let Some(config) = ConfigKv::get(&key)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to read {key}: {error}")))?
+    else {
+        return Ok(None);
+    };
+    let value = config.value.trim_end_matches('\n').to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+/// Render `--interdiff`: Git compares `<rev>`'s tree directly with the last
+/// patch's tree, and titles the block after the previous reroll version.
+async fn interdiff_block(
+    args: &FormatPatchArgs,
+    spec: &str,
+    last: &ObjectHash,
+) -> Result<String, CliError> {
+    let rev = resolve_single_rev(spec).await?;
+    let argv: Vec<String> = vec!["diff".to_string(), rev.to_string(), last.to_string()];
+    let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+        .map_err(|error| CliError::command_usage(error.to_string()))?;
+    let output = crate::command::diff::run_diff_for_service(diff_args).await?;
+    let patch = crate::command::diff::render::format_unified_diff(&output);
+    let title = match args
+        .reroll_count
+        .as_deref()
+        .and_then(|version| version.parse::<usize>().ok())
+    {
+        Some(version) if version > 1 => format!("Interdiff against v{}:", version - 1),
+        _ => "Interdiff:".to_string(),
+    };
+    let mut block = format!("{title}\n");
+    if !patch.is_empty() {
+        block.push_str(patch.trim_end_matches('\n'));
+        block.push('\n');
+    }
+    Ok(block)
+}
+
+/// Split a branch description into Git's cover `Subject:` text and remaining
+/// body according to `--cover-from-description`.
+fn cover_text(mode: &str, description: Option<&str>) -> (String, String) {
+    const SUBJECT: &str = "*** SUBJECT HERE ***";
+    const BLURB: &str = "*** BLURB HERE ***";
+    let Some(description) = description.filter(|text| !text.trim().is_empty()) else {
+        return (SUBJECT.to_string(), BLURB.to_string());
+    };
+    let formatted_subject = description
+        .split_once("\n\n")
+        .map_or(description, |(first, _)| first)
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let subject_mode = match mode {
+        "subject" => true,
+        // Git compares the formatted subject's byte length to 100 and uses
+        // `subject` only when it does not exceed the limit.
+        "auto" => formatted_subject.len() <= 100,
+        _ => false,
+    };
+    if subject_mode {
+        let remainder = description
+            .split_once("\n\n")
+            .map(|(_, rest)| rest.trim_start_matches('\n').trim_end().to_string())
+            .unwrap_or_default();
+        (formatted_subject, remainder)
+    } else if mode == "none" {
+        (SUBJECT.to_string(), BLURB.to_string())
+    } else {
+        (SUBJECT.to_string(), description.trim_end().to_string())
+    }
+}
+
 /// Generate a cover-letter template (named `0000-cover-letter<suffix>`, or `0`
 /// under `--numbered-files`).
+#[allow(clippy::too_many_arguments)]
 fn format_cover_letter(
     args: &FormatPatchArgs,
     commits: &[Commit],
     threading: &Option<Threading>,
     from_identity: Option<&(String, String)>,
     base_block: Option<&str>,
+    series_stat: Option<&str>,
+    interdiff: Option<&str>,
+    description_mode: &str,
+    description: Option<&str>,
 ) -> Result<String, CliError> {
     let now = Utc::now();
 
     let mut out = String::new();
 
-    // "From " envelope
-    out.push_str(&format!(
-        "From 0000000000000000000000000000000000000000 {}\n",
-        now.format("%a %b %e %H:%M:%S %Y")
-    ));
+    // "From " envelope: Git uses the series' last commit oid and the fixed
+    // separator timestamp; `--zero-commit` zeroes that hash.
+    const MBOX_FIXED_DATE: &str = "Mon Sep 17 00:00:00 2001";
+    let envelope_hash = commits.last().map_or_else(
+        || "0".repeat(40),
+        |commit| {
+            if args.zero_commit {
+                "0".repeat(commit.id.to_string().len())
+            } else {
+                commit.id.to_string()
+            }
+        },
+    );
+    out.push_str(&format!("From {envelope_hash} {MBOX_FIXED_DATE}\n"));
+
+    // Cover thread headers also follow the envelope, before `From:`.
+    if let Some(threading) = threading {
+        out.push_str(&format!("Message-ID: <{}-cover>\n", threading.series_id));
+        if let Some(parent) = threading.external_reply_to.as_deref() {
+            out.push_str(&format!("In-Reply-To: <{parent}>\n"));
+            out.push_str(&format!("References: <{parent}>\n"));
+        }
+    }
 
     let version = args
         .reroll_count
+        .as_deref()
         .map(|v| format!(" v{v}"))
         .unwrap_or_default();
     let prefix = format!("{}{}", sanitize_header_value(subject_prefix(args)), version);
@@ -1434,25 +2070,28 @@ fn format_cover_letter(
         let width = subject_counter_width(displayed_total);
         format!(" {:0width$}/{displayed_total}", 0)
     };
-    out.push_str(&format!(
-        "Subject: [{prefix}{counter}] *** SUBJECT HERE ***\n"
-    ));
-    if let Some(threading) = threading {
-        out.push_str(&format!("Message-ID: <{}-cover>\n", threading.series_id));
-        if let Some(parent) = threading.external_reply_to.as_deref() {
-            out.push_str(&format!("In-Reply-To: <{parent}>\n"));
-            out.push_str(&format!("References: <{parent}>\n"));
-        }
+    let (subject_text, body_text) = cover_text(description_mode, description);
+    out.push_str(&format!("Subject: [{prefix}{counter}] {subject_text}\n"));
+    // Git's `make_cover_letter` emits MIME headers only when any commit's raw
+    // object buffer (headers + message) contains non-ASCII bytes.
+    if commits.iter().any(|commit| {
+        commit
+            .to_data()
+            .map_or(true, |data| data.iter().any(|byte| !byte.is_ascii()))
+    }) {
+        out.push_str("MIME-Version: 1.0\n");
+        out.push_str("Content-Type: text/plain; charset=UTF-8\n");
+        out.push_str("Content-Transfer-Encoding: 8bit\n");
     }
-    out.push_str("MIME-Version: 1.0\n");
-    out.push_str("Content-Type: text/plain; charset=UTF-8\n");
-    out.push_str("Content-Transfer-Encoding: 8bit\n");
     let (to, cc) = resolve_recipients(args);
     push_recipient_headers(&mut out, &to, &cc);
     out.push('\n');
 
-    out.push_str("*** SUBJECT HERE ***\n\n");
-    out.push_str("*** BLURB HERE ***\n\n");
+    // Git's `prepare_cover_text` writes the subject placeholder only into the
+    // `Subject:` header; the body starts with the branch description when one
+    // is configured, otherwise the blurb placeholder.
+    out.push_str(&body_text);
+    out.push_str("\n\n");
 
     // Commit list. Git's default is a shortlog grouped by author
     // (`Name (N):` + indented subjects); `--commit-list-format=modern` uses
@@ -1465,6 +2104,23 @@ fn format_cover_letter(
     }
     out.push_str(&commit_list);
 
+    // Series diffstat: Git computes it from the unique boundary commit (the
+    // oldest patch's parent) to the last patch, independent of `--no-stat`/`-p`
+    // (those only affect the individual patches).
+    if let Some(stat) = series_stat {
+        out.push_str(stat);
+        out.push('\n');
+        // Git separates the diffstat from a following base trailer or
+        // signature with a blank line.
+        if !args.no_signature || base_block.is_some() || interdiff.is_some() {
+            out.push('\n');
+        }
+    }
+
+    if let Some(interdiff) = interdiff {
+        out.push_str(interdiff);
+    }
+
     // `--base` trailer rides on the cover letter when one is present (the blank
     // line above separates it from the shortlog), before the signature.
     if let Some(block) = base_block {
@@ -1474,6 +2130,46 @@ fn format_cover_letter(
     push_signature(&mut out, args);
 
     Ok(out)
+}
+
+/// Series diffstat for the cover letter: the tree difference from the unique
+/// boundary commit (the oldest patch's parent) to the last patch. Git omits it
+/// when the series starts at a root commit (no boundary) or has no unique one.
+async fn cover_letter_series_stat(
+    args: &FormatPatchArgs,
+    commits: &[Commit],
+) -> Result<Option<String>, CliError> {
+    let Some(first) = commits.first() else {
+        return Ok(None);
+    };
+    let Some(last) = commits.last() else {
+        return Ok(None);
+    };
+    let [origin] = first.parent_commit_ids.as_slice() else {
+        return Ok(None);
+    };
+    if commits.iter().any(|commit| commit.id == *origin) {
+        return Ok(None);
+    }
+    let mut argv: Vec<String> = vec!["diff".to_string(), "--stat".to_string()];
+    // The cover diffstat inherits the patch rename options (t4014 "cover-letter
+    // inherits diff options").
+    if args.no_renames {
+        argv.push("--no-renames".to_string());
+    } else if let Some(score) = &args.find_renames {
+        argv.push(format!("--find-renames={score}"));
+    }
+    argv.push(origin.to_string());
+    argv.push(last.id.to_string());
+    let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+        .map_err(|error| CliError::command_usage(error.to_string()))?;
+    let output = crate::command::diff::run_diff_for_service(diff_args).await?;
+    let stat = crate::command::diff::render::format_diff_stat_output(&output);
+    if stat.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(stat))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1559,16 +2255,23 @@ fn clean_subject(subject: &str, keep: bool) -> String {
 /// Build a safe filename slug from the commit subject.
 /// Render the cover letter's commit list the way Git does.
 ///
-/// * default / `--commit-list-format=short`: shortlog grouped by author, in
+/// * default / `--commit-list-format=short`/`shortlog`: grouped by author, in
 ///   first-appearance order, subjects wrapped at 72 columns with a 4-space
 ///   continuation indent.
 /// * `--commit-list-format=modern`: `[i/N] subject` per commit.
 /// * anything else: a pretty-format string over a small placeholder set.
 fn render_commit_list(args: &FormatPatchArgs, commits: &[Commit]) -> String {
-    let format = args.commit_list_format.as_deref().unwrap_or("short");
+    let raw_format = args.commit_list_format.as_deref().unwrap_or("short");
+    // Git recognizes `log:` first and treats the remainder as a pretty-format
+    // string; `shortlog`/`modern` are keywords, and any other value must look
+    // like a format (contain `%`) or is rejected.
+    let (format, has_log_prefix) = match raw_format.strip_prefix("log:") {
+        Some(rest) => (rest, true),
+        None => (raw_format, false),
+    };
     let mut out = String::new();
     match format {
-        "short" => {
+        "short" | "shortlog" => {
             // Group consecutive first-appearance authors, like `git shortlog`.
             let mut groups: Vec<(String, Vec<&Commit>)> = Vec::new();
             for commit in commits {
@@ -1599,12 +2302,17 @@ fn render_commit_list(args: &FormatPatchArgs, commits: &[Commit]) -> String {
             }
         }
         custom => {
-            for commit in commits {
-                match render_pretty_format_commit(custom, commit) {
+            if !has_log_prefix && !custom.contains('%') {
+                return format!("\u{0}invalid:{raw_format}");
+            }
+            let total = commits.len();
+            let width = total.to_string().len();
+            for (index, commit) in commits.iter().enumerate() {
+                match render_pretty_format_commit(custom, commit, index + 1, total, width) {
                     Some(rendered) => out.push_str(&rendered),
                     // Git reports an unusable format string as a fatal error
                     // (`fatal: '<fmt>' is not a valid format string`).
-                    None => return format!("\u{0}invalid:{custom}"),
+                    None => return format!("\u{0}invalid:{raw_format}"),
                 }
                 out.push('\n');
             }
@@ -1650,7 +2358,13 @@ fn wrap_shortlog_subject(subject: &str) -> String {
 /// Expand a small `git log --format` subset for `--commit-list-format`.
 /// Unsupported conversions yield `None`, which the caller reports as a
 /// Git-style `fatal: ... is not a valid format string` error.
-fn render_pretty_format_commit(format: &str, commit: &Commit) -> Option<String> {
+fn render_pretty_format_commit(
+    format: &str,
+    commit: &Commit,
+    count: usize,
+    total: usize,
+    width: usize,
+) -> Option<String> {
     let mut out = String::new();
     let mut chars = format.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1659,6 +2373,20 @@ fn render_pretty_format_commit(format: &str, commit: &Commit) -> Option<String> 
             continue;
         }
         match chars.next()? {
+            '(' => {
+                let mut atom = String::new();
+                loop {
+                    match chars.next()? {
+                        ')' => break,
+                        c => atom.push(c),
+                    }
+                }
+                match atom.as_str() {
+                    "count" => out.push_str(&format!("{count:0width$}")),
+                    "total" => out.push_str(&total.to_string()),
+                    _ => return None,
+                }
+            }
             'h' => out.push_str(&commit.id.to_string()[..7.min(commit.id.to_string().len())]),
             'H' => out.push_str(&commit.id.to_string()),
             's' => out.push_str(&commit_subject_line(commit)),
@@ -1676,40 +2404,37 @@ fn render_pretty_format_commit(format: &str, commit: &Commit) -> Option<String> 
 }
 
 fn patch_slug(commit: &Commit, _args: &FormatPatchArgs) -> String {
-    let slug = commit_subject_line(commit)
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
+    // Git's `format_sanitized_subject`: preserve case, keep ASCII alphanumerics
+    // plus `.`/`_`, collapse dot runs, turn every other run into one `-`, and
+    // trim trailing dots/dashes.
+    let subject = commit_subject_line(commit);
+    let mut out = String::new();
+    let mut pending_dash = false;
+    let mut last_dot = false;
+    for ch in subject.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
+            if ch == '.' {
+                if last_dot {
+                    continue;
+                }
+                last_dot = true;
             } else {
-                '-'
+                last_dot = false;
             }
-        })
-        .collect::<String>();
-
-    // Collapse consecutive dashes
-    let slug = slug
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-
-    truncate_slug(&slug)
-}
-
-/// Truncate a slug to at most `MAX_CHARS` characters without splitting a
-/// word segment.  Uses [`char`] iteration to stay on UTF-8 boundaries so
-/// non-ASCII subjects never panic on a mid-codepoint slice.
-fn truncate_slug(slug: &str) -> String {
-    const MAX_CHARS: usize = 52;
-    let prefix: String = slug.chars().take(MAX_CHARS).collect();
-    if prefix.len() == slug.len() {
-        return slug.to_string();
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch);
+        } else {
+            pending_dash = true;
+            last_dot = false;
+        }
     }
-    // Walk back from the end of `prefix` to the last `-`.
-    let end = prefix.rfind('-').unwrap_or(prefix.len());
-    prefix[..end].to_string()
+    while out.ends_with('.') || out.ends_with('-') {
+        out.pop();
+    }
+    out
 }
 
 /// Build the output file path for a single patch.
@@ -1726,26 +2451,62 @@ struct FilenameSpec<'a> {
     suffix: &'a str,
     numbered_files: bool,
     max_length: Option<usize>,
+    reroll: Option<String>,
+}
+
+/// Git's reroll filename prefix sanitizer: keep alphanumerics, collapse dot
+/// runs to one dot, collapse every other run to one dash, trim trailing dots /
+/// dashes, then append the stem separator.
+fn sanitize_reroll(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dot = false;
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dot = false;
+            last_dash = false;
+        } else if ch == '.' {
+            if !last_dot {
+                out.push('.');
+            }
+            last_dot = true;
+            last_dash = false;
+        } else {
+            if !last_dash {
+                out.push('-');
+            }
+            last_dash = true;
+            last_dot = false;
+        }
+    }
+    while out.ends_with('-') || out.ends_with('.') {
+        out.pop();
+    }
+    out
 }
 
 fn patch_filename(spec: &FilenameSpec<'_>) -> String {
-    let FilenameSpec {
-        patch_num,
-        total,
-        start_num,
-        slug,
-        suffix,
-        numbered_files,
-        max_length,
-    } = *spec;
+    let patch_num = spec.patch_num;
+    let total = spec.total;
+    let start_num = spec.start_num;
+    let slug = spec.slug;
+    let suffix = spec.suffix;
+    let numbered_files = spec.numbered_files;
+    let max_length = spec.max_length;
+    let version_prefix = spec
+        .reroll
+        .as_deref()
+        .map(|version| format!("v{}-", sanitize_reroll(version)))
+        .unwrap_or_default();
     if numbered_files {
         // `--numbered-files`: bare sequence number, no slug and no suffix
         // (the cover letter, with patch_num 0, becomes "0"), matching Git.
-        return patch_num.to_string();
+        return format!("{version_prefix}{patch_num}");
     }
     if slug.is_empty() {
         // Cover letter (only the cover-letter code path passes an empty slug)
-        format!("0000-cover-letter{suffix}")
+        format!("{version_prefix}0000-cover-letter{suffix}")
     } else {
         let width = number_width(total + start_num - 1);
         let number = format!("{patch_num:0width$}");
@@ -1755,7 +2516,7 @@ fn patch_filename(spec: &FilenameSpec<'_>) -> String {
         // may collapse to just the sequence number.
         let stem = match max_length {
             Some(limit) => {
-                let budget = limit.saturating_sub(suffix.len() + 1);
+                let budget = limit.saturating_sub(suffix.len() + 1 + version_prefix.len());
                 if budget < number.len() {
                     number
                 } else {
@@ -1764,7 +2525,7 @@ fn patch_filename(spec: &FilenameSpec<'_>) -> String {
             }
             None => stem,
         };
-        format!("{stem}{suffix}")
+        format!("{version_prefix}{stem}{suffix}")
     }
 }
 
@@ -1838,9 +2599,14 @@ fn write_patch_file(
         stdout
             .write_all(body.as_bytes())
             .map_err(|error| stdout_write_error("write format-patch output", error))?;
-        stdout
-            .write_all(b"\n")
-            .map_err(|error| stdout_write_error("finish format-patch output", error))?;
+        // Git separates consecutive patches with one blank line but does not
+        // append an extra newline after the final patch.
+        let is_last = total > 0 && patch_num >= start_num + total - 1;
+        if !is_last {
+            stdout
+                .write_all(b"\n")
+                .map_err(|error| stdout_write_error("finish format-patch output", error))?;
+        }
         Ok(PathBuf::from("<stdout>"))
     } else {
         let filename = patch_filename(&FilenameSpec {
@@ -1851,6 +2617,7 @@ fn write_patch_file(
             suffix: suffix(args),
             numbered_files: args.numbered_files,
             max_length: args.filename_max_length,
+            reroll: args.reroll_count.clone(),
         });
         let path = out_dir.join(&filename);
         atomic_write::write_atomic(&path, body.as_bytes(), atomic_write::sync_data_enabled())
@@ -1866,9 +2633,38 @@ fn write_patch_file(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a commit's committer timestamp to a `DateTime<Utc>`.
-fn timestamp_from_commit(commit: &Commit) -> DateTime<Utc> {
-    DateTime::from_timestamp(commit.committer.timestamp as i64, 0).unwrap_or(DateTime::UNIX_EPOCH)
+/// Render the patch `Date:` from the AUTHOR timestamp and timezone, like Git's
+/// `DATE_RFC2822` (the committer time is only used by the mbox envelope's fixed
+/// separator, which is not this header).
+fn patch_date_header(commit: &Commit) -> String {
+    let timestamp = commit.author.timestamp as i64;
+    let Some(utc) = DateTime::from_timestamp(timestamp, 0) else {
+        return DateTime::UNIX_EPOCH.to_rfc2822();
+    };
+    let offset_seconds = parse_signature_timezone(&commit.author.timezone).unwrap_or(0);
+    let Some(offset) = chrono::FixedOffset::east_opt(offset_seconds) else {
+        return utc.to_rfc2822();
+    };
+    utc.with_timezone(&offset)
+        .format("%a, %-d %b %Y %H:%M:%S %z")
+        .to_string()
+}
+
+fn parse_signature_timezone(timezone: &str) -> Option<i32> {
+    let bytes = timezone.as_bytes();
+    if bytes.len() != 5 || !matches!(bytes[0], b'+' | b'-') {
+        return None;
+    }
+    if !bytes[1..].iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let hours = i32::from(bytes[1] - b'0') * 10 + i32::from(bytes[2] - b'0');
+    let minutes = i32::from(bytes[3] - b'0') * 10 + i32::from(bytes[4] - b'0');
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let seconds = hours * 3600 + minutes * 60;
+    Some(if bytes[0] == b'-' { -seconds } else { seconds })
 }
 
 fn subject_prefix(args: &FormatPatchArgs) -> &str {
@@ -1889,6 +2685,11 @@ async fn diff_engine_patch_parts(
     commit: &Commit,
     args: &FormatPatchArgs,
 ) -> Result<(String, String, String), CliError> {
+    if relative_prefix(args)?.as_deref() == Some(RELATIVE_OUTSIDE) {
+        // A prefix outside the repository has an empty view; do not run the
+        // diff engine (which would otherwise render the whole commit).
+        return Ok((String::new(), String::new(), String::new()));
+    }
     if let Some(parent) = commit.parent_commit_ids.first() {
         // `DiffArgs` keeps private bookkeeping fields, so build it through its
         // clap definition like the CLI does.
@@ -1898,6 +2699,12 @@ async fn diff_engine_patch_parts(
         }
         if args.full_index {
             argv.push("--full-index".to_string());
+        }
+        if let Some(context) = args.unified {
+            argv.push(format!("--unified={context}"));
+        }
+        if let Some(filter) = &args.diff_filter {
+            argv.push(format!("--diff-filter={filter}"));
         }
         if args.no_renames {
             argv.push("--no-renames".to_string());
@@ -1909,6 +2716,9 @@ async fn diff_engine_patch_parts(
         }
         if let Some(prefix) = &args.dst_prefix {
             argv.push(format!("--dst-prefix={prefix}"));
+        }
+        if let Some(relative) = relative_diff_arg(args)? {
+            argv.push(relative);
         }
         argv.push(parent.to_string());
         argv.push(commit.id.to_string());
@@ -1924,20 +2734,122 @@ async fn diff_engine_patch_parts(
         return Ok((stat, numstat, patch));
     }
     let mut stat = String::new();
-    if let Ok(stats) = log::compute_commit_stat(commit, vec![]).await {
+    if let Ok(mut stats) = log::compute_commit_stat(commit, vec![]).await {
+        if let Some(prefix) = relative_prefix(args)? {
+            stats.retain(|record| record.path.starts_with(&prefix));
+            for record in &mut stats {
+                record.path = record.path[prefix.len()..].to_string();
+            }
+        }
         stat = format_diffstat_plain(&stats);
     }
-    let patch = log::generate_diff_with_options(commit, vec![], &commit_diff_options(args)).await?;
+    let patch =
+        log::generate_diff_with_options(commit, vec![], &commit_diff_options(args)?).await?;
     Ok((stat, String::new(), patch))
 }
 
-fn commit_diff_options(args: &FormatPatchArgs) -> log::CommitDiffOptions {
-    log::CommitDiffOptions {
+/// Internal marker for a `--relative` prefix that escapes the repository. Such a
+/// view never matches a tracked path, so no diff is rendered (Git exits 0 with
+/// an empty patch body).
+const RELATIVE_OUTSIDE: &str = "\u{0}";
+
+/// Normalize a repository-root-relative prefix (no leading/trailing slash).
+fn normalize_relative_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().replace('\\', "/");
+    let trimmed = trimmed.trim_start_matches("./").trim_matches('/');
+    if trimmed.is_empty() || trimmed == "." {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// The repository-root-relative directory prefix selected by `--relative` /
+/// `diff.relative`, or `None` when paths stay repository-relative.
+fn relative_prefix(args: &FormatPatchArgs) -> Result<Option<String>, CliError> {
+    if args.no_relative {
+        return Ok(None);
+    }
+    let root = util::working_dir();
+    let cwd = util::cur_dir();
+    match &args.relative {
+        None => Ok(None),
+        Some(None) => {
+            // Bare `--relative`: the current directory, which must live inside
+            // the repository.
+            match cwd.strip_prefix(&root) {
+                Ok(relative) => Ok(normalize_relative_path(&relative.to_string_lossy())),
+                Err(_) => Err(CliError::failure(format!(
+                    "--relative: current directory '{}' is outside the repository",
+                    cwd.display()
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)),
+            }
+        }
+        Some(Some(raw)) => {
+            let normalized = normalize_relative_path(raw).unwrap_or_default();
+            if normalized.is_empty() {
+                return Ok(None);
+            }
+            let escapes = normalized == ".."
+                || normalized.starts_with("../")
+                || std::path::Path::new(&normalized).is_absolute();
+            if escapes {
+                return Ok(Some(RELATIVE_OUTSIDE.to_string()));
+            }
+            let target = root.join(&normalized);
+            if target.exists() && !target.is_dir() {
+                return Err(
+                    CliError::failure(format!("--relative: '{raw}' is not a directory"))
+                        .with_stable_code(StableErrorCode::CliInvalidTarget),
+                );
+            }
+            Ok(Some(normalized))
+        }
+    }
+}
+
+/// The `--relative` argument to forward to the shared diff engine. The engine
+/// resolves its value from the current directory, while `format-patch --relative`
+/// resolves the value from the repository root; translate between the two.
+fn relative_diff_arg(args: &FormatPatchArgs) -> Result<Option<String>, CliError> {
+    let Some(prefix) = relative_prefix(args)? else {
+        return Ok(None);
+    };
+    if prefix == RELATIVE_OUTSIDE {
+        // Do not forward a cwd-relative `--relative`: the outside view matches
+        // nothing and must not strip the current directory instead.
+        return Ok(None);
+    }
+    let root = util::working_dir();
+    let cwd = util::cur_dir();
+    let target = root.join(&prefix);
+    if target == cwd {
+        return Ok(Some("--relative".to_string()));
+    }
+    if let Ok(relative) = target.strip_prefix(&cwd) {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.is_empty() {
+            return Ok(Some("--relative".to_string()));
+        }
+        return Ok(Some(format!("--relative={relative}")));
+    }
+    // The target is an ancestor of the current directory: the shared engine's
+    // cwd-relative strip cannot express it, so use bare `--relative` at the
+    // ancestor only when the current directory is the target root.
+    Ok(Some("--relative".to_string()))
+}
+
+fn commit_diff_options(args: &FormatPatchArgs) -> Result<log::CommitDiffOptions, CliError> {
+    Ok(log::CommitDiffOptions {
+        relative: relative_prefix(args)?,
         histogram: args.histogram,
         full_index: args.full_index,
         source_prefix: args.src_prefix.clone().unwrap_or_else(|| "a/".to_string()),
         destination_prefix: args.dst_prefix.clone().unwrap_or_else(|| "b/".to_string()),
-    }
+        context_lines: args.unified.unwrap_or(3),
+        diff_filter: args.diff_filter.clone().unwrap_or_default(),
+    })
 }
 
 async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatPatchError> {
@@ -1968,6 +2880,23 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
                 .unwrap_or_else(|| DEFAULT_SUFFIX.to_string()),
         );
     }
+    if args.filename_max_length.is_none() {
+        args.filename_max_length = match read_format_config("format.filenameMaxLength").await? {
+            Some(value) => {
+                let trimmed = value.trim();
+                Some(
+                    trimmed
+                        .parse::<usize>()
+                        .map_err(|_| FormatPatchError::InvalidConfig {
+                            key: "format.filenameMaxLength",
+                            value,
+                            expected: "a non-negative integer",
+                        })?,
+                )
+            }
+            None => Some(64),
+        };
+    }
     if !args.signoff
         && !args.no_signoff
         && let Some(value) = read_format_config("format.signOff").await?
@@ -1979,6 +2908,117 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
                 expected: "a Git boolean",
             },
         )?;
+    }
+    // `format.thread` applies only when the CLI says nothing about threading.
+    // Each value fully determines the style; the strict cascade already gives
+    // local-over-global and last-write-wins at the same layer.
+    let thread_cli = args.thread.is_some() || args.no_thread;
+    // `format.commitListFormat` supplies the default list format; only the
+    // command-line option implies a cover letter (Git's `cover_letter == -1`
+    // check), so this config value must not force one.
+    let base_cli = args.base.is_some() || args.no_base;
+    if !base_cli
+        && args.base.is_none()
+        && !args.no_base
+        && let Some(value) = read_format_config("format.useAutoBase").await?
+    {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("whenAble") {
+            args.base = Some("auto".to_string());
+            args.base_when_able = true;
+        } else {
+            let enabled = crate::internal::config::parse_git_config_bool(trimmed).ok_or(
+                FormatPatchError::InvalidConfig {
+                    key: "format.useAutoBase",
+                    value,
+                    expected: "true, false, or whenAble",
+                },
+            )?;
+            if enabled {
+                args.base = Some("auto".to_string());
+            }
+        }
+    }
+    // `format.attach` supplies the boundary: a non-empty value (including the
+    // literal `true`) is the boundary, an empty value disables multipart, and
+    // the strict cascade makes local override global. CLI flags win.
+    let attach_cli = args.attach.is_some() || args.inline.is_some() || args.no_attach;
+    if !attach_cli && let Some(value) = read_format_config("format.attach").await? {
+        if value.is_empty() {
+            args.attach = None;
+        } else {
+            args.attach = Some(Some(value));
+        }
+    }
+    // Git validates `format.coverFromDescription` in the config callback, even
+    // when the CLI supplies a valid mode and even without a cover letter.
+    if let Some(value) = read_format_config("format.coverFromDescription").await? {
+        let trimmed = value.trim();
+        if !matches!(trimmed, "default" | "none" | "message" | "subject" | "auto") {
+            return Err(FormatPatchError::InvalidCoverMode(trimmed.to_string()));
+        }
+        if args.cover_from_description.is_none() {
+            args.cover_from_description = Some(trimmed.to_string());
+        }
+    }
+    if args.commit_list_format.is_none()
+        && let Some(value) = read_format_config("format.commitListFormat").await?
+    {
+        args.commit_list_format = Some(value);
+    }
+    if !thread_cli && let Some(value) = read_format_config("format.thread").await? {
+        let trimmed = value.trim();
+        args.thread = if trimmed.is_empty() {
+            None
+        } else if trimmed.eq_ignore_ascii_case("deep") {
+            Some("deep".to_string())
+        } else if trimmed.eq_ignore_ascii_case("shallow") {
+            Some("shallow".to_string())
+        } else {
+            match crate::internal::config::parse_git_config_bool(trimmed) {
+                Some(true) => Some("shallow".to_string()),
+                Some(false) => None,
+                None => {
+                    return Err(FormatPatchError::InvalidConfig {
+                        key: "format.thread",
+                        value,
+                        expected: "true, false, shallow, deep, or empty",
+                    });
+                }
+            }
+        };
+    }
+    if args.relative.is_none()
+        && !args.no_relative
+        && let Some(value) = read_format_config("diff.relative").await?
+    {
+        let enabled = crate::internal::config::parse_git_config_bool(&value).ok_or(
+            FormatPatchError::InvalidConfig {
+                key: "diff.relative",
+                value,
+                expected: "a Git boolean",
+            },
+        )?;
+        if enabled {
+            args.relative = Some(None);
+        }
+    }
+    // `format.from` is applied only when no command-line `--from` was given:
+    // `true` uses the committer identity, `false` leaves the author untouched,
+    // and any other value is used as an ident line (validated after this
+    // resolve pass, so a CLI override wins over an invalid config value).
+    if args.from.is_none()
+        && !args.no_from
+        && let Some(value) = read_format_config("format.from").await?
+    {
+        let trimmed = value.trim();
+        if let Some(enabled) = crate::internal::config::parse_git_config_bool(trimmed) {
+            if enabled {
+                args.from = Some(None);
+            }
+        } else if !trimmed.is_empty() {
+            args.from = Some(Some(trimmed.to_string()));
+        }
     }
     Ok(())
 }
@@ -2101,16 +3141,16 @@ fn encode_email_header(value: &str, enable: bool) -> String {
 
 /// Parse a `Name <email>` identity into `(name, email)`; a string without
 /// angle brackets is treated as a bare name with an empty email.
-fn parse_from_ident(ident: &str) -> (String, String) {
+fn parse_from_ident(ident: &str) -> Result<(String, String), FormatPatchError> {
     if let (Some(lt), Some(gt)) = (ident.find('<'), ident.rfind('>'))
         && lt < gt
     {
-        return (
+        return Ok((
             ident[..lt].trim().to_string(),
             ident[lt + 1..gt].trim().to_string(),
-        );
+        ));
     }
-    (ident.trim().to_string(), String::new())
+    Err(FormatPatchError::InvalidFromIdent(ident.to_string()))
 }
 
 /// Resolve the `--from` identity: `--from=<ident>` is parsed; bare `--from`
@@ -2121,8 +3161,16 @@ async fn resolve_from_identity(
 ) -> Result<Option<(String, String)>, FormatPatchError> {
     match &args.from {
         None => Ok(None),
-        Some(Some(ident)) => Ok(Some(parse_from_ident(ident))),
-        Some(None) => Ok(Some(resolve_signoff_identity().await?)),
+        Some(Some(ident)) => Ok(Some(parse_from_ident(ident)?)),
+        Some(None) => {
+            // Bare `--from` uses the execution-time committer identity (Git's
+            // GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL aware resolution), not
+            // `format.from`.
+            let (_, identity) = crate::command::commit::create_committer_signature()
+                .await
+                .map_err(|error| FormatPatchError::IdentityMissing(error.to_string()))?;
+            Ok(Some((identity.name, identity.email)))
+        }
     }
 }
 

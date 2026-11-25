@@ -38,7 +38,7 @@ pub mod log;
 pub mod maintenance_lock;
 pub mod merge_base;
 pub mod metadata;
-pub mod model;
+pub use libra_model as model;
 pub mod mutable_state_ownership;
 pub mod notes;
 pub mod object_format;

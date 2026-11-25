@@ -3833,3 +3833,159 @@ fn branch_no_sort_cancels_sort_keys() {
         "the trailing --sort must win"
     );
 }
+
+fn column_branch_repo(names: &[&str]) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    for name in names {
+        assert_cli_success(
+            &run_libra_command(&["branch", name], repo.path()),
+            "create branch",
+        );
+    }
+    repo
+}
+
+fn column_stdout(repo: &std::path::Path, args: &[&str], columns: &str) -> String {
+    let out = run_libra_command_with_env(args, repo, &[("COLUMNS", columns)]);
+    assert_cli_success(&out, "branch column run");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// I698-01 AC1: `COLUMNS=81` with 16 branches is byte-identical to Git.
+#[test]
+fn column_git_parity_16_branches_columns_81() {
+    use std::process::Command;
+
+    let names: Vec<String> = (1..=15).map(|i| format!("b{i:02}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let repo = column_branch_repo(&refs);
+    let libra_out = column_stdout(repo.path(), &["branch", "--column=column"], "81");
+
+    let git_dir = tempdir().expect("git repo");
+    let g = git_dir.path();
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(g)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("HOME", g)
+            .env("COLUMNS", "81")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    run(&["init", "-q", "-b", "main", "."]);
+    run(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    for name in &names {
+        run(&["branch", name]);
+    }
+    let git_out = String::from_utf8_lossy(&run(&["branch", "--column=column"]).stdout).to_string();
+    assert_eq!(libra_out, git_out, "AC1 Git parity");
+    assert_eq!(libra_out.lines().count(), 2, "AC1 two rows");
+}
+
+/// I698-01 AC2/AC3: the slot is `max rendered + 1` and rows stay within COLUMNS.
+#[test]
+fn column_slot_width_is_max_render_plus_one() {
+    use unicode_width::UnicodeWidthStr;
+
+    let repo = column_branch_repo(&["averylongname", "short"]);
+    let out = column_stdout(repo.path(), &["branch", "--column=column"], "200");
+    let line = out.lines().next().expect("one row");
+    // The widest entry (including its two-space marker) is followed by exactly
+    // one padding space before the next slot.
+    let max_name_start = line.find("averylongname").expect("long branch");
+    let next_start = line.find("* main").expect("current branch");
+    assert_eq!(
+        next_start - (max_name_start - 2),
+        UnicodeWidthStr::width("  averylongname") + 1,
+        "AC2 slot width = max + 1"
+    );
+    for row in out.lines() {
+        assert!(
+            UnicodeWidthStr::width(row) <= 200,
+            "AC3 row within COLUMNS: {row:?}"
+        );
+    }
+}
+
+/// I698-01 AC4: an entry wider than COLUMNS degrades to one full name per line.
+#[test]
+fn column_overflow_degrades_to_single_full_column() {
+    let repo = column_branch_repo(&["a-very-long-branch-name"]);
+    let out = column_stdout(repo.path(), &["branch", "--column=column"], "10");
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(!lines.is_empty(), "AC4 output");
+    assert!(
+        lines.iter().any(|l| l.contains("a-very-long-branch-name")),
+        "AC4 full name not truncated: {out:?}"
+    );
+}
+
+/// I698-01 AC8: CJK/combining names align by terminal display width.
+#[test]
+fn column_cjk_display_width_alignment() {
+    use unicode_width::UnicodeWidthStr;
+
+    let repo = column_branch_repo(&["中文字", "abc"]);
+    let out = column_stdout(repo.path(), &["branch", "--column=column"], "200");
+    let line = out.lines().next().expect("row");
+    // `* main` is padded to the display width of the widest CJK slot + 1; the
+    // CJK entry itself starts with its two-space marker.
+    let main_start = line.find("* main").expect("main");
+    let cjk_start = line.find("中文字").expect("CJK");
+    assert_eq!(
+        (cjk_start - 2) - main_start,
+        UnicodeWidthStr::width("  中文字") + 1,
+        "AC8 CJK slot width"
+    );
+}
+
+/// I698-01 AC5–AC7: `--no-column`, `--column=never` and default stay single-column.
+#[test]
+fn column_disabled_modes_keep_single_column() {
+    let repo = column_branch_repo(&["aa", "bb", "cc"]);
+    for args in [
+        vec!["branch", "--no-column"],
+        vec!["branch", "--column=never"],
+        vec!["branch"],
+    ] {
+        let out = column_stdout(repo.path(), &args, "200");
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 4, "{args:?} one branch per line: {out:?}");
+        for line in lines {
+            assert!(
+                !line.trim_end().contains("  b")
+                    || line.trim_end().ends_with("bb")
+                    || line.trim_end().ends_with("cc")
+                    || line.trim_end().contains("aa"),
+                "{args:?} single column: {line:?}"
+            );
+        }
+    }
+}
+
+/// I698-01 AC1: the exact t3200 `git branch --column` golden at `COLUMNS=81`.
+#[test]
+fn column_golden_16_branch_columns_81() {
+    let repo = create_committed_repo_via_cli();
+    for name in [
+        "a/b/c", "abc", "bam", "bar", "foo", "j/k", "l", "m/m", "mb", "n", "o/o", "o/p", "q", "r",
+        "topic",
+    ] {
+        assert_cli_success(
+            &run_libra_command(&["branch", name], repo.path()),
+            "create golden branch",
+        );
+    }
+    let out = column_stdout(repo.path(), &["branch", "--column=column"], "81");
+    assert_eq!(
+        out,
+        "  a/b/c   bam     foo     l     * main    n       o/p     r\n  abc     bar     j/k     m/m     mb      o/o     q       topic\n",
+        "AC1 t3200#52 golden"
+    );
+}

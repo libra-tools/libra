@@ -90,3 +90,72 @@ fn compile_globs_rejects_overlong_and_invalid() {
         Err(DescribeError::InvalidArgument(_))
     ));
 }
+
+/// DESC-04 AC8: `--long` / `--no-long` are last-wins at the parser layer.
+#[test]
+fn no_long_parse_order() {
+    use clap::Parser;
+
+    let args = super::DescribeArgs::try_parse_from(["describe", "--long", "--no-long"])
+        .expect("both flags parse");
+    assert!(!args.long, "AC8: --no-long wins when it comes last");
+    assert!(args.no_long);
+
+    let args = super::DescribeArgs::try_parse_from(["describe", "--no-long", "--long"])
+        .expect("both flags parse");
+    assert!(args.long, "AC4: --long wins when it comes last");
+    assert!(!args.no_long);
+}
+
+/// DESC-06 AC5: `--abbrev=N --no-abbrev` leaves `--no-abbrev` in effect.
+#[test]
+fn no_abbrev_parse_order() {
+    use clap::Parser;
+
+    let args = super::DescribeArgs::try_parse_from(["describe", "--abbrev=5", "--no-abbrev"])
+        .expect("both flags parse");
+    assert_eq!(args.abbrev, None, "AC5 abbrev cleared");
+    assert!(args.no_abbrev, "AC5 no_abbrev active");
+}
+
+/// DESC-07 AC2: pin the commit-ish incompatibility message.
+#[test]
+fn commitish_incompatible_display_pin() {
+    assert_eq!(
+        super::DescribeError::CommitishIncompatible {
+            option: "--dirty".to_string(),
+        }
+        .to_string(),
+        "option '--dirty' and commit-ishes cannot be used together",
+    );
+}
+
+/// DESC-08 AC7: the suffix helper defaults a dirty worktree to `-dirty`.
+#[test]
+fn worktree_suffix_defaults_to_dirty_mark() {
+    use super::{WorktreeCheck, worktree_suffix};
+
+    assert_eq!(
+        worktree_suffix(None, None, WorktreeCheck::Dirty),
+        Some("-dirty".to_string())
+    );
+    assert_eq!(
+        worktree_suffix(Some("-bk"), None, WorktreeCheck::Dirty),
+        Some("-bk".to_string())
+    );
+    assert_eq!(
+        worktree_suffix(Some("-dirty"), None, WorktreeCheck::Clean),
+        None
+    );
+}
+
+/// DESC-08a AC5: a failed check uses the `--broken` mark.
+#[test]
+fn worktree_suffix_failed_uses_broken_mark() {
+    use super::{WorktreeCheck, worktree_suffix};
+
+    assert_eq!(
+        worktree_suffix(None, Some("-bk"), WorktreeCheck::Failed),
+        Some("-bk".to_string())
+    );
+}
