@@ -43,8 +43,8 @@ use std::{
 use chrono::Utc;
 use futures::TryStreamExt as _;
 use redb::{
-    Builder as RedbBuilder, ConcurrencyMode, Database as RedbDatabase, ReadableTable,
-    ReadableTableMetadata as _, TableDefinition, TableHandle, WriteTransaction,
+    BackendError, Builder as RedbBuilder, ConcurrencyMode, Database as RedbDatabase, ReadableTable,
+    ReadableTableMetadata as _, StorageBackend, TableDefinition, TableHandle, WriteTransaction,
     backends::FileBackend,
 };
 use sea_orm::sqlx::{
@@ -921,28 +921,6 @@ struct PreparedSqliteQuiescence {
 impl PreparedSqliteQuiescence {
     async fn close_quietly(self) {
         let _ = self.conn.close().await;
-    }
-
-    fn connection_mut(&mut self) -> &mut SqliteConnection {
-        &mut self.conn
-    }
-
-    /// Consume the prepared handle as an already-fenced quiesced connection
-    /// (committed fence; the WAL -> DELETE PRAGMAs must not run).
-    fn into_fenced_quiesced(self) -> QuiescedSqliteConnection {
-        #[cfg(unix)]
-        let source_inode = {
-            use std::os::unix::fs::MetadataExt as _;
-            (self.expected_meta.dev(), self.expected_meta.ino())
-        };
-        QuiescedSqliteConnection {
-            conn: self.conn,
-            role: self.role,
-            path: self.path,
-            journal_mode: "delete".to_string(),
-            #[cfg(unix)]
-            source_inode,
-        }
     }
 }
 
@@ -3968,15 +3946,24 @@ async fn verify_layout_b_table_key_coverage(
 pub async fn inspect_legacy_repository_layout(
     sources: &mut QuiescedRepositorySqliteSources,
 ) -> StorageResult<LegacyRepositoryLayout> {
-    let Some(cap) = sources.capture.as_mut() else {
+    inspect_legacy_repository_layout_conns(
+        &mut sources.git.conn,
+        sources.capture.as_mut().map(|c| &mut c.conn),
+    )
+    .await
+}
+
+async fn inspect_legacy_repository_layout_conns(
+    git_conn: &mut SqliteConnection,
+    cap_conn: Option<&mut SqliteConnection>,
+) -> StorageResult<LegacyRepositoryLayout> {
+    let Some(cap_conn) = cap_conn else {
         return Ok(LegacyRepositoryLayout::LayoutA);
     };
 
     let mut present_inline_tables = Vec::new();
     for table in LEGACY_INLINE_CAPTURE_TABLES {
-        if sqlite_table_exists_on_conn(&mut sources.git.conn, DatabaseRole::Repository, table)
-            .await?
-        {
+        if sqlite_table_exists_on_conn(git_conn, DatabaseRole::Repository, table).await? {
             present_inline_tables.push(table);
         }
     }
@@ -3987,7 +3974,7 @@ pub async fn inspect_legacy_repository_layout(
 
     // Layout B: validate `capture_catalog_copy_receipt` completeness first.
     let receipt_cols = sqlite_table_columns_on_conn(
-        &mut cap.conn,
+        cap_conn,
         DatabaseRole::Capture,
         "capture_catalog_copy_receipt",
     )
@@ -3998,7 +3985,7 @@ pub async fn inspect_legacy_repository_layout(
         });
     }
     let count_row = sea_orm::sqlx::query("SELECT COUNT(*) FROM capture_catalog_copy_receipt")
-        .fetch_one(&mut cap.conn)
+        .fetch_one(&mut *cap_conn)
         .await
         .map_err(|err| {
             map_export_sqlite_err(
@@ -4024,7 +4011,7 @@ pub async fn inspect_legacy_repository_layout(
     let receipt_row = sea_orm::sqlx::query(
         "SELECT copied_at FROM capture_catalog_copy_receipt WHERE id = 1 LIMIT 1",
     )
-    .fetch_optional(&mut cap.conn)
+    .fetch_optional(&mut *cap_conn)
     .await
     .map_err(|err| {
         map_export_sqlite_err(
@@ -4056,7 +4043,7 @@ pub async fn inspect_legacy_repository_layout(
     // Verify 100% table + primary-key coverage for every inline capture table
     // still present in `libra.db` in bounded batches of <= 500 keys.
     for table in present_inline_tables {
-        verify_layout_b_table_key_coverage(&mut sources.git.conn, &mut cap.conn, table).await?;
+        verify_layout_b_table_key_coverage(git_conn, cap_conn, table).await?;
     }
 
     Ok(LegacyRepositoryLayout::LayoutB)
@@ -4138,16 +4125,16 @@ async fn read_sqlite_sequence_highwater(
 /// Strictly read-only pre-validation of the required source-table inventory for
 /// the detected legacy layout (`RB-10a`), executed over the sole held `c_mig`
 /// connection(s) BEFORE creating any staging directory or `.tmp` redb artifact.
-async fn validate_forward_source_table_inventory(
-    sources: &mut QuiescedRepositorySqliteSources,
+async fn validate_forward_source_table_inventory_conns(
+    git_conn: &mut SqliteConnection,
+    cap_conn: Option<&mut SqliteConnection>,
     layout: LegacyRepositoryLayout,
 ) -> StorageResult<()> {
-    let git_tables =
-        sqlite_list_user_tables_on_conn(&mut sources.git.conn, DatabaseRole::Repository).await?;
+    let git_tables = sqlite_list_user_tables_on_conn(git_conn, DatabaseRole::Repository).await?;
     use crate::storage::git_state_store::SQLITE_ONLY_SYMBOLIC_REF;
     if git_tables.contains(SQLITE_ONLY_SYMBOLIC_REF)
         && sea_orm::sqlx::query("SELECT 1 FROM symbolic_ref LIMIT 1")
-            .fetch_optional(&mut sources.git.conn)
+            .fetch_optional(&mut *git_conn)
             .await
             .map_err(|err| {
                 map_export_sqlite_err(
@@ -4188,17 +4175,12 @@ async fn validate_forward_source_table_inventory(
             }
         }
         LegacyRepositoryLayout::LayoutB | LegacyRepositoryLayout::LayoutC => {
-            let cap =
-                sources
-                    .capture
-                    .as_mut()
-                    .ok_or_else(|| StorageBackendError::BackendInternal {
-                        detail:
-                            "forward migration Phase 1 Layout B/C missing quiesced capture source"
-                                .to_string(),
-                    })?;
+            let cap_conn = cap_conn.ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "forward migration Phase 1 Layout B/C missing quiesced capture source"
+                    .to_string(),
+            })?;
             let cap_tables =
-                sqlite_list_user_tables_on_conn(&mut cap.conn, DatabaseRole::Capture).await?;
+                sqlite_list_user_tables_on_conn(cap_conn, DatabaseRole::Capture).await?;
             for table in CAPTURE_SOURCE_TABLES {
                 if !cap_tables.contains(table) {
                     return Err(StorageBackendError::BackendInternal {
@@ -19316,7 +19298,7 @@ async fn export_forward_phase1_to_redb_tmp_inner(
     common_storage: &Path,
     generation: u64,
     telemetry: &mut ExportStreamTelemetry<'_>,
-    mut artifact_guard: Option<&mut Phase1ArtifactGuard>,
+    artifact_guard: Option<&mut Phase1ArtifactGuard>,
     #[cfg(test)] fail_on_git_redb_init: bool,
     #[cfg(test)] fail_after_transfer: bool,
 ) -> StorageResult<ForwardPhase1ExportReport> {
@@ -19352,11 +19334,51 @@ async fn export_forward_phase1_to_redb_tmp_inner(
         }
     }
 
+    #[cfg(unix)]
+    let protected_live_inodes = collect_live_sqlite_inodes_no_open(common_storage);
+    export_forward_phase1_to_redb_tmp_conns(
+        &mut guard.sqlite.git.conn,
+        guard.sqlite.capture.as_mut().map(|c| &mut c.conn),
+        common_storage,
+        generation,
+        None,
+        #[cfg(unix)]
+        &protected_live_inodes,
+        telemetry,
+        artifact_guard,
+        #[cfg(test)]
+        fail_on_git_redb_init,
+        #[cfg(test)]
+        fail_after_transfer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn export_forward_phase1_to_redb_tmp_conns(
+    git_conn: &mut SqliteConnection,
+    mut cap_conn: Option<&mut SqliteConnection>,
+    common_storage: &Path,
+    generation: u64,
+    prior_spool_snapshot: Option<&VerifiedSpoolBackupSnapshot>,
+    #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    mut artifact_guard: Option<&mut Phase1ArtifactGuard>,
+    #[cfg(test)] fail_on_git_redb_init: bool,
+    #[cfg(test)] fail_after_transfer: bool,
+) -> StorageResult<ForwardPhase1ExportReport> {
+    if generation == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 export requires generation >= 1".to_string(),
+        });
+    }
+
     // Step 1: Strictly read-only 3-layout classification, Layout B receipt +
     // PK coverage verification, and required source-table inventory check
     // BEFORE creating any staging directory or `.tmp` file.
-    let layout = inspect_legacy_repository_layout(&mut guard.sqlite).await?;
-    validate_forward_source_table_inventory(&mut guard.sqlite, layout).await?;
+    let layout = inspect_legacy_repository_layout_conns(git_conn, cap_conn.as_deref_mut()).await?;
+    validate_forward_source_table_inventory_conns(git_conn, cap_conn.as_deref_mut(), layout)
+        .await?;
 
     let git_tmp_path = git_redb_tmp_path(common_storage, generation);
     let capture_tmp_path = capture_redb_tmp_path(common_storage, generation);
@@ -19411,13 +19433,8 @@ async fn export_forward_phase1_to_redb_tmp_inner(
             let git_db_ref = git_staged.db()?;
             initialize_git_export_redb_schema(git_db_ref)?;
             // Step 3: Stream-export all 61 active repository tables from `libra.db`.
-            export_repository_tables_to_redb(
-                &mut guard.sqlite.git.conn,
-                git_db_ref,
-                &mut git_table_counts,
-                telemetry,
-            )
-            .await?;
+            export_repository_tables_to_redb(git_conn, git_db_ref, &mut git_table_counts, telemetry)
+                .await?;
         }
         if git_table_counts.len() != REPOSITORY_ACTIVE_SOURCE_TABLES_COUNT {
             return Err(StorageBackendError::BackendInternal {
@@ -19444,7 +19461,7 @@ async fn export_forward_phase1_to_redb_tmp_inner(
         }
         return Err(err);
     }
-    let _ = guard.sqlite.git.conn.execute("PRAGMA shrink_memory;").await;
+    let _ = git_conn.execute("PRAGMA shrink_memory;").await;
 
     let (cap_db, cap_tmp_guard) = match create_redb_tmp_database_inner(
         common_storage,
@@ -19496,7 +19513,7 @@ async fn export_forward_phase1_to_redb_tmp_inner(
         match layout {
             LegacyRepositoryLayout::LayoutA => {
                 export_capture_tables_to_redb(
-                    &mut guard.sqlite.git.conn,
+                    git_conn,
                     CaptureExportOptions {
                         source_role: DatabaseRole::Repository,
                         include_capture_ledger_and_receipt: false,
@@ -19519,13 +19536,13 @@ async fn export_forward_phase1_to_redb_tmp_inner(
                     if layout == LegacyRepositoryLayout::LayoutB {
                         (
                             read_sqlite_sequence_highwater(
-                                &mut guard.sqlite.git.conn,
+                                git_conn,
                                 DatabaseRole::Repository,
                                 "agent_bridge_event",
                             )
                             .await?,
                             read_sqlite_sequence_highwater(
-                                &mut guard.sqlite.git.conn,
+                                git_conn,
                                 DatabaseRole::Repository,
                                 "agent_bridge_link",
                             )
@@ -19534,13 +19551,13 @@ async fn export_forward_phase1_to_redb_tmp_inner(
                     } else {
                         (0, 0)
                     };
-                let cap_conn = guard.sqlite.capture.as_mut().ok_or_else(|| {
+                let cap_conn = cap_conn.as_deref_mut().ok_or_else(|| {
                     StorageBackendError::BackendInternal {
                         detail: "Layout B/C export missing quiesced capture connection".to_string(),
                     }
                 })?;
                 export_capture_tables_to_redb(
-                    &mut cap_conn.conn,
+                    cap_conn,
                     CaptureExportOptions {
                         source_role: DatabaseRole::Capture,
                         include_capture_ledger_and_receipt: true,
@@ -19553,7 +19570,7 @@ async fn export_forward_phase1_to_redb_tmp_inner(
                     telemetry,
                 )
                 .await?;
-                let _ = cap_conn.conn.execute("PRAGMA shrink_memory;").await;
+                let _ = cap_conn.execute("PRAGMA shrink_memory;").await;
             }
         }
 
@@ -19566,10 +19583,38 @@ async fn export_forward_phase1_to_redb_tmp_inner(
             });
         }
 
-        // Step 5 (RB-10i AC1): Strictly read-only direct ingest of pending
-        // `capture-spool/ready/` envelopes into `capture.gen-<id>.redb.tmp`.
-        let spool_ingest =
-            ingest_capture_spool_ready_readonly(common_storage, cap_db_ref, telemetry)?;
+        // Step 5 (RB-10i AC1 / RB-10h AC3): Strictly read-only direct ingest of
+        // pending `capture-spool/ready/` envelopes into `capture.gen-<id>.redb.tmp`.
+        // During cross-source tombstone-gap drift reconciliation (`RB-10h` AC3),
+        // ingest the verified prior backup `ready/` FIRST and then live `ready/`
+        // so `backup ∪ live` is deduplicated by `dedup_key` with zero event loss.
+        let spool_ingest = if let Some(prev_snap) = prior_spool_snapshot {
+            let from_backup = ingest_capture_spool_ready_from_backup_readonly(
+                common_storage,
+                prev_snap,
+                cap_db_ref,
+                telemetry,
+                #[cfg(unix)]
+                protected_live_inodes,
+            )?;
+            let from_live =
+                ingest_capture_spool_ready_readonly(common_storage, cap_db_ref, telemetry)?;
+            SpoolDirectIngestReport {
+                files_read: from_backup.files_read.saturating_add(from_live.files_read),
+                applied_events: from_backup
+                    .applied_events
+                    .saturating_add(from_live.applied_events),
+                deduplicated_events: from_backup
+                    .deduplicated_events
+                    .saturating_add(from_live.deduplicated_events),
+                batches_committed: from_backup
+                    .batches_committed
+                    .saturating_add(from_live.batches_committed),
+                already_fenced: from_live.already_fenced && from_backup.files_read == 0,
+            }
+        } else {
+            ingest_capture_spool_ready_readonly(common_storage, cap_db_ref, telemetry)?
+        };
 
         // Step 6 (RB-10i AC2): Strictly read-only direct ingest of pending
         // `capture-queue/` frames (`priority/` then `normal/`) into
@@ -24672,9 +24717,9 @@ fn compute_git_redb_full_content_sha256(rtx: &redb::ReadTransaction) -> StorageR
 ///
 /// For Layout A only, `schema_versions` is seeded synthetically with wall-clock
 /// `applied_at`, so Layout A authenticates exact `len == 1`, key
-/// `CAPTURE_SCHEMA_VERSION`, and decoded `name == "initial_capture_schema"`
-/// without hashing the wall-clock timestamp; Layouts B & C hash every byte of
-/// `schema_versions` verbatim.
+/// `CAPTURE_SCHEMA_VERSION`, and decoded `version == CAPTURE_SCHEMA_VERSION` /
+/// `name == CAPTURE_SCHEMA_NAME` without hashing the wall-clock timestamp;
+/// Layouts B & C hash every byte of `schema_versions` verbatim.
 fn compute_capture_redb_full_content_sha256(
     rtx: &redb::ReadTransaction,
     is_layout_a: bool,
@@ -24733,7 +24778,10 @@ fn compute_capture_redb_full_content_sha256(
             })?;
         let sv_decoded: CaptureSchemaVersionRecord =
             decode_versioned(sv_raw.value(), redb_cap::CAPTURE_CODEC_VERSION)?;
-        if sv_decoded.name != "initial_capture_schema" || sv_decoded.applied_at.is_empty() {
+        if sv_decoded.version != CAPTURE_SCHEMA_VERSION
+            || sv_decoded.name != CAPTURE_SCHEMA_NAME
+            || sv_decoded.applied_at.is_empty()
+        {
             return Err(StorageBackendError::BackendInternal {
                 detail: "forward migration recovery rejected tampered Layout A capture schema_versions row"
                     .to_string(),
@@ -30307,18 +30355,14 @@ async fn unlink_fenced_sqlite_source_and_close(
             Some(role),
             rel_file,
         );
-        // Under `locking_mode = EXCLUSIVE`, SQLite unlinks the zeroed
-        // `-journal` sidecar when `c_mig.close()` runs; verify absence and
-        // flush parent directory metadata once more before persisting
-        // `unlinked`.
-        let journal_path = sqlite_sidecar_path(&expected_path, "-journal");
-        if path_exists_no_open(&journal_path)? {
-            return Err(StorageBackendError::BackendInternal {
-                detail: format!(
-                    "forward migration Phase 2 detected lingering rollback journal after closing {role} connection"
-                ),
-            });
-        }
+        // Under `locking_mode = EXCLUSIVE`, SQLite normally unlinks the zeroed
+        // `-journal` sidecar when `c_mig.close()` runs; if a prior crash left a
+        // cold zeroed `-journal` from an earlier process (never opened for write
+        // by this recovery connection), safely reconcile and unlink only a
+        // verified zero-header cold `-journal` while still failing closed on
+        // any active non-zero `-journal` or stray `-wal`/`-shm` (`RB-10k`).
+        let protected_live_inodes = collect_live_sqlite_inodes_no_open(common_storage);
+        reconcile_sidecars_for_unlinked_source(common_storage, role, &protected_live_inodes)?;
         fsync_dir_fd_unix(
             &parent_fd,
             "fenced sqlite source parent directory after close",
@@ -30484,14 +30528,10 @@ async fn unlink_fenced_sqlite_source_and_close(
             )?;
         }
 
-        let journal_path = sqlite_sidecar_path(&expected_path, "-journal");
-        if path_exists_no_open(&journal_path)? {
-            return Err(StorageBackendError::BackendInternal {
-                detail: format!(
-                    "forward migration Phase 2 detected lingering rollback journal after closing {role} connection"
-                ),
-            });
-        }
+        // Safely remove any cold zeroed `-journal` left behind by a prior
+        // post-fence crash while still failing closed on any active non-zero
+        // `-journal` or stray `-wal`/`-shm` (`RB-10k`).
+        reconcile_sidecars_for_unlinked_source(common_storage, role)?;
         let parent_dir = if role == DatabaseRole::Capture {
             private_dir.as_path()
         } else {
@@ -33907,10 +33947,17 @@ enum RecoverySqliteProbeOutcome {
 /// Read-only inspection of `.libra/private/capture-spool/` during Phase 2 resume.
 struct SpoolRecoveryInspection {
     spool_drifted: bool,
-    /// When the complete backed-up spool manifest (`ready/` + `quarantine/`) has
-    /// already been authenticated against `manifest.source_digests.spool_manifest_sha256`,
-    /// holds the exact verified file count in `sqlite-backup/<gen>/capture-spool/ready/`.
-    verified_backup_ready_count: Option<u64>,
+    /// True whenever Step 2.3 may have started removing live spool files or any
+    /// tombstone slot is already installed, meaning any drift re-export MUST
+    /// take the union `sqlite-backup/<gen>/capture-spool/ ∪ live capture-spool/`
+    /// so pre-crash backed-up spool events are never dropped (`RB-10h` AC3).
+    prior_backup_union_needed: bool,
+    /// Single-pass authenticated private snapshot of
+    /// `.libra/sqlite-backup/<gen>/capture-spool/` (`ready/` + `quarantine/`)
+    /// matching `manifest.source_digests.spool_manifest_sha256`. All downstream
+    /// parity verification, `gen + 1` ingestion, and `gen + 1` union backup
+    /// consume ONLY this immutable snapshot (zero check-to-use TOCTOU).
+    verified_prior_spool_snapshot: Option<VerifiedSpoolBackupSnapshot>,
 }
 
 /// Return the exact numeric SQLite error code without bitmasking (`RB-10e`),
@@ -34092,15 +34139,38 @@ fn inspect_sqlite_journal_sidecar_before_open(
         Ok(magic == SQLITE_HOT_ROLLBACK_JOURNAL_MAGIC)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        use std::io::Read as _;
+        use std::{io::Read as _, os::windows::fs::MetadataExt as _};
+
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration recovery rejected reparse -journal sidecar for {role}"
+                ),
+            });
+        }
         if meta.len() < 28 {
             return Ok(false);
         }
-        let mut file = File::open(&journal_path).map_err(|err| {
-            StorageBackendError::io("open sqlite -journal sidecar before recovery open", err)
-        })?;
+        let parent = journal_path
+            .parent()
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "sqlite rollback journal sidecar missing parent directory".to_string(),
+            })?;
+        let (_parent_pin, parent_id) = win_tmp_guard::open_pinned_non_reparse_dir(
+            parent,
+            "sqlite rollback journal parent dir",
+        )?;
+        let pinned = [(parent, parent_id, "sqlite rollback journal parent dir")];
+        let (mut file, _) = open_readonly_non_reparse_file_windows(
+            &journal_path,
+            false,
+            &pinned,
+            "sqlite rollback journal sidecar",
+        )?;
         let mut magic = [0u8; 8];
         if let Err(err) = file.read_exact(&mut magic) {
             if err.kind() == io::ErrorKind::UnexpectedEof {
@@ -34113,70 +34183,619 @@ fn inspect_sqlite_journal_sidecar_before_open(
         }
         Ok(magic == SQLITE_HOT_ROLLBACK_JOURNAL_MAGIC)
     }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (meta, &journal_path);
+        Err(StorageBackendError::BackendInternal {
+            detail: "sqlite -journal sidecar inspection is unsupported on this platform"
+                .to_string(),
+        })
+    }
 }
 
-/// For a legally absent (`ENOENT`) post-unlink source database (`State 1`),
-/// reject any stray `-wal`/`-shm` sidecar or active (non-zero-header)
-/// `-journal`, and clean up a cold zeroed `-journal` left behind if power failed
-/// between `unlink(db) + fsync_dir` and `c_mig.close()`.
-fn reconcile_sidecars_for_unlinked_source(db_path: &Path, role: DatabaseRole) -> StorageResult<()> {
-    for suffix in ["-wal", "-shm"] {
-        if path_exists_no_open(&sqlite_sidecar_path(db_path, suffix))? {
+/// For a legally absent (`ENOENT`) post-unlink source database (`State 1`), or
+/// immediately after unlinking a previously fenced source, reject any stray
+/// `-wal`/`-shm` sidecar or active (non-zero-header) `-journal`, and securely
+/// clean up a cold zeroed `-journal` left behind if power failed between
+/// `fence COMMIT` / `unlink(db) + fsync_dir` and `c_mig.close()` (`RB-10k`).
+///
+/// Uses pinned directory descriptors (`openat`/`fstatat`/`unlinkat` +
+/// `fsync_dir_fd_unix`) on Unix and pinned non-reparse directory handles +
+/// `FILE_FLAG_OPEN_REPARSE_POINT` on Windows so there is zero pathname TOCTOU
+/// and zero risk of following symlinks, NTFS junctions, or hard links.
+fn reconcile_sidecars_for_unlinked_source(
+    common_storage: &Path,
+    role: DatabaseRole,
+    #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
+) -> StorageResult<()> {
+    let base_name = match role {
+        DatabaseRole::Repository => LEGACY_SQLITE_DB_FILE,
+        DatabaseRole::Capture => "capture.db",
+        _ => {
             return Err(StorageBackendError::BackendInternal {
                 detail: format!(
-                    "forward migration recovery detected unexpected {suffix} sidecar for unlinked {role} database"
+                    "forward migration recovery rejected invalid role {role} for sidecar reconciliation"
                 ),
             });
         }
-    }
-    let journal_path = sqlite_sidecar_path(db_path, "-journal");
-    let meta = match fs::symlink_metadata(&journal_path) {
-        Ok(m) => m,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
+    };
+
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            io::Read as _,
+            os::unix::{
+                ffi::OsStrExt as _,
+                io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+            },
+        };
+
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let c_storage = CString::new(common_storage.as_os_str().as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "invalid repository storage root path".to_string(),
+            }
+        })?;
+        // SAFETY: `c_storage` is NUL-terminated.
+        let raw_root = unsafe {
+            libc::open(
+                c_storage.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw_root < 0 {
+            return Err(StorageBackendError::io(
+                "open repository storage root for sidecar reconciliation",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `raw_root >= 0` is exclusively owned here.
+        let root_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
+        let mut root_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `root_fd` is valid.
+        if unsafe { libc::fstat(root_fd.as_raw_fd(), root_st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat repository storage root for sidecar reconciliation",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let root_st = unsafe { root_st.assume_init() };
+        if (root_st.st_mode & libc::S_IFMT) != libc::S_IFDIR || root_st.st_uid != euid {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "repository storage root is not a directory owned by current user"
+                    .to_string(),
+            });
+        }
+
+        let parent_fd = if role == DatabaseRole::Capture {
+            let c_priv =
+                CString::new(PRIVATE_SUBDIR).map_err(|_| StorageBackendError::BackendInternal {
+                    detail: "invalid private directory name".to_string(),
+                })?;
+            // SAFETY: `root_fd` is valid and `c_priv` is NUL-terminated.
+            let raw_priv = unsafe {
+                libc::openat(
+                    root_fd.as_raw_fd(),
+                    c_priv.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw_priv < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(StorageBackendError::io(
+                    "open private directory for sidecar reconciliation",
+                    err,
+                ));
+            }
+            // SAFETY: `raw_priv >= 0` is exclusively owned here.
+            let priv_fd = unsafe { OwnedFd::from_raw_fd(raw_priv) };
+            let mut priv_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `priv_fd` is valid.
+            if unsafe { libc::fstat(priv_fd.as_raw_fd(), priv_st.as_mut_ptr()) } != 0 {
+                return Err(StorageBackendError::io(
+                    "stat private directory for sidecar reconciliation",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `fstat` succeeded.
+            let priv_st = unsafe { priv_st.assume_init() };
+            if (priv_st.st_mode & libc::S_IFMT) != libc::S_IFDIR || priv_st.st_uid != euid {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "private directory is not a directory owned by current user"
+                        .to_string(),
+                });
+            }
+            priv_fd
+        } else {
+            root_fd
+        };
+
+        for suffix in ["-wal", "-shm"] {
+            let c_sidecar = CString::new(format!("{base_name}{suffix}")).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "invalid sqlite sidecar filename".to_string(),
+                }
+            })?;
+            let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `parent_fd` is valid and `c_sidecar` is NUL-terminated.
+            if unsafe {
+                libc::fstatat(
+                    parent_fd.as_raw_fd(),
+                    c_sidecar.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration recovery detected unexpected {suffix} sidecar for unlinked {role} database"
+                    ),
+                });
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(StorageBackendError::io(
+                    "inspect sqlite sidecar for unlinked source",
+                    err,
+                ));
+            }
+        }
+
+        let c_journal = CString::new(format!("{base_name}-journal")).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "invalid sqlite -journal filename".to_string(),
+            }
+        })?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `parent_fd` is valid and `c_journal` is NUL-terminated.
+        if unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                c_journal.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(());
+            }
             return Err(StorageBackendError::io(
                 "inspect lingering -journal sidecar for unlinked source",
                 err,
             ));
         }
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return Err(StorageBackendError::BackendInternal {
-            detail: format!(
-                "forward migration recovery rejected non-regular -journal sidecar for unlinked {role}"
-            ),
-        });
-    }
-    // Verify the header is cold (all zeroes — zeroed by SQLite on `COMMIT`
-    // under `locking_mode = EXCLUSIVE` before `c_mig.close()` could unlink it).
-    let header_len = usize::try_from(meta.len().min(28)).unwrap_or(28);
-    if header_len > 0 {
-        use std::io::Read as _;
-        let mut f = File::open(&journal_path).map_err(|err| {
-            StorageBackendError::io("read lingering -journal header for unlinked source", err)
-        })?;
-        let mut hdr = vec![0u8; header_len];
-        f.read_exact(&mut hdr).map_err(|err| {
-            StorageBackendError::io("read lingering -journal bytes for unlinked source", err)
-        })?;
-        if hdr.iter().any(|&b| b != 0) {
+        // SAFETY: `fstatat` succeeded.
+        let st = unsafe { st.assume_init() };
+        let j_inode = (st.st_dev as u64, st.st_ino as u64);
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || st.st_uid != euid
+            || st.st_nlink != 1
+            || protected_live_inodes.contains(&j_inode)
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration recovery rejected unsafe, foreign, or hard-linked -journal sidecar for unlinked {role}"
+                ),
+            });
+        }
+
+        // Open directly via pinned `openat(..., O_NOFOLLOW | O_NONBLOCK)` and
+        // confirm exact inode identity before inspecting header bytes.
+        // SAFETY: `parent_fd` is valid and `c_journal` is NUL-terminated.
+        let raw_file = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_journal.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if raw_file < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(StorageBackendError::io(
+                "open lingering -journal sidecar for unlinked source",
+                err,
+            ));
+        }
+        // SAFETY: `raw_file >= 0` is exclusively owned here.
+        let mut file = File::from(unsafe { OwnedFd::from_raw_fd(raw_file) });
+        let mut fd_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `file` is valid.
+        if unsafe { libc::fstat(file.as_raw_fd(), fd_st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "fstat lingering -journal sidecar for unlinked source",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let fd_st = unsafe { fd_st.assume_init() };
+        if (fd_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || fd_st.st_uid != euid
+            || fd_st.st_nlink != 1
+            || (fd_st.st_dev as u64, fd_st.st_ino as u64) != j_inode
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration recovery detected replaced -journal sidecar for unlinked {role}"
+                ),
+            });
+        }
+
+        // Verify the header is cold (all zeroes — zeroed by SQLite on `COMMIT`
+        // under `locking_mode = EXCLUSIVE` before `c_mig.close()` could unlink it).
+        let mut hdr = [0u8; 28];
+        let mut filled = 0usize;
+        while filled < hdr.len() {
+            match file.read(&mut hdr[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    return Err(StorageBackendError::io(
+                        "read lingering -journal bytes for unlinked source",
+                        err,
+                    ));
+                }
+            }
+        }
+        drop(file);
+        if hdr[..filled].iter().any(|&b| b != 0) {
             return Err(StorageBackendError::BackendInternal {
                 detail: format!(
                     "forward migration recovery rejected active non-zero -journal alongside missing {role} database"
                 ),
             });
         }
+
+        // Atomically isolate `c_journal` under an unpredictable 128-bit hidden
+        // name inside `parent_fd` BEFORE unlinking, then re-verify exact inode
+        // identity and cold header bytes AFTER isolation (closing check-to-delete
+        // races; restoring atomically and failing closed on any concurrent swap!).
+        use std::{collections::hash_map::RandomState, hash::BuildHasher as _};
+        let mut c_isolated: Option<CString> = None;
+        for _ in 0..64 {
+            let seq = PHASE2_SPOOL_TOMBSTONE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let nonce_a = RandomState::new().hash_one(seq);
+            let nonce_b = RandomState::new().hash_one((std::process::id(), seq));
+            let iso_name = format!(".rb10k-coldj.{nonce_a:016x}{nonce_b:016x}.{seq}.tmp");
+            let candidate =
+                CString::new(iso_name).map_err(|_| StorageBackendError::BackendInternal {
+                    detail: "invalid cold journal isolation filename".to_string(),
+                })?;
+            match strict_atomic_rename_noreplace_at_unix(&parent_fd, &c_journal, &candidate) {
+                Ok(()) => {
+                    c_isolated = Some(candidate);
+                    break;
+                }
+                Err(UnixNoReplaceError::AlreadyExists) => continue,
+                Err(UnixNoReplaceError::NotPublished(err))
+                    if err.kind() == io::ErrorKind::NotFound =>
+                {
+                    return Ok(());
+                }
+                Err(UnixNoReplaceError::NotPublished(err))
+                | Err(UnixNoReplaceError::PublishedWithStaleSource(err)) => {
+                    return Err(StorageBackendError::io(
+                        "atomically isolate cold lingering -journal sidecar",
+                        err,
+                    ));
+                }
+            }
+        }
+        let Some(c_iso) = c_isolated else {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration recovery could not allocate unique isolation name for {role} -journal"
+                ),
+            });
+        };
+
+        let restore_and_reject = |detail: String| -> StorageResult<()> {
+            let _ = strict_atomic_rename_noreplace_at_unix(&parent_fd, &c_iso, &c_journal);
+            let _ = fsync_dir_fd_unix(
+                &parent_fd,
+                "unlinked sqlite source parent directory after restoring swapped journal",
+            );
+            Err(StorageBackendError::BackendInternal { detail })
+        };
+
+        // Re-open the isolated entry without following symlinks and verify that
+        // the isolated inode STILL matches `j_inode` and STILL has an all-zero
+        // cold header before unlinking it.
+        // SAFETY: `parent_fd` is valid and `c_iso` is NUL-terminated.
+        let iso_raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_iso.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if iso_raw < 0 {
+            return restore_and_reject(format!(
+                "forward migration recovery refused to unlink non-regular or replaced -journal sidecar for unlinked {role}"
+            ));
+        }
+        // SAFETY: `iso_raw >= 0` is exclusively owned here.
+        let mut iso_file = File::from(unsafe { OwnedFd::from_raw_fd(iso_raw) });
+        let mut post_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `iso_file` is valid.
+        if unsafe { libc::fstat(iso_file.as_raw_fd(), post_st.as_mut_ptr()) } != 0 {
+            drop(iso_file);
+            return restore_and_reject(format!(
+                "forward migration recovery failed to fstat isolated -journal sidecar for unlinked {role}"
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let post_st = unsafe { post_st.assume_init() };
+        if (post_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || post_st.st_uid != euid
+            || post_st.st_nlink != 1
+            || (post_st.st_dev as u64, post_st.st_ino as u64) != j_inode
+            || protected_live_inodes.contains(&(post_st.st_dev as u64, post_st.st_ino as u64))
+        {
+            drop(iso_file);
+            return restore_and_reject(format!(
+                "forward migration recovery refused to unlink replaced -journal sidecar for unlinked {role}"
+            ));
+        }
+        let mut post_hdr = [0u8; 28];
+        let mut post_filled = 0usize;
+        while post_filled < post_hdr.len() {
+            match iso_file.read(&mut post_hdr[post_filled..]) {
+                Ok(0) => break,
+                Ok(n) => post_filled += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    drop(iso_file);
+                    return restore_and_reject(format!(
+                        "forward migration recovery failed reading isolated -journal sidecar for unlinked {role}"
+                    ));
+                }
+            }
+        }
+        drop(iso_file);
+        if post_hdr[..post_filled].iter().any(|&b| b != 0) {
+            return restore_and_reject(format!(
+                "forward migration recovery rejected -journal sidecar modified to non-zero before unlink for unlinked {role}"
+            ));
+        }
+
+        // SAFETY: `parent_fd` is valid and `c_iso` is our exclusively isolated NUL-terminated name.
+        if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), c_iso.as_ptr(), 0) } != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(StorageBackendError::io(
+                    "unlink isolated cold lingering -journal sidecar for unlinked source",
+                    err,
+                ));
+            }
+        }
+        fsync_dir_fd_unix(
+            &parent_fd,
+            "unlinked sqlite source parent directory after cold journal cleanup",
+        )?;
+        Ok(())
     }
-    if let Err(err) = fs::remove_file(&journal_path)
-        && err.kind() != io::ErrorKind::NotFound
+
+    #[cfg(windows)]
     {
-        return Err(StorageBackendError::io(
-            "remove cold lingering -journal sidecar for unlinked source",
-            err,
-        ));
+        use std::{
+            io::Read as _,
+            os::windows::io::{AsRawHandle as _, FromRawHandle as _},
+        };
+
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::{
+                CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
+                FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+                FILE_WRITE_ATTRIBUTES, FileBasicInfo, FileDispositionInfo,
+                GetFileInformationByHandleEx, OPEN_EXISTING, SetFileInformationByHandle,
+            },
+        };
+
+        let (_root_pin, root_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+        let private_dir = common_storage.join(PRIVATE_SUBDIR);
+        let priv_pin_opt = if role == DatabaseRole::Capture {
+            match win_tmp_guard::open_pinned_non_reparse_dir_optional(
+                &private_dir,
+                "private directory",
+            )? {
+                Some(pair) => Some(pair),
+                None => return Ok(()),
+            }
+        } else {
+            None
+        };
+        let mut pinned = vec![(common_storage, root_id, "repository storage root")];
+        let parent_dir = if let Some((_, priv_id)) = priv_pin_opt.as_ref() {
+            pinned.push((private_dir.as_path(), *priv_id, "private directory"));
+            private_dir.as_path()
+        } else {
+            common_storage
+        };
+        win_tmp_guard::verify_pinned_dir_ids(&pinned)?;
+
+        for suffix in ["-wal", "-shm"] {
+            if path_exists_no_open(&parent_dir.join(format!("{base_name}{suffix}")))? {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration recovery detected unexpected {suffix} sidecar for unlinked {role} database"
+                    ),
+                });
+            }
+        }
+
+        // Open the journal ONCE with exclusive share mode (`0`) and
+        // `GENERIC_READ | DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES`
+        // + `FILE_FLAG_OPEN_REPARSE_POINT`, inspect header bytes directly on
+        // THAT handle, and mark THAT EXACT handle for deletion via
+        // `FileDispositionInfo` (zero close-and-reopen race!).
+        let journal_path = parent_dir.join(format!("{base_name}-journal"));
+        let wide = win_tmp_guard::encode_wide_nul(&journal_path);
+        // SAFETY: `wide` is NUL-terminated UTF-16.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(StorageBackendError::io(
+                "open lingering -journal sidecar for unlinked source",
+                err,
+            ));
+        }
+        // SAFETY: `handle` is a valid exclusively owned Win32 file handle.
+        let mut f = unsafe { File::from_raw_handle(handle as std::os::windows::io::RawHandle) };
+        win_tmp_guard::verify_pinned_dir_ids(&pinned)?;
+        let raw = f.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let info = win_tmp_guard::file_info(raw, "cold lingering -journal sidecar")?;
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+            || info.nNumberOfLinks != 1
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration recovery rejected unsafe, reparse, or hard-linked -journal sidecar for unlinked {role}"
+                ),
+            });
+        }
+        let mut hdr = [0u8; 28];
+        let mut filled = 0usize;
+        while filled < hdr.len() {
+            match f.read(&mut hdr[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    return Err(StorageBackendError::io(
+                        "read lingering -journal bytes for unlinked source",
+                        err,
+                    ));
+                }
+            }
+        }
+        if hdr[..filled].iter().any(|&b| b != 0) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration recovery rejected active non-zero -journal alongside missing {role} database"
+                ),
+            });
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0 {
+            let mut basic = std::mem::MaybeUninit::<FILE_BASIC_INFO>::zeroed();
+            // SAFETY: `raw` is valid and `basic` is sized to `FILE_BASIC_INFO`.
+            if unsafe {
+                GetFileInformationByHandleEx(
+                    raw,
+                    FileBasicInfo,
+                    basic.as_mut_ptr().cast(),
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(StorageBackendError::io(
+                    "query basic info on cold lingering -journal sidecar",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `GetFileInformationByHandleEx` succeeded.
+            let mut basic = unsafe { basic.assume_init() };
+            basic.CreationTime = 0;
+            basic.LastAccessTime = 0;
+            basic.LastWriteTime = 0;
+            basic.ChangeTime = 0;
+            let cleared = basic.FileAttributes & !FILE_ATTRIBUTE_READONLY;
+            basic.FileAttributes = if cleared == 0 {
+                FILE_ATTRIBUTE_NORMAL
+            } else {
+                cleared
+            };
+            // SAFETY: `raw` holds `FILE_WRITE_ATTRIBUTES` and `basic` is valid.
+            if unsafe {
+                SetFileInformationByHandle(
+                    raw,
+                    FileBasicInfo,
+                    (&basic as *const FILE_BASIC_INFO).cast(),
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(StorageBackendError::io(
+                    "clear readonly attribute on cold lingering -journal sidecar",
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+        let disp = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: `raw` holds `DELETE` access and `disp` is valid.
+        if unsafe {
+            SetFileInformationByHandle(
+                raw,
+                FileDispositionInfo,
+                (&disp as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(StorageBackendError::io(
+                "delete cold lingering -journal sidecar by handle",
+                io::Error::last_os_error(),
+            ));
+        }
+        drop(f);
+        fsync_dir_durable_windows(
+            parent_dir,
+            &pinned,
+            "fsync unlinked sqlite source parent directory after cold journal cleanup",
+        )?;
+        Ok(())
     }
-    fsync_parent_dir(&journal_path)?;
-    Ok(())
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (common_storage, base_name);
+        Err(StorageBackendError::BackendInternal {
+            detail:
+                "sidecar reconciliation for unlinked sqlite source is unsupported on this platform"
+                    .to_string(),
+        })
+    }
+}
+
+/// Return `true` iff `err` is SQLite's exact primary `SQLITE_CORRUPT (11)`
+/// schema-parse failure naming our canonical [`SQLITE_MIGRATED_FENCE_TABLE`]
+/// sentinel (strictly excluding `SQLITE_NOTADB`, non-sentinel schema
+/// corruption, extended corruption codes, and lock errors).
+fn is_exact_sqlite_fence_corrupt_error(err: &sea_orm::sqlx::Error) -> bool {
+    sqlite_error_exact_numeric_code(err) == Some(11) && {
+        let lower = err.to_string().to_ascii_lowercase();
+        lower.contains("malformed database schema") && lower.contains(SQLITE_MIGRATED_FENCE_TABLE)
+    }
 }
 
 /// Phase A non-mutating (or hot-journal-recovering) exclusive open for Forward
@@ -34240,9 +34859,76 @@ async fn prepare_recovery_sqlite_source(
 
         // Configure `synchronous = FULL` BEFORE `BEGIN EXCLUSIVE;` so any hot
         // rollback journal recovery (`pager_playback()`) executes with `FULL` sync.
-        configure_and_verify_synchronous_full(&mut conn, role).await?;
+        // Because SQLite marks `PRAGMA synchronous` with `PragFlg_NeedSchema`, an
+        // already-fenced (`State 3`) database fails `PRAGMA synchronous = FULL;`
+        // with exact `SQLITE_CORRUPT (11)` naming `__libra_migrated_fence__`.
+        // In that exact non-WAL case only, acquire the OS `EXCLUSIVE` lock via
+        // `BEGIN EXCLUSIVE; ROLLBACK;` (which does NOT parse `sqlite_master`) and
+        // verify DELETE-mode header bytes directly via `SQLITE_FCNTL_FILE_POINTER`
+        // so `probe_recovery_sqlite_schema_state` can verify the exact sentinel row
+        // under the continuously held exclusive lock (`RB-10k`).
+        let mut already_fenced_candidate = false;
+        match conn.execute("PRAGMA synchronous = FULL;").await {
+            Ok(_) => {
+                let sync_level: i64 = sea_orm::sqlx::query_scalar("PRAGMA synchronous;")
+                    .persistent(false)
+                    .fetch_one(&mut conn)
+                    .await
+                    .map_err(|err| {
+                        map_quiesce_sqlite_error(role, SqliteQuiesceStage::ConfigurePragmas, &err)
+                    })?;
+                if sync_level != 2 {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration quiescence failed for {role} at {}: expected synchronous=FULL (2), got {sync_level}",
+                            SqliteQuiesceStage::ConfigurePragmas.as_str()
+                        ),
+                    });
+                }
+            }
+            Err(err) if !wal_sidecar_present && is_exact_sqlite_fence_corrupt_error(&err) => {
+                already_fenced_candidate = true;
+            }
+            Err(err) => {
+                return Err(map_quiesce_sqlite_error(
+                    role,
+                    SqliteQuiesceStage::ConfigurePragmas,
+                    &err,
+                ));
+            }
+        }
 
-        let action = if wal_sidecar_present {
+        let action = if already_fenced_candidate {
+            // Acquire the OS `EXCLUSIVE` lock without parsing `sqlite_master` or
+            // toggling `writable_schema` (keeps `DB_SchemaLoaded == 0` so
+            // `probe_recovery_sqlite_schema_state` independently authenticates
+            // the exact sentinel row under the held exclusive lock).
+            sea_orm::sqlx::query("BEGIN EXCLUSIVE;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await
+                .map_err(|err| {
+                    map_quiesce_sqlite_error(role, SqliteQuiesceStage::BeginExclusive, &err)
+                })?;
+
+            let is_wal_res = read_sqlite_header_is_wal(&mut conn, role).await;
+            let rollback_res = sea_orm::sqlx::query("ROLLBACK;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await;
+            let is_wal = is_wal_res?;
+            rollback_res.map_err(|err| {
+                map_quiesce_sqlite_error(role, SqliteQuiesceStage::RollbackProbe, &err)
+            })?;
+            if is_wal {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration recovery rejected fenced {role} database with WAL header"
+                    ),
+                });
+            }
+            classify_delete_mode_post_action(db_path, &wal_path, &shm_path, role)?
+        } else if wal_sidecar_present {
             #[cfg(test)]
             let default_hooks = QuiesceTestHooks::default();
             #[cfg(test)]
@@ -34392,12 +35078,7 @@ async fn probe_recovery_sqlite_schema_state(
             // Distinguish State 3 (exact `__libra_migrated_fence__` sentinel
             // committed prior to `unlink`) from State 4 (any other corruption,
             // `SQLITE_NOTADB`, non-sentinel malformed schema, etc.).
-            let is_exact_fence_corrupt = sqlite_error_exact_numeric_code(&err) == Some(11) && {
-                let lower = err.to_string().to_ascii_lowercase();
-                lower.contains("malformed database schema")
-                    && lower.contains(SQLITE_MIGRATED_FENCE_TABLE)
-            };
-            if !is_exact_fence_corrupt {
+            if !is_exact_sqlite_fence_corrupt_error(&err) {
                 return Err(StorageBackendError::BackendInternal {
                     detail: format!(
                         "forward migration recovery rejected corrupt or non-sentinel {role} database (fail-closed)"
@@ -34424,17 +35105,26 @@ async fn probe_recovery_sqlite_schema_state(
                     ),
                 })?;
 
-            let rows_res: Result<Vec<(String, String, String, String)>, sea_orm::sqlx::Error> =
+            type SqliteMasterRow = (String, String, String, i64, String);
+            let rows_res: Result<Vec<SqliteMasterRow>, sea_orm::sqlx::Error> =
                 sea_orm::sqlx::query_as(
-                    "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = ?1;",
+                    "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master WHERE name = ?1;",
                 )
                 .bind(SQLITE_MIGRATED_FENCE_TABLE)
                 .persistent(false)
                 .fetch_all(&mut source.conn)
                 .await;
 
-            // Always restore `writable_schema = OFF` immediately.
-            let _ = sea_orm::sqlx::query("PRAGMA writable_schema = OFF;")
+            let sql_match_count_res: Result<i64, sea_orm::sqlx::Error> =
+                sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE sql = ?1;")
+                    .bind(SQLITE_MIGRATED_FENCE_SQL)
+                    .persistent(false)
+                    .fetch_one(&mut source.conn)
+                    .await;
+
+            // Always restore `writable_schema = OFF` immediately and fail closed
+            // if restoring fails.
+            let restore_res = sea_orm::sqlx::query("PRAGMA writable_schema = OFF;")
                 .persistent(false)
                 .execute(&mut source.conn)
                 .await;
@@ -34444,11 +35134,24 @@ async fn probe_recovery_sqlite_schema_state(
                     "forward migration recovery failed querying sqlite_master sentinel for {role}"
                 ),
             })?;
+            let sql_match_count =
+                sql_match_count_res.map_err(|_| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration recovery failed counting sqlite_master fence sentinel rows for {role}"
+                    ),
+                })?;
+            restore_res.map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration recovery failed restoring writable_schema=OFF for {role}"
+                ),
+            })?;
             if rows.len() != 1
+                || sql_match_count != 1
                 || rows[0].0 != "table"
                 || rows[0].1 != SQLITE_MIGRATED_FENCE_TABLE
                 || rows[0].2 != SQLITE_MIGRATED_FENCE_TABLE
-                || rows[0].3 != SQLITE_MIGRATED_FENCE_SQL
+                || rows[0].3 <= 0
+                || rows[0].4 != SQLITE_MIGRATED_FENCE_SQL
             {
                 return Err(StorageBackendError::BackendInternal {
                     detail: format!(
@@ -34461,17 +35164,42 @@ async fn probe_recovery_sqlite_schema_state(
     }
 }
 
+/// Ephemeral private (`0700`) authenticated copy of `.libra/sqlite-backup/<gen>/<db>`
+/// materialized in a SINGLE streaming pass from a protected descriptor (`O_NOFOLLOW`,
+/// non-reparse, `nlink == 1`, non-aliasing live `.db` inodes, exact `backup_sha256`,
+/// and `PRAGMA integrity_check == "ok"`).
+///
+/// All downstream consumers (`PRAGMA integrity_check`, parity reference export,
+/// cross-source `gen + 1` re-export, and `gen + 1` backup carry-forward) read ONLY
+/// from `snapshot_path`, NEVER reopening `.libra/sqlite-backup/<gen>/<db>` via SQLite:
+/// - Eliminates check-to-use backup substitution TOCTOU.
+/// - Guarantees exported redb data and `gen + 1` backup are bit-identical to the
+///   authenticated `expected_backup_sha256`.
+/// - Guarantees a hostile backup-path swap aliasing a live `.db` can NEVER cause
+///   SQLite to close an extra descriptor and release process-scoped POSIX locks.
+struct VerifiedBackupSnapshot {
+    _private_dir: tempfile::TempDir,
+    snapshot_dir: PathBuf,
+    snapshot_path: PathBuf,
+    file_name: &'static str,
+    byte_len: u64,
+    sha256: String,
+}
+
 /// Independently verify `.libra/sqlite-backup/<gen>/<db>` exists, is a regular
 /// non-symlink file not aliasing any live `.db`, has zero sidecars, matches
-/// `expected_backup_sha256` via streaming 64 KiB SHA-256, and passes read-only
-/// `PRAGMA integrity_check == "ok"` (`ADR-RB-07` #1).
+/// `expected_backup_sha256` via a single-pass protected streaming copy into a
+/// private `0700` staging directory, and passes read-only
+/// `PRAGMA integrity_check == "ok"` on that exact immutable snapshot (`ADR-RB-07` #1).
 async fn verify_sqlite_backup_for_recovery(
     common_storage: &Path,
     backup_rel_dir: &str,
     role: DatabaseRole,
     expected_backup_sha256: &str,
     #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
-) -> StorageResult<PathBuf> {
+) -> StorageResult<VerifiedBackupSnapshot> {
+    use std::io::{Read as _, Write as _};
+
     let file_name = match role {
         DatabaseRole::Repository => LEGACY_SQLITE_DB_FILE,
         DatabaseRole::Capture => "capture.db",
@@ -34494,79 +35222,130 @@ async fn verify_sqlite_backup_for_recovery(
         }
     }
 
-    // Step 1: Streaming 64 KiB SHA-256 verification on protected descriptor.
-    #[cfg(unix)]
-    let backup_inode = {
-        use std::{ffi::CString, os::unix::io::AsRawFd as _};
-        let parent_fd = open_verified_backup_parent_dir_unix(&backup_dir)?;
-        let c_name = CString::new(file_name.as_bytes()).map_err(|_| {
-            StorageBackendError::BackendInternal {
-                detail: "invalid backup sqlite filename".to_string(),
-            }
+    // Create a private `0700` staging directory for the authenticated snapshot.
+    let private_dir = tempfile::Builder::new()
+        .prefix("libra-verified-bk-")
+        .tempdir()
+        .map_err(|err| {
+            StorageBackendError::io("create private verified sqlite backup snapshot dir", err)
         })?;
-        let (mut file, size) = open_readonly_regular_file_at_unix_protected(
-            &parent_fd,
-            &c_name,
-            0o177,
-            Some(0o600),
-            protected_live_inodes,
-            "recovery sqlite backup",
-        )?;
-        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        // SAFETY: `file` is valid.
-        if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
-            return Err(StorageBackendError::io(
-                "stat recovery sqlite backup descriptor",
-                io::Error::last_os_error(),
-            ));
-        }
-        // SAFETY: `fstat` succeeded.
-        let st = unsafe { st.assume_init() };
-        let b_inode = (st.st_dev as u64, st.st_ino as u64);
-        let (actual_sha, hashed_len) = stream_hash_file(&mut file, "recovery sqlite backup")?;
-        if size == 0 || hashed_len != size || actual_sha != expected_backup_sha256 {
-            return Err(StorageBackendError::BackendInternal {
-                detail: format!(
-                    "forward migration recovery rejected {role} backup: backup_sha256 mismatch"
-                ),
-            });
-        }
-        b_inode
-    };
-    #[cfg(windows)]
-    let (_parent_pin, parent_id) = {
-        let (pin, pid) =
-            win_tmp_guard::open_pinned_non_reparse_dir(&backup_dir, "recovery sqlite backup dir")?;
-        let pinned = [(backup_dir.as_path(), pid, "recovery sqlite backup dir")];
-        let (mut file, size) = open_readonly_non_reparse_file_windows(
-            &backup_path,
-            false,
-            &pinned,
-            "recovery sqlite backup",
-        )?;
-        let (actual_sha, hashed_len) = stream_hash_file(&mut file, "recovery sqlite backup")?;
-        if size == 0 || hashed_len != size || actual_sha != expected_backup_sha256 {
-            return Err(StorageBackendError::BackendInternal {
-                detail: format!(
-                    "forward migration recovery rejected {role} backup: backup_sha256 mismatch"
-                ),
-            });
-        }
-        (pin, pid)
-    };
-    #[cfg(all(not(unix), not(windows)))]
+    #[cfg(unix)]
     {
-        let _ = (expected_backup_sha256, &backup_path);
-        return Err(StorageBackendError::BackendInternal {
-            detail: "recovery sqlite backup verification is unsupported on this platform"
-                .to_string(),
-        });
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(private_dir.path(), fs::Permissions::from_mode(0o700)).map_err(
+            |err| StorageBackendError::io("chmod private verified sqlite backup snapshot dir", err),
+        )?;
     }
+    let snapshot_dir = private_dir.path().to_path_buf();
+    let snapshot_path = snapshot_dir.join(file_name);
 
-    // Step 2: Independent read-only `PRAGMA integrity_check == "ok"` bound to
-    // the exact verified backup inode/directory.
+    // Step 1: Single-pass protected descriptor read -> simultaneous SHA-256
+    // authentication + private immutable copy (`0600` on Unix).
+    let mut snapshot_opts = OpenOptions::new();
+    snapshot_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        snapshot_opts.mode(0o600);
+    }
+    let mut snapshot_file = snapshot_opts.open(&snapshot_path).map_err(|err| {
+        StorageBackendError::io("create private verified sqlite backup snapshot file", err)
+    })?;
+
+    let (byte_len, actual_sha) = {
+        #[cfg(unix)]
+        let (mut src_file, expected_size) = {
+            use std::ffi::CString;
+            let parent_fd = open_verified_backup_parent_dir_unix(&backup_dir)?;
+            let c_name = CString::new(file_name.as_bytes()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "invalid backup sqlite filename".to_string(),
+                }
+            })?;
+            open_readonly_regular_file_at_unix_protected(
+                &parent_fd,
+                &c_name,
+                0o177,
+                Some(0o600),
+                protected_live_inodes,
+                "recovery sqlite backup",
+            )?
+        };
+        #[cfg(windows)]
+        let (mut src_file, expected_size) = {
+            let (_pin, pid) = win_tmp_guard::open_pinned_non_reparse_dir(
+                &backup_dir,
+                "recovery sqlite backup dir",
+            )?;
+            let pinned = [(backup_dir.as_path(), pid, "recovery sqlite backup dir")];
+            open_readonly_non_reparse_file_windows(
+                &backup_path,
+                false,
+                &pinned,
+                "recovery sqlite backup",
+            )?
+        };
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let _ = (expected_backup_sha256, &backup_path, &mut snapshot_file);
+            return Err(StorageBackendError::BackendInternal {
+                detail: "recovery sqlite backup verification is unsupported on this platform"
+                    .to_string(),
+            });
+        }
+
+        #[cfg(any(unix, windows))]
+        {
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 64 * 1024];
+            let mut copied_len = 0u64;
+            loop {
+                match src_file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        hasher.update(&buf[..n]);
+                        snapshot_file.write_all(&buf[..n]).map_err(|err| {
+                            StorageBackendError::io(
+                                "write private verified sqlite backup snapshot",
+                                err,
+                            )
+                        })?;
+                        copied_len = copied_len.saturating_add(n as u64);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        return Err(StorageBackendError::io(
+                            "read recovery sqlite backup into private snapshot",
+                            err,
+                        ));
+                    }
+                }
+            }
+            snapshot_file.flush().map_err(|err| {
+                StorageBackendError::io("flush private verified sqlite backup snapshot", err)
+            })?;
+            drop(snapshot_file);
+            drop(src_file);
+            let actual_sha = sha256_hex_from_hasher(hasher);
+            if expected_size == 0
+                || copied_len != expected_size
+                || actual_sha != expected_backup_sha256
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration recovery rejected {role} backup: backup_sha256 mismatch"
+                    ),
+                });
+            }
+            (copied_len, actual_sha)
+        }
+    };
+
+    // Step 2: Independent read-only `PRAGMA integrity_check == "ok"` STRICTLY
+    // against the private authenticated snapshot (NEVER reopening the on-disk
+    // `.libra/sqlite-backup/<gen>/<db>` pathname with SQLite!).
     let verify_opts = SqliteConnectOptions::new()
-        .filename(&backup_path)
+        .filename(&snapshot_path)
         .create_if_missing(false)
         .read_only(true)
         .busy_timeout(Duration::ZERO);
@@ -34574,11 +35353,10 @@ async fn verify_sqlite_backup_for_recovery(
         .await
         .map_err(|_| StorageBackendError::BackendInternal {
             detail: format!(
-                "forward migration recovery failed to open {role} backup read-only for integrity_check"
+                "forward migration recovery failed to open verified {role} backup snapshot read-only for integrity_check"
             ),
         })?;
     let ic_res: StorageResult<()> = async {
-        verify_connection_not_moved(&mut verify_conn, role).await?;
         let rows: Vec<String> = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
             .persistent(false)
             .fetch_all(&mut verify_conn)
@@ -34595,33 +35373,6 @@ async fn verify_sqlite_backup_for_recovery(
                 ),
             });
         }
-        verify_connection_not_moved(&mut verify_conn, role).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let post_meta = fs::symlink_metadata(&backup_path).map_err(|err| {
-                StorageBackendError::io("re-stat recovery sqlite backup after integrity_check", err)
-            })?;
-            if post_meta.file_type().is_symlink()
-                || !post_meta.file_type().is_file()
-                || (post_meta.dev(), post_meta.ino()) != backup_inode
-                || protected_live_inodes.contains(&(post_meta.dev(), post_meta.ino()))
-            {
-                return Err(StorageBackendError::BackendInternal {
-                    detail: format!(
-                        "forward migration recovery detected {role} backup inode change during integrity_check"
-                    ),
-                });
-            }
-        }
-        #[cfg(windows)]
-        {
-            win_tmp_guard::verify_pinned_dir_ids(&[(
-                backup_dir.as_path(),
-                parent_id,
-                "recovery sqlite backup dir",
-            )])?;
-        }
         Ok(())
     }
     .await;
@@ -34635,36 +35386,86 @@ async fn verify_sqlite_backup_for_recovery(
         });
     }
 
-    Ok(backup_path)
+    Ok(VerifiedBackupSnapshot {
+        _private_dir: private_dir,
+        snapshot_dir,
+        snapshot_path,
+        file_name,
+        byte_len,
+        sha256: actual_sha,
+    })
 }
 
-/// Count regular backed-up files in `.libra/sqlite-backup/<gen>/capture-spool/ready/`
-/// strictly read-only without following symlinks/reparse points (`RB-10c`).
+/// Ephemeral private (`0700`) authenticated copy of
+/// `.libra/sqlite-backup/<gen>/capture-spool/` (`ready/` and `quarantine/`,
+/// `0600` files on Unix) materialized in a SINGLE streaming pass whose
+/// canonical manifest matched `manifest.source_digests.spool_manifest_sha256`.
+///
+/// All downstream consumers (parity verification, `gen + 1` redb ingestion, and
+/// `gen + 1` union backup) consume ONLY this immutable snapshot and NEVER reopen
+/// `.libra/sqlite-backup/<gen>/capture-spool/` (`RB-10h`).
+struct VerifiedSpoolBackupSnapshot {
+    _private_dir: tempfile::TempDir,
+    snapshot_spool_dir: PathBuf,
+    ready_file_count: u64,
+    expected_ready_digests: BTreeMap<String, (u64, String)>,
+    expected_quarantine_digests: BTreeMap<String, (u64, String)>,
+}
+
 /// Authenticate the COMPLETE backed-up `.libra/sqlite-backup/<gen>/capture-spool/`
 /// tree (`ready/` AND `quarantine/`) strictly read-only against
 /// `expected_spool_sha` (`LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0`) without
-/// following symlinks or reparse points (`ADR-RB-07` #1, `RB-10c`).
-///
-/// Rejects any missing, extra, or modified file in EITHER `ready/` OR
-/// `quarantine/` fail-closed (`LBR-IO-001`), even after partial or complete
-/// live spool tombstoning. Returns the exact verified regular-file count in
-/// backed-up `capture-spool/ready/`.
+/// following symlinks or reparse points, materializing the exact verified bytes
+/// in a single streaming pass into an immutable private `0700` snapshot
+/// (`ADR-RB-07` #1, `RB-10c`, `RB-10h`).
 fn verify_spool_backup_manifest_for_recovery(
     common_storage: &Path,
     backup_rel_dir: &str,
     expected_spool_sha: &str,
     #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
-) -> StorageResult<u64> {
+) -> StorageResult<VerifiedSpoolBackupSnapshot> {
+    use std::io::{Read as _, Write as _};
+
     let backup_dir = common_storage.join(backup_rel_dir);
+    let private_dir = tempfile::Builder::new()
+        .prefix("libra-verified-spool-bk-")
+        .tempdir()
+        .map_err(|err| {
+            StorageBackendError::io("create private verified spool backup snapshot dir", err)
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(private_dir.path(), fs::Permissions::from_mode(0o700)).map_err(
+            |err| StorageBackendError::io("chmod private verified spool backup snapshot dir", err),
+        )?;
+    }
+    let snapshot_spool_dir = private_dir.path().join(CAPTURE_SPOOL_SUBDIR);
+    fs::create_dir(&snapshot_spool_dir).map_err(|err| {
+        StorageBackendError::io("create capture-spool dir in private snapshot", err)
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&snapshot_spool_dir, fs::Permissions::from_mode(0o700)).map_err(
+            |err| StorageBackendError::io("chmod capture-spool dir in private snapshot", err),
+        )?;
+    }
+
     let mut manifest_hasher = Sha256::new();
     manifest_hasher.update(b"LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0");
     let mut ready_file_count = 0u64;
+    let mut expected_ready_digests: BTreeMap<String, (u64, String)> = BTreeMap::new();
+    let mut expected_quarantine_digests: BTreeMap<String, (u64, String)> = BTreeMap::new();
     let mut remaining_file_budget = MAX_SPOOL_BACKUP_FILES;
     let mut remaining_name_bytes = MAX_SPOOL_BACKUP_NAME_BYTES;
 
     #[cfg(unix)]
     {
-        use std::ffi::CString;
+        use std::{
+            ffi::CString,
+            os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+        };
         let parent_fd = open_verified_backup_parent_dir_unix(&backup_dir)?;
         let spool_fd_opt = open_readonly_subdir_unix(
             &parent_fd,
@@ -34709,32 +35510,76 @@ fn verify_spool_backup_manifest_for_recovery(
             if is_ready {
                 ready_file_count = names.len() as u64;
             }
-            for name in names {
-                let c_name = CString::new(name.as_bytes()).map_err(|_| {
-                    StorageBackendError::BackendInternal {
-                        detail: "invalid backed-up capture-spool filename during recovery"
-                            .to_string(),
+            if !names.is_empty() {
+                let snap_sub_dir = snapshot_spool_dir.join(subdir_str);
+                fs::create_dir(&snap_sub_dir)
+                    .map_err(|err| StorageBackendError::io("create spool snapshot subdir", err))?;
+                fs::set_permissions(&snap_sub_dir, fs::Permissions::from_mode(0o700))
+                    .map_err(|err| StorageBackendError::io("chmod spool snapshot subdir", err))?;
+                for name in names {
+                    let c_name = CString::new(name.as_bytes()).map_err(|_| {
+                        StorageBackendError::BackendInternal {
+                            detail: "invalid backed-up capture-spool filename during recovery"
+                                .to_string(),
+                        }
+                    })?;
+                    let (mut file, size) = open_readonly_regular_file_at_unix_protected(
+                        &sub_fd,
+                        &c_name,
+                        0o177,
+                        Some(0o600),
+                        protected_live_inodes,
+                        subject,
+                    )?;
+                    let mut snap_file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(snap_sub_dir.join(&name))
+                        .map_err(|err| {
+                            StorageBackendError::io("create spool snapshot file", err)
+                        })?;
+                    let mut hasher = Sha256::new();
+                    let mut buf = [0u8; 64 * 1024];
+                    let mut copied_len = 0u64;
+                    loop {
+                        match file.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                hasher.update(&buf[..n]);
+                                snap_file.write_all(&buf[..n]).map_err(|err| {
+                                    StorageBackendError::io("write spool snapshot file", err)
+                                })?;
+                                copied_len = copied_len.saturating_add(n as u64);
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(err) => {
+                                return Err(StorageBackendError::io(subject, err));
+                            }
+                        }
                     }
-                })?;
-                let (mut file, size) = open_readonly_regular_file_at_unix_protected(
-                    &sub_fd,
-                    &c_name,
-                    0o177,
-                    Some(0o600),
-                    protected_live_inodes,
-                    subject,
-                )?;
-                let (actual_sha, hashed_len) = stream_hash_file(&mut file, subject)?;
-                if hashed_len != size {
-                    return Err(StorageBackendError::BackendInternal {
-                        detail: format!(
-                            "forward migration recovery detected concurrent size change in {subject}"
-                        ),
-                    });
+                    snap_file
+                        .flush()
+                        .map_err(|err| StorageBackendError::io("flush spool snapshot file", err))?;
+                    drop(snap_file);
+                    drop(file);
+                    if copied_len != size {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward migration recovery detected concurrent size change in {subject}"
+                            ),
+                        });
+                    }
+                    let actual_sha = sha256_hex_from_hasher(hasher);
+                    hash_len_prefixed_bytes(&mut manifest_hasher, name.as_bytes());
+                    manifest_hasher.update(size.to_le_bytes());
+                    hash_len_prefixed_bytes(&mut manifest_hasher, actual_sha.as_bytes());
+                    if is_ready {
+                        expected_ready_digests.insert(name, (size, actual_sha));
+                    } else {
+                        expected_quarantine_digests.insert(name, (size, actual_sha));
+                    }
                 }
-                hash_len_prefixed_bytes(&mut manifest_hasher, name.as_bytes());
-                manifest_hasher.update(size.to_le_bytes());
-                hash_len_prefixed_bytes(&mut manifest_hasher, actual_sha.as_bytes());
             }
         }
     }
@@ -34823,38 +35668,79 @@ fn verify_spool_backup_manifest_for_recovery(
             if is_ready {
                 ready_file_count = names.len() as u64;
             }
-            for name in names {
-                let entry_path = sub_dir.join(&name);
-                let emeta = fs::symlink_metadata(&entry_path).map_err(|err| {
-                    StorageBackendError::io("stat backed-up capture-spool entry", err)
-                })?;
-                if (emeta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-                    || emeta.file_type().is_symlink()
-                    || !emeta.file_type().is_file()
-                {
-                    return Err(StorageBackendError::BackendInternal {
-                        detail: format!(
-                            "forward migration recovery rejected unsafe entry in {subject}"
-                        ),
-                    });
+            if !names.is_empty() {
+                let snap_sub_dir = snapshot_spool_dir.join(subdir_str);
+                fs::create_dir(&snap_sub_dir)
+                    .map_err(|err| StorageBackendError::io("create spool snapshot subdir", err))?;
+                for name in names {
+                    let entry_path = sub_dir.join(&name);
+                    let emeta = fs::symlink_metadata(&entry_path).map_err(|err| {
+                        StorageBackendError::io("stat backed-up capture-spool entry", err)
+                    })?;
+                    if (emeta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                        || emeta.file_type().is_symlink()
+                        || !emeta.file_type().is_file()
+                    {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward migration recovery rejected unsafe entry in {subject}"
+                            ),
+                        });
+                    }
+                    let (mut file, size) = open_readonly_non_reparse_file_windows(
+                        &entry_path,
+                        false,
+                        &sub_ancestors,
+                        subject,
+                    )?;
+                    let mut snap_file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(snap_sub_dir.join(&name))
+                        .map_err(|err| {
+                            StorageBackendError::io("create spool snapshot file", err)
+                        })?;
+                    let mut hasher = Sha256::new();
+                    let mut buf = [0u8; 64 * 1024];
+                    let mut copied_len = 0u64;
+                    loop {
+                        match file.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                hasher.update(&buf[..n]);
+                                snap_file.write_all(&buf[..n]).map_err(|err| {
+                                    StorageBackendError::io("write spool snapshot file", err)
+                                })?;
+                                copied_len = copied_len.saturating_add(n as u64);
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(err) => {
+                                return Err(StorageBackendError::io(subject, err));
+                            }
+                        }
+                    }
+                    snap_file
+                        .flush()
+                        .map_err(|err| StorageBackendError::io("flush spool snapshot file", err))?;
+                    drop(snap_file);
+                    drop(file);
+                    if copied_len != size {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward migration recovery detected concurrent size change in {subject}"
+                            ),
+                        });
+                    }
+                    let actual_sha = sha256_hex_from_hasher(hasher);
+                    hash_len_prefixed_bytes(&mut manifest_hasher, name.as_bytes());
+                    manifest_hasher.update(size.to_le_bytes());
+                    hash_len_prefixed_bytes(&mut manifest_hasher, actual_sha.as_bytes());
+                    if is_ready {
+                        expected_ready_digests.insert(name, (size, actual_sha));
+                    } else {
+                        expected_quarantine_digests.insert(name, (size, actual_sha));
+                    }
                 }
-                let (mut file, size) = open_readonly_non_reparse_file_windows(
-                    &entry_path,
-                    false,
-                    &sub_ancestors,
-                    subject,
-                )?;
-                let (actual_sha, hashed_len) = stream_hash_file(&mut file, subject)?;
-                if hashed_len != size {
-                    return Err(StorageBackendError::BackendInternal {
-                        detail: format!(
-                            "forward migration recovery detected concurrent size change in {subject}"
-                        ),
-                    });
-                }
-                hash_len_prefixed_bytes(&mut manifest_hasher, name.as_bytes());
-                manifest_hasher.update(size.to_le_bytes());
-                hash_len_prefixed_bytes(&mut manifest_hasher, actual_sha.as_bytes());
             }
             win_tmp_guard::verify_pinned_dir_ids(&sub_ancestors)?;
         }
@@ -34882,35 +35768,35 @@ fn verify_spool_backup_manifest_for_recovery(
                 .to_string(),
         });
     }
-    Ok(ready_file_count)
+    Ok(VerifiedSpoolBackupSnapshot {
+        _private_dir: private_dir,
+        snapshot_spool_dir,
+        ready_file_count,
+        expected_ready_digests,
+        expected_quarantine_digests,
+    })
 }
 
-/// Strictly read-only direct ingestion of the already-authenticated backed-up
-/// `.libra/sqlite-backup/<gen>/capture-spool/ready/` files into an ephemeral
-/// reference `capture.redb` for full source-to-target cryptographic recovery
-/// verification (`RB-10c`).
+/// Strictly read-only direct ingestion of the already-authenticated private
+/// [`VerifiedSpoolBackupSnapshot`] `ready/` files into a target or reference
+/// `capture.redb` (never reopening `.libra/sqlite-backup/<gen>/capture-spool/`,
+/// `RB-10c`, `RB-10h`).
 fn ingest_capture_spool_ready_from_backup_readonly(
     common_storage: &Path,
-    backup_rel_dir: &str,
+    snapshot: &VerifiedSpoolBackupSnapshot,
     cap_db: &RedbDatabase,
     telemetry: &mut ExportStreamTelemetry<'_>,
     #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
 ) -> StorageResult<SpoolDirectIngestReport> {
-    let backup_dir = common_storage.join(backup_rel_dir);
+    let spool_dir = &snapshot.snapshot_spool_dir;
 
     #[cfg(unix)]
     {
-        use std::ffi::CString;
-        let parent_fd = open_verified_backup_parent_dir_unix(&backup_dir)?;
-        let Some((spool_fd, _)) = open_readonly_subdir_unix(
-            &parent_fd,
-            c"capture-spool",
-            0o077,
-            "recovery backup capture-spool directory",
-        )?
-        else {
-            return Ok(SpoolDirectIngestReport::default());
+        use std::{
+            ffi::CString,
+            io::{Seek as _, SeekFrom},
         };
+        let spool_fd = open_verified_backup_parent_dir_unix(spool_dir)?;
         let Some((ready_fd, _)) = open_readonly_subdir_unix(
             &spool_fd,
             c"ready",
@@ -34918,7 +35804,14 @@ fn ingest_capture_spool_ready_from_backup_readonly(
             "recovery backup capture-spool/ready",
         )?
         else {
-            return Ok(SpoolDirectIngestReport::default());
+            if snapshot.expected_ready_digests.is_empty() {
+                return Ok(SpoolDirectIngestReport::default());
+            }
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "authenticated spool backup snapshot missing expected ready/ directory during ingest"
+                        .to_string(),
+            });
         };
         let names = list_sorted_dir_names_bounded_unix(
             &ready_fd,
@@ -34926,6 +35819,12 @@ fn ingest_capture_spool_ready_from_backup_readonly(
             MAX_SPOOL_BACKUP_NAME_BYTES,
             "recovery backup capture-spool/ready",
         )?;
+        if names.len() != snapshot.expected_ready_digests.len() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "authenticated spool backup snapshot file count drifted before ingest"
+                    .to_string(),
+            });
+        }
         if names.is_empty() {
             return Ok(SpoolDirectIngestReport::default());
         }
@@ -34933,6 +35832,14 @@ fn ingest_capture_spool_ready_from_backup_readonly(
         let mut batch: Vec<DecodedSpoolReadyEvent> = Vec::new();
         let mut batch_bytes = 0usize;
         for name in names {
+            let Some((expected_size, expected_sha)) = snapshot.expected_ready_digests.get(&name)
+            else {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "authenticated spool backup snapshot contained unexpected ready file during ingest"
+                            .to_string(),
+                });
+            };
             let c_name = CString::new(name.as_bytes()).map_err(|_| {
                 StorageBackendError::BackendInternal {
                     detail: "invalid filename in backed-up capture-spool/ready".to_string(),
@@ -34946,6 +35853,18 @@ fn ingest_capture_spool_ready_from_backup_readonly(
                 protected_live_inodes,
                 "recovery backup capture-spool/ready entry",
             )?;
+            let (actual_sha, hashed_len) =
+                stream_hash_file(&mut file, "recovery backup capture-spool/ready entry")?;
+            if size != *expected_size || hashed_len != *expected_size || actual_sha != *expected_sha
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "authenticated spool backup snapshot digest drifted before ingest"
+                        .to_string(),
+                });
+            }
+            file.seek(SeekFrom::Start(0)).map_err(|err| {
+                StorageBackendError::io("rewind authenticated spool backup snapshot file", err)
+            })?;
             let ev = decode_spool_ready_envelope_reader(&mut file, size, common_storage)?;
             process_decoded_spool_event(
                 cap_db,
@@ -34968,37 +35887,37 @@ fn ingest_capture_spool_ready_from_backup_readonly(
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
+        use std::{
+            io::{Seek as _, SeekFrom},
+            os::windows::fs::MetadataExt as _,
+        };
 
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-        let (_root_pin, root_id) =
-            win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
-        let (_bk_pin, bk_id) =
-            win_tmp_guard::open_pinned_non_reparse_dir(&backup_dir, "recovery sqlite backup dir")?;
-        let spool_dir = backup_dir.join(CAPTURE_SPOOL_SUBDIR);
-        let Some((_spool_pin, spool_id)) = win_tmp_guard::open_pinned_non_reparse_dir_optional(
-            &spool_dir,
-            "recovery backup capture-spool directory",
-        )?
-        else {
-            return Ok(SpoolDirectIngestReport::default());
-        };
+        let (_spool_pin, spool_id) = win_tmp_guard::open_pinned_non_reparse_dir(
+            spool_dir,
+            "private verified spool backup snapshot dir",
+        )?;
         let ready_dir = spool_dir.join(CAPTURE_SPOOL_READY_SUBDIR);
         let Some((_ready_pin, ready_id)) = win_tmp_guard::open_pinned_non_reparse_dir_optional(
             &ready_dir,
             "recovery backup capture-spool/ready",
         )?
         else {
-            return Ok(SpoolDirectIngestReport::default());
+            if snapshot.expected_ready_digests.is_empty() {
+                return Ok(SpoolDirectIngestReport::default());
+            }
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "authenticated spool backup snapshot missing expected ready/ directory during ingest"
+                        .to_string(),
+            });
         };
         let ready_ancestors = [
-            (common_storage, root_id, "repository storage root"),
-            (backup_dir.as_path(), bk_id, "recovery sqlite backup dir"),
             (
                 spool_dir.as_path(),
                 spool_id,
-                "recovery backup capture-spool directory",
+                "private verified spool backup snapshot dir",
             ),
             (
                 ready_dir.as_path(),
@@ -35032,6 +35951,12 @@ fn ingest_capture_spool_ready_from_backup_readonly(
             names.push(name);
         }
         names.sort();
+        if names.len() != snapshot.expected_ready_digests.len() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "authenticated spool backup snapshot file count drifted before ingest"
+                    .to_string(),
+            });
+        }
         if names.is_empty() {
             return Ok(SpoolDirectIngestReport::default());
         }
@@ -35039,6 +35964,14 @@ fn ingest_capture_spool_ready_from_backup_readonly(
         let mut batch: Vec<DecodedSpoolReadyEvent> = Vec::new();
         let mut batch_bytes = 0usize;
         for name in names {
+            let Some((expected_size, expected_sha)) = snapshot.expected_ready_digests.get(&name)
+            else {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "authenticated spool backup snapshot contained unexpected ready file during ingest"
+                            .to_string(),
+                });
+            };
             let entry_path = ready_dir.join(&name);
             let emeta = fs::symlink_metadata(&entry_path).map_err(|err| {
                 StorageBackendError::io("stat backed-up capture-spool/ready entry", err)
@@ -35057,6 +35990,18 @@ fn ingest_capture_spool_ready_from_backup_readonly(
                 &ready_ancestors,
                 "recovery backup capture-spool/ready entry",
             )?;
+            let (actual_sha, hashed_len) =
+                stream_hash_file(&mut file, "recovery backup capture-spool/ready entry")?;
+            if size != *expected_size || hashed_len != *expected_size || actual_sha != *expected_sha
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "authenticated spool backup snapshot digest drifted before ingest"
+                        .to_string(),
+                });
+            }
+            file.seek(SeekFrom::Start(0)).map_err(|err| {
+                StorageBackendError::io("rewind authenticated spool backup snapshot file", err)
+            })?;
             let ev = decode_spool_ready_envelope_reader(&mut file, size, common_storage)?;
             process_decoded_spool_event(
                 cap_db,
@@ -35079,11 +36024,116 @@ fn ingest_capture_spool_ready_from_backup_readonly(
 
     #[cfg(all(not(unix), not(windows)))]
     {
-        let _ = (backup_dir, cap_db, telemetry);
+        let _ = (spool_dir, cap_db, telemetry);
         Err(StorageBackendError::BackendInternal {
             detail: "recovery backup capture-spool ingest is unsupported on this platform"
                 .to_string(),
         })
+    }
+}
+
+/// File-backed `redb::StorageBackend` used EXCLUSIVELY for throwaway ephemeral
+/// reference stores inside `verify_promoted_redb_targets_for_recovery`'s private
+/// OS tempdir (immediately deleted after computing its full-content SHA-256
+/// digest; NEVER created inside `.libra/` and NEVER promoted). Keeps on-disk
+/// pagination with `PHASE1_VERIFY_REDB_CACHE_BYTES` (`<= 64 MiB` bounded RAM)
+/// while skipping redundant `fsync()` barriers on the disposable temp file so
+/// crash-recovery parity verification satisfies the `<= 500ms` budget (`RB-10k`).
+#[derive(Debug)]
+struct EphemeralParityFileBackend {
+    inner: FileBackend,
+}
+
+impl EphemeralParityFileBackend {
+    fn create(path: &Path) -> StorageResult<Self> {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let file = opts.open(path).map_err(|err| {
+            StorageBackendError::io("create ephemeral recovery parity redb file", err)
+        })?;
+        let inner = FileBackend::new(file);
+        Ok(Self { inner })
+    }
+}
+
+impl StorageBackend for EphemeralParityFileBackend {
+    fn len(&self) -> Result<u64, BackendError> {
+        self.inner.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
+        self.inner.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
+        self.inner.set_len(len)
+    }
+
+    fn sync_data(&self) -> Result<(), BackendError> {
+        // Ephemeral throwaway file outside `.libra/`, deleted immediately after
+        // computing the reference SHA-256 parity digest.
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
+        self.inner.write(offset, data)
+    }
+
+    fn close(&self) -> Result<(), BackendError> {
+        self.inner.close()
+    }
+
+    fn try_lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.inner.try_lock_range(start, end)
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.inner.try_lock_shared_range(start, end)
+    }
+
+    fn lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<(), BackendError> {
+        self.inner.lock_range(start, end)
+    }
+
+    fn lock_shared_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<(), BackendError> {
+        self.inner.lock_shared_range(start, end)
+    }
+
+    fn unlock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<(), BackendError> {
+        self.inner.unlock_range(start, end)
+    }
+
+    fn query_lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.inner.query_lock_range(start, end)
     }
 }
 
@@ -35102,12 +36152,11 @@ fn ingest_capture_spool_ready_from_backup_readonly(
 async fn verify_promoted_redb_targets_for_recovery(
     common_storage: &Path,
     generation: u64,
-    backup_rel_dir: &str,
     git_classified: &mut ClassifiedRecoverySource,
     cap_classified: &mut ClassifiedRecoverySource,
     git_backup_path: &Path,
     cap_backup_path: Option<&Path>,
-    verified_spool_ready_count: u64,
+    verified_spool_snapshot: &VerifiedSpoolBackupSnapshot,
     queue_inspection: &CaptureQueueReadonlyInspection,
     #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
 ) -> StorageResult<(PathBuf, PathBuf)> {
@@ -35248,7 +36297,7 @@ async fn verify_promoted_redb_targets_for_recovery(
             git_name,
             cap_name,
             None,
-            verified_spool_ready_count,
+            verified_spool_snapshot.ready_file_count,
             queue_inspection.has_any_queue_segments,
             Some((
                 queue_inspection.priority_highwater,
@@ -35307,11 +36356,12 @@ async fn verify_promoted_redb_targets_for_recovery(
 
             let expected_git_path = verify_tmp.path().join("expected-git.redb");
             let expected_git_sha = {
+                let backend = EphemeralParityFileBackend::create(&expected_git_path)?;
                 let mut builder = RedbBuilder::new();
                 builder
                     .set_concurrency_mode(ConcurrencyMode::MultiWriter)
                     .set_cache_size(PHASE1_VERIFY_REDB_CACHE_BYTES);
-                let expected_git_db = builder.create(&expected_git_path).map_err(|err| {
+                let expected_git_db = builder.create_with_backend(backend).map_err(|err| {
                     map_redb_database_err(
                         err,
                         DatabaseRole::Repository,
@@ -35370,11 +36420,12 @@ async fn verify_promoted_redb_targets_for_recovery(
 
             let expected_cap_path = verify_tmp.path().join("expected-capture.redb");
             let expected_cap_sha = {
+                let backend = EphemeralParityFileBackend::create(&expected_cap_path)?;
                 let mut builder = RedbBuilder::new();
                 builder
                     .set_concurrency_mode(ConcurrencyMode::MultiWriter)
                     .set_cache_size(PHASE1_VERIFY_REDB_CACHE_BYTES);
-                let expected_cap_db = builder.create(&expected_cap_path).map_err(|err| {
+                let expected_cap_db = builder.create_with_backend(backend).map_err(|err| {
                     map_redb_database_err(
                         err,
                         DatabaseRole::Capture,
@@ -35452,10 +36503,10 @@ async fn verify_promoted_redb_targets_for_recovery(
                         let _ = cap_conn.execute("PRAGMA shrink_memory;").await;
                     }
                 }
-                if verified_spool_ready_count > 0 {
+                if verified_spool_snapshot.ready_file_count > 0 {
                     let _ = ingest_capture_spool_ready_from_backup_readonly(
                         common_storage,
-                        backup_rel_dir,
+                        verified_spool_snapshot,
                         &expected_cap_db,
                         &mut telemetry,
                         #[cfg(unix)]
@@ -35610,37 +36661,44 @@ fn inspect_spool_state_for_recovery(
                 manifest.phase2_progress.capture_db,
                 Some(Phase2DbState::Unlinked | Phase2DbState::Absent)
             );
+        let prior_backup_union_needed =
+            all_tombstoned || any_tombstoned || step2_3_may_have_started;
         // Whenever partial or complete tombstoning occurred (or Step 2.3 may have
         // begun clearing live spool files), unconditionally authenticate the
         // COMPLETE backed-up `capture-spool/` (`ready/` AND `quarantine/`)
-        // against `manifest.source_digests.spool_manifest_sha256`!
-        let verified_backup_ready_count =
-            if all_tombstoned || any_tombstoned || step2_3_may_have_started {
-                Some(verify_spool_backup_manifest_for_recovery(
-                    common_storage,
-                    backup_rel_dir,
-                    expected_spool_sha,
-                    protected_live_inodes,
-                )?)
-            } else {
-                None
-            };
+        // against `manifest.source_digests.spool_manifest_sha256` and materialize
+        // an immutable private snapshot used by all downstream consumers!
+        let verified_prior_spool_snapshot = if prior_backup_union_needed {
+            Some(verify_spool_backup_manifest_for_recovery(
+                common_storage,
+                backup_rel_dir,
+                expected_spool_sha,
+                protected_live_inodes,
+            )?)
+        } else {
+            None
+        };
         if all_tombstoned {
             return Ok(SpoolRecoveryInspection {
                 spool_drifted: false,
-                verified_backup_ready_count,
+                prior_backup_union_needed,
+                verified_prior_spool_snapshot,
             });
         }
 
         // Compute canonical read-only live spool manifest SHA-256 (matching
         // `backup_capture_spool_inplace_unix` byte-for-byte) AND check whether
         // every live file in `ready/`/`quarantine/` is backed up when Step 2.3
-        // may have already begun clearing files.
+        // may have already begun clearing files (preferring the immutable
+        // private snapshot whenever already authenticated!).
         let mut manifest_hasher = Sha256::new();
         manifest_hasher.update(b"LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0");
-        let backup_spool_dir = common_storage
-            .join(backup_rel_dir)
-            .join(CAPTURE_SPOOL_SUBDIR);
+        let backup_spool_dir = match verified_prior_spool_snapshot.as_ref() {
+            Some(snap) => snap.snapshot_spool_dir.clone(),
+            None => common_storage
+                .join(backup_rel_dir)
+                .join(CAPTURE_SPOOL_SUBDIR),
+        };
         let mut any_live_unbacked = false;
         let mut remaining_file_budget = MAX_SPOOL_BACKUP_FILES;
         let mut remaining_name_bytes = MAX_SPOOL_BACKUP_NAME_BYTES;
@@ -35735,7 +36793,8 @@ fn inspect_spool_state_for_recovery(
         };
         Ok(SpoolRecoveryInspection {
             spool_drifted,
-            verified_backup_ready_count,
+            prior_backup_union_needed,
+            verified_prior_spool_snapshot,
         })
     }
 
@@ -35854,28 +36913,33 @@ fn inspect_spool_state_for_recovery(
                 manifest.phase2_progress.capture_db,
                 Some(Phase2DbState::Unlinked | Phase2DbState::Absent)
             );
-        let verified_backup_ready_count =
-            if all_tombstoned || any_tombstoned || step2_3_may_have_started {
-                Some(verify_spool_backup_manifest_for_recovery(
-                    common_storage,
-                    backup_rel_dir,
-                    expected_spool_sha,
-                )?)
-            } else {
-                None
-            };
+        let prior_backup_union_needed =
+            all_tombstoned || any_tombstoned || step2_3_may_have_started;
+        let verified_prior_spool_snapshot = if prior_backup_union_needed {
+            Some(verify_spool_backup_manifest_for_recovery(
+                common_storage,
+                backup_rel_dir,
+                expected_spool_sha,
+            )?)
+        } else {
+            None
+        };
         if all_tombstoned {
             return Ok(SpoolRecoveryInspection {
                 spool_drifted: false,
-                verified_backup_ready_count,
+                prior_backup_union_needed,
+                verified_prior_spool_snapshot,
             });
         }
 
         let mut manifest_hasher = Sha256::new();
         manifest_hasher.update(b"LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0");
-        let backup_spool_dir = common_storage
-            .join(backup_rel_dir)
-            .join(CAPTURE_SPOOL_SUBDIR);
+        let backup_spool_dir = match verified_prior_spool_snapshot.as_ref() {
+            Some(snap) => snap.snapshot_spool_dir.clone(),
+            None => common_storage
+                .join(backup_rel_dir)
+                .join(CAPTURE_SPOOL_SUBDIR),
+        };
         let mut any_live_unbacked = false;
         let mut remaining_file_budget = MAX_SPOOL_BACKUP_FILES;
         let mut remaining_name_bytes = MAX_SPOOL_BACKUP_NAME_BYTES;
@@ -36006,7 +37070,8 @@ fn inspect_spool_state_for_recovery(
         };
         Ok(SpoolRecoveryInspection {
             spool_drifted,
-            verified_backup_ready_count,
+            prior_backup_union_needed,
+            verified_prior_spool_snapshot,
         })
     }
 
@@ -36691,112 +37756,1626 @@ fn prepare_exact_next_forward_generation_for_reexport(
     Ok(next_gen)
 }
 
-/// Execute the full Phase 1 streaming export (`<= 500` rows/batch, `<= 64 MiB`
-/// extra heap), independent verification, durable atomic no-replace promotion,
-/// lock-safe `VACUUM INTO` backups, in-place `capture-spool` backup, queue
-/// manifest digest, and durability verification onto `target_generation` under
-/// an already-locked [`ForwardPhase1QuiesceGuard`] (`ADR-RB-07` #1, `RB-10c` AC4).
-/// Restore a legally unlinked source from its verified lock-safe backup so the
-/// regular drift re-export pipeline can use it again (`RB-10h`).
-async fn restore_unlinked_source_for_reexport(
-    common_storage: &Path,
-    backup_rel_dir: &str,
+/// Source handle for cross-source drift re-export (`RB-10c` AC4, `RB-10h` AC1–AC4).
+///
+/// Crucially NEVER restores a verified immutable backup back onto a live
+/// `.libra/libra.db` or `.libra/private/capture.db` path: sources that were
+/// already fenced or legally unlinked are read directly through a strictly
+/// read-only SQLite connection bound to `.libra/sqlite-backup/<gen>/<db>` while
+/// preserving their Phase 2 state (`FencedReadyToUnlink` or `Unlinked`).
+enum ReexportSourceSlot {
+    /// Source database is still live (`Pending`) under its held exclusive `c_mig`.
+    Live(QuiescedSqliteConnection),
+    /// Source database is already fenced (`held_fenced_conn = Some`) or legally
+    /// unlinked (`held_fenced_conn = None`): reads execute strictly read-only
+    /// from the private authenticated [`VerifiedBackupSnapshot`] and backups for
+    /// `next_gen` are copied directly from that same immutable snapshot without
+    /// ever reopening `.libra/sqlite-backup/<gen>/<db>` or touching live paths.
+    VerifiedBackup {
+        read_conn: SqliteConnection,
+        snapshot: Box<VerifiedBackupSnapshot>,
+        role: DatabaseRole,
+        expected_backup_sha256: String,
+        expected_logical_sha256: String,
+        held_fenced_conn: Option<QuiescedSqliteConnection>,
+        next_phase2_state: Phase2DbState,
+    },
+}
+
+impl ReexportSourceSlot {
+    fn read_conn_mut(&mut self) -> &mut SqliteConnection {
+        match self {
+            Self::Live(c) => &mut c.conn,
+            Self::VerifiedBackup { read_conn, .. } => read_conn,
+        }
+    }
+
+    fn next_phase2_state(&self) -> Phase2DbState {
+        match self {
+            Self::Live(_) => Phase2DbState::Pending,
+            Self::VerifiedBackup {
+                next_phase2_state, ..
+            } => *next_phase2_state,
+        }
+    }
+
+    async fn into_stage_closing_backup_reader(self) -> ClassifiedRecoverySource {
+        match self {
+            Self::Live(conn) => ClassifiedRecoverySource::CleanMatchedPending {
+                conn,
+                hot_journal_recovered: false,
+            },
+            Self::VerifiedBackup {
+                read_conn,
+                snapshot,
+                held_fenced_conn,
+                ..
+            } => {
+                let _ = read_conn.close().await;
+                drop(snapshot);
+                match held_fenced_conn {
+                    Some(conn) => ClassifiedRecoverySource::FencedPreUnlink { conn },
+                    None => ClassifiedRecoverySource::LegallyAbsentPostUnlink,
+                }
+            }
+        }
+    }
+
+    async fn close_quietly(self) {
+        match self {
+            Self::Live(conn) => {
+                let _ = conn.close().await;
+            }
+            Self::VerifiedBackup {
+                read_conn,
+                snapshot,
+                held_fenced_conn,
+                ..
+            } => {
+                let _ = read_conn.close().await;
+                drop(snapshot);
+                if let Some(conn) = held_fenced_conn {
+                    let _ = conn.close().await;
+                }
+            }
+        }
+    }
+}
+
+/// Open a strictly read-only SQLite connection onto the private authenticated
+/// [`VerifiedBackupSnapshot`] for cross-source re-export without touching live
+/// `.db` paths or reopening `.libra/sqlite-backup/<gen>/<db>` (`RB-10h`).
+async fn open_verified_backup_readonly_conn(
+    snapshot: &VerifiedBackupSnapshot,
     role: DatabaseRole,
-    live_path: &Path,
+) -> StorageResult<SqliteConnection> {
+    let opts = SqliteConnectOptions::new()
+        .filename(&snapshot.snapshot_path)
+        .create_if_missing(false)
+        .read_only(true)
+        .busy_timeout(Duration::ZERO);
+    SqliteConnection::connect_with(&opts).await.map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration cross-source re-export failed opening verified {role} backup snapshot read-only"
+            ),
+        }
+    })
+}
+
+/// Descriptor-bound verified copy of a regular file from one pinned Unix
+/// directory to another (supporting optional rename to a collision-free
+/// destination filename), enforcing `0600`, `sync_all()`, read-back SHA-256
+/// match, and atomic `rename_noreplace_at_unix` (`RB-10h`).
+static REEXPORT_BACKUP_COPY_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn copy_verified_regular_file_at_unix(
+    src_dir_fd: &std::os::unix::io::OwnedFd,
+    src_name: &str,
+    dst_dir_fd: &std::os::unix::io::OwnedFd,
+    dst_name: &str,
+    src_forbidden_bits: u32,
+    src_required_mode: Option<u32>,
+    protected_live_inodes: &[(u64, u64)],
+    rel_file_label: &str,
+    subject: &'static str,
+    mut durability: Option<&mut Phase1DurabilityReceipt>,
+) -> StorageResult<(u64, String)> {
+    use std::{
+        ffi::CString,
+        io::{Read as _, Write as _},
+        os::unix::io::{AsRawFd as _, FromRawFd as _},
+    };
+
+    let c_src =
+        CString::new(src_name.as_bytes()).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!("invalid source filename for {subject}"),
+        })?;
+    let c_dst =
+        CString::new(dst_name.as_bytes()).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!("invalid destination filename for {subject}"),
+        })?;
+    let tmp_name = format!(
+        ".{dst_name}.copy-{}-{}.tmp",
+        std::process::id(),
+        REEXPORT_BACKUP_COPY_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let c_tmp =
+        CString::new(tmp_name.as_bytes()).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!("invalid temporary filename for {subject}"),
+        })?;
+
+    let (mut src_file, expected_len) = open_readonly_regular_file_at_unix_protected(
+        src_dir_fd,
+        &c_src,
+        src_forbidden_bits,
+        src_required_mode,
+        protected_live_inodes,
+        subject,
+    )?;
+
+    // SAFETY: `dst_dir_fd` is valid and `c_tmp` is NUL-terminated.
+    let dst_raw = unsafe {
+        libc::openat(
+            dst_dir_fd.as_raw_fd(),
+            c_tmp.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if dst_raw < 0 {
+        return Err(StorageBackendError::io(
+            "create temporary verified copy file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `dst_raw` is a fresh owned fd.
+    let mut dst_file = unsafe { File::from_raw_fd(dst_raw) };
+
+    struct TmpCopyGuard<'a> {
+        dir_fd: &'a std::os::unix::io::OwnedFd,
+        c_tmp: CString,
+        armed: bool,
+    }
+    impl Drop for TmpCopyGuard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                // SAFETY: `dir_fd` is valid and `c_tmp` is NUL-terminated.
+                let _ = unsafe { libc::unlinkat(self.dir_fd.as_raw_fd(), self.c_tmp.as_ptr(), 0) };
+            }
+        }
+    }
+    let mut guard = TmpCopyGuard {
+        dir_fd: dst_dir_fd,
+        c_tmp: c_tmp.clone(),
+        armed: true,
+    };
+
+    // SAFETY: `dst_file` is valid.
+    if unsafe { libc::fchmod(dst_file.as_raw_fd(), 0o600 as libc::mode_t) } != 0 {
+        return Err(StorageBackendError::io(
+            "enforce 0600 permissions on verified copy file",
+            io::Error::last_os_error(),
+        ));
+    }
+    let mut dst_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dst_file` is valid.
+    if unsafe { libc::fstat(dst_file.as_raw_fd(), dst_st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat temporary verified copy file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let dst_st = unsafe { dst_st.assume_init() };
+    let dst_inode = (dst_st.st_dev as u64, dst_st.st_ino);
+
+    let mut src_hasher = Sha256::new();
+    let mut buf = vec![0u8; BACKUP_STREAM_BUF_BYTES];
+    let mut copied_len = 0u64;
+    loop {
+        let n = src_file
+            .read(&mut buf)
+            .map_err(|err| StorageBackendError::io("read source file for verified copy", err))?;
+        if n == 0 {
+            break;
+        }
+        src_hasher.update(&buf[..n]);
+        dst_file.write_all(&buf[..n]).map_err(|err| {
+            StorageBackendError::io("write destination file for verified copy", err)
+        })?;
+        copied_len = copied_len.saturating_add(n as u64);
+    }
+    if copied_len != expected_len {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("size drift while copying {subject}"),
+        });
+    }
+    let src_sha256 = sha256_hex_from_hasher(src_hasher);
+    dst_file
+        .sync_all()
+        .map_err(|err| StorageBackendError::io("fsync temporary verified copy file", err))?;
+    if let Some(log) = durability.as_deref_mut() {
+        log.record(Phase1DurabilityOpKind::FileFsync, rel_file_label);
+    }
+    drop(dst_file);
+    drop(src_file);
+
+    let (mut verify_file, verify_size) = open_readonly_regular_file_at_unix_protected(
+        dst_dir_fd,
+        &c_tmp,
+        0o177,
+        Some(0o600),
+        protected_live_inodes,
+        subject,
+    )?;
+    let mut verify_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `verify_file` is valid.
+    if unsafe { libc::fstat(verify_file.as_raw_fd(), verify_st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "re-stat verified copy file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let verify_st = unsafe { verify_st.assume_init() };
+    if (verify_st.st_dev as u64, verify_st.st_ino) != dst_inode || verify_size != copied_len {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("inode or length mismatch on verified copy read-back for {subject}"),
+        });
+    }
+    let (dst_sha256, read_back_len) = stream_hash_file(&mut verify_file, subject)?;
+    drop(verify_file);
+    if read_back_len != copied_len || dst_sha256 != src_sha256 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("byte-for-byte SHA-256 verification failed for {subject}"),
+        });
+    }
+
+    match rename_noreplace_at_unix(dst_dir_fd, &c_tmp, &c_dst) {
+        Ok(()) => {}
+        Err(UnixNoReplaceError::AlreadyExists) => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("destination already exists during verified copy for {subject}"),
+            });
+        }
+        Err(UnixNoReplaceError::NotPublished(err)) => {
+            return Err(StorageBackendError::io("publish verified copy file", err));
+        }
+        Err(UnixNoReplaceError::PublishedWithStaleSource(unlink_err)) => {
+            if let Err(rb_err) = rollback_published_fallback_dst_unix(dst_dir_fd, &c_dst, dst_inode)
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "fallback publish failed removing tmp ({unlink_err}) and rolling back dst ({rb_err}) for {subject}"
+                    ),
+                });
+            }
+            return Err(StorageBackendError::io(
+                "remove temporary file after fallback link",
+                unlink_err,
+            ));
+        }
+    }
+    if let Some(log) = durability {
+        log.record(Phase1DurabilityOpKind::AtomicPublish, rel_file_label);
+    }
+    guard.armed = false;
+    Ok((copied_len, dst_sha256))
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn copy_verified_regular_file_windows(
+    src_path: &Path,
+    src_ancestors: &[(&Path, win_tmp_guard::WinFileId, &'static str)],
+    dst_dir: &Path,
+    dst_ancestors: &[(&Path, win_tmp_guard::WinFileId, &'static str)],
+    dst_name: &str,
+    rel_file_label: &str,
+    subject: &'static str,
+    mut durability: Option<&mut Phase1DurabilityReceipt>,
+) -> StorageResult<(u64, String)> {
+    use std::io::{Read as _, Write as _};
+
+    let (mut src_file, expected_len) =
+        open_readonly_non_reparse_file_windows(src_path, false, src_ancestors, subject)?;
+    let tmp_name = format!(
+        ".{dst_name}.copy-{}-{}.tmp",
+        std::process::id(),
+        REEXPORT_BACKUP_COPY_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let tmp_path = dst_dir.join(&tmp_name);
+    let dst_path = dst_dir.join(dst_name);
+    win_tmp_guard::verify_pinned_dir_ids(dst_ancestors)?;
+
+    struct WinTmpCopyGuard {
+        path: PathBuf,
+        armed: bool,
+    }
+    impl Drop for WinTmpCopyGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+    let mut guard = WinTmpCopyGuard {
+        path: tmp_path.clone(),
+        armed: true,
+    };
+
+    let mut dst_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|err| StorageBackendError::io("create temporary verified copy file", err))?;
+
+    let mut src_hasher = Sha256::new();
+    let mut buf = vec![0u8; BACKUP_STREAM_BUF_BYTES];
+    let mut copied_len = 0u64;
+    loop {
+        let n = src_file
+            .read(&mut buf)
+            .map_err(|err| StorageBackendError::io("read source file for verified copy", err))?;
+        if n == 0 {
+            break;
+        }
+        src_hasher.update(&buf[..n]);
+        dst_file.write_all(&buf[..n]).map_err(|err| {
+            StorageBackendError::io("write destination file for verified copy", err)
+        })?;
+        copied_len = copied_len.saturating_add(n as u64);
+    }
+    if copied_len != expected_len {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("size drift while copying {subject}"),
+        });
+    }
+    let src_sha256 = sha256_hex_from_hasher(src_hasher);
+    dst_file
+        .sync_all()
+        .map_err(|err| StorageBackendError::io("fsync temporary verified copy file", err))?;
+    if let Some(log) = durability.as_deref_mut() {
+        log.record(Phase1DurabilityOpKind::FileFsync, rel_file_label);
+    }
+    drop(dst_file);
+    drop(src_file);
+
+    let (mut verify_file, verify_size) =
+        open_readonly_non_reparse_file_windows(&tmp_path, false, dst_ancestors, subject)?;
+    let (dst_sha256, read_back_len) = stream_hash_file(&mut verify_file, subject)?;
+    drop(verify_file);
+    if verify_size != copied_len || read_back_len != copied_len || dst_sha256 != src_sha256 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("byte-for-byte SHA-256 verification failed for {subject}"),
+        });
+    }
+    win_tmp_guard::verify_pinned_dir_ids(dst_ancestors)?;
+    rename_noreplace_windows(&tmp_path, &dst_path)?;
+    if let Some(log) = durability {
+        log.record(Phase1DurabilityOpKind::AtomicPublish, rel_file_label);
+    }
+    guard.armed = false;
+    Ok((copied_len, dst_sha256))
+}
+
+/// Carry forward the exact authenticated [`VerifiedBackupSnapshot`] into
+/// `.libra/sqlite-backup/<next_gen>/<file_name>` without reopening the prior
+/// backup pathname or ever touching live `.db` paths (`RB-10h`).
+#[allow(clippy::too_many_arguments)]
+fn copy_verified_sqlite_backup_for_reexport(
+    snapshot: &VerifiedBackupSnapshot,
+    dst_backup_dir: &Path,
+    role: DatabaseRole,
     expected_backup_sha256: &str,
+    dst_rel_file: &str,
+    dst_rel_parent: &str,
     #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
-) -> StorageResult<QuiescedSqliteConnection> {
-    if path_exists_no_open(live_path)? {
+    durability: &mut Phase1DurabilityReceipt,
+) -> StorageResult<SqliteVacuumBackupReceipt> {
+    let dst_path = dst_backup_dir.join(snapshot.file_name);
+    let (byte_len, copied_sha) = {
+        #[cfg(unix)]
+        {
+            let src_dir_fd = open_verified_backup_parent_dir_unix(&snapshot.snapshot_dir)?;
+            let dst_dir_fd = open_verified_backup_parent_dir_unix(dst_backup_dir)?;
+            let pair = copy_verified_regular_file_at_unix(
+                &src_dir_fd,
+                snapshot.file_name,
+                &dst_dir_fd,
+                snapshot.file_name,
+                0o177,
+                Some(0o600),
+                protected_live_inodes,
+                dst_rel_file,
+                "carry-forward verified sqlite backup",
+                Some(durability),
+            )?;
+            fsync_dir_fd_unix(&dst_dir_fd, "sqlite-backup generation directory")?;
+            durability.record(Phase1DurabilityOpKind::DirFsync, dst_rel_parent);
+            pair
+        }
+        #[cfg(windows)]
+        {
+            let (_src_pin, src_id) = win_tmp_guard::open_pinned_non_reparse_dir(
+                &snapshot.snapshot_dir,
+                "private verified sqlite backup snapshot directory",
+            )?;
+            let (_dst_pin, dst_id) = win_tmp_guard::open_pinned_non_reparse_dir(
+                dst_backup_dir,
+                "next sqlite-backup generation directory",
+            )?;
+            let src_ancestors = [(
+                snapshot.snapshot_dir.as_path(),
+                src_id,
+                "private verified sqlite backup snapshot directory",
+            )];
+            let dst_ancestors = [(
+                dst_backup_dir,
+                dst_id,
+                "next sqlite-backup generation directory",
+            )];
+            let pair = copy_verified_regular_file_windows(
+                &snapshot.snapshot_path,
+                &src_ancestors,
+                dst_backup_dir,
+                &dst_ancestors,
+                snapshot.file_name,
+                dst_rel_file,
+                "carry-forward verified sqlite backup",
+                Some(durability),
+            )?;
+            fsync_dir_durable_windows(
+                dst_backup_dir,
+                &dst_ancestors,
+                "next sqlite-backup generation directory",
+            )?;
+            durability.record(Phase1DurabilityOpKind::DirFsync, dst_rel_parent);
+            pair
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let _ = (
+                snapshot,
+                dst_backup_dir,
+                dst_rel_file,
+                dst_rel_parent,
+                durability,
+            );
+            return Err(StorageBackendError::BackendInternal {
+                detail: "verified sqlite backup carry-forward is unsupported on this platform"
+                    .to_string(),
+            });
+        }
+    };
+    if byte_len != snapshot.byte_len
+        || copied_sha != snapshot.sha256
+        || copied_sha != expected_backup_sha256
+    {
         return Err(StorageBackendError::BackendInternal {
             detail: format!(
-                "forward migration drift re-export expected {role} source to be absent before backup restore"
+                "forward migration cross-source re-export detected {role} backup_sha256 drift during carry-forward"
             ),
         });
     }
-    let backup_path = verify_sqlite_backup_for_recovery(
-        common_storage,
-        backup_rel_dir,
-        role,
-        expected_backup_sha256,
-        #[cfg(unix)]
-        protected_live_inodes,
-    )
-    .await?;
-    fs::copy(&backup_path, live_path).map_err(|err| StorageBackendError::Io {
-        context: "restore verified backup for drift re-export",
-        kind: err.kind(),
-        raw_os_error: err.raw_os_error(),
-    })?;
-    let restored = File::open(live_path).map_err(|err| StorageBackendError::Io {
-        context: "open restored source for fsync",
-        kind: err.kind(),
-        raw_os_error: err.raw_os_error(),
-    })?;
-    restored.sync_all().map_err(|err| StorageBackendError::Io {
-        context: "fsync restored source",
-        kind: err.kind(),
-        raw_os_error: err.raw_os_error(),
-    })?;
-    drop(restored);
-    if let Some(parent) = live_path.parent() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd as _;
-            let dir = File::open(parent).map_err(|err| StorageBackendError::Io {
-                context: "open restored source parent directory",
-                kind: err.kind(),
-                raw_os_error: err.raw_os_error(),
-            })?;
-            // SAFETY: `dir` is a valid open directory descriptor.
-            if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
-                return Err(StorageBackendError::io(
-                    "fsync restored source parent directory",
-                    io::Error::last_os_error(),
-                ));
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = parent;
-    }
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let sidecar = sqlite_sidecar_path(live_path, suffix);
-        match fs::remove_file(&sidecar) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(StorageBackendError::Io {
-                    context: "remove stale sidecar of restored source",
-                    kind: err.kind(),
-                    raw_os_error: err.raw_os_error(),
-                });
-            }
-        }
-    }
-    let meta = fs::symlink_metadata(live_path).map_err(|err| StorageBackendError::Io {
-        context: "stat restored source",
-        kind: err.kind(),
-        raw_os_error: err.raw_os_error(),
-    })?;
-    let (prepared, _hot) = prepare_recovery_sqlite_source(
-        live_path,
-        role,
-        &meta,
-        #[cfg(unix)]
-        protected_live_inodes,
-    )
-    .await?;
-    #[cfg(test)]
-    let result =
-        finalize_prepared_sqlite_quiescence_inner(prepared, &QuiesceTestHooks::default()).await;
-    #[cfg(not(test))]
-    let result = finalize_prepared_sqlite_quiescence(prepared).await;
-    result
+    // `snapshot` already passed `PRAGMA integrity_check == "ok"` on these exact
+    // bytes, and `copy_verified_regular_file_*` already read back the written
+    // `dst_path` descriptor and proved SHA-256 == `expected_backup_sha256`.
+    Ok(SqliteVacuumBackupReceipt {
+        backup_path: dst_path,
+        backup_sha256: copied_sha,
+        byte_len,
+    })
 }
 
-async fn run_forward_drift_reexport_to_next_generation(
-    guard: &mut ForwardPhase1QuiesceGuard,
+/// Resolve a lossless destination filename for a prior-generation backed-up
+/// spool entry when building the `prior_backup ∪ live` union backup (`RB-10h`).
+///
+/// Returns `Ok(None)` **ONLY** when an entry already present in `subdir_entries`
+/// has BOTH the same name (original or disambiguated candidate) AND identical
+/// `(byte_len, sha256)`. On any filename collision with different bytes, allocates
+/// a deterministic collision-free suffix (`prior-gen-<prev:08>-<sha8>-<name>` or
+/// `prior-gen-<prev:08>-<sha8>-<attempt:04>-<name>`) and fails closed if exhausted
+/// — NEVER silently omitting an event.
+fn resolve_union_prior_spool_dst_name(
+    subdir_entries: &BTreeMap<String, (u64, String)>,
+    prev_generation: u64,
+    prev_name: &str,
+    prev_size: u64,
+    prev_sha: &str,
+    subject: &'static str,
+) -> StorageResult<Option<String>> {
+    match subdir_entries.get(prev_name) {
+        None => Ok(Some(prev_name.to_string())),
+        Some((existing_len, existing_sha))
+            if *existing_len == prev_size && existing_sha == prev_sha =>
+        {
+            Ok(None)
+        }
+        Some(_) => {
+            for attempt in 0u32..1024 {
+                let candidate = if attempt == 0 {
+                    format!(
+                        "prior-gen-{prev_generation:08}-{}-{prev_name}",
+                        &prev_sha[..8]
+                    )
+                } else {
+                    format!(
+                        "prior-gen-{prev_generation:08}-{}-{attempt:04}-{prev_name}",
+                        &prev_sha[..8]
+                    )
+                };
+                match subdir_entries.get(&candidate) {
+                    None => return Ok(Some(candidate)),
+                    Some((existing_len, existing_sha))
+                        if *existing_len == prev_size && existing_sha == prev_sha =>
+                    {
+                        return Ok(None);
+                    }
+                    Some(_) => continue,
+                }
+            }
+            Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration union backup exhausted collision-free filenames in {subject}"
+                ),
+            })
+        }
+    }
+}
+
+/// Build the durable `gen + 1` backup directory
+/// `.libra/sqlite-backup/<next_gen>/capture-spool/{ready,quarantine}/` as the
+/// **exact lossless union** of live `.libra/private/capture-spool/` and the
+/// authenticated prior backup `.libra/sqlite-backup/<prev_gen>/capture-spool/`
+/// (`ADR-RB-07` #1, `RB-10h` AC3).
+///
+/// - Live files are copied first under their exact live names (recording
+///   `VerifiedSpoolFileIdentity` so Step 2.3 can delete live files cleanly).
+/// - Prior backed-up files not already present with identical `(size, sha256)`
+///   are preserved verbatim (disambiguating any same-name different-content
+///   collision via `prior-gen-<prev>-<sha8>-<name>`).
+/// - Computes `spool_manifest_sha256` in canonical sorted-filename order matching
+///   [`verify_spool_backup_manifest_for_recovery`].
+#[allow(clippy::too_many_arguments)]
+fn backup_capture_spool_union_inner(
+    common_storage: &Path,
+    prior_spool_snapshot: &VerifiedSpoolBackupSnapshot,
+    prev_generation: u64,
+    backup_spool_dir: &Path,
+    rel_spool_dir: &str,
+    rel_parent_dir: &str,
+    #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
+    mut durability: Option<&mut Phase1DurabilityReceipt>,
+) -> StorageResult<SpoolBackupReport> {
+    let prev_spool_dir = &prior_spool_snapshot.snapshot_spool_dir;
+
+    #[cfg(unix)]
+    {
+        use std::{ffi::CString, os::unix::io::AsRawFd as _};
+
+        let root_fd = open_readonly_root_dir_unix(common_storage)?;
+        let prev_spool_fd = open_verified_backup_parent_dir_unix(prev_spool_dir)?;
+        let prev_spool_opt = Some((prev_spool_fd, (0u64, 0u64)));
+
+        let backup_parent =
+            backup_spool_dir
+                .parent()
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "capture-spool union backup path missing parent directory".to_string(),
+                })?;
+        let backup_leaf = backup_spool_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains(['/', '\0']))
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "capture-spool union backup directory name is invalid".to_string(),
+            })?;
+        let c_backup_leaf = CString::new(backup_leaf.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "capture-spool union backup directory name is invalid".to_string(),
+            }
+        })?;
+        let backup_parent_fd = open_verified_backup_parent_dir_unix(backup_parent)?;
+        let (dst_spool_fd, _) = open_or_create_private_dir_at_unix(
+            &backup_parent_fd,
+            &c_backup_leaf,
+            false,
+            "capture-spool union backup directory",
+            None,
+            #[cfg(test)]
+            false,
+        )?;
+
+        let src_spool_opt =
+            match open_readonly_subdir_unix(&root_fd, c"private", 0o022, "private directory")? {
+                Some((private_fd, _)) => open_readonly_subdir_unix(
+                    &private_fd,
+                    c"capture-spool",
+                    0o022,
+                    "capture-spool directory",
+                )?,
+                None => None,
+            };
+
+        let mut ready_fenced = false;
+        let mut quarantine_fenced = false;
+        let mut files: Vec<SpoolBackupFileReceipt> = Vec::new();
+        let mut verified_identities: Vec<VerifiedSpoolFileIdentity> = Vec::new();
+        let mut remaining_file_budget = MAX_SPOOL_BACKUP_FILES;
+        let mut remaining_name_bytes = MAX_SPOOL_BACKUP_NAME_BYTES;
+        let mut manifest_hasher = Sha256::new();
+        manifest_hasher.update(b"LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0");
+
+        for (subdir_str, c_subdir, fenced_slot, subject) in [
+            (
+                CAPTURE_SPOOL_READY_SUBDIR,
+                c"ready",
+                &mut ready_fenced,
+                "capture-spool/ready",
+            ),
+            (
+                CAPTURE_SPOOL_QUARANTINE_SUBDIR,
+                c"quarantine",
+                &mut quarantine_fenced,
+                "capture-spool/quarantine",
+            ),
+        ] {
+            hash_len_prefixed_bytes(&mut manifest_hasher, subdir_str.as_bytes());
+            let mut live_sub_fd_opt = None;
+            if let Some((src_spool_fd, _)) = src_spool_opt.as_ref() {
+                let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                // SAFETY: `src_spool_fd` is valid and `c_subdir` is NUL-terminated.
+                if unsafe {
+                    libc::fstatat(
+                        src_spool_fd.as_raw_fd(),
+                        c_subdir.as_ptr(),
+                        st.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                {
+                    // SAFETY: `fstatat` succeeded.
+                    let st = unsafe { st.assume_init() };
+                    let kind = st.st_mode & libc::S_IFMT;
+                    if kind == libc::S_IFREG {
+                        verify_spool_tombstone_file_unix_protected(
+                            src_spool_fd,
+                            c_subdir,
+                            protected_live_inodes,
+                            subject,
+                        )?;
+                        *fenced_slot = true;
+                    } else if kind == libc::S_IFDIR {
+                        live_sub_fd_opt =
+                            open_readonly_subdir_unix(src_spool_fd, c_subdir, 0o022, subject)?;
+                    } else {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward migration union backup rejected non-directory {subject}"
+                            ),
+                        });
+                    }
+                } else {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::NotFound {
+                        return Err(StorageBackendError::io(
+                            "inspect live capture-spool subdir during union backup",
+                            err,
+                        ));
+                    }
+                }
+            }
+
+            let prev_sub_fd_opt = match prev_spool_opt.as_ref() {
+                Some((prev_spool_fd, _)) => {
+                    open_readonly_subdir_unix(prev_spool_fd, c_subdir, 0o077, subject)?
+                }
+                None => None,
+            };
+
+            let live_names = match live_sub_fd_opt.as_ref() {
+                Some((fd, _)) => list_sorted_dir_names_bounded_unix(
+                    fd,
+                    remaining_file_budget,
+                    remaining_name_bytes,
+                    subject,
+                )?,
+                None => Vec::new(),
+            };
+            let prev_names = match prev_sub_fd_opt.as_ref() {
+                Some((fd, _)) => list_sorted_dir_names_bounded_unix(
+                    fd,
+                    remaining_file_budget,
+                    remaining_name_bytes,
+                    subject,
+                )?,
+                None => Vec::new(),
+            };
+
+            let expected_prev_digests = if subdir_str == CAPTURE_SPOOL_READY_SUBDIR {
+                &prior_spool_snapshot.expected_ready_digests
+            } else {
+                &prior_spool_snapshot.expected_quarantine_digests
+            };
+            if prev_names.len() != expected_prev_digests.len() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "authenticated spool backup snapshot file count drifted before union backup in {subject}"
+                    ),
+                });
+            }
+
+            if live_names.is_empty() && prev_names.is_empty() {
+                manifest_hasher.update(0u64.to_le_bytes());
+                continue;
+            }
+
+            let (dst_sub_fd, _) = open_or_create_private_dir_at_unix(
+                &dst_spool_fd,
+                c_subdir,
+                false,
+                subject,
+                None,
+                #[cfg(test)]
+                false,
+            )?;
+            let rel_sub_dir = format!("{rel_spool_dir}/{subdir_str}");
+            let mut subdir_entries: BTreeMap<String, (u64, String)> = BTreeMap::new();
+
+            if let Some((live_fd, _)) = live_sub_fd_opt.as_ref() {
+                for name in live_names {
+                    if remaining_file_budget == 0 || name.len() > remaining_name_bytes {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward migration union backup exceeded bounded file cap in {subject}"
+                            ),
+                        });
+                    }
+                    remaining_file_budget -= 1;
+                    remaining_name_bytes -= name.len();
+                    let rel_file = format!("{rel_sub_dir}/{name}");
+                    let (receipt, identity) = copy_spool_file_verified_unix(
+                        live_fd,
+                        &dst_sub_fd,
+                        &name,
+                        subdir_str,
+                        &rel_file,
+                        protected_live_inodes,
+                        durability.as_deref_mut(),
+                        #[cfg(test)]
+                        None,
+                    )?;
+                    subdir_entries.insert(
+                        receipt.file_name.clone(),
+                        (receipt.byte_len, receipt.sha256.clone()),
+                    );
+                    files.push(receipt);
+                    verified_identities.push(identity);
+                }
+            }
+
+            if let Some((prev_fd, _)) = prev_sub_fd_opt.as_ref() {
+                for prev_name in prev_names {
+                    let Some((expected_size, expected_sha)) = expected_prev_digests.get(&prev_name)
+                    else {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "authenticated spool backup snapshot contained unexpected file during union backup in {subject}"
+                            ),
+                        });
+                    };
+                    let c_prev = CString::new(prev_name.as_bytes()).map_err(|_| {
+                        StorageBackendError::BackendInternal {
+                            detail: format!("invalid prior backup filename in {subject}"),
+                        }
+                    })?;
+                    let (mut pf, prev_size) = open_readonly_regular_file_at_unix_protected(
+                        prev_fd,
+                        &c_prev,
+                        0o177,
+                        Some(0o600),
+                        protected_live_inodes,
+                        subject,
+                    )?;
+                    let (prev_sha, hashed_len) = stream_hash_file(&mut pf, subject)?;
+                    drop(pf);
+                    if prev_size != *expected_size
+                        || hashed_len != *expected_size
+                        || prev_sha != *expected_sha
+                    {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "authenticated spool backup snapshot digest drifted before union backup in {subject}"
+                            ),
+                        });
+                    }
+
+                    let Some(dst_name) = resolve_union_prior_spool_dst_name(
+                        &subdir_entries,
+                        prev_generation,
+                        &prev_name,
+                        prev_size,
+                        &prev_sha,
+                        subject,
+                    )?
+                    else {
+                        continue;
+                    };
+
+                    if remaining_file_budget == 0 || dst_name.len() > remaining_name_bytes {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward migration union backup exceeded bounded file cap in {subject}"
+                            ),
+                        });
+                    }
+                    remaining_file_budget -= 1;
+                    remaining_name_bytes -= dst_name.len();
+                    let rel_file = format!("{rel_sub_dir}/{dst_name}");
+                    let (copied_len, copied_sha) = copy_verified_regular_file_at_unix(
+                        prev_fd,
+                        &prev_name,
+                        &dst_sub_fd,
+                        &dst_name,
+                        0o177,
+                        Some(0o600),
+                        protected_live_inodes,
+                        &rel_file,
+                        subject,
+                        durability.as_deref_mut(),
+                    )?;
+                    if copied_len != prev_size || copied_sha != prev_sha {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "prior backup SHA-256 mismatch during union copy in {subject}"
+                            ),
+                        });
+                    }
+                    subdir_entries.insert(dst_name.clone(), (copied_len, copied_sha.clone()));
+                    files.push(SpoolBackupFileReceipt {
+                        subdir: subdir_str,
+                        file_name: dst_name,
+                        byte_len: copied_len,
+                        sha256: copied_sha,
+                    });
+                }
+            }
+
+            manifest_hasher.update((subdir_entries.len() as u64).to_le_bytes());
+            for (name, (size, sha)) in subdir_entries {
+                hash_len_prefixed_bytes(&mut manifest_hasher, name.as_bytes());
+                manifest_hasher.update(size.to_le_bytes());
+                hash_len_prefixed_bytes(&mut manifest_hasher, sha.as_bytes());
+            }
+
+            fsync_dir_fd_unix(&dst_sub_fd, subject)?;
+            if let Some(log) = durability.as_deref_mut() {
+                log.record(Phase1DurabilityOpKind::DirFsync, rel_sub_dir);
+            }
+        }
+
+        fsync_dir_fd_unix(&dst_spool_fd, "capture-spool union backup directory")?;
+        if let Some(log) = durability.as_deref_mut() {
+            log.record(Phase1DurabilityOpKind::DirFsync, rel_spool_dir);
+        }
+        fsync_dir_fd_unix(&backup_parent_fd, "sqlite backup generation directory")?;
+        if let Some(log) = durability {
+            log.record(Phase1DurabilityOpKind::DirFsync, rel_parent_dir);
+        }
+
+        Ok(SpoolBackupReport {
+            backup_spool_dir: backup_spool_dir.to_path_buf(),
+            files,
+            spool_manifest_sha256: sha256_hex_from_hasher(manifest_hasher),
+            ready_fenced,
+            quarantine_fenced,
+            verified_identities,
+        })
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        // First copy live spool files via the existing non-reparse Windows backup
+        // path, then union any missing or colliding files from the verified prior
+        // generation backup and recompute canonical sorted `spool_manifest_sha256`.
+        let mut live_report = backup_capture_spool_inplace_windows(
+            common_storage,
+            backup_spool_dir,
+            rel_spool_dir,
+            rel_parent_dir,
+            durability.as_deref_mut(),
+            #[cfg(test)]
+            None,
+        )?;
+        let (_root_pin, root_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+        let prev_spool_pin_opt = win_tmp_guard::open_pinned_non_reparse_dir_optional(
+            prev_spool_dir,
+            "private verified spool backup snapshot directory",
+        )?;
+
+        let backup_parent =
+            backup_spool_dir
+                .parent()
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "capture-spool union backup path missing parent directory".to_string(),
+                })?;
+        let (_dst_parent_pin, dst_parent_id) = win_tmp_guard::open_pinned_non_reparse_dir(
+            backup_parent,
+            "next sqlite-backup generation directory",
+        )?;
+        let (_dst_spool_pin, dst_spool_id) = win_tmp_guard::open_pinned_non_reparse_dir(
+            backup_spool_dir,
+            "capture-spool union backup directory",
+        )?;
+        let dst_spool_ancestors = [
+            (
+                backup_parent,
+                dst_parent_id,
+                "next sqlite-backup generation directory",
+            ),
+            (
+                backup_spool_dir,
+                dst_spool_id,
+                "capture-spool union backup directory",
+            ),
+        ];
+
+        let mut remaining_file_budget =
+            MAX_SPOOL_BACKUP_FILES.saturating_sub(live_report.files.len());
+        let mut remaining_name_bytes = MAX_SPOOL_BACKUP_NAME_BYTES.saturating_sub(
+            live_report
+                .files
+                .iter()
+                .map(|f| f.file_name.len())
+                .sum::<usize>(),
+        );
+        let mut manifest_hasher = Sha256::new();
+        manifest_hasher.update(b"LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0");
+
+        for (subdir_str, subject) in [
+            (CAPTURE_SPOOL_READY_SUBDIR, "capture-spool/ready"),
+            (CAPTURE_SPOOL_QUARANTINE_SUBDIR, "capture-spool/quarantine"),
+        ] {
+            hash_len_prefixed_bytes(&mut manifest_hasher, subdir_str.as_bytes());
+            let mut subdir_entries: BTreeMap<String, (u64, String)> = BTreeMap::new();
+            for existing in live_report.files.iter().filter(|f| f.subdir == subdir_str) {
+                subdir_entries.insert(
+                    existing.file_name.clone(),
+                    (existing.byte_len, existing.sha256.clone()),
+                );
+            }
+
+            let expected_prev_digests = if subdir_str == CAPTURE_SPOOL_READY_SUBDIR {
+                &prior_spool_snapshot.expected_ready_digests
+            } else {
+                &prior_spool_snapshot.expected_quarantine_digests
+            };
+            if !expected_prev_digests.is_empty() && prev_spool_pin_opt.is_none() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "authenticated spool backup snapshot directory missing before union backup in {subject}"
+                    ),
+                });
+            }
+            if let Some((_, prev_spool_id)) = prev_spool_pin_opt.as_ref() {
+                let prev_sub = prev_spool_dir.join(subdir_str);
+                let prev_sub_pin_opt =
+                    win_tmp_guard::open_pinned_non_reparse_dir_optional(&prev_sub, subject)?;
+                if !expected_prev_digests.is_empty() && prev_sub_pin_opt.is_none() {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "authenticated spool backup snapshot subdir missing before union backup in {subject}"
+                        ),
+                    });
+                }
+                if let Some((_prev_sub_pin, prev_sub_id)) = prev_sub_pin_opt {
+                    let prev_sub_ancestors = [
+                        (
+                            prev_spool_dir.as_path(),
+                            *prev_spool_id,
+                            "private verified spool backup snapshot directory",
+                        ),
+                        (prev_sub.as_path(), prev_sub_id, subject),
+                    ];
+                    win_tmp_guard::verify_pinned_dir_ids(&prev_sub_ancestors)?;
+                    let mut prev_names = Vec::new();
+                    for entry in fs::read_dir(&prev_sub).map_err(|err| {
+                        StorageBackendError::io("read prior backup capture-spool subdir", err)
+                    })? {
+                        let entry = entry.map_err(|err| {
+                            StorageBackendError::io(
+                                "iterate prior backup capture-spool subdir",
+                                err,
+                            )
+                        })?;
+                        let name = entry.file_name().into_string().map_err(|_| {
+                            StorageBackendError::BackendInternal {
+                                detail: format!("non-UTF-8 entry in prior backup {subject}"),
+                            }
+                        })?;
+                        prev_names.push(name);
+                    }
+                    prev_names.sort();
+                    if prev_names.len() != expected_prev_digests.len() {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "authenticated spool backup snapshot file count drifted before union backup in {subject}"
+                            ),
+                        });
+                    }
+
+                    if !prev_names.is_empty() {
+                        let (_dst_sub_pin, dst_sub_id, _) = open_or_create_pinned_subdir_windows(
+                            common_storage,
+                            root_id,
+                            backup_spool_dir,
+                            dst_spool_id,
+                            &dst_spool_ancestors,
+                            subdir_str,
+                            false,
+                            subject,
+                            None,
+                        )?;
+                        let dst_sub = backup_spool_dir.join(subdir_str);
+                        let dst_sub_ancestors = [
+                            (
+                                backup_parent,
+                                dst_parent_id,
+                                "next sqlite-backup generation directory",
+                            ),
+                            (
+                                backup_spool_dir,
+                                dst_spool_id,
+                                "capture-spool union backup directory",
+                            ),
+                            (dst_sub.as_path(), dst_sub_id, subject),
+                        ];
+                        let rel_sub_dir = format!("{rel_spool_dir}/{subdir_str}");
+                        for prev_name in prev_names {
+                            let Some((expected_size, expected_sha)) =
+                                expected_prev_digests.get(&prev_name)
+                            else {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: format!(
+                                        "authenticated spool backup snapshot contained unexpected file during union backup in {subject}"
+                                    ),
+                                });
+                            };
+                            let prev_path = prev_sub.join(&prev_name);
+                            let emeta = fs::symlink_metadata(&prev_path).map_err(|err| {
+                                StorageBackendError::io("stat prior backup spool entry", err)
+                            })?;
+                            if (emeta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                                || emeta.file_type().is_symlink()
+                                || !emeta.file_type().is_file()
+                            {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: format!("unsafe entry in prior backup {subject}"),
+                                });
+                            }
+                            let (mut pf, prev_size) = open_readonly_non_reparse_file_windows(
+                                &prev_path,
+                                false,
+                                &prev_sub_ancestors,
+                                subject,
+                            )?;
+                            let (prev_sha, hashed_len) = stream_hash_file(&mut pf, subject)?;
+                            drop(pf);
+                            if prev_size != *expected_size
+                                || hashed_len != *expected_size
+                                || prev_sha != *expected_sha
+                            {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: format!(
+                                        "authenticated spool backup snapshot digest drifted before union backup in {subject}"
+                                    ),
+                                });
+                            }
+                            let Some(dst_name) = resolve_union_prior_spool_dst_name(
+                                &subdir_entries,
+                                prev_generation,
+                                &prev_name,
+                                prev_size,
+                                &prev_sha,
+                                subject,
+                            )?
+                            else {
+                                continue;
+                            };
+                            if remaining_file_budget == 0 || dst_name.len() > remaining_name_bytes {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: format!(
+                                        "forward migration union backup exceeded bounded file cap in {subject}"
+                                    ),
+                                });
+                            }
+                            remaining_file_budget -= 1;
+                            remaining_name_bytes -= dst_name.len();
+                            let rel_file = format!("{rel_sub_dir}/{dst_name}");
+                            let (copied_len, copied_sha) = copy_verified_regular_file_windows(
+                                &prev_path,
+                                &prev_sub_ancestors,
+                                &dst_sub,
+                                &dst_sub_ancestors,
+                                &dst_name,
+                                &rel_file,
+                                subject,
+                                durability.as_deref_mut(),
+                            )?;
+                            if copied_len != prev_size || copied_sha != prev_sha {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: format!(
+                                        "prior backup SHA-256 mismatch during union copy in {subject}"
+                                    ),
+                                });
+                            }
+                            subdir_entries
+                                .insert(dst_name.clone(), (copied_len, copied_sha.clone()));
+                            live_report.files.push(SpoolBackupFileReceipt {
+                                subdir: subdir_str,
+                                file_name: dst_name,
+                                byte_len: copied_len,
+                                sha256: copied_sha,
+                            });
+                        }
+                        fsync_dir_durable_windows(&dst_sub, &dst_sub_ancestors, subject)?;
+                        if let Some(log) = durability.as_deref_mut() {
+                            log.record(Phase1DurabilityOpKind::DirFsync, rel_sub_dir);
+                        }
+                    }
+                }
+            }
+
+            manifest_hasher.update((subdir_entries.len() as u64).to_le_bytes());
+            for (name, (size, sha)) in subdir_entries {
+                hash_len_prefixed_bytes(&mut manifest_hasher, name.as_bytes());
+                manifest_hasher.update(size.to_le_bytes());
+                hash_len_prefixed_bytes(&mut manifest_hasher, sha.as_bytes());
+            }
+        }
+
+        fsync_dir_durable_windows(
+            backup_spool_dir,
+            &dst_spool_ancestors,
+            "capture-spool union backup directory",
+        )?;
+        if let Some(log) = durability.as_deref_mut() {
+            log.record(Phase1DurabilityOpKind::DirFsync, rel_spool_dir);
+        }
+        let parent_ancestors = [(
+            backup_parent,
+            dst_parent_id,
+            "next sqlite-backup generation directory",
+        )];
+        fsync_dir_durable_windows(
+            backup_parent,
+            &parent_ancestors,
+            "next sqlite-backup generation directory",
+        )?;
+        if let Some(log) = durability {
+            log.record(Phase1DurabilityOpKind::DirFsync, rel_parent_dir);
+        }
+
+        live_report.spool_manifest_sha256 = sha256_hex_from_hasher(manifest_hasher);
+        Ok(live_report)
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (
+            common_storage,
+            prev_spool_dir,
+            prev_generation,
+            backup_spool_dir,
+            rel_spool_dir,
+            rel_parent_dir,
+            durability,
+        );
+        Err(StorageBackendError::BackendInternal {
+            detail: "capture-spool union backup is unsupported on this platform".to_string(),
+        })
+    }
+}
+
+/// Create `target_generation` SQLite, capture-spool (with optional prior backup
+/// union), and queue manifest backups for cross-source drift re-export without
+/// ever writing back to an already-fenced or already-unlinked live `.db` path
+/// (`ADR-RB-07` #1, `RB-10c` AC4, `RB-10h` AC1–AC4).
+#[allow(clippy::too_many_arguments)]
+async fn create_forward_reexport_backups(
+    git_slot: &mut ReexportSourceSlot,
+    mut cap_slot: Option<&mut ReexportSourceSlot>,
     common_storage: &Path,
     target_generation: u64,
+    prior_spool_backup: Option<(&VerifiedSpoolBackupSnapshot, u64)>,
+    pins_out: &mut Phase1BackupDirPins,
+) -> StorageResult<ForwardPhase1BackupReport> {
+    if target_generation == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration re-export backup requires generation >= 1".to_string(),
+        });
+    }
+
+    #[cfg(unix)]
+    let protected_live_inodes = collect_live_sqlite_inodes_no_open(common_storage);
+
+    let backup_rel_dir = canonical_sqlite_backup_rel_dir(target_generation);
+    let backup_dir = sqlite_backup_dir_path(common_storage, target_generation);
+    let gen_dir_name = format_generation_id(target_generation);
+
+    // Step 1: Obtain deterministic logical digests for Git and optional Capture.
+    let git_logical_sha256 = match git_slot {
+        ReexportSourceSlot::Live(conn) => {
+            compute_sqlite_source_logical_sha256_inner(
+                &mut conn.conn,
+                DatabaseRole::Repository,
+                #[cfg(test)]
+                None,
+            )
+            .await?
+        }
+        ReexportSourceSlot::VerifiedBackup {
+            expected_logical_sha256,
+            ..
+        } => expected_logical_sha256.clone(),
+    };
+    let capture_logical_sha256 = match cap_slot.as_deref_mut() {
+        Some(ReexportSourceSlot::Live(conn)) => Some(
+            compute_sqlite_source_logical_sha256_inner(
+                &mut conn.conn,
+                DatabaseRole::Capture,
+                #[cfg(test)]
+                None,
+            )
+            .await?,
+        ),
+        Some(ReexportSourceSlot::VerifiedBackup {
+            expected_logical_sha256,
+            ..
+        }) => Some(expected_logical_sha256.clone()),
+        None => None,
+    };
+
+    // Step 2: Create `.libra/sqlite-backup/<next_gen>/` (`0700` / pinned non-reparse).
+    let mut durability = Phase1DurabilityReceipt::new();
+
+    #[cfg(unix)]
+    let (sqlite_backup_root_fd, backup_gen_fd) = {
+        use std::ffi::CString;
+        let root_fd = open_readonly_root_dir_unix(common_storage)?;
+        let (backup_root_fd, created_backup_root) = open_or_create_private_dir_at_unix(
+            &root_fd,
+            c"sqlite-backup",
+            false,
+            "sqlite-backup root directory",
+            Some(&mut pins_out.created_backup_root),
+            #[cfg(test)]
+            false,
+        )?;
+        if created_backup_root {
+            durability.record(Phase1DurabilityOpKind::DirFsync, ".");
+        }
+        let c_gen = CString::new(gen_dir_name.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "failed to format backup generation directory name".to_string(),
+            }
+        })?;
+        let (gen_fd, created_gen_dir) = open_or_create_private_dir_at_unix(
+            &backup_root_fd,
+            &c_gen,
+            true,
+            "sqlite-backup generation directory",
+            Some(&mut pins_out.gen_dir),
+            #[cfg(test)]
+            false,
+        )?;
+        if created_gen_dir {
+            durability.record(Phase1DurabilityOpKind::DirFsync, SQLITE_BACKUP_SUBDIR);
+        }
+        (backup_root_fd, gen_fd)
+    };
+    #[cfg(windows)]
+    let (
+        _win_root_pin,
+        _win_backup_root_pin,
+        root_id_win,
+        backup_root_path_win,
+        backup_root_id_win,
+        gen_id_win,
+    ) = {
+        let (root_pin, root_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+        let root_ancestors = [(common_storage, root_id, "repository storage root")];
+        let (backup_root_pin, backup_root_id, created_backup_root) =
+            open_or_create_pinned_subdir_windows(
+                common_storage,
+                root_id,
+                common_storage,
+                root_id,
+                &root_ancestors,
+                SQLITE_BACKUP_SUBDIR,
+                false,
+                "sqlite-backup root directory",
+                Some(&mut pins_out.created_backup_root),
+            )?;
+        let backup_root_path = common_storage.join(SQLITE_BACKUP_SUBDIR);
+        if created_backup_root {
+            fsync_dir_durable_windows(common_storage, &root_ancestors, "repository storage root")?;
+            durability.record(Phase1DurabilityOpKind::DirFsync, ".");
+        }
+        let backup_ancestors = [
+            (common_storage, root_id, "repository storage root"),
+            (
+                backup_root_path.as_path(),
+                backup_root_id,
+                "sqlite-backup root directory",
+            ),
+        ];
+        let (_gen_pin_opt, gen_id, created_gen_dir) = open_or_create_pinned_subdir_windows(
+            common_storage,
+            root_id,
+            &backup_root_path,
+            backup_root_id,
+            &backup_ancestors,
+            &gen_dir_name,
+            true,
+            "sqlite-backup generation directory",
+            Some(&mut pins_out.gen_dir),
+        )?;
+        if created_gen_dir {
+            fsync_dir_durable_windows(
+                &backup_root_path,
+                &backup_ancestors,
+                "sqlite-backup root directory",
+            )?;
+            durability.record(Phase1DurabilityOpKind::DirFsync, SQLITE_BACKUP_SUBDIR);
+        }
+        (
+            root_pin,
+            backup_root_pin,
+            root_id,
+            backup_root_path,
+            backup_root_id,
+            gen_id,
+        )
+    };
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (&gen_dir_name, pins_out);
+        return Err(StorageBackendError::BackendInternal {
+            detail: "safe re-export sqlite-backup creation is unsupported on this platform"
+                .to_string(),
+        });
+    }
+
+    // Step 3: Materialize SQLite backups via `VACUUM INTO` for live `Pending`
+    // sources or direct verified immutable copy for already-fenced/unlinked sources.
+    let git_backup_path = sqlite_backup_git_db_path(common_storage, target_generation);
+    let git_backup_rel = format!("{backup_rel_dir}/{LEGACY_SQLITE_DB_FILE}");
+    let git_backup = match git_slot {
+        ReexportSourceSlot::Live(conn) => {
+            #[cfg(test)]
+            {
+                vacuum_into_lock_safe_backup_inner(
+                    conn,
+                    &git_backup_path,
+                    &git_backup_rel,
+                    &backup_rel_dir,
+                    Some(&mut durability),
+                    None,
+                    None,
+                )
+                .await?
+            }
+            #[cfg(not(test))]
+            {
+                vacuum_into_lock_safe_backup_inner(
+                    conn,
+                    &git_backup_path,
+                    &git_backup_rel,
+                    &backup_rel_dir,
+                    Some(&mut durability),
+                )
+                .await?
+            }
+        }
+        ReexportSourceSlot::VerifiedBackup {
+            snapshot,
+            role,
+            expected_backup_sha256,
+            ..
+        } => copy_verified_sqlite_backup_for_reexport(
+            snapshot,
+            &backup_dir,
+            *role,
+            expected_backup_sha256,
+            &git_backup_rel,
+            &backup_rel_dir,
+            #[cfg(unix)]
+            &protected_live_inodes,
+            &mut durability,
+        )?,
+    };
+
+    let capture_backup = match cap_slot {
+        Some(ReexportSourceSlot::Live(cap)) => {
+            let cap_backup_path = sqlite_backup_capture_db_path(common_storage, target_generation);
+            let cap_backup_rel = format!("{backup_rel_dir}/capture.db");
+            #[cfg(test)]
+            let receipt = vacuum_into_lock_safe_backup_inner(
+                cap,
+                &cap_backup_path,
+                &cap_backup_rel,
+                &backup_rel_dir,
+                Some(&mut durability),
+                None,
+                None,
+            )
+            .await?;
+            #[cfg(not(test))]
+            let receipt = vacuum_into_lock_safe_backup_inner(
+                cap,
+                &cap_backup_path,
+                &cap_backup_rel,
+                &backup_rel_dir,
+                Some(&mut durability),
+            )
+            .await?;
+            Some(receipt)
+        }
+        Some(ReexportSourceSlot::VerifiedBackup {
+            snapshot,
+            role,
+            expected_backup_sha256,
+            ..
+        }) => {
+            let cap_backup_rel = format!("{backup_rel_dir}/capture.db");
+            Some(copy_verified_sqlite_backup_for_reexport(
+                snapshot,
+                &backup_dir,
+                *role,
+                expected_backup_sha256,
+                &cap_backup_rel,
+                &backup_rel_dir,
+                #[cfg(unix)]
+                &protected_live_inodes,
+                &mut durability,
+            )?)
+        }
+        None => None,
+    };
+
+    // Step 4: Back up `capture-spool/` (full union `prior_backup ∪ live` when
+    // Step 2.3 may have already started clearing live spool files, else in-place).
+    let backup_spool_dir = sqlite_backup_capture_spool_dir_path(common_storage, target_generation);
+    let backup_spool_rel = format!("{backup_rel_dir}/{CAPTURE_SPOOL_SUBDIR}");
+    let spool_backup = if let Some((prev_snap, prev_gen)) = prior_spool_backup {
+        backup_capture_spool_union_inner(
+            common_storage,
+            prev_snap,
+            prev_gen,
+            &backup_spool_dir,
+            &backup_spool_rel,
+            &backup_rel_dir,
+            #[cfg(unix)]
+            &protected_live_inodes,
+            Some(&mut durability),
+        )?
+    } else {
+        backup_capture_spool_inplace_inner(
+            common_storage,
+            &backup_spool_dir,
+            &backup_spool_rel,
+            &backup_rel_dir,
+            #[cfg(unix)]
+            &protected_live_inodes,
+            Some(&mut durability),
+            #[cfg(test)]
+            None,
+        )?
+    };
+
+    // Step 5: Read-only deterministic queue manifest digest.
+    let queue_manifest_sha256 = compute_capture_queue_manifest_sha256_readonly_inner(
+        common_storage,
+        #[cfg(unix)]
+        &protected_live_inodes,
+        MAX_SPOOL_BACKUP_FILES,
+        MAX_SPOOL_BACKUP_NAME_BYTES,
+    )?;
+
+    #[cfg(unix)]
+    {
+        fsync_dir_fd_unix(&backup_gen_fd, "sqlite-backup generation directory")?;
+        durability.record(Phase1DurabilityOpKind::DirFsync, &backup_rel_dir);
+        fsync_dir_fd_unix(&sqlite_backup_root_fd, "sqlite-backup root directory")?;
+        durability.record(Phase1DurabilityOpKind::DirFsync, SQLITE_BACKUP_SUBDIR);
+    }
+    #[cfg(windows)]
+    {
+        let gen_ancestors = [
+            (common_storage, root_id_win, "repository storage root"),
+            (
+                backup_root_path_win.as_path(),
+                backup_root_id_win,
+                "sqlite-backup root directory",
+            ),
+            (
+                backup_dir.as_path(),
+                gen_id_win,
+                "sqlite-backup generation directory",
+            ),
+        ];
+        fsync_dir_durable_windows(
+            &backup_dir,
+            &gen_ancestors,
+            "sqlite-backup generation directory",
+        )?;
+        durability.record(Phase1DurabilityOpKind::DirFsync, &backup_rel_dir);
+        let root_backup_ancestors = [
+            (common_storage, root_id_win, "repository storage root"),
+            (
+                backup_root_path_win.as_path(),
+                backup_root_id_win,
+                "sqlite-backup root directory",
+            ),
+        ];
+        fsync_dir_durable_windows(
+            &backup_root_path_win,
+            &root_backup_ancestors,
+            "sqlite-backup root directory",
+        )?;
+        durability.record(Phase1DurabilityOpKind::DirFsync, SQLITE_BACKUP_SUBDIR);
+    }
+
+    let source_digests = SourceDigests {
+        git_logical_sha256: Some(git_logical_sha256.clone()),
+        git_backup_sha256: Some(git_backup.backup_sha256.clone()),
+        cap_logical_sha256: capture_logical_sha256.clone(),
+        cap_backup_sha256: capture_backup.as_ref().map(|b| b.backup_sha256.clone()),
+        git_redb_sha256: None,
+        cap_redb_sha256: None,
+        spool_manifest_sha256: Some(spool_backup.spool_manifest_sha256.clone()),
+        queue_manifest_sha256: Some(queue_manifest_sha256.clone()),
+    };
+
+    Ok(ForwardPhase1BackupReport {
+        generation: target_generation,
+        backup_rel_dir,
+        backup_dir,
+        git_logical_sha256,
+        git_backup,
+        capture_logical_sha256,
+        capture_backup,
+        spool_backup,
+        queue_manifest_sha256,
+        source_digests,
+        durability,
+    })
+}
+
+/// Execute the full Phase 1 streaming export (`<= 500` rows/batch, `<= 64 MiB`
+/// extra heap), independent verification, durable atomic no-replace promotion,
+/// lock-safe `VACUUM INTO` / verified carry-forward backups, in-place or union
+/// `capture-spool` backup, queue manifest digest, and durability verification
+/// onto `target_generation` under all 6 held migration locks (`ADR-RB-07` #1,
+/// `RB-10c` AC4, `RB-10h` AC1–AC4).
+#[allow(clippy::too_many_arguments)]
+async fn run_forward_drift_reexport_to_next_generation(
+    git_slot: &mut ReexportSourceSlot,
+    mut cap_slot: Option<&mut ReexportSourceSlot>,
+    common_storage: &Path,
+    target_generation: u64,
+    prior_spool_backup: Option<(&VerifiedSpoolBackupSnapshot, u64)>,
     artifact_guard: &mut Phase1ArtifactGuard,
     #[cfg(test)] crash_point: Option<ForwardDriftReexportCrashPoint>,
 ) -> StorageResult<(
@@ -36810,11 +39389,19 @@ async fn run_forward_drift_reexport_to_next_generation(
     let cap_final = capture_redb_path(common_storage, target_generation);
     let redb_dir_existed_before = path_exists_no_open(&common_storage.join(REDB_SUBDIR))?;
 
+    #[cfg(unix)]
+    let protected_live_inodes = collect_live_sqlite_inodes_no_open(common_storage);
     let mut telemetry = ExportStreamTelemetry::new();
-    let export = export_forward_phase1_to_redb_tmp_inner(
-        guard,
+    let export = export_forward_phase1_to_redb_tmp_conns(
+        git_slot.read_conn_mut(),
+        cap_slot
+            .as_deref_mut()
+            .map(ReexportSourceSlot::read_conn_mut),
         common_storage,
         target_generation,
+        prior_spool_backup.map(|(snap, _)| snap),
+        #[cfg(unix)]
+        &protected_live_inodes,
         &mut telemetry,
         Some(artifact_guard),
         #[cfg(test)]
@@ -36860,10 +39447,33 @@ async fn run_forward_drift_reexport_to_next_generation(
             detail: "invalid final capture redb filename for drift re-export".to_string(),
         })?;
 
-    let _verification = verify_forward_phase1_redb_tmp_inner(
-        guard,
+    let cap_verify_conn = match export.layout {
+        LegacyRepositoryLayout::LayoutA => None,
+        LegacyRepositoryLayout::LayoutB | LegacyRepositoryLayout::LayoutC => Some(
+            cap_slot
+                .as_deref_mut()
+                .map(ReexportSourceSlot::read_conn_mut)
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "Layout B/C drift re-export verification missing capture connection"
+                        .to_string(),
+                })?,
+        ),
+    };
+    let _verification = verify_forward_redb_targets_core(
         common_storage,
-        &export,
+        git_slot.read_conn_mut(),
+        cap_verify_conn,
+        git_tmp_name,
+        cap_tmp_name,
+        Some(&export),
+        0,
+        false,
+        Some((
+            export.queue_ingest.priority_highwater,
+            export.queue_ingest.normal_highwater,
+        )),
+        #[cfg(unix)]
+        &protected_live_inodes,
         #[cfg(unix)]
         artifact_guard.git_file.as_ref().and_then(|f| f.inode),
         #[cfg(unix)]
@@ -36875,8 +39485,6 @@ async fn run_forward_drift_reexport_to_next_generation(
     )
     .await?;
 
-    #[cfg(unix)]
-    let protected_live_inodes = collect_live_sqlite_inodes_no_open(common_storage);
     let mut durability = Phase1DurabilityReceipt::new();
     let git_rel = canonical_git_redb_rel_path(target_generation);
     let cap_rel = canonical_capture_redb_rel_path(target_generation);
@@ -36930,15 +39538,13 @@ async fn run_forward_drift_reexport_to_next_generation(
     )?;
 
     let mut backup_pins = Phase1BackupDirPins::default();
-    let backup_res = create_forward_phase1_lock_safe_backups_inner(
-        guard,
+    let backup_res = create_forward_reexport_backups(
+        git_slot,
+        cap_slot,
         common_storage,
         target_generation,
+        prior_spool_backup,
         &mut backup_pins,
-        #[cfg(test)]
-        None,
-        #[cfg(test)]
-        None,
     )
     .await;
     #[cfg(any(unix, windows))]
@@ -37199,122 +39805,6 @@ pub async fn resume_forward_migration_for_role(
 
 /// Convenience entrypoint resuming an interrupted repository
 /// (`DatabaseRole::Repository`) Forward Migration (`SQLite -> redb`, `RB-10c`).
-/// Probe the committed migration fence sentinel through an already-locked
-/// connection (`RB-10k` AC1: fence committed, progress still `pending`).
-async fn recovery_conn_has_fence_sentinel(conn: &mut SqliteConnection) -> StorageResult<bool> {
-    conn.execute("PRAGMA writable_schema = ON;")
-        .await
-        .map_err(|err| StorageBackendError::BackendInternal {
-            detail: format!("enable writable_schema for recovery fence check: {err}"),
-        })?;
-    let row: Option<String> =
-        sea_orm::sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = ? LIMIT 1;")
-            .bind(SQLITE_MIGRATED_FENCE_TABLE)
-            .persistent(false)
-            .fetch_optional(conn)
-            .await
-            .map_err(|err| StorageBackendError::BackendInternal {
-                detail: format!("read recovery fence sentinel: {err}"),
-            })?;
-    match row {
-        None => Ok(false),
-        Some(sql) if sql == SQLITE_MIGRATED_FENCE_SQL => Ok(true),
-        Some(_) => Err(StorageBackendError::BackendInternal {
-            detail: "forward migration recovery found a tampered fence sentinel".to_string(),
-        }),
-    }
-}
-
-/// Read-only probe for a committed fence sentinel through a fresh plain
-/// connection (no PRAGMAs), tolerating the deliberately malformed schema.
-async fn source_has_committed_fence(db_path: &Path) -> StorageResult<bool> {
-    use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
-    let opts = SqliteConnectOptions::new()
-        .filename(db_path)
-        .create_if_missing(false)
-        .read_only(false)
-        .busy_timeout(Duration::ZERO);
-    let mut conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
-        .await
-        .map_err(|err| StorageBackendError::BackendInternal {
-            detail: format!("open fenced source probe: {err}"),
-        })?;
-    let probe = sea_orm::sqlx::query_scalar::<_, String>("SELECT name FROM sqlite_master LIMIT 1;")
-        .persistent(false)
-        .fetch_optional(&mut conn)
-        .await;
-    match probe {
-        Ok(_) => Ok(false),
-        Err(err) => {
-            let lower = err.to_string().to_ascii_lowercase();
-            if !(lower.contains("malformed database schema")
-                && lower.contains(SQLITE_MIGRATED_FENCE_TABLE))
-            {
-                let _ = conn.close().await;
-                return Err(StorageBackendError::BackendInternal {
-                    detail: format!("fenced source probe rejected corrupt database: {err}"),
-                });
-            }
-            conn.execute("PRAGMA writable_schema = ON;")
-                .await
-                .map_err(|err| StorageBackendError::BackendInternal {
-                    detail: format!("enable writable_schema for fence probe: {err}"),
-                })?;
-            let row: Option<String> = sea_orm::sqlx::query_scalar(
-                "SELECT sql FROM sqlite_master WHERE name = ? LIMIT 1;",
-            )
-            .bind(SQLITE_MIGRATED_FENCE_TABLE)
-            .persistent(false)
-            .fetch_optional(&mut conn)
-            .await
-            .map_err(|err| StorageBackendError::BackendInternal {
-                detail: format!("read fence sentinel for probe: {err}"),
-            })?;
-            let _ = conn.close().await;
-            match row {
-                Some(sql) if sql == SQLITE_MIGRATED_FENCE_SQL => Ok(true),
-                Some(_) => Err(StorageBackendError::BackendInternal {
-                    detail: "forward migration recovery found a tampered fence sentinel"
-                        .to_string(),
-                }),
-                None => Ok(false),
-            }
-        }
-    }
-}
-
-/// Open a plain (PRAGMA-free) quiesced connection for an already-fenced source.
-async fn open_fenced_quiesced_connection(
-    db_path: &Path,
-    role: DatabaseRole,
-    meta: &fs::Metadata,
-) -> StorageResult<QuiescedSqliteConnection> {
-    use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
-    let opts = SqliteConnectOptions::new()
-        .filename(db_path)
-        .create_if_missing(false)
-        .read_only(false)
-        .busy_timeout(Duration::ZERO);
-    let conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
-        .await
-        .map_err(|err| StorageBackendError::BackendInternal {
-            detail: format!("open fenced {role} source: {err}"),
-        })?;
-    #[cfg(unix)]
-    let source_inode = {
-        use std::os::unix::fs::MetadataExt as _;
-        (meta.dev(), meta.ino())
-    };
-    Ok(QuiescedSqliteConnection {
-        conn,
-        role,
-        path: db_path.to_path_buf(),
-        journal_mode: "delete".to_string(),
-        #[cfg(unix)]
-        source_inode,
-    })
-}
-
 pub async fn resume_forward_migration(
     common_storage: &Path,
 ) -> StorageResult<ForwardPhase2ResumeReport> {
@@ -37468,26 +39958,7 @@ async fn resume_forward_migration_inner(
     }
 
     // Phase A: Acquire exclusive locks on all present live SQLite sources first.
-    // A committed fence leaves a deliberately malformed schema, so skip the
-    // PRAGMA-configured quiescence and keep a plain locked connection instead.
-    let git_fence_committed = match git_exists_meta {
-        // A hot rollback journal means a pre-fence power loss: opening the file
-        // for the fence probe would consume the journal, so let the normal
-        // Phase A recovery path replay it instead.
-        Some(_) if !path_exists_no_open(&sqlite_sidecar_path(&git_db_path, "-journal"))? => {
-            source_has_committed_fence(&git_db_path).await?
-        }
-        _ => false,
-    };
-    let mut git_fenced_conn = if git_fence_committed {
-        let meta = git_exists_meta.as_ref().expect("checked above");
-        Some(open_fenced_quiesced_connection(&git_db_path, DatabaseRole::Repository, meta).await?)
-    } else {
-        None
-    };
-    let mut git_prepared = if let Some(ref meta) = git_exists_meta
-        && !git_fence_committed
-    {
+    let mut git_prepared = if let Some(ref meta) = git_exists_meta {
         Some(
             prepare_recovery_sqlite_source(
                 &git_db_path,
@@ -37525,38 +39996,24 @@ async fn resume_forward_migration_inner(
     };
 
     // Phase B: Finalize any offline WAL -> DELETE transitions under all held locks.
-    let (git_conn_opt, git_hot_journal) = if let Some(fenced) = git_fenced_conn.take() {
-        (Some(fenced), false)
-    } else {
-        match git_prepared.take() {
-            Some((mut prep, hot)) => {
-                // A committed fence makes the schema deliberately malformed, so the
-                // offline WAL -> DELETE PRAGMAs would fail; keep the locked connection
-                // and let the schema probe classify it as `FencedPreUnlink`.
-                if recovery_conn_has_fence_sentinel(prep.connection_mut()).await? {
-                    (Some(prep.into_fenced_quiesced()), hot)
-                } else {
-                    #[cfg(test)]
-                    let res = finalize_prepared_sqlite_quiescence_inner(
-                        prep,
-                        &QuiesceTestHooks::default(),
-                    )
-                    .await;
-                    #[cfg(not(test))]
-                    let res = finalize_prepared_sqlite_quiescence(prep).await;
-                    match res {
-                        Ok(conn) => (Some(conn), hot),
-                        Err(err) => {
-                            if let Some((c_prep, _)) = cap_prepared {
-                                c_prep.close_quietly().await;
-                            }
-                            return Err(err);
-                        }
+    let (git_conn_opt, git_hot_journal) = match git_prepared.take() {
+        Some((prep, hot)) => {
+            #[cfg(test)]
+            let res =
+                finalize_prepared_sqlite_quiescence_inner(prep, &QuiesceTestHooks::default()).await;
+            #[cfg(not(test))]
+            let res = finalize_prepared_sqlite_quiescence(prep).await;
+            match res {
+                Ok(conn) => (Some(conn), hot),
+                Err(err) => {
+                    if let Some((c_prep, _)) = cap_prepared {
+                        c_prep.close_quietly().await;
                     }
+                    return Err(err);
                 }
             }
-            None => (None, false),
         }
+        None => (None, false),
     };
 
     let (cap_conn_opt, cap_hot_journal) = match cap_prepared {
@@ -37616,9 +40073,12 @@ async fn resume_forward_migration_inner(
         }
         None => {
             // `git_manifest_state` is guaranteed to be `FencedReadyToUnlink | Unlinked`.
-            if let Err(err) =
-                reconcile_sidecars_for_unlinked_source(&git_db_path, DatabaseRole::Repository)
-            {
+            if let Err(err) = reconcile_sidecars_for_unlinked_source(
+                common_storage,
+                DatabaseRole::Repository,
+                #[cfg(unix)]
+                &protected_live_inodes,
+            ) {
                 if let Some(c_conn) = cap_conn_opt {
                     let _ = c_conn.close().await;
                 }
@@ -37662,9 +40122,12 @@ async fn resume_forward_migration_inner(
         }
         (None, Phase2DbState::Absent) => ClassifiedRecoverySource::Absent,
         (None, Phase2DbState::FencedReadyToUnlink | Phase2DbState::Unlinked) => {
-            if let Err(err) =
-                reconcile_sidecars_for_unlinked_source(&cap_db_path, DatabaseRole::Capture)
-            {
+            if let Err(err) = reconcile_sidecars_for_unlinked_source(
+                common_storage,
+                DatabaseRole::Capture,
+                #[cfg(unix)]
+                &protected_live_inodes,
+            ) {
                 git_classified.close_quietly().await;
                 return Err(err);
             }
@@ -37739,8 +40202,11 @@ async fn resume_forward_migration_inner(
                     | ForwardSourceRecoveryState::LegallyAbsentPostUnlink
             ));
 
-    let precheck_res: StorageResult<()> = async {
-        let git_backup_path = if verify_existing_git_backup {
+    let precheck_res: StorageResult<(
+        Option<VerifiedBackupSnapshot>,
+        Option<VerifiedBackupSnapshot>,
+    )> = async {
+        let git_backup_snapshot = if verify_existing_git_backup {
             Some(
                 verify_sqlite_backup_for_recovery(
                     common_storage,
@@ -37755,7 +40221,7 @@ async fn resume_forward_migration_inner(
         } else {
             None
         };
-        let cap_backup_path = if verify_existing_cap_backup {
+        let cap_backup_snapshot = if verify_existing_cap_backup {
             let cap_sha = cap_expected_backup_sha.as_deref().ok_or_else(|| {
                 StorageBackendError::BackendInternal {
                     detail: "unfinalized forward manifest missing cap_backup_sha256".to_string(),
@@ -37784,135 +40250,198 @@ async fn resume_forward_migration_inner(
                     detail: "in-progress forward manifest missing spool_manifest_sha256"
                         .to_string(),
                 })?;
-            let verified_spool_ready_count = match spool_inspection.verified_backup_ready_count {
-                Some(cnt) => cnt,
-                None => verify_spool_backup_manifest_for_recovery(
-                    common_storage,
-                    &backup_rel_dir,
-                    expected_spool_sha,
-                    #[cfg(unix)]
-                    &protected_live_inodes,
-                )?,
-            };
-            let git_bk =
-                git_backup_path
-                    .as_deref()
-                    .ok_or_else(|| StorageBackendError::BackendInternal {
-                        detail:
-                            "missing verified git backup path before recovery redb verification"
-                                .to_string(),
-                    })?;
+            let owned_spool_snapshot;
+            let verified_spool_snapshot =
+                match spool_inspection.verified_prior_spool_snapshot.as_ref() {
+                    Some(snap) => snap,
+                    None => {
+                        owned_spool_snapshot = verify_spool_backup_manifest_for_recovery(
+                            common_storage,
+                            &backup_rel_dir,
+                            expected_spool_sha,
+                            #[cfg(unix)]
+                            &protected_live_inodes,
+                        )?;
+                        &owned_spool_snapshot
+                    }
+                };
+            let git_bk = git_backup_snapshot.as_ref().ok_or_else(|| {
+                StorageBackendError::BackendInternal {
+                    detail:
+                        "missing verified git backup snapshot before recovery redb verification"
+                            .to_string(),
+                }
+            })?;
             let _ = verify_promoted_redb_targets_for_recovery(
                 common_storage,
                 manifest.generation,
-                &backup_rel_dir,
                 &mut git_classified,
                 &mut cap_classified,
-                git_bk,
-                cap_backup_path.as_deref(),
-                verified_spool_ready_count,
+                git_bk.snapshot_path.as_path(),
+                cap_backup_snapshot
+                    .as_ref()
+                    .map(|s| s.snapshot_path.as_path()),
+                verified_spool_snapshot,
                 &queue_inspection,
                 #[cfg(unix)]
                 &protected_live_inodes,
             )
             .await?;
         }
-        Ok(())
+        Ok((git_backup_snapshot, cap_backup_snapshot))
     }
     .await;
-    if let Err(err) = precheck_res {
-        cap_classified.close_quietly().await;
-        git_classified.close_quietly().await;
-        return Err(err);
-    }
+    let (mut verified_git_backup_snapshot, mut verified_cap_backup_snapshot) = match precheck_res {
+        Ok(snapshots) => snapshots,
+        Err(err) => {
+            cap_classified.close_quietly().await;
+            git_classified.close_quietly().await;
+            return Err(err);
+        }
+    };
 
     let mut durability = Phase2DurabilityReceipt::new();
     let mut verified_spool_identities: Vec<VerifiedSpoolFileIdentity> = Vec::new();
     let mut max_reexport_batch_rows = 0usize;
 
-    // Step R3: Either re-export drifted live sources to `gen + 1` (and atomically
-    // publish the refreshed `finalized = false` manifest for `gen + 1`), OR
-    // resume directly on `manifest.generation` with the already-verified targets!
+    // Step R3: Either re-export drifted sources (combining live `Pending` DBs,
+    // strictly read-only private `VerifiedBackupSnapshot` copies for already-fenced/
+    // unlinked DBs, backup ∪ live spool events, and latest queue frames) onto
+    // `gen + 1` and atomically publish the refreshed `finalized = false` manifest
+    // for `gen + 1`, OR resume directly on `manifest.generation` with the
+    // already-verified targets!
     let (locks, git_stage, cap_stage) = if needs_reexport {
-        // RB-10h cross-source reconciliation: a source that was already legally
-        // unlinked still has a verified VACUUM INTO backup. Restore that backup
-        // as the live source so the regular re-export pipeline re-exports it
-        // alongside the still-live drifted source (zero data loss).
-        let mut git_classified = git_classified;
-        let mut cap_classified = cap_classified;
-        if matches!(
-            git_classified,
-            ClassifiedRecoverySource::LegallyAbsentPostUnlink
-        ) {
-            let conn = restore_unlinked_source_for_reexport(
-                common_storage,
-                &backup_rel_dir,
-                DatabaseRole::Repository,
-                &git_db_path,
-                &git_expected_backup_sha,
-                #[cfg(unix)]
-                &protected_live_inodes,
-            )
-            .await?;
-            git_classified = ClassifiedRecoverySource::CleanMatchedPending {
-                conn,
-                hot_journal_recovered: false,
-            };
-        }
-        if matches!(
-            cap_classified,
-            ClassifiedRecoverySource::LegallyAbsentPostUnlink
-        ) && cap_manifest_state != Phase2DbState::Absent
-        {
-            let cap_sha = cap_expected_backup_sha.as_deref().ok_or_else(|| {
-                StorageBackendError::BackendInternal {
-                    detail: "unfinalized forward manifest missing cap_backup_sha256".to_string(),
-                }
-            })?;
-            let conn = restore_unlinked_source_for_reexport(
-                common_storage,
-                &backup_rel_dir,
-                DatabaseRole::Capture,
-                &cap_db_path,
-                cap_sha,
-                #[cfg(unix)]
-                &protected_live_inodes,
-            )
-            .await?;
-            cap_classified = ClassifiedRecoverySource::CleanMatchedPending {
-                conn,
-                hot_journal_recovered: false,
-            };
-        }
-
-        // When both present sources are still live `Pending` (the `RB-10c` AC4
-        // path), re-run the exact streaming Phase 1 export + verify + atomic
-        // promote + `VACUUM INTO` backup pipeline onto `gen + 1`.
-        let git_live_conn = match git_classified {
+        let mut git_reexport_slot = match git_classified {
             ClassifiedRecoverySource::CleanMatchedPending { conn, .. }
-            | ClassifiedRecoverySource::DriftedLivePending { conn, .. } => conn,
-            other => {
-                other.close_quietly().await;
+            | ClassifiedRecoverySource::DriftedLivePending { conn, .. } => {
+                ReexportSourceSlot::Live(conn)
+            }
+            ClassifiedRecoverySource::FencedPreUnlink { conn } => {
+                let Some(snapshot) = verified_git_backup_snapshot.take() else {
+                    let _ = conn.close().await;
+                    cap_classified.close_quietly().await;
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "missing verified libra.db backup for cross-source drift re-export"
+                            .to_string(),
+                    });
+                };
+                match open_verified_backup_readonly_conn(&snapshot, DatabaseRole::Repository).await
+                {
+                    Ok(read_conn) => ReexportSourceSlot::VerifiedBackup {
+                        read_conn,
+                        snapshot: Box::new(snapshot),
+                        role: DatabaseRole::Repository,
+                        expected_backup_sha256: git_expected_backup_sha.clone(),
+                        expected_logical_sha256: git_expected_logical.clone(),
+                        held_fenced_conn: Some(conn),
+                        next_phase2_state: Phase2DbState::FencedReadyToUnlink,
+                    },
+                    Err(err) => {
+                        let _ = conn.close().await;
+                        cap_classified.close_quietly().await;
+                        return Err(err);
+                    }
+                }
+            }
+            ClassifiedRecoverySource::LegallyAbsentPostUnlink => {
+                let Some(snapshot) = verified_git_backup_snapshot.take() else {
+                    cap_classified.close_quietly().await;
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "missing verified libra.db backup for cross-source drift re-export"
+                            .to_string(),
+                    });
+                };
+                match open_verified_backup_readonly_conn(&snapshot, DatabaseRole::Repository).await
+                {
+                    Ok(read_conn) => ReexportSourceSlot::VerifiedBackup {
+                        read_conn,
+                        snapshot: Box::new(snapshot),
+                        role: DatabaseRole::Repository,
+                        expected_backup_sha256: git_expected_backup_sha.clone(),
+                        expected_logical_sha256: git_expected_logical.clone(),
+                        held_fenced_conn: None,
+                        next_phase2_state: Phase2DbState::Unlinked,
+                    },
+                    Err(err) => {
+                        cap_classified.close_quietly().await;
+                        return Err(err);
+                    }
+                }
+            }
+            ClassifiedRecoverySource::Absent => {
                 cap_classified.close_quietly().await;
                 return Err(StorageBackendError::BackendInternal {
-                    detail:
-                        "forward migration drift re-export requires cross-source backup reconciliation when libra.db is already fenced or unlinked"
-                            .to_string(),
+                    detail: "unexpected absent Repository state during forward drift re-export"
+                        .to_string(),
                 });
             }
         };
-        let cap_live_conn = match cap_classified {
+
+        let mut cap_reexport_slot = match cap_classified {
             ClassifiedRecoverySource::CleanMatchedPending { conn, .. }
-            | ClassifiedRecoverySource::DriftedLivePending { conn, .. } => Some(conn),
+            | ClassifiedRecoverySource::DriftedLivePending { conn, .. } => {
+                Some(ReexportSourceSlot::Live(conn))
+            }
             ClassifiedRecoverySource::Absent => None,
-            other => {
-                other.close_quietly().await;
-                let _ = git_live_conn.close().await;
-                return Err(StorageBackendError::BackendInternal {
-                    detail:
-                        "forward migration drift re-export requires cross-source backup reconciliation when capture.db is already fenced or unlinked"
-                            .to_string(),
-                });
+            ClassifiedRecoverySource::FencedPreUnlink { conn } => {
+                let (Some(snapshot), Some(cap_bk_sha), Some(cap_log_sha)) = (
+                    verified_cap_backup_snapshot.take(),
+                    cap_expected_backup_sha.clone(),
+                    cap_expected_logical.clone(),
+                ) else {
+                    let _ = conn.close().await;
+                    git_reexport_slot.close_quietly().await;
+                    return Err(StorageBackendError::BackendInternal {
+                        detail:
+                            "missing verified capture.db backup metadata for cross-source drift re-export"
+                                .to_string(),
+                    });
+                };
+                match open_verified_backup_readonly_conn(&snapshot, DatabaseRole::Capture).await {
+                    Ok(read_conn) => Some(ReexportSourceSlot::VerifiedBackup {
+                        read_conn,
+                        snapshot: Box::new(snapshot),
+                        role: DatabaseRole::Capture,
+                        expected_backup_sha256: cap_bk_sha,
+                        expected_logical_sha256: cap_log_sha,
+                        held_fenced_conn: Some(conn),
+                        next_phase2_state: Phase2DbState::FencedReadyToUnlink,
+                    }),
+                    Err(err) => {
+                        let _ = conn.close().await;
+                        git_reexport_slot.close_quietly().await;
+                        return Err(err);
+                    }
+                }
+            }
+            ClassifiedRecoverySource::LegallyAbsentPostUnlink => {
+                let (Some(snapshot), Some(cap_bk_sha), Some(cap_log_sha)) = (
+                    verified_cap_backup_snapshot.take(),
+                    cap_expected_backup_sha.clone(),
+                    cap_expected_logical.clone(),
+                ) else {
+                    git_reexport_slot.close_quietly().await;
+                    return Err(StorageBackendError::BackendInternal {
+                        detail:
+                            "missing verified capture.db backup metadata for cross-source drift re-export"
+                                .to_string(),
+                    });
+                };
+                match open_verified_backup_readonly_conn(&snapshot, DatabaseRole::Capture).await {
+                    Ok(read_conn) => Some(ReexportSourceSlot::VerifiedBackup {
+                        read_conn,
+                        snapshot: Box::new(snapshot),
+                        role: DatabaseRole::Capture,
+                        expected_backup_sha256: cap_bk_sha,
+                        expected_logical_sha256: cap_log_sha,
+                        held_fenced_conn: None,
+                        next_phase2_state: Phase2DbState::Unlinked,
+                    }),
+                    Err(err) => {
+                        git_reexport_slot.close_quietly().await;
+                        return Err(err);
+                    }
+                }
             }
         };
 
@@ -37924,27 +40453,37 @@ async fn resume_forward_migration_inner(
         ) {
             Ok(g) => g,
             Err(err) => {
-                if let Some(c) = cap_live_conn {
-                    let _ = c.close().await;
+                if let Some(c) = cap_reexport_slot {
+                    c.close_quietly().await;
                 }
-                let _ = git_live_conn.close().await;
+                git_reexport_slot.close_quietly().await;
                 return Err(err);
             }
         };
 
-        let mut guard = ForwardPhase1QuiesceGuard {
-            sqlite: QuiescedRepositorySqliteSources {
-                git: git_live_conn,
-                capture: cap_live_conn,
-            },
-            locks,
+        let prior_spool_backup = if spool_inspection.prior_backup_union_needed {
+            let Some(snap) = spool_inspection.verified_prior_spool_snapshot.as_ref() else {
+                if let Some(c) = cap_reexport_slot {
+                    c.close_quietly().await;
+                }
+                git_reexport_slot.close_quietly().await;
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "missing verified prior spool backup snapshot for union re-export"
+                        .to_string(),
+                });
+            };
+            Some((snap, initial_generation))
+        } else {
+            None
         };
         let mut artifact_guard = Phase1ArtifactGuard::new();
 
         let reexport_res = run_forward_drift_reexport_to_next_generation(
-            &mut guard,
+            &mut git_reexport_slot,
+            cap_reexport_slot.as_mut(),
             common_storage,
             next_gen,
+            prior_spool_backup,
             &mut artifact_guard,
             #[cfg(test)]
             drift_crash_point,
@@ -37954,13 +40493,14 @@ async fn resume_forward_migration_inner(
             Ok(triple) => triple,
             Err(err) => {
                 let cleanup_res = artifact_guard.cleanup_now();
-                let close_res = guard.close().await;
+                if let Some(c) = cap_reexport_slot {
+                    c.close_quietly().await;
+                }
+                git_reexport_slot.close_quietly().await;
+                drop(locks);
                 let mut detail = err.to_string();
                 if let Err(ce) = cleanup_res {
                     detail.push_str(&format!("; drift re-export cleanup failed ({ce})"));
-                }
-                if let Err(cl) = close_res {
-                    detail.push_str(&format!("; guard close failed ({cl})"));
                 }
                 return Err(StorageBackendError::BackendInternal { detail });
             }
@@ -37970,11 +40510,10 @@ async fn resume_forward_migration_inner(
         verified_spool_identities = backup_report.spool_backup.verified_identities;
 
         let next_progress = Phase2Progress {
-            git_db: Some(Phase2DbState::Pending),
-            capture_db: Some(if guard.sqlite.capture.is_some() {
-                Phase2DbState::Pending
-            } else {
-                Phase2DbState::Absent
+            git_db: Some(git_reexport_slot.next_phase2_state()),
+            capture_db: Some(match cap_reexport_slot.as_ref() {
+                Some(slot) => slot.next_phase2_state(),
+                None => Phase2DbState::Absent,
             }),
             git_redb: None,
             cap_redb: None,
@@ -37990,7 +40529,11 @@ async fn resume_forward_migration_inner(
             Ok(m) => m,
             Err(err) => {
                 let _ = artifact_guard.cleanup_now();
-                let _ = guard.close().await;
+                if let Some(c) = cap_reexport_slot {
+                    c.close_quietly().await;
+                }
+                git_reexport_slot.close_quietly().await;
+                drop(locks);
                 return Err(err);
             }
         };
@@ -38017,29 +40560,23 @@ async fn resume_forward_migration_inner(
             if !renamed_manifest {
                 let _ = artifact_guard.cleanup_now();
             }
-            let _ = guard.close().await;
+            if let Some(c) = cap_reexport_slot {
+                c.close_quietly().await;
+            }
+            git_reexport_slot.close_quietly().await;
+            drop(locks);
             return Err(err);
         }
         artifact_guard.disarm();
         drop(artifact_guard);
 
         manifest = next_manifest;
-        let ForwardPhase1QuiesceGuard { sqlite, locks } = guard;
-        let QuiescedRepositorySqliteSources { git, capture } = sqlite;
-        (
-            locks,
-            ClassifiedRecoverySource::CleanMatchedPending {
-                conn: git,
-                hot_journal_recovered: false,
-            },
-            match capture {
-                Some(cap) => ClassifiedRecoverySource::CleanMatchedPending {
-                    conn: cap,
-                    hot_journal_recovered: false,
-                },
-                None => ClassifiedRecoverySource::Absent,
-            },
-        )
+        let next_git_stage = git_reexport_slot.into_stage_closing_backup_reader().await;
+        let next_cap_stage = match cap_reexport_slot {
+            Some(slot) => slot.into_stage_closing_backup_reader().await,
+            None => ClassifiedRecoverySource::Absent,
+        };
+        (locks, next_git_stage, next_cap_stage)
     } else {
         (locks, git_classified, cap_classified)
     };
@@ -58883,7 +61420,7 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             let disk_m = read_storage_manifest(&storage)
                 .expect("read finalized manifest")
                 .expect("manifest must exist");
-            let bk_git_path = verify_sqlite_backup_for_recovery(
+            let bk_git_snap = verify_sqlite_backup_for_recovery(
                 &storage,
                 "sqlite-backup/00000002",
                 DatabaseRole::Repository,
@@ -58899,7 +61436,7 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             .expect("gen+1 git backup must pass SHA-256 + integrity_check");
             let mut bk_conn = SqliteConnection::connect_with(
                 &SqliteConnectOptions::new()
-                    .filename(&bk_git_path)
+                    .filename(&bk_git_snap.snapshot_path)
                     .read_only(true),
             )
             .await
@@ -58917,10 +61454,11 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             .await
             .expect("read postcrash.marker in gen+1 git backup");
             bk_conn.close().await.expect("close bk_conn");
+            drop(bk_git_snap);
             assert_eq!(bk_post_cnt as usize, POST_CRASH_REF_COUNT);
             assert_eq!(bk_marker, "preserved-100-percent");
 
-            let bk_cap_path = verify_sqlite_backup_for_recovery(
+            let bk_cap_snap = verify_sqlite_backup_for_recovery(
                 &storage,
                 "sqlite-backup/00000002",
                 DatabaseRole::Capture,
@@ -58936,7 +61474,7 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             .expect("gen+1 capture backup must pass SHA-256 + integrity_check");
             let mut bk_cap_conn = SqliteConnection::connect_with(
                 &SqliteConnectOptions::new()
-                    .filename(&bk_cap_path)
+                    .filename(&bk_cap_snap.snapshot_path)
                     .read_only(true),
             )
             .await
@@ -58948,6 +61486,7 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             .await
             .expect("read post-crash agent_session in gen+1 capture backup");
             bk_cap_conn.close().await.expect("close bk_cap_conn");
+            drop(bk_cap_snap);
             assert_eq!(bk_cap_row.0, "prov-post-crash");
             assert_eq!(bk_cap_row.1, "/work/post-crash");
 
@@ -59367,288 +61906,1554 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
         }
     }
 
-    async fn rb10k_crash_at_point(storage: &Path, point: Phase2TestPoint) {
-        let prepared = prepare_forward_phase1(storage, 1)
+    // ========================================================================
+    // RB-10k: Forward Migration Phase 2 Post-Fence Pre-Unlink & Dual-Source
+    // Post-Unlink Legally-Absent Recovery (`AC1`, `AC2`, `AC3`, `AC4`, `<= 500ms`)
+    // ========================================================================
+
+    /// Run Phase 1 + Phase 2 up to `target_point` and inject a deterministic
+    /// crash error there, leaving `storage-format.json(finalized = false)` and
+    /// all Phase 1 / Phase 2 artifacts on disk with locks cleanly released.
+    async fn crash_forward_phase2_at_point(
+        storage: &Path,
+        generation: u64,
+        target_point: Phase2TestPoint,
+    ) {
+        let prepared = prepare_forward_phase1(storage, generation)
             .await
-            .expect("Phase 1 prepare");
-        let mut crash_hook = move |seen: Phase2TestPoint, _root: &Path| -> StorageResult<()> {
-            if seen == point {
+            .expect("prepare_forward_phase1 must succeed");
+        let mut crash_hook = |point: Phase2TestPoint, _root: &Path| -> StorageResult<()> {
+            if point == target_point {
                 return Err(StorageBackendError::BackendInternal {
-                    detail: "RB-10k injected crash".to_string(),
+                    detail: format!("injected RB-10k crash at {target_point:?}"),
                 });
             }
             Ok(())
         };
-        execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut crash_hook))
+        let err = execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut crash_hook))
             .await
-            .expect_err("injected RB-10k crash");
-        let manifest = read_storage_manifest(storage)
-            .expect("read manifest")
-            .expect("crashed run must leave an unfinalized manifest");
-        assert!(!manifest.finalized);
+            .expect_err("injected RB-10k crash point must abort Phase 2");
+        assert!(
+            err.to_string()
+                .contains(&format!("injected RB-10k crash at {target_point:?}")),
+            "unexpected Phase 2 error before reaching {target_point:?}: {err}"
+        );
     }
 
-    async fn rb10k_assert_backup(storage: &Path, generation: u64, capture: bool) {
-        use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
-        let path = if capture {
-            sqlite_backup_capture_db_path(storage, generation)
-        } else {
-            sqlite_backup_git_db_path(storage, generation)
+    /// Assert that `durability` contains `UnlinkSource` for `role` (`expected_file`)
+    /// IMMEDIATELY followed by `ParentDirFsyncAfterUnlink` (`expected_parent`),
+    /// and that `PublishManifestUnlinked` for `role` occurs strictly afterward (`RB-10k` AC2).
+    fn assert_unlink_followed_immediately_by_dir_fsync(
+        durability: &Phase2DurabilityReceipt,
+        role: DatabaseRole,
+        expected_file: &str,
+        expected_parent: &str,
+        label: &str,
+    ) {
+        let unlink_positions: Vec<usize> = durability
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, op)| {
+                (op.kind == Phase2DurabilityOpKind::UnlinkSource
+                    && op.role == Some(role)
+                    && op.rel_target == expected_file)
+                    .then_some(idx)
+            })
+            .collect();
+        assert_eq!(
+            unlink_positions.len(),
+            1,
+            "[{label}] expected exactly one UnlinkSource({role}, {expected_file}), got {:?}",
+            durability.ops
+        );
+        let unlink_idx = unlink_positions[0];
+        let next_op = durability.ops.get(unlink_idx + 1).unwrap_or_else(|| {
+            panic!(
+                "[{label}] missing immediate ParentDirFsyncAfterUnlink after UnlinkSource({role}): {:?}",
+                durability.ops
+            )
+        });
+        assert_eq!(
+            next_op.kind,
+            Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+            "[{label}] expected ParentDirFsyncAfterUnlink immediately after UnlinkSource({role}), got {next_op:?}"
+        );
+        assert_eq!(next_op.role, Some(role), "[{label}] wrong fsync_dir role");
+        assert_eq!(
+            next_op.rel_target, expected_parent,
+            "[{label}] wrong fsync_dir target parent"
+        );
+
+        #[cfg(unix)]
+        {
+            let close_idx = durability
+                .ops
+                .iter()
+                .position(|op| {
+                    op.kind == Phase2DurabilityOpKind::CloseMigrationConn && op.role == Some(role)
+                })
+                .expect("expected CloseMigrationConn for unlinked role on Unix");
+            assert!(
+                close_idx > unlink_idx + 1,
+                "[{label}] Unix unlink + fsync_dir must finish BEFORE CloseMigrationConn (unlink={unlink_idx}, close={close_idx})"
+            );
+        }
+
+        let publish_unlinked_idx = durability
+            .ops
+            .iter()
+            .position(|op| {
+                op.kind == Phase2DurabilityOpKind::PublishManifestUnlinked && op.role == Some(role)
+            })
+            .expect("expected PublishManifestUnlinked for unlinked role");
+        assert!(
+            publish_unlinked_idx > unlink_idx + 1,
+            "[{label}] PublishManifestUnlinked must occur after UnlinkSource + ParentDirFsyncAfterUnlink"
+        );
+    }
+
+    /// Write a cold zeroed 512-byte `-journal` sidecar simulating power loss
+    /// under SQLite `locking_mode = EXCLUSIVE` after `COMMIT` (and optionally
+    /// after `unlink(db) + fsync_dir`) before `c_mig.close()` could unlink it.
+    fn plant_cold_zeroed_journal(db_path: &Path) -> PathBuf {
+        let j_path = sqlite_sidecar_path(db_path, "-journal");
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&j_path).expect("create cold zeroed -journal");
+        f.write_all(&[0u8; 512])
+            .expect("write 512 zero bytes to cold -journal");
+        f.sync_all().expect("fsync cold -journal");
+        j_path
+    }
+
+    /// Overwrite an existing backup file in place while preserving its Unix `0o600` mode.
+    fn overwrite_backup_bytes_preserving_mode(path: &Path, bytes: &[u8]) {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("open backup file for overwrite");
+        f.write_all(bytes).expect("write backup bytes");
+        f.sync_all().expect("fsync overwritten backup");
+    }
+
+    /// Corrupt a non-header B-tree page (page 2, offset 4096) of a valid SQLite
+    /// database so `SqliteConnection::connect_with` still opens cleanly while
+    /// `PRAGMA integrity_check` deterministically fails (`RB-10k` AC3/AC4).
+    fn corrupt_sqlite_btree_page2(original: &[u8]) -> Vec<u8> {
+        assert!(
+            original.len() >= 8192,
+            "fixture SQLite backup must have at least 2 pages (len={})",
+            original.len()
+        );
+        let mut out = original.to_vec();
+        for b in &mut out[4096..4128] {
+            *b = 0xFE;
+        }
+        out
+    }
+
+    fn sha256_hex_bytes(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Assert that a finalized Layout C `RB-10k` recovery report has 100% intact
+    /// git, capture, spool, and queue records, installed `capture-spool`
+    /// tombstones, absent legacy `.db` files, and all 6 locks released.
+    async fn assert_rb10k_layout_c_converged(
+        storage: &Path,
+        resumed: &ForwardPhase2ResumeReport,
+        tag: &str,
+        label: &str,
+    ) {
+        use crate::storage::{
+            GitStore as _, RedbCaptureStore, RedbGitStore, capture_store::CaptureStore as _,
         };
-        assert!(path.is_file(), "backup {} must exist", path.display());
-        let opts = SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(false)
-            .read_only(true);
-        let mut conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
+
+        assert_eq!(
+            resumed.initial_generation, 1,
+            "[{label}] initial_generation"
+        );
+        assert_eq!(resumed.final_generation, 1, "[{label}] final_generation");
+        assert!(
+            !resumed.reexported_due_to_drift,
+            "[{label}] clean post-fence/post-unlink recovery must not drift-reexport"
+        );
+        assert!(
+            resumed.finalized.manifest.finalized,
+            "[{label}] manifest must be finalized"
+        );
+        assert_eq!(
+            resumed.finalized.manifest.backend,
+            StorageBackendKind::Redb,
+            "[{label}] manifest backend must be redb"
+        );
+        assert_eq!(
+            resumed.finalized.manifest.phase2_progress.git_db,
+            Some(Phase2DbState::Unlinked),
+            "[{label}] git_db must be unlinked"
+        );
+        assert_eq!(
+            resumed.finalized.manifest.phase2_progress.capture_db,
+            Some(Phase2DbState::Unlinked),
+            "[{label}] capture_db must be unlinked"
+        );
+        assert!(
+            resumed.finalized.manifest.phase2_progress.spool_fenced,
+            "[{label}] spool_fenced must be true"
+        );
+
+        let disk_manifest = read_storage_manifest(storage)
+            .expect("read finalized manifest")
+            .expect("manifest must exist on disk");
+        assert!(disk_manifest.finalized, "[{label}] disk manifest finalized");
+        assert_eq!(disk_manifest.generation, 1, "[{label}] disk manifest gen");
+        assert_eq!(
+            disk_manifest.phase2_progress.git_db,
+            Some(Phase2DbState::Unlinked)
+        );
+        assert_eq!(
+            disk_manifest.phase2_progress.capture_db,
+            Some(Phase2DbState::Unlinked)
+        );
+        assert!(disk_manifest.phase2_progress.spool_fenced);
+
+        let git_db = git_sqlite_db_path(storage);
+        let cap_db = capture_sqlite_db_path(storage);
+        assert!(!git_db.exists(), "[{label}] libra.db must be unlinked");
+        assert!(!cap_db.exists(), "[{label}] capture.db must be unlinked");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !sqlite_sidecar_path(&git_db, suffix).exists(),
+                "[{label}] libra.db{suffix} must be absent"
+            );
+            assert!(
+                !sqlite_sidecar_path(&cap_db, suffix).exists(),
+                "[{label}] capture.db{suffix} must be absent"
+            );
+        }
+
+        for slot in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let p = capture_spool_dir_path(storage).join(slot);
+            let meta = fs::symlink_metadata(&p).expect("stat spool tombstone");
+            assert!(
+                meta.file_type().is_file(),
+                "[{label}] tombstone must be file"
+            );
+            assert_eq!(
+                fs::read(&p).expect("read spool tombstone"),
+                CAPTURE_SPOOL_TOMBSTONE_SENTINEL,
+                "[{label}] tombstone sentinel bytes"
+            );
+        }
+
+        let git_store = RedbGitStore::open_read_only(&resumed.finalized.git_redb_path)
+            .expect("open finalized git.gen-00000001.redb");
+        let refs = git_store.list_refs(None).await.expect("list git refs");
+        assert!(!refs.is_empty(), "[{label}] git refs must be intact");
+
+        let cap_store = RedbCaptureStore::open_read_only(&resumed.finalized.capture_redb_path)
             .await
-            .expect("open backup");
-        let integrity: String = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
-            .persistent(false)
-            .fetch_one(&mut conn)
+            .expect("open finalized capture.gen-00000001.redb");
+        let sessions = cap_store
+            .list_sessions_by_started_desc()
             .await
-            .expect("integrity_check");
-        assert_eq!(integrity, "ok");
+            .expect("list capture sessions");
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.provider_session_id == format!("prov-{tag}")),
+            "[{label}] migrated capture-spool session prov-{tag} must be intact"
+        );
+        let cap_db_ro =
+            open_redb_read_only(&resumed.finalized.capture_redb_path, DatabaseRole::Capture)
+                .expect("open capture redb read-only to check queue record");
+        let cap_rtx =
+            begin_checked_read(&cap_db_ro, DatabaseRole::Capture).expect("begin capture read txn");
+        let usage_tbl = cap_rtx
+            .open_table(redb_cap::AGENT_USAGE_STATS_TABLE)
+            .expect("open agent_usage_stats table");
+        let queue_usage_id = format!("usage-{tag}-1");
+        assert!(
+            usage_tbl
+                .get(queue_usage_id.as_str())
+                .expect("lookup queue usage_stats")
+                .is_some(),
+            "[{label}] migrated capture-queue record {queue_usage_id} must be intact"
+        );
+
+        let _locks = acquire_forward_recovery_non_sqlite_locks(storage)
+            .expect("all 6 non-SQLite locks must be released after finalized resume");
     }
 
-    /// RB-10k AC1/AC2: finish a committed fence before unlink.
     #[tokio::test]
     async fn forward_phase2_crash_after_fence_before_unlink() {
-        let dir = tempdir().expect("rb10k fence tempdir");
-        let storage = dir.path().join(".libra");
-        build_rb10c_layout_c_fixture(&storage, "rb10k-fence").await;
-        rb10k_crash_at_point(
-            &storage,
-            Phase2TestPoint::AfterFenceCommitBeforePersistReady(DatabaseRole::Repository),
-        )
-        .await;
-        let git_db = git_sqlite_db_path(&storage);
-        assert!(git_db.is_file(), "crashed fence leaves libra.db on disk");
+        use crate::storage::{
+            GitStore as _, RedbCaptureStore, RedbGitStore, capture_store::CaptureStore as _,
+        };
 
-        let resumed = resume_forward_phase2(&storage)
-            .await
-            .expect("resume must finish the committed fence");
-        assert!(resumed.finalized.manifest.finalized, "AC1 finalized");
-        assert!(!git_db.exists(), "AC2 source unlinked");
-        rb10k_assert_backup(&storage, 1, false).await;
-        rb10k_assert_backup(&storage, 1, true).await;
+        const RESUME_BUDGET_MS: u128 = 500;
+
+        // --------------------------------------------------------------------
+        // Scenario 1A (AC1 + AC2): Crash immediately after `libra.db` fence
+        // `COMMIT`, BEFORE persisting `fenced_ready_to_unlink` and BEFORE
+        // `unlink(libra.db)` (`phase2_progress.git_db == "pending"`), including
+        // a genuine cold zeroed `libra.db-journal` left behind by power loss
+        // under `locking_mode = EXCLUSIVE`.
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10k 1A tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10k-1a").await;
+            crash_forward_phase2_at_point(
+                &storage,
+                1,
+                Phase2TestPoint::AfterFenceCommitBeforePersistReady(DatabaseRole::Repository),
+            )
+            .await;
+
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            assert!(
+                git_db.exists(),
+                "fenced libra.db must still exist pre-unlink"
+            );
+            assert!(cap_db.exists(), "capture.db must still exist pre-unlink");
+            let m_before = read_storage_manifest(&storage)
+                .expect("read pre-resume manifest")
+                .expect("manifest must exist");
+            assert!(!m_before.finalized);
+            assert_eq!(
+                m_before.phase2_progress.git_db,
+                Some(Phase2DbState::Pending)
+            );
+            assert_eq!(
+                m_before.phase2_progress.capture_db,
+                Some(Phase2DbState::Pending)
+            );
+
+            // Independently confirm `libra.db` rejects normal opens with
+            // `SQLITE_CORRUPT (11)` on `__libra_migrated_fence__`, and that
+            // `PRAGMA writable_schema = ON` reveals the exact fence sentinel.
+            {
+                let mut probe = SqliteConnection::connect_with(
+                    &SqliteConnectOptions::new()
+                        .filename(&git_db)
+                        .read_only(true),
+                )
+                .await
+                .expect("connect read-only to fenced libra.db");
+                let err = sea_orm::sqlx::query_scalar::<_, String>(
+                    "SELECT name FROM sqlite_master LIMIT 1;",
+                )
+                .fetch_optional(&mut probe)
+                .await
+                .expect_err("normal query on fenced libra.db must fail with SQLITE_CORRUPT");
+                assert_eq!(sqlite_error_exact_numeric_code(&err), Some(11));
+                assert!(err.to_string().contains(SQLITE_MIGRATED_FENCE_TABLE));
+                probe
+                    .execute("PRAGMA writable_schema = ON;")
+                    .await
+                    .expect("enable writable_schema for test check");
+                let sentinel: (String, String, String, i64, String) = sea_orm::sqlx::query_as(
+                    "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master WHERE name = ?1;",
+                )
+                .bind(SQLITE_MIGRATED_FENCE_TABLE)
+                .fetch_one(&mut probe)
+                .await
+                .expect("read exact fence sentinel row");
+                assert_eq!(sentinel.0, "table");
+                assert_eq!(sentinel.1, SQLITE_MIGRATED_FENCE_TABLE);
+                assert_eq!(sentinel.2, SQLITE_MIGRATED_FENCE_TABLE);
+                assert!(sentinel.3 > 0);
+                assert_eq!(sentinel.4, SQLITE_MIGRATED_FENCE_SQL);
+                probe.close().await.expect("close fenced probe");
+            }
+
+            // Plant cold zeroed `libra.db-journal` left behind by `SIGKILL`
+            // after fence `COMMIT` under `locking_mode = EXCLUSIVE`.
+            let cold_journal = plant_cold_zeroed_journal(&git_db);
+            assert!(cold_journal.exists());
+            assert_rb10c_unfinalized_rejects_both_env_overrides(
+                &storage,
+                "rb10k_1a_fenced_pending",
+            );
+
+            let started = Instant::now();
+            let resumed = resume_forward_migration(&storage)
+                .await
+                .expect("resume after libra.db fence COMMIT (pending) must succeed");
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms <= RESUME_BUDGET_MS,
+                "RB-10k 1A resume took {elapsed_ms}ms (budget <= {RESUME_BUDGET_MS}ms)"
+            );
+            assert_eq!(
+                resumed.git_recovery_state,
+                ForwardSourceRecoveryState::FencedPreUnlink
+            );
+            assert_eq!(
+                resumed.capture_recovery_state,
+                ForwardSourceRecoveryState::CleanMatchedPending
+            );
+            assert_unlink_followed_immediately_by_dir_fsync(
+                &resumed.finalized.durability,
+                DatabaseRole::Repository,
+                LEGACY_SQLITE_DB_FILE,
+                ".libra",
+                "rb10k-1a-git",
+            );
+            assert_unlink_followed_immediately_by_dir_fsync(
+                &resumed.finalized.durability,
+                DatabaseRole::Capture,
+                LEGACY_CAPTURE_SQLITE_REL_PATH,
+                PRIVATE_SUBDIR,
+                "rb10k-1a-capture",
+            );
+            assert_rb10k_layout_c_converged(&storage, &resumed, "rb10k-1a", "rb10k-1a").await;
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 1B (AC1 + AC2): Crash after persisting `git_db =
+        // "fenced_ready_to_unlink"`, right BEFORE `unlink(libra.db)`.
+        // Includes negative checks proving BOTH `backup_sha256` AND exact
+        // `sqlite_master` fence SQL are verified BEFORE `unlink`!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10k 1B tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10k-1b").await;
+            crash_forward_phase2_at_point(
+                &storage,
+                1,
+                Phase2TestPoint::AfterPersistReadyBeforeUnlink(DatabaseRole::Repository),
+            )
+            .await;
+
+            let git_db = git_sqlite_db_path(&storage);
+            let m_before = read_storage_manifest(&storage)
+                .expect("read manifest 1B")
+                .expect("manifest must exist");
+            assert!(!m_before.finalized);
+            assert_eq!(
+                m_before.phase2_progress.git_db,
+                Some(Phase2DbState::FencedReadyToUnlink)
+            );
+            assert!(git_db.exists());
+
+            // Negative check 1: Corrupt `sqlite-backup/00000001/libra.db` ->
+            // resume MUST fail closed (`LBR-IO-001`) WITHOUT unlinking `libra.db`!
+            let git_bk = sqlite_backup_git_db_path(&storage, 1);
+            let valid_git_bk = fs::read(&git_bk).expect("read valid git backup");
+            let mut tampered_bk = valid_git_bk.clone();
+            tampered_bk[64] ^= 0xFF;
+            overwrite_backup_bytes_preserving_mode(&git_bk, &tampered_bk);
+            let bk_err = resume_forward_migration(&storage)
+                .await
+                .expect_err("corrupt git backup must block post-fence unlink");
+            assert_eq!(bk_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                bk_err.to_string().contains("backup_sha256 mismatch"),
+                "expected backup_sha256 mismatch error, got: {bk_err}"
+            );
+            assert!(
+                git_db.exists(),
+                "fenced libra.db MUST NOT be unlinked when backup_sha256 fails"
+            );
+            assert!(
+                !read_storage_manifest(&storage)
+                    .expect("read manifest")
+                    .expect("manifest")
+                    .finalized
+            );
+            overwrite_backup_bytes_preserving_mode(&git_bk, &valid_git_bk);
+
+            // Negative check 2: Mutate `__libra_migrated_fence__` SQL to a
+            // non-exact syntax error -> resume MUST reject via `PRAGMA writable_schema`
+            // WITHOUT unlinking `libra.db`!
+            {
+                let mut conn = SqliteConnection::connect_with(
+                    &SqliteConnectOptions::new()
+                        .filename(&git_db)
+                        .create_if_missing(false),
+                )
+                .await
+                .expect("open fenced libra.db to tamper sentinel SQL");
+                conn.execute("PRAGMA writable_schema = ON;")
+                    .await
+                    .expect("writable_schema ON");
+                sea_orm::sqlx::query(
+                    "UPDATE sqlite_master SET sql = 'NON_EXACT_FENCE_SYNTAX_ERROR' WHERE name = ?1;",
+                )
+                .bind(SQLITE_MIGRATED_FENCE_TABLE)
+                .execute(&mut conn)
+                .await
+                .expect("tamper sentinel SQL");
+                conn.execute("PRAGMA writable_schema = OFF;")
+                    .await
+                    .expect("writable_schema OFF");
+                conn.close().await.expect("close tampered conn");
+            }
+            let sentinel_err = resume_forward_migration(&storage)
+                .await
+                .expect_err("non-exact fence sentinel SQL must be rejected fail-closed");
+            assert_eq!(sentinel_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                sentinel_err
+                    .to_string()
+                    .contains("non-exact fence sentinel"),
+                "expected non-exact fence sentinel error, got: {sentinel_err}"
+            );
+            assert!(
+                git_db.exists(),
+                "libra.db MUST NOT be unlinked on non-exact fence sentinel"
+            );
+
+            // Restore exact canonical fence sentinel SQL and verify clean convergence.
+            {
+                let mut conn = SqliteConnection::connect_with(
+                    &SqliteConnectOptions::new()
+                        .filename(&git_db)
+                        .create_if_missing(false),
+                )
+                .await
+                .expect("open libra.db to restore canonical fence sentinel");
+                conn.execute("PRAGMA writable_schema = ON;")
+                    .await
+                    .expect("writable_schema ON");
+                sea_orm::sqlx::query("UPDATE sqlite_master SET sql = ?1 WHERE name = ?2;")
+                    .bind(SQLITE_MIGRATED_FENCE_SQL)
+                    .bind(SQLITE_MIGRATED_FENCE_TABLE)
+                    .execute(&mut conn)
+                    .await
+                    .expect("restore canonical sentinel SQL");
+                conn.execute("PRAGMA writable_schema = OFF;")
+                    .await
+                    .expect("writable_schema OFF");
+                conn.close().await.expect("close restored conn");
+            }
+
+            let started = Instant::now();
+            let resumed = resume_forward_migration(&storage)
+                .await
+                .expect("resume after libra.db fenced_ready_to_unlink must succeed");
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms <= RESUME_BUDGET_MS,
+                "RB-10k 1B resume took {elapsed_ms}ms (budget <= {RESUME_BUDGET_MS}ms)"
+            );
+            assert_eq!(
+                resumed.git_recovery_state,
+                ForwardSourceRecoveryState::FencedPreUnlink
+            );
+            assert_eq!(
+                resumed.capture_recovery_state,
+                ForwardSourceRecoveryState::CleanMatchedPending
+            );
+            assert_unlink_followed_immediately_by_dir_fsync(
+                &resumed.finalized.durability,
+                DatabaseRole::Repository,
+                LEGACY_SQLITE_DB_FILE,
+                ".libra",
+                "rb10k-1b-git",
+            );
+            assert_rb10k_layout_c_converged(&storage, &resumed, "rb10k-1b", "rb10k-1b").await;
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 1C (AC1 + AC2): Crash after `capture.db` fence `COMMIT`,
+        // BEFORE `unlink(capture.db)`, at BOTH `pending` and
+        // `fenced_ready_to_unlink` manifest progress checkpoints!
+        // --------------------------------------------------------------------
+        for (idx, crash_point, expected_cap_state) in [
+            (
+                "1c-pending",
+                Phase2TestPoint::AfterFenceCommitBeforePersistReady(DatabaseRole::Capture),
+                Phase2DbState::Pending,
+            ),
+            (
+                "1c-ready",
+                Phase2TestPoint::AfterPersistReadyBeforeUnlink(DatabaseRole::Capture),
+                Phase2DbState::FencedReadyToUnlink,
+            ),
+        ] {
+            let dir = tempdir().expect("create RB-10k 1C tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, idx).await;
+            crash_forward_phase2_at_point(&storage, 1, crash_point).await;
+
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            assert!(!git_db.exists(), "[{idx}] libra.db already unlinked");
+            assert!(
+                cap_db.exists(),
+                "[{idx}] fenced capture.db must remain pre-unlink"
+            );
+            let m_before = read_storage_manifest(&storage)
+                .expect("read manifest 1C")
+                .expect("manifest must exist");
+            assert!(!m_before.finalized);
+            assert_eq!(
+                m_before.phase2_progress.git_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            assert_eq!(
+                m_before.phase2_progress.capture_db,
+                Some(expected_cap_state)
+            );
+
+            let _cold_cap_journal = plant_cold_zeroed_journal(&cap_db);
+
+            // Corrupt `capture.db` backup -> MUST block `unlink(capture.db)`!
+            let cap_bk = sqlite_backup_capture_db_path(&storage, 1);
+            let valid_cap_bk = fs::read(&cap_bk).expect("read valid capture backup");
+            let mut bad_cap_bk = valid_cap_bk.clone();
+            bad_cap_bk[64] ^= 0xFF;
+            overwrite_backup_bytes_preserving_mode(&cap_bk, &bad_cap_bk);
+            let cap_bk_err = resume_forward_migration(&storage)
+                .await
+                .expect_err("corrupt capture backup must block post-fence capture.db unlink");
+            assert_eq!(cap_bk_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                cap_db.exists(),
+                "[{idx}] fenced capture.db MUST NOT be unlinked when backup fails"
+            );
+            overwrite_backup_bytes_preserving_mode(&cap_bk, &valid_cap_bk);
+
+            let started = Instant::now();
+            let resumed = resume_forward_migration(&storage)
+                .await
+                .expect("resume after capture.db fence before unlink must succeed");
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms <= RESUME_BUDGET_MS,
+                "RB-10k {idx} resume took {elapsed_ms}ms (budget <= {RESUME_BUDGET_MS}ms)"
+            );
+            assert_eq!(
+                resumed.git_recovery_state,
+                ForwardSourceRecoveryState::LegallyAbsentPostUnlink
+            );
+            assert_eq!(
+                resumed.capture_recovery_state,
+                ForwardSourceRecoveryState::FencedPreUnlink
+            );
+            assert_unlink_followed_immediately_by_dir_fsync(
+                &resumed.finalized.durability,
+                DatabaseRole::Capture,
+                LEGACY_CAPTURE_SQLITE_REL_PATH,
+                PRIVATE_SUBDIR,
+                idx,
+            );
+            assert_rb10k_layout_c_converged(&storage, &resumed, idx, idx).await;
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 1D (Layout A — `capture_db == absent`): Crash after
+        // `libra.db` fence `COMMIT`, before `unlink(libra.db)`.
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10k 1D Layout A tempdir");
+            let storage = dir.path().join(".libra");
+            fs::create_dir_all(&storage).expect("create .libra");
+            let git_db = git_sqlite_db_path(&storage);
+            populate_all_61_repository_tables(&git_db).await;
+            populate_capture_rows_via_sql(&git_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            crash_forward_phase2_at_point(
+                &storage,
+                1,
+                Phase2TestPoint::AfterFenceCommitBeforePersistReady(DatabaseRole::Repository),
+            )
+            .await;
+
+            let started = Instant::now();
+            let resumed = resume_forward_migration(&storage)
+                .await
+                .expect("Layout A resume after libra.db fence must succeed");
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms <= RESUME_BUDGET_MS,
+                "RB-10k 1D Layout A resume took {elapsed_ms}ms (budget <= {RESUME_BUDGET_MS}ms)"
+            );
+            assert_eq!(
+                resumed.git_recovery_state,
+                ForwardSourceRecoveryState::FencedPreUnlink
+            );
+            assert_eq!(
+                resumed.capture_recovery_state,
+                ForwardSourceRecoveryState::Absent
+            );
+            assert!(resumed.finalized.manifest.finalized);
+            assert!(!git_db.exists());
+            assert_unlink_followed_immediately_by_dir_fsync(
+                &resumed.finalized.durability,
+                DatabaseRole::Repository,
+                LEGACY_SQLITE_DB_FILE,
+                ".libra",
+                "rb10k-1d-layout-a",
+            );
+            let git_store = RedbGitStore::open_read_only(&resumed.finalized.git_redb_path)
+                .expect("open Layout A git redb");
+            assert!(
+                !git_store
+                    .list_refs(None)
+                    .await
+                    .expect("list refs")
+                    .is_empty()
+            );
+            let cap_store = RedbCaptureStore::open_read_only(&resumed.finalized.capture_redb_path)
+                .await
+                .expect("open Layout A capture redb");
+            assert!(
+                !cap_store
+                    .list_sessions_by_started_desc()
+                    .await
+                    .expect("list Layout A inline sessions")
+                    .is_empty()
+            );
+        }
     }
 
-    /// RB-10k AC3: resume right after `unlink(libra.db)+fsync`.
     #[tokio::test]
     async fn forward_phase2_crash_immediately_after_libra_db_unlink() {
-        let dir = tempdir().expect("rb10k git-unlink tempdir");
-        let storage = dir.path().join(".libra");
-        build_rb10c_layout_c_fixture(&storage, "rb10k-git-unlink").await;
-        rb10k_crash_at_point(
-            &storage,
-            Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Repository),
-        )
-        .await;
-        assert!(!git_sqlite_db_path(&storage).exists());
+        use crate::storage::{
+            GitStore as _, RedbCaptureStore, RedbGitStore, capture_store::CaptureStore as _,
+        };
 
-        let resumed = resume_forward_phase2(&storage)
-            .await
-            .expect("resume must verify backups and finalize");
-        assert!(resumed.finalized.manifest.finalized, "AC3 finalized");
-        rb10k_assert_backup(&storage, 1, false).await;
+        const RESUME_BUDGET_MS: u128 = 500;
+
+        // --------------------------------------------------------------------
+        // Scenario 2A (AC3 — `phase2_progress.git_db == "fenced_ready_to_unlink"`):
+        // Crash IMMEDIATELY after `unlink(libra.db) + fsync_dir`, BEFORE
+        // updating `git_db = "unlinked"` and BEFORE fencing `capture.db`.
+        // Verifies cold zeroed `libra.db-journal` cleanup, active/symlink/hardlink
+        // sidecar rejection, AND independent `backup_sha256` + `PRAGMA integrity_check`
+        // enforcement before converging to `finalized = true` (`<= 500ms`).
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10k 2A tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10k-2a").await;
+            crash_forward_phase2_at_point(
+                &storage,
+                1,
+                Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Repository),
+            )
+            .await;
+
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            assert!(!git_db.exists(), "libra.db must already be unlinked");
+            assert!(cap_db.exists(), "capture.db must still exist unfenced");
+            let m_before = read_storage_manifest(&storage)
+                .expect("read manifest 2A")
+                .expect("manifest must exist");
+            assert!(!m_before.finalized);
+            assert_eq!(
+                m_before.phase2_progress.git_db,
+                Some(Phase2DbState::FencedReadyToUnlink)
+            );
+            assert_eq!(
+                m_before.phase2_progress.capture_db,
+                Some(Phase2DbState::Pending)
+            );
+
+            assert_rb10c_unfinalized_rejects_both_env_overrides(
+                &storage,
+                "rb10k_2a_post_git_unlink",
+            );
+
+            // Negative check 1: Active (non-zero) `libra.db-journal` alongside
+            // missing `libra.db` MUST fail closed (`LBR-IO-001`)!
+            let git_journal = sqlite_sidecar_path(&git_db, "-journal");
+            fs::write(&git_journal, SQLITE_HOT_ROLLBACK_JOURNAL_MAGIC)
+                .expect("write non-zero libra.db-journal");
+            let hot_j_err = resume_forward_migration(&storage).await.expect_err(
+                "non-zero libra.db-journal alongside unlinked libra.db must fail closed",
+            );
+            assert_eq!(hot_j_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                cap_db.exists(),
+                "capture.db must stay untouched on rejection"
+            );
+            fs::remove_file(&git_journal).expect("remove active journal");
+
+            // Negative check 2: Stray `libra.db-wal` alongside missing `libra.db`
+            // MUST fail closed (`LBR-IO-001`)!
+            let git_wal = sqlite_sidecar_path(&git_db, "-wal");
+            fs::write(&git_wal, b"stray-wal").expect("write stray libra.db-wal");
+            let wal_err = resume_forward_migration(&storage)
+                .await
+                .expect_err("stray libra.db-wal alongside unlinked libra.db must fail closed");
+            assert_eq!(wal_err.stable_code_str(), "LBR-IO-001");
+            fs::remove_file(&git_wal).expect("remove stray wal");
+
+            // Negative check 3 (Unix): Symlinked or hard-linked `libra.db-journal`
+            // MUST fail closed (`LBR-IO-001`) WITHOUT touching outside target!
+            #[cfg(unix)]
+            {
+                let decoy = dir.path().join("decoy-journal-target.bin");
+                fs::write(&decoy, [0u8; 512]).expect("write decoy file");
+                std::os::unix::fs::symlink(&decoy, &git_journal).expect("symlink libra.db-journal");
+                let sym_err = resume_forward_migration(&storage)
+                    .await
+                    .expect_err("symlinked libra.db-journal must fail closed");
+                assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
+                assert!(decoy.exists(), "decoy target must stay untouched");
+                fs::remove_file(&git_journal).expect("remove test symlink");
+
+                fs::hard_link(&decoy, &git_journal).expect("hardlink libra.db-journal");
+                let hl_err = resume_forward_migration(&storage)
+                    .await
+                    .expect_err("hard-linked libra.db-journal (nlink>1) must fail closed");
+                assert_eq!(hl_err.stable_code_str(), "LBR-IO-001");
+                assert!(decoy.exists(), "hard-linked decoy must stay untouched");
+                fs::remove_file(&git_journal).expect("remove test hardlink");
+            }
+
+            // Plant genuine cold zeroed 512-byte `libra.db-journal` (power loss
+            // between `unlink(libra.db) + fsync_dir` and `c_mig.close()`).
+            let _cold_git_journal = plant_cold_zeroed_journal(&git_db);
+
+            // Negative check 4: Corrupt `sqlite-backup/00000001/libra.db` ->
+            // `backup_sha256` mismatch MUST fail closed (`LBR-IO-001`)!
+            let git_bk = sqlite_backup_git_db_path(&storage, 1);
+            let valid_git_bk = fs::read(&git_bk).expect("read valid git backup");
+            let corrupt_git_bk = corrupt_sqlite_btree_page2(&valid_git_bk);
+            overwrite_backup_bytes_preserving_mode(&git_bk, &corrupt_git_bk);
+            let sha_err = resume_forward_migration(&storage)
+                .await
+                .expect_err("backup_sha256 mismatch on unlinked libra.db backup must fail closed");
+            assert_eq!(sha_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                sha_err.to_string().contains("backup_sha256 mismatch"),
+                "expected backup_sha256 mismatch, got: {sha_err}"
+            );
+
+            // Negative check 5: Even if `git_backup_sha256` in manifest matches
+            // the corrupted backup bytes, `PRAGMA integrity_check` MUST catch
+            // the B-tree corruption and fail closed (`LBR-IO-001`)!
+            let manifest_path = crate::storage::manifest::storage_manifest_path(&storage);
+            let valid_manifest_bytes = fs::read(&manifest_path).expect("read valid manifest bytes");
+            let mut m_tampered = m_before.clone();
+            m_tampered.source_digests.git_backup_sha256 = Some(sha256_hex_bytes(&corrupt_git_bk));
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&m_tampered).expect("serialize tampered manifest"),
+            )
+            .expect("write manifest with matching corrupt backup sha");
+            let ic_err = resume_forward_migration(&storage).await.expect_err(
+                "corrupt git backup must fail PRAGMA integrity_check even if sha matches",
+            );
+            assert_eq!(ic_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                ic_err.to_string().contains("integrity_check"),
+                "expected PRAGMA integrity_check failure, got: {ic_err}"
+            );
+            assert!(
+                cap_db.exists(),
+                "capture.db must remain untouched on backup failure"
+            );
+
+            // Restore valid backup + manifest and verify clean idempotent convergence!
+            overwrite_backup_bytes_preserving_mode(&git_bk, &valid_git_bk);
+            fs::write(&manifest_path, &valid_manifest_bytes).expect("restore valid manifest");
+
+            let started = Instant::now();
+            let resumed = resume_forward_migration(&storage).await.expect(
+                "resume after unlink(libra.db)+fsync_dir (fenced_ready_to_unlink) must succeed",
+            );
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms <= RESUME_BUDGET_MS,
+                "RB-10k 2A resume took {elapsed_ms}ms (budget <= {RESUME_BUDGET_MS}ms)"
+            );
+            assert_eq!(
+                resumed.git_recovery_state,
+                ForwardSourceRecoveryState::LegallyAbsentPostUnlink
+            );
+            assert_eq!(
+                resumed.capture_recovery_state,
+                ForwardSourceRecoveryState::CleanMatchedPending
+            );
+            assert_unlink_followed_immediately_by_dir_fsync(
+                &resumed.finalized.durability,
+                DatabaseRole::Capture,
+                LEGACY_CAPTURE_SQLITE_REL_PATH,
+                PRIVATE_SUBDIR,
+                "rb10k-2a-capture",
+            );
+            assert_rb10k_layout_c_converged(&storage, &resumed, "rb10k-2a", "rb10k-2a").await;
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 2B (AC3 — `phase2_progress.git_db == "unlinked"`):
+        // Crash immediately AFTER persisting `git_db = "unlinked"`, BEFORE
+        // fencing `capture.db`.
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10k 2B tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10k-2b").await;
+            crash_forward_phase2_at_point(
+                &storage,
+                1,
+                Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Repository),
+            )
+            .await;
+
+            let m_before = read_storage_manifest(&storage)
+                .expect("read manifest 2B")
+                .expect("manifest must exist");
+            assert!(!m_before.finalized);
+            assert_eq!(
+                m_before.phase2_progress.git_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            assert_eq!(
+                m_before.phase2_progress.capture_db,
+                Some(Phase2DbState::Pending)
+            );
+            assert!(!git_sqlite_db_path(&storage).exists());
+            assert!(capture_sqlite_db_path(&storage).exists());
+
+            // Verify missing `libra.db` backup fails closed before restoring it.
+            let git_bk = sqlite_backup_git_db_path(&storage, 1);
+            let git_bk_backup_tmp = dir.path().join("saved-git-bk.db");
+            fs::rename(&git_bk, &git_bk_backup_tmp).expect("temporarily move git backup away");
+            let missing_err = resume_forward_migration(&storage)
+                .await
+                .expect_err("missing libra.db backup must fail closed");
+            assert_eq!(missing_err.stable_code_str(), "LBR-IO-001");
+            fs::rename(&git_bk_backup_tmp, &git_bk).expect("restore git backup");
+
+            let started = Instant::now();
+            let resumed = resume_forward_migration(&storage)
+                .await
+                .expect("resume after git_db=unlinked must succeed");
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms <= RESUME_BUDGET_MS,
+                "RB-10k 2B resume took {elapsed_ms}ms (budget <= {RESUME_BUDGET_MS}ms)"
+            );
+            assert_eq!(
+                resumed.git_recovery_state,
+                ForwardSourceRecoveryState::LegallyAbsentPostUnlink
+            );
+            assert_eq!(
+                resumed.capture_recovery_state,
+                ForwardSourceRecoveryState::CleanMatchedPending
+            );
+            assert_rb10k_layout_c_converged(&storage, &resumed, "rb10k-2b", "rb10k-2b").await;
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 2C (AC3 Layout A — `capture_db == "absent"`):
+        // Both `git_db == "fenced_ready_to_unlink"` AND `git_db == "unlinked"`.
+        // --------------------------------------------------------------------
+        for (tag, point, expected_git_state) in [
+            (
+                "2c-ready",
+                Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Repository),
+                Phase2DbState::FencedReadyToUnlink,
+            ),
+            (
+                "2c-unlinked",
+                Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Repository),
+                Phase2DbState::Unlinked,
+            ),
+        ] {
+            let dir = tempdir().expect("create RB-10k 2C Layout A tempdir");
+            let storage = dir.path().join(".libra");
+            fs::create_dir_all(&storage).expect("create .libra");
+            let git_db = git_sqlite_db_path(&storage);
+            populate_all_61_repository_tables(&git_db).await;
+            populate_capture_rows_via_sql(&git_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            crash_forward_phase2_at_point(&storage, 1, point).await;
+            assert!(!git_db.exists(), "[{tag}] libra.db must be unlinked");
+            let m_before = read_storage_manifest(&storage)
+                .expect("read manifest 2C")
+                .expect("manifest must exist");
+            assert!(!m_before.finalized);
+            assert_eq!(m_before.phase2_progress.git_db, Some(expected_git_state));
+            assert_eq!(
+                m_before.phase2_progress.capture_db,
+                Some(Phase2DbState::Absent)
+            );
+
+            let started = Instant::now();
+            let resumed = resume_forward_migration(&storage)
+                .await
+                .expect("Layout A resume after libra.db unlink must succeed");
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms <= RESUME_BUDGET_MS,
+                "RB-10k {tag} resume took {elapsed_ms}ms (budget <= {RESUME_BUDGET_MS}ms)"
+            );
+            assert_eq!(
+                resumed.git_recovery_state,
+                ForwardSourceRecoveryState::LegallyAbsentPostUnlink
+            );
+            assert_eq!(
+                resumed.capture_recovery_state,
+                ForwardSourceRecoveryState::Absent
+            );
+            assert!(resumed.finalized.manifest.finalized);
+            assert_eq!(
+                resumed.finalized.manifest.phase2_progress.git_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            let git_store = RedbGitStore::open_read_only(&resumed.finalized.git_redb_path)
+                .expect("open Layout A git redb");
+            assert!(
+                !git_store
+                    .list_refs(None)
+                    .await
+                    .expect("list refs")
+                    .is_empty()
+            );
+            let cap_store = RedbCaptureStore::open_read_only(&resumed.finalized.capture_redb_path)
+                .await
+                .expect("open Layout A capture redb");
+            assert!(
+                !cap_store
+                    .list_sessions_by_started_desc()
+                    .await
+                    .expect("list Layout A inline sessions")
+                    .is_empty()
+            );
+        }
     }
 
-    /// RB-10k AC4: resume right after `unlink(capture.db)+fsync`.
     #[tokio::test]
     async fn forward_phase2_crash_immediately_after_capture_db_unlink() {
-        let dir = tempdir().expect("rb10k capture-unlink tempdir");
-        let storage = dir.path().join(".libra");
-        build_rb10c_layout_c_fixture(&storage, "rb10k-cap-unlink").await;
-        rb10k_crash_at_point(
-            &storage,
-            Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Capture),
-        )
-        .await;
-        assert!(!git_sqlite_db_path(&storage).exists());
-        assert!(!capture_sqlite_db_path(&storage).exists());
+        const RESUME_BUDGET_MS: u128 = 500;
 
-        let resumed = resume_forward_phase2(&storage)
-            .await
-            .expect("resume must verify both backups and finalize");
-        assert!(resumed.finalized.manifest.finalized, "AC4 finalized");
-        rb10k_assert_backup(&storage, 1, false).await;
-        rb10k_assert_backup(&storage, 1, true).await;
+        // --------------------------------------------------------------------
+        // Scenario 3A (AC4 — `phase2_progress.capture_db == "fenced_ready_to_unlink"`):
+        // Crash IMMEDIATELY after `unlink(capture.db) + fsync_dir`, BEFORE
+        // updating `capture_db = "unlinked"` and BEFORE Step 2.3 spool tombstones.
+        // Verifies cold zeroed `capture.db-journal` cleanup, active/symlink/hardlink
+        // sidecar rejection, AND independent `cap_backup_sha256` +
+        // `PRAGMA integrity_check` enforcement before converging to `finalized = true`
+        // (`<= 500ms`).
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10k 3A tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10k-3a").await;
+            crash_forward_phase2_at_point(
+                &storage,
+                1,
+                Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Capture),
+            )
+            .await;
+
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            assert!(!git_db.exists(), "libra.db must already be unlinked");
+            assert!(!cap_db.exists(), "capture.db must already be unlinked");
+            let m_before = read_storage_manifest(&storage)
+                .expect("read manifest 3A")
+                .expect("manifest must exist");
+            assert!(!m_before.finalized);
+            assert_eq!(
+                m_before.phase2_progress.git_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            assert_eq!(
+                m_before.phase2_progress.capture_db,
+                Some(Phase2DbState::FencedReadyToUnlink)
+            );
+            assert!(!m_before.phase2_progress.spool_fenced);
+
+            assert_rb10c_unfinalized_rejects_both_env_overrides(
+                &storage,
+                "rb10k_3a_post_capture_unlink",
+            );
+
+            // Negative check 1: Active non-zero `capture.db-journal` MUST fail closed!
+            let cap_journal = sqlite_sidecar_path(&cap_db, "-journal");
+            fs::write(&cap_journal, SQLITE_HOT_ROLLBACK_JOURNAL_MAGIC)
+                .expect("write active capture.db-journal");
+            let hot_err = resume_forward_migration(&storage).await.expect_err(
+                "active capture.db-journal alongside missing capture.db must fail closed",
+            );
+            assert_eq!(hot_err.stable_code_str(), "LBR-IO-001");
+            fs::remove_file(&cap_journal).expect("remove active capture journal");
+
+            // Negative check 2: Stray `capture.db-wal` MUST fail closed!
+            let cap_wal = sqlite_sidecar_path(&cap_db, "-wal");
+            fs::write(&cap_wal, b"stray-cap-wal").expect("write stray capture.db-wal");
+            let wal_err = resume_forward_migration(&storage)
+                .await
+                .expect_err("stray capture.db-wal alongside missing capture.db must fail closed");
+            assert_eq!(wal_err.stable_code_str(), "LBR-IO-001");
+            fs::remove_file(&cap_wal).expect("remove stray capture wal");
+
+            // Negative check 3 (Unix): Symlinked or hard-linked `capture.db-journal`
+            // MUST fail closed WITHOUT touching decoy!
+            #[cfg(unix)]
+            {
+                let decoy = dir.path().join("decoy-cap-journal.bin");
+                fs::write(&decoy, [0u8; 512]).expect("write decoy file");
+                std::os::unix::fs::symlink(&decoy, &cap_journal)
+                    .expect("symlink capture.db-journal");
+                let sym_err = resume_forward_migration(&storage)
+                    .await
+                    .expect_err("symlinked capture.db-journal must fail closed");
+                assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
+                assert!(decoy.exists(), "decoy target must stay untouched");
+                fs::remove_file(&cap_journal).expect("remove capture symlink");
+
+                fs::hard_link(&decoy, &cap_journal).expect("hardlink capture.db-journal");
+                let hl_err = resume_forward_migration(&storage)
+                    .await
+                    .expect_err("hard-linked capture.db-journal must fail closed");
+                assert_eq!(hl_err.stable_code_str(), "LBR-IO-001");
+                assert!(decoy.exists(), "hard-linked decoy must stay untouched");
+                fs::remove_file(&cap_journal).expect("remove capture hardlink");
+            }
+
+            // Plant genuine cold zeroed 512-byte `capture.db-journal` (power loss
+            // between `unlink(capture.db) + fsync_dir` and `c_mig.close()`).
+            let _cold_cap_journal = plant_cold_zeroed_journal(&cap_db);
+
+            // Negative check 4: Corrupt `sqlite-backup/00000001/capture.db` ->
+            // `backup_sha256` mismatch MUST fail closed (`LBR-IO-001`)!
+            let cap_bk = sqlite_backup_capture_db_path(&storage, 1);
+            let valid_cap_bk = fs::read(&cap_bk).expect("read valid capture backup");
+            let corrupt_cap_bk = corrupt_sqlite_btree_page2(&valid_cap_bk);
+            overwrite_backup_bytes_preserving_mode(&cap_bk, &corrupt_cap_bk);
+            let sha_err = resume_forward_migration(&storage)
+                .await
+                .expect_err("corrupt capture backup must fail backup_sha256 check");
+            assert_eq!(sha_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                sha_err.to_string().contains("backup_sha256 mismatch"),
+                "expected backup_sha256 mismatch, got: {sha_err}"
+            );
+
+            // Negative check 5: Even when `cap_backup_sha256` matches the
+            // corrupted bytes, `PRAGMA integrity_check` MUST fail closed (`LBR-IO-001`)!
+            let manifest_path = crate::storage::manifest::storage_manifest_path(&storage);
+            let valid_manifest_bytes = fs::read(&manifest_path).expect("read valid manifest");
+            let mut m_tampered = m_before.clone();
+            m_tampered.source_digests.cap_backup_sha256 = Some(sha256_hex_bytes(&corrupt_cap_bk));
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&m_tampered).expect("serialize tampered manifest"),
+            )
+            .expect("write manifest with matching corrupt cap backup sha");
+            let ic_err = resume_forward_migration(&storage).await.expect_err(
+                "corrupt capture backup must fail PRAGMA integrity_check even if sha matches",
+            );
+            assert_eq!(ic_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                ic_err.to_string().contains("integrity_check"),
+                "expected PRAGMA integrity_check failure, got: {ic_err}"
+            );
+            assert!(
+                !read_storage_manifest(&storage)
+                    .expect("read manifest")
+                    .expect("manifest")
+                    .finalized
+            );
+
+            // Restore valid backup + manifest and verify idempotent convergence!
+            overwrite_backup_bytes_preserving_mode(&cap_bk, &valid_cap_bk);
+            fs::write(&manifest_path, &valid_manifest_bytes).expect("restore valid manifest");
+
+            let started = Instant::now();
+            let resumed = resume_forward_migration(&storage).await.expect(
+                "resume after unlink(capture.db)+fsync_dir (fenced_ready_to_unlink) must succeed",
+            );
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms <= RESUME_BUDGET_MS,
+                "RB-10k 3A resume took {elapsed_ms}ms (budget <= {RESUME_BUDGET_MS}ms)"
+            );
+            assert_eq!(
+                resumed.git_recovery_state,
+                ForwardSourceRecoveryState::LegallyAbsentPostUnlink
+            );
+            assert_eq!(
+                resumed.capture_recovery_state,
+                ForwardSourceRecoveryState::LegallyAbsentPostUnlink
+            );
+            assert_rb10k_layout_c_converged(&storage, &resumed, "rb10k-3a", "rb10k-3a").await;
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 3B (AC4 — `phase2_progress.capture_db == "unlinked"`):
+        // Crash immediately AFTER persisting `capture_db = "unlinked"`, right
+        // BEFORE Step 2.3 spool tombstones & Step 2.4 `finalized = true`.
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10k 3B tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10k-3b").await;
+            crash_forward_phase2_at_point(
+                &storage,
+                1,
+                Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Capture),
+            )
+            .await;
+
+            let m_before = read_storage_manifest(&storage)
+                .expect("read manifest 3B")
+                .expect("manifest must exist");
+            assert!(!m_before.finalized);
+            assert_eq!(
+                m_before.phase2_progress.git_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            assert_eq!(
+                m_before.phase2_progress.capture_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            assert!(!m_before.phase2_progress.spool_fenced);
+
+            // Missing `capture.db` backup MUST fail closed (`LBR-IO-001`)!
+            let cap_bk = sqlite_backup_capture_db_path(&storage, 1);
+            let cap_bk_tmp = dir.path().join("saved-cap-bk.db");
+            fs::rename(&cap_bk, &cap_bk_tmp).expect("temporarily move capture backup away");
+            let missing_err = resume_forward_migration(&storage)
+                .await
+                .expect_err("missing capture.db backup must fail closed");
+            assert_eq!(missing_err.stable_code_str(), "LBR-IO-001");
+            fs::rename(&cap_bk_tmp, &cap_bk).expect("restore capture backup");
+
+            let started = Instant::now();
+            let resumed = resume_forward_migration(&storage)
+                .await
+                .expect("resume after capture_db=unlinked must succeed");
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms <= RESUME_BUDGET_MS,
+                "RB-10k 3B resume took {elapsed_ms}ms (budget <= {RESUME_BUDGET_MS}ms)"
+            );
+            assert_eq!(
+                resumed.git_recovery_state,
+                ForwardSourceRecoveryState::LegallyAbsentPostUnlink
+            );
+            assert_eq!(
+                resumed.capture_recovery_state,
+                ForwardSourceRecoveryState::LegallyAbsentPostUnlink
+            );
+            assert_rb10k_layout_c_converged(&storage, &resumed, "rb10k-3b", "rb10k-3b").await;
+        }
     }
 
-    /// RB-10d AC1–AC4: unexpected missing pending sources and non-sentinel
-    /// corruption fail closed with `LBR-IO-001`.
+    /// `RB-10d` AC1–AC4: unexpected missing `pending` sources (`libra.db` and
+    /// `capture.db`), damaged page-1 headers without a hot rollback journal or
+    /// fence sentinel, and non-sentinel schema corruption (both unrelated table
+    /// syntax corruption and tampered `__libra_migrated_fence__` SQL text) on
+    /// BOTH `libra.db` and `capture.db` all fail closed with `LBR-IO-001` within
+    /// the `<= 100ms` budget without discarding or mutating source bytes.
     #[tokio::test]
     async fn forward_phase2_unexpected_missing_pending_and_corrupt_non_sentinel_reject() {
-        // AC1: pending libra.db unexpectedly missing.
+        const FAIL_CLOSED_BUDGET_MS: u128 = 100;
+
+        // AC1: `phase2_progress.git_db == "pending"` with unexpectedly missing `libra.db`.
         {
-            let dir = tempdir().expect("rb10d missing git tempdir");
+            let dir = tempdir().expect("rb10d ac1 tempdir");
             let storage = dir.path().join(".libra");
-            build_rb10c_layout_c_fixture(&storage, "rb10d-missing-git").await;
+            build_rb10c_layout_c_fixture(&storage, "rb10d-ac1").await;
             crash_after_step2_1_pending(&storage, 1).await;
-            fs::remove_file(git_sqlite_db_path(&storage)).expect("remove libra.db");
+            let cap_before = fs::read(capture_sqlite_db_path(&storage)).expect("read capture.db");
+            fs::remove_file(git_sqlite_db_path(&storage)).expect("remove pending libra.db");
+
+            let started = Instant::now();
             let err = resume_forward_migration(&storage)
                 .await
                 .expect_err("AC1 missing pending libra.db must fail closed");
             assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC1");
+            assert!(
+                started.elapsed().as_millis() <= FAIL_CLOSED_BUDGET_MS,
+                "AC1 fail-closed took {}ms (budget <= {FAIL_CLOSED_BUDGET_MS}ms)",
+                started.elapsed().as_millis()
+            );
+            assert!(
+                !read_storage_manifest(&storage)
+                    .expect("read manifest")
+                    .expect("manifest present")
+                    .finalized
+            );
+            assert_eq!(
+                fs::read(capture_sqlite_db_path(&storage)).expect("re-read capture.db"),
+                cap_before,
+                "AC1 must leave capture.db untouched"
+            );
         }
 
-        // AC2: pending capture.db unexpectedly missing.
+        // AC2: `phase2_progress.capture_db == "pending"` with unexpectedly missing `capture.db`.
         {
-            let dir = tempdir().expect("rb10d missing cap tempdir");
+            let dir = tempdir().expect("rb10d ac2 tempdir");
             let storage = dir.path().join(".libra");
-            build_rb10c_layout_c_fixture(&storage, "rb10d-missing-cap").await;
+            build_rb10c_layout_c_fixture(&storage, "rb10d-ac2").await;
             crash_after_step2_1_pending(&storage, 1).await;
-            fs::remove_file(capture_sqlite_db_path(&storage)).expect("remove capture.db");
+            let git_before = fs::read(git_sqlite_db_path(&storage)).expect("read libra.db");
+            fs::remove_file(capture_sqlite_db_path(&storage)).expect("remove pending capture.db");
+
+            let started = Instant::now();
             let err = resume_forward_migration(&storage)
                 .await
                 .expect_err("AC2 missing pending capture.db must fail closed");
             assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC2");
+            assert!(
+                started.elapsed().as_millis() <= FAIL_CLOSED_BUDGET_MS,
+                "AC2 fail-closed took {}ms (budget <= {FAIL_CLOSED_BUDGET_MS}ms)",
+                started.elapsed().as_millis()
+            );
+            assert!(
+                !read_storage_manifest(&storage)
+                    .expect("read manifest")
+                    .expect("manifest present")
+                    .finalized
+            );
+            assert_eq!(
+                fs::read(git_sqlite_db_path(&storage)).expect("re-read libra.db"),
+                git_before,
+                "AC2 must leave libra.db untouched"
+            );
         }
 
-        // AC3: damaged page header without a hot journal or fence sentinel.
-        {
-            let dir = tempdir().expect("rb10d torn header tempdir");
+        // AC3: damaged page-1 header (zeroed first 512 bytes, no hot journal, no
+        // sentinel) on BOTH `libra.db` and `capture.db` fails closed and never
+        // discards source bytes.
+        for (label, corrupt_capture) in [("git-header", false), ("cap-header", true)] {
+            let dir = tempdir().expect("rb10d ac3 tempdir");
             let storage = dir.path().join(".libra");
-            build_rb10c_layout_c_fixture(&storage, "rb10d-torn-header").await;
+            build_rb10c_layout_c_fixture(&storage, label).await;
             crash_after_step2_1_pending(&storage, 1).await;
-            let git_db = git_sqlite_db_path(&storage);
-            let mut bytes = fs::read(&git_db).expect("read libra.db");
-            for byte in &mut bytes[..512] {
-                *byte = 0;
-            }
-            fs::write(&git_db, bytes).expect("torn page 1");
+            let target = if corrupt_capture {
+                capture_sqlite_db_path(&storage)
+            } else {
+                git_sqlite_db_path(&storage)
+            };
+            let mut bytes = fs::read(&target).expect("read target db");
+            bytes[..512].fill(0);
+            fs::write(&target, &bytes).expect("write torn page-1 header");
+
+            let started = Instant::now();
             let err = resume_forward_migration(&storage)
                 .await
-                .expect_err("AC3 corrupt page header must fail closed");
-            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC3");
+                .expect_err("AC3 torn page header must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC3 {label}");
+            assert!(
+                started.elapsed().as_millis() <= FAIL_CLOSED_BUDGET_MS,
+                "AC3 {label} fail-closed took {}ms (budget <= {FAIL_CLOSED_BUDGET_MS}ms)",
+                started.elapsed().as_millis()
+            );
+            assert_eq!(
+                fs::read(&target).expect("re-read target db"),
+                bytes,
+                "AC3 {label} must never mutate or silently drop source data"
+            );
+            assert!(
+                !read_storage_manifest(&storage)
+                    .expect("read manifest")
+                    .expect("manifest present")
+                    .finalized
+            );
         }
 
-        // AC4: malformed schema that is NOT the exact fence sentinel.
-        {
-            let dir = tempdir().expect("rb10d bogus schema tempdir");
-            let storage = dir.path().join(".libra");
-            build_rb10c_layout_c_fixture(&storage, "rb10d-bogus-schema").await;
-            crash_after_step2_1_pending(&storage, 1).await;
-            let git_db = git_sqlite_db_path(&storage);
-            use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
-            let opts = SqliteConnectOptions::new()
-                .filename(&git_db)
-                .create_if_missing(false)
-                .busy_timeout(Duration::ZERO);
-            let mut conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
-                .await
-                .expect("open libra.db");
-            conn.execute("PRAGMA writable_schema = ON;")
-                .await
-                .expect("writable_schema");
-            conn.execute(
+        // AC4: non-sentinel schema corruption (both malformed non-sentinel table
+        // SQL AND tampered `__libra_migrated_fence__` SQL) on BOTH `libra.db`
+        // and `capture.db` fails closed without silently dropping source data.
+        for (label, corrupt_capture, sql_mutation) in [
+            (
+                "git-non-sentinel-table",
+                false,
                 "UPDATE sqlite_master SET sql = 'CREATE TABLE bogus (' WHERE name = 'reference';",
-            )
-            .await
-            .expect("inject bogus schema");
-            let _ = conn.close().await;
+            ),
+            (
+                "cap-non-sentinel-table",
+                true,
+                "UPDATE sqlite_master SET sql = 'CREATE TABLE bogus (' WHERE name = 'agent_session';",
+            ),
+            (
+                "git-tampered-sentinel-sql",
+                false,
+                "CREATE TABLE __libra_migrated_fence__ (x INTEGER); PRAGMA writable_schema = ON; UPDATE sqlite_master SET sql = 'CORRUPT_BUT_NOT_OUR_SENTINEL' WHERE name = '__libra_migrated_fence__'; PRAGMA writable_schema = OFF;",
+            ),
+            (
+                "cap-tampered-sentinel-sql",
+                true,
+                "CREATE TABLE __libra_migrated_fence__ (x INTEGER); PRAGMA writable_schema = ON; UPDATE sqlite_master SET sql = 'CORRUPT_BUT_NOT_OUR_SENTINEL' WHERE name = '__libra_migrated_fence__'; PRAGMA writable_schema = OFF;",
+            ),
+        ] {
+            let dir = tempdir().expect("rb10d ac4 tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, label).await;
+            crash_after_step2_1_pending(&storage, 1).await;
+            let target = if corrupt_capture {
+                capture_sqlite_db_path(&storage)
+            } else {
+                git_sqlite_db_path(&storage)
+            };
+            {
+                let opts = SqliteConnectOptions::new()
+                    .filename(&target)
+                    .create_if_missing(false)
+                    .busy_timeout(Duration::ZERO);
+                let mut conn = SqliteConnection::connect_with(&opts)
+                    .await
+                    .expect("open target sqlite for non-sentinel corruption");
+                conn.execute("PRAGMA writable_schema = ON;")
+                    .await
+                    .expect("enable writable_schema");
+                conn.execute(sql_mutation)
+                    .await
+                    .expect("inject non-sentinel schema corruption");
+                conn.execute("PRAGMA writable_schema = OFF;")
+                    .await
+                    .expect("disable writable_schema");
+                conn.close().await.expect("close target sqlite");
+            }
+            let bytes_before = fs::read(&target).expect("snapshot corrupted source bytes");
+
+            let started = Instant::now();
             let err = resume_forward_migration(&storage)
                 .await
-                .expect_err("AC4 non-sentinel malformed schema must fail closed");
-            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC4");
+                .expect_err("AC4 non-sentinel schema corruption must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC4 {label}");
+            assert!(
+                started.elapsed().as_millis() <= FAIL_CLOSED_BUDGET_MS,
+                "AC4 {label} fail-closed took {}ms (budget <= {FAIL_CLOSED_BUDGET_MS}ms)",
+                started.elapsed().as_millis()
+            );
+            assert_eq!(
+                fs::read(&target).expect("re-read target db"),
+                bytes_before,
+                "AC4 {label} must never mutate or silently drop source data"
+            );
+            assert!(
+                !read_storage_manifest(&storage)
+                    .expect("read manifest")
+                    .expect("manifest present")
+                    .finalized
+            );
         }
     }
 
-    /// RB-10d AC5/AC6: missing or digest-mismatched backups for legally
-    /// unlinked sources fail closed with `LBR-IO-001`.
+    /// `RB-10d` AC5–AC6: missing or `backup_sha256`-mismatched backups for
+    /// legally unlinked `libra.db` and `capture.db` each fail closed with
+    /// `LBR-IO-001` within the `<= 100ms` budget.
     #[tokio::test]
     async fn forward_phase2_post_unlink_corrupt_backup_fails_closed() {
-        // AC5: missing backup after both sources are legally unlinked.
-        {
-            let dir = tempdir().expect("rb10d missing backup tempdir");
-            let storage = dir.path().join(".libra");
-            build_rb10c_layout_c_fixture(&storage, "rb10d-missing-backup").await;
-            rb10k_crash_at_point(
-                &storage,
-                Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Capture),
-            )
-            .await;
-            fs::remove_file(sqlite_backup_git_db_path(&storage, 1)).expect("remove git backup");
-            let err = resume_forward_migration(&storage)
-                .await
-                .expect_err("AC5 missing backup must fail closed");
-            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC5");
-        }
+        const FAIL_CLOSED_BUDGET_MS: u128 = 100;
 
-        // AC6: backup digest mismatch after both sources are legally unlinked.
-        {
-            let dir = tempdir().expect("rb10d bad digest tempdir");
+        for (label, target_capture, tamper_instead_of_delete) in [
+            ("ac5-missing-git-backup", false, false),
+            ("ac5-missing-cap-backup", true, false),
+            ("ac6-tampered-git-backup", false, true),
+            ("ac6-tampered-cap-backup", true, true),
+        ] {
+            let dir = tempdir().expect("rb10d ac5/ac6 tempdir");
             let storage = dir.path().join(".libra");
-            build_rb10c_layout_c_fixture(&storage, "rb10d-bad-backup-digest").await;
-            rb10k_crash_at_point(
+            build_rb10c_layout_c_fixture(&storage, label).await;
+            crash_forward_phase2_at_point(
                 &storage,
+                1,
                 Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Capture),
             )
             .await;
-            let backup = sqlite_backup_git_db_path(&storage, 1);
-            let mut bytes = fs::read(&backup).expect("read git backup");
-            let mid = bytes.len() / 2;
-            bytes[mid] ^= 0xFF;
-            fs::write(&backup, bytes).expect("tamper git backup");
+            assert!(!git_sqlite_db_path(&storage).exists());
+            assert!(!capture_sqlite_db_path(&storage).exists());
+
+            let backup = if target_capture {
+                sqlite_backup_capture_db_path(&storage, 1)
+            } else {
+                sqlite_backup_git_db_path(&storage, 1)
+            };
+            if tamper_instead_of_delete {
+                let mut bytes = fs::read(&backup).expect("read backup");
+                let mid = bytes.len() / 2;
+                bytes[mid] ^= 0xFF;
+                overwrite_backup_bytes_preserving_mode(&backup, &bytes);
+            } else {
+                fs::remove_file(&backup).expect("remove backup file");
+            }
+
+            let started = Instant::now();
             let err = resume_forward_migration(&storage)
                 .await
-                .expect_err("AC6 backup digest mismatch must fail closed");
-            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC6");
+                .expect_err("AC5/AC6 missing or tampered backup must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001", "{label}");
+            assert!(
+                started.elapsed().as_millis() <= FAIL_CLOSED_BUDGET_MS,
+                "{label} fail-closed took {}ms (budget <= {FAIL_CLOSED_BUDGET_MS}ms)",
+                started.elapsed().as_millis()
+            );
+            assert!(
+                !read_storage_manifest(&storage)
+                    .expect("read manifest")
+                    .expect("manifest present")
+                    .finalized
+            );
         }
     }
 
-    /// RB-10h AC1/AC4: after `libra.db` is legally unlinked, post-crash
-    /// `capture.db` writes and appended queue frames are merged into `gen+1`.
+    /// `RB-10h` AC1 + AC4: after `libra.db` is already fenced and legally
+    /// unlinked (`phase2_progress.git_db == "unlinked"`), post-crash writes to
+    /// live `capture.db` and newly appended `capture-queue/` frames are
+    /// reconciled via immutable verified `libra.db` backup + live `capture.db` +
+    /// latest queue frames into `gen + 1` WITHOUT EVER resurrecting live
+    /// `.libra/libra.db` (even if re-export crashes before publishing `gen + 1`
+    /// manifest!).
     #[tokio::test]
     async fn forward_phase2_crash_capture_db_and_queue_post_crash_reexport() {
         use crate::storage::{
-            FRAME_FLAG_NONE, RedbCaptureStore, append_postcard_frame,
+            FRAME_FLAG_NONE, GitStore as _, RedbCaptureStore, RedbGitStore, append_postcard_frame,
             capture_store::CaptureStore as _,
         };
 
-        let dir = tempdir().expect("rb10h capture/queue drift tempdir");
+        let dir = tempdir().expect("rb10h ac1/ac4 tempdir");
         let storage = dir.path().join(".libra");
         build_rb10c_layout_c_fixture(&storage, "rb10h-drift").await;
         let git_db = git_sqlite_db_path(&storage);
         let cap_db = capture_sqlite_db_path(&storage);
 
-        let prepared = prepare_forward_phase1(&storage, 1)
-            .await
-            .expect("Phase 1 prepare");
-        let mut hook = |point: Phase2TestPoint, _root: &Path| -> StorageResult<()> {
-            if point == Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Repository) {
-                return Err(StorageBackendError::BackendInternal {
-                    detail: "RB-10h injected repo-unlinked crash".to_string(),
-                });
-            }
-            Ok(())
-        };
-        execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut hook))
-            .await
-            .expect_err("injected RB-10h crash");
+        crash_forward_phase2_at_point(
+            &storage,
+            1,
+            Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Repository),
+        )
+        .await;
         assert!(!git_db.exists(), "libra.db must already be unlinked");
-        assert!(cap_db.exists(), "capture.db is still pending");
+        assert!(cap_db.exists(), "capture.db must still be pending");
 
-        // Post-crash legacy capture write.
+        // Post-crash legacy write to live `capture.db`.
         {
-            use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
             let opts = SqliteConnectOptions::new()
                 .filename(&cap_db)
                 .create_if_missing(false)
                 .busy_timeout(Duration::ZERO);
-            let mut conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
+            let mut conn = SqliteConnection::connect_with(&opts)
                 .await
-                .expect("open capture.db");
+                .expect("open live capture.db");
             conn.execute(
                 "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, thread_id, state, working_dir, worktree_id, parent_commit, parent_session_id, metadata_json, redaction_report, started_at, last_event_at, stopped_at, schema_version, sync_revision, repo_id, workspace_id, workspace_fence, scope_state) VALUES ('sess-rb10h-post', 'codex', 'prov-rb10h-post', NULL, 'active', '/work/rb10h', 'wt-1', NULL, NULL, '{}', '{}', 1795402000, 1795402010, NULL, 1, 1, 'repo-1', 'ws-1', 1, 'scoped');",
             )
             .await
-            .expect("post-crash capture insert");
-            let _ = conn.close().await;
+            .expect("insert post-crash capture session");
+            conn.close().await.expect("close capture.db");
         }
 
-        // Post-crash queue append.
+        // Post-crash queue frame append (AC4).
         let usage = AgentUsageStatsRecord {
             id: "usage-rb10h-post".to_string(),
             session_id: None,
@@ -59659,13 +63464,13 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             model: "gpt-5".to_string(),
             request_kind: "chat".to_string(),
             intent: None,
-            prompt_tokens: 1,
-            completion_tokens: 1,
+            prompt_tokens: 11,
+            completion_tokens: 22,
             cached_tokens: 0,
             reasoning_tokens: 0,
-            total_tokens: 2,
+            total_tokens: 33,
             tool_call_count: 0,
-            wall_clock_ms: 1,
+            wall_clock_ms: 4,
             provider_latency_ms: None,
             cost_estimate_micro_dollars: None,
             cost_usd: None,
@@ -59691,21 +63496,62 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
         )
         .expect("append post-crash queue frame");
 
-        let resumed = resume_forward_migration(&storage)
-            .await
-            .expect("resume must merge capture/queue drift into gen+1");
+        // Crash-safety proof: even if `gen + 1` re-export suffers SIGKILL after
+        // promotion and BEFORE manifest publish, live `.libra/libra.db` MUST
+        // NEVER be resurrected and the next resume MUST still converge cleanly!
+        resume_forward_migration_inner(
+            DatabaseRole::Repository,
+            &storage,
+            None,
+            None,
+            Some(ForwardDriftReexportCrashPoint::AfterPromotionBeforeManifest),
+        )
+        .await
+        .expect_err("injected SIGKILL before gen+1 manifest publish");
+        assert!(
+            !git_db.exists(),
+            "cross-source re-export MUST NEVER resurrect unlinked live libra.db"
+        );
+
+        let resumed = resume_forward_migration(&storage).await.expect(
+            "resume must merge verified libra.db backup + live capture.db + queue into gen+1",
+        );
         assert_eq!(resumed.initial_generation, 1);
-        assert_eq!(resumed.final_generation, 2, "AC1 gen+1");
-        assert!(resumed.reexported_due_to_drift, "AC1 drift re-export");
+        assert_eq!(resumed.final_generation, 2, "AC1 exact gen+1");
+        assert!(
+            resumed.reexported_due_to_drift,
+            "AC1 reexported_due_to_drift"
+        );
+        assert!(
+            resumed.max_reexport_batch_rows <= FORWARD_MIGRATION_STREAM_BATCH_ROWS,
+            "streaming batch cap <= 500"
+        );
+        assert_eq!(
+            resumed.git_recovery_state,
+            ForwardSourceRecoveryState::LegallyAbsentPostUnlink
+        );
         assert_eq!(
             resumed.capture_recovery_state,
-            ForwardSourceRecoveryState::DriftedLivePending,
-            "AC1 capture drift"
+            ForwardSourceRecoveryState::DriftedLivePending
         );
-        assert!(resumed.queue_drift_detected, "AC4 queue drift");
+        assert!(resumed.queue_drift_detected, "AC4 queue drift detected");
         assert!(resumed.finalized.manifest.finalized);
-        assert!(!cap_db.exists(), "capture.db unlinked after finalize");
+        assert!(!git_db.exists(), "libra.db remains unlinked");
+        assert!(!cap_db.exists(), "capture.db fenced and unlinked");
 
+        // Verify Git rows (from verified backup), pre-crash + post-crash Capture
+        // rows, pre-crash Spool event, and pre-crash + post-crash Queue frames
+        // are 100% preserved in `gen-00000002`!
+        let git_store = RedbGitStore::open_read_only(&resumed.finalized.git_redb_path)
+            .expect("open git.gen-00000002.redb");
+        assert!(
+            !git_store
+                .list_refs(None)
+                .await
+                .expect("list git refs")
+                .is_empty(),
+            "AC1 backed-up git rows preserved in gen+1"
+        );
         let cap_store = RedbCaptureStore::open_read_only(&resumed.finalized.capture_redb_path)
             .await
             .expect("open capture.gen-00000002.redb");
@@ -59713,30 +63559,61 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             cap_store
                 .get_session("sess-rb10h-post")
                 .await
-                .expect("get session")
+                .expect("get post-crash capture session")
                 .is_some(),
-            "AC1 post-crash capture row preserved"
+            "AC1 post-crash capture.db session preserved"
+        );
+        assert!(
+            cap_store
+                .get_usage_stats("usage-rb10h-drift-1")
+                .await
+                .expect("get pre-crash queue usage")
+                .is_some(),
+            "AC4 pre-crash queue frame preserved"
         );
         assert!(
             cap_store
                 .get_usage_stats("usage-rb10h-post")
                 .await
-                .expect("get usage")
+                .expect("get post-crash queue usage")
                 .is_some(),
             "AC4 post-crash queue frame preserved"
         );
+        let sessions = cap_store
+            .list_sessions_by_started_desc()
+            .await
+            .expect("list capture sessions");
+        let providers: Vec<&str> = sessions
+            .iter()
+            .map(|s| s.provider_session_id.as_str())
+            .collect();
+        assert!(
+            providers.contains(&"prov-rb10h-drift"),
+            "AC1 pre-crash spool session preserved: {providers:?}"
+        );
     }
 
-    /// RB-10h AC2/AC3: a crash between spool rmdir and tombstone installation is
-    /// reconciled; a concurrent legacy hook re-creating the directory merges the
-    /// backup ∪ live spool events into `gen+1` with zero loss.
+    /// `RB-10h` AC2 + AC3: crash in the gap between removing `capture-spool/`
+    /// subdirectories and installing `0400` tombstones:
+    /// - AC2 (no concurrent hook): reacquires in-place `capacity.lock`, verifies
+    ///   backed-up `.libra/sqlite-backup/<gen>/capture-spool/`, installs all 3
+    ///   `0400` tombstones, and converges on `gen = 1` with zero data loss.
+    /// - AC3 (concurrent old hook recreates `ready/` and publishes new confirmed
+    ///   events, including a same-filename collision sub-case): reacquires
+    ///   in-place `capacity.lock`, merges **backup ∪ live `capture-spool/ready/`**
+    ///   by dedup key into `gen + 1` (without ever resurrecting `libra.db` or
+    ///   `capture.db`), backs up the full union into `gen + 1`, installs all 3
+    ///   `0400` tombstones, and preserves BOTH pre-crash backed-up events AND
+    ///   concurrent-hook live events 100% losslessly.
     #[tokio::test]
     async fn forward_phase2_spool_tombstone_gap_crash_and_concurrent_hook_reconcile() {
         use crate::storage::{RedbCaptureStore, capture_store::CaptureStore as _};
 
-        // AC2: no concurrent hook -> reacquire lock, install tombstones, finalize.
+        // --------------------------------------------------------------------
+        // AC2: Spool tombstone gap crash with NO concurrent legacy hook writes.
+        // --------------------------------------------------------------------
         {
-            let dir = tempdir().expect("rb10h spool gap tempdir");
+            let dir = tempdir().expect("rb10h ac2 tempdir");
             let storage = dir.path().join(".libra");
             build_rb10c_layout_c_fixture(&storage, "rb10h-gap").await;
             let prepared = prepare_forward_phase1(&storage, 1)
@@ -59744,39 +63621,59 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
                 .expect("Phase 1 prepare");
             let fenced = execute_forward_phase2_fence_and_unlink(prepared)
                 .await
-                .expect("fence + unlink");
+                .expect("Phase 2 fence + unlink");
             let mut hook = |point: Phase2FinalizeTestPoint, _root: &Path| -> StorageResult<()> {
                 if point == Phase2FinalizeTestPoint::AfterRmdirBeforeLinkTombstone("ready") {
                     return Err(StorageBackendError::BackendInternal {
-                        detail: "RB-10h injected spool tombstone gap".to_string(),
+                        detail: "RB-10h AC2 injected spool gap crash".to_string(),
                     });
                 }
                 Ok(())
             };
             finalize_forward_phase2_spool_tombstones_and_manifest_inner(fenced, Some(&mut hook))
-                .expect_err("injected spool gap crash");
-            let manifest = read_storage_manifest(&storage)
-                .expect("read manifest")
-                .expect("unfinalized manifest survives spool gap");
-            assert!(!manifest.finalized);
+                .expect_err("injected AC2 spool gap crash");
+            assert!(
+                !read_storage_manifest(&storage)
+                    .expect("read manifest")
+                    .expect("manifest present")
+                    .finalized
+            );
 
             let resumed = resume_forward_migration(&storage)
                 .await
-                .expect("AC2 resume must install tombstones and finalize");
+                .expect("AC2 resume must verify backup, install 3 tombstones, and finalize");
+            assert_eq!(resumed.final_generation, 1, "AC2 stays on gen=1");
+            assert!(!resumed.reexported_due_to_drift, "AC2 no drift re-export");
             assert!(resumed.finalized.manifest.finalized, "AC2 finalized");
+            assert!(resumed.finalized.manifest.phase2_progress.spool_fenced);
             for slot in CAPTURE_SPOOL_TOMBSTONE_NAMES {
                 let path = capture_spool_dir_path(&storage).join(slot);
                 assert_eq!(
-                    fs::read(&path).expect("read tombstone"),
+                    fs::read(&path).expect("read AC2 tombstone"),
                     CAPTURE_SPOOL_TOMBSTONE_SENTINEL,
                     "AC2 tombstone {slot}"
                 );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = fs::symlink_metadata(&path)
+                        .expect("stat tombstone")
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(mode, 0o400, "AC2 tombstone {slot} must be 0400");
+                }
             }
+            assert_rb10k_layout_c_converged(&storage, &resumed, "rb10h-gap", "rb10h-gap").await;
         }
 
-        // AC3: concurrent hook re-creates `ready/` and publishes a new event.
+        // --------------------------------------------------------------------
+        // AC3: Spool tombstone gap crash WITH concurrent legacy hook recreating
+        // `ready/` and writing BOTH a fresh filename AND a colliding filename
+        // carrying a new event payload (plus a duplicate-dedup-key event).
+        // --------------------------------------------------------------------
         {
-            let dir = tempdir().expect("rb10h concurrent hook tempdir");
+            let dir = tempdir().expect("rb10h ac3 tempdir");
             let storage = dir.path().join(".libra");
             build_rb10c_layout_c_fixture(&storage, "rb10h-hook").await;
             let prepared = prepare_forward_phase1(&storage, 1)
@@ -59784,21 +63681,51 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
                 .expect("Phase 1 prepare");
             let fenced = execute_forward_phase2_fence_and_unlink(prepared)
                 .await
-                .expect("fence + unlink");
+                .expect("Phase 2 fence + unlink");
             let mut hook = |point: Phase2FinalizeTestPoint, _root: &Path| -> StorageResult<()> {
                 if point == Phase2FinalizeTestPoint::AfterRmdirBeforeLinkTombstone("ready") {
                     return Err(StorageBackendError::BackendInternal {
-                        detail: "RB-10h injected spool tombstone gap".to_string(),
+                        detail: "RB-10h AC3 injected spool gap crash".to_string(),
                     });
                 }
                 Ok(())
             };
             finalize_forward_phase2_spool_tombstones_and_manifest_inner(fenced, Some(&mut hook))
-                .expect_err("injected spool gap crash");
+                .expect_err("injected AC3 spool gap crash");
 
-            // Concurrent legacy hook re-creates the directory and publishes a
-            // new already-confirmed event.
+            // Confirm both SQLite sources are already unlinked & live `ready/`
+            // is gone while the pre-crash event survives in gen-1 backup.
+            assert!(!git_sqlite_db_path(&storage).exists());
+            assert!(!capture_sqlite_db_path(&storage).exists());
             let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+            assert!(!ready.exists());
+
+            // Compute the exact SHA-256 prefix of the gen-1 backed-up spool file so
+            // we can also test a secondary collision against the primary disambiguated
+            // candidate name (`prior-gen-00000001-<sha8>-0001-rb10h-hook.json`).
+            let gen1_file_bytes = fs::read(
+                sqlite_backup_capture_spool_dir_path(&storage, 1)
+                    .join(CAPTURE_SPOOL_READY_SUBDIR)
+                    .join("0001-rb10h-hook.json"),
+            )
+            .expect("read gen-1 backed-up spool file");
+            let mut gen1_hasher = Sha256::new();
+            gen1_hasher.update(&gen1_file_bytes);
+            let gen1_sha8 = sha256_hex_from_hasher(gen1_hasher)[..8].to_string();
+            let primary_disambig_name =
+                format!("prior-gen-00000001-{gen1_sha8}-0001-rb10h-hook.json");
+
+            // Concurrent legacy hook recreates `ready/` and publishes:
+            // 1. A brand-new event file (`0002-rb10h-hook.json`).
+            // 2. A colliding filename (`0001-rb10h-hook.json` — exact same filename
+            //    as the pre-crash backed-up spool file!) carrying a distinct event.
+            // 3. A secondary-collision file literally named `primary_disambig_name`
+            //    carrying another distinct event (proving the union backup NEVER
+            //    silently omits a prior event when the primary disambiguated name
+            //    is already occupied by different bytes!).
+            // 4. A duplicate-dedup-key replay (`0003-rb10h-hook-dup.json` with
+            //    `dedup:rb10h-hook:spool-1`) proving dedup across backup ∪ live
+            //    ignores replays with zero double-counting.
             fs::create_dir_all(&ready).expect("recreate ready dir");
             fs::write(
                 ready.join("0002-rb10h-hook.json"),
@@ -59807,7 +63734,7 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
                     "codex",
                     "33333333-3333-4333-8333-333333333399",
                     Some("dedup:rb10h:hook-1"),
-                    "prov-rb10h-hook",
+                    "prov-rb10h-hook-live-1",
                     "/work/rb10h-hook",
                     &storage,
                     "session_start",
@@ -59815,23 +63742,100 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
                     "",
                 ),
             )
-            .expect("write concurrent hook event");
+            .expect("write concurrent hook event 1");
+            fs::write(
+                ready.join("0001-rb10h-hook.json"),
+                build_spool_envelope_bytes(
+                    "codex",
+                    "codex",
+                    "44444444-4444-4444-8444-444444444488",
+                    Some("dedup:rb10h:hook-collision"),
+                    "prov-rb10h-hook-live-collision",
+                    "/work/rb10h-hook",
+                    &storage,
+                    "session_start",
+                    "2026-11-24T03:05:00Z",
+                    "",
+                ),
+            )
+            .expect("write concurrent hook colliding-name event");
+            fs::write(
+                ready.join(&primary_disambig_name),
+                build_spool_envelope_bytes(
+                    "codex",
+                    "codex",
+                    "66666666-6666-4666-8666-666666666666",
+                    Some("dedup:rb10h:hook-disambig-collision"),
+                    "prov-rb10h-hook-live-disambig-collision",
+                    "/work/rb10h-hook",
+                    &storage,
+                    "session_start",
+                    "2026-11-24T03:05:30Z",
+                    "",
+                ),
+            )
+            .expect("write concurrent hook secondary disambiguated collision event");
+            fs::write(
+                ready.join("0003-rb10h-hook-dup.json"),
+                build_spool_envelope_bytes(
+                    "codex",
+                    "codex",
+                    "55555555-5555-4555-8555-555555555577",
+                    Some("dedup:rb10h-hook:spool-1"),
+                    "prov-rb10h-hook-dup-ignored",
+                    "/work/rb10h-hook",
+                    &storage,
+                    "session_start",
+                    "2026-11-24T03:06:00Z",
+                    "",
+                ),
+            )
+            .expect("write concurrent hook duplicate-dedup-key replay");
 
             let resumed = resume_forward_migration(&storage)
                 .await
-                .expect("AC3 resume must merge backup ∪ live spool events");
+                .expect("AC3 resume must union backup ∪ live spool events into gen+1");
+            assert_eq!(resumed.initial_generation, 1);
+            assert_eq!(resumed.final_generation, 2, "AC3 exact gen+1");
+            assert!(resumed.reexported_due_to_drift, "AC3 drift re-export");
+            assert!(resumed.spool_drift_detected, "AC3 spool drift detected");
             assert!(resumed.finalized.manifest.finalized, "AC3 finalized");
+            assert!(resumed.finalized.manifest.phase2_progress.spool_fenced);
+            assert!(
+                !git_sqlite_db_path(&storage).exists(),
+                "AC3 must never resurrect libra.db"
+            );
+            assert!(
+                !capture_sqlite_db_path(&storage).exists(),
+                "AC3 must never resurrect capture.db"
+            );
+
             for slot in CAPTURE_SPOOL_TOMBSTONE_NAMES {
                 let path = capture_spool_dir_path(&storage).join(slot);
                 assert_eq!(
-                    fs::read(&path).expect("read tombstone"),
+                    fs::read(&path).expect("read AC3 tombstone"),
                     CAPTURE_SPOOL_TOMBSTONE_SENTINEL,
                     "AC3 tombstone {slot}"
                 );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = fs::symlink_metadata(&path)
+                        .expect("stat AC3 tombstone")
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(mode, 0o400, "AC3 tombstone {slot} must be 0400");
+                }
             }
+
+            // CRITICAL AC3 PROOF: BOTH the pre-crash backed-up spool event
+            // (`prov-rb10h-hook`) AND BOTH concurrent-hook live events
+            // (`prov-rb10h-hook-live-1` & `prov-rb10h-hook-live-collision`)
+            // MUST be 100% present in `capture.gen-00000002.redb`!
             let cap_store = RedbCaptureStore::open_read_only(&resumed.finalized.capture_redb_path)
                 .await
-                .expect("open capture redb");
+                .expect("open capture.gen-00000002.redb");
             let sessions = cap_store
                 .list_sessions_by_started_desc()
                 .await
@@ -59842,8 +63846,227 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
                 .collect();
             assert!(
                 provider_ids.contains(&"prov-rb10h-hook"),
-                "AC3 concurrent-hook spool event preserved: {provider_ids:?}"
+                "AC3 pre-crash backed-up spool event MUST NOT be lost: {provider_ids:?}"
             );
+            assert!(
+                provider_ids.contains(&"prov-rb10h-hook-live-1"),
+                "AC3 concurrent-hook live event 1 must be preserved: {provider_ids:?}"
+            );
+            assert!(
+                provider_ids.contains(&"prov-rb10h-hook-live-collision"),
+                "AC3 concurrent-hook colliding-filename event must be preserved: {provider_ids:?}"
+            );
+            assert!(
+                provider_ids.contains(&"prov-rb10h-hook-live-disambig-collision"),
+                "AC3 concurrent-hook secondary disambiguated-filename collision event must be preserved: {provider_ids:?}"
+            );
+            assert!(
+                !provider_ids.contains(&"prov-rb10h-hook-dup-ignored"),
+                "AC3 duplicate-dedup-key replay must be deduplicated cleanly: {provider_ids:?}"
+            );
+
+            // Also verify `gen-00000002` spool backup contains all 5 union files
+            // (4 live files + 1 secondary-disambiguated `prior-gen-00000001-<sha8>-0001-*`
+            // prior-gen file, proving zero silent omission even under secondary name collision)!
+            let gen2_ready_bk =
+                sqlite_backup_capture_spool_dir_path(&storage, 2).join(CAPTURE_SPOOL_READY_SUBDIR);
+            let bk_entries: Vec<String> = fs::read_dir(&gen2_ready_bk)
+                .expect("read gen-2 spool ready backup")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
+                .collect();
+            assert_eq!(
+                bk_entries.len(),
+                5,
+                "gen-2 backup must preserve full backup ∪ live union including secondary-disambiguated colliding filename: {bk_entries:?}"
+            );
+            let expected_secondary_name =
+                format!("prior-gen-00000001-{gen1_sha8}-0001-0001-rb10h-hook.json");
+            assert!(
+                bk_entries.contains(&expected_secondary_name),
+                "gen-2 backup must allocate unique secondary disambiguated filename {expected_secondary_name}: {bk_entries:?}"
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // Snapshot authenticity regression (`ready/` AND `quarantine/`):
+        // 1. Mutating the original `.libra/sqlite-backup/<gen>/capture-spool/`
+        //    AFTER `verify_spool_backup_manifest_for_recovery` still consumes
+        //    the exact originally authenticated bytes during both redb ingest
+        //    and union backup.
+        // 2. Tampering with or removing any `ready/` or `quarantine/` file inside
+        //    the snapshot itself fails closed (`LBR-IO-001`) before publication.
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("rb10h snapshot regression tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10h-snap").await;
+            let q_dir = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+            fs::create_dir_all(&q_dir).expect("create live quarantine dir");
+            fs::write(q_dir.join("q-0001.json"), b"{\"quarantined\":\"orig\"}")
+                .expect("write quarantine fixture");
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let expected_spool_sha = prepared.backup.spool_backup.spool_manifest_sha256.clone();
+            let _ = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 fence + unlink");
+
+            let snap = verify_spool_backup_manifest_for_recovery(
+                &storage,
+                "sqlite-backup/00000001",
+                &expected_spool_sha,
+                #[cfg(unix)]
+                &[],
+            )
+            .expect("authenticate gen-1 spool backup snapshot");
+
+            // 1. Mutate BOTH `ready/` and `quarantine/` in the original on-disk
+            //    gen-1 backup AFTER authentication.
+            let orig_bk_spool = sqlite_backup_capture_spool_dir_path(&storage, 1);
+            fs::write(
+                orig_bk_spool
+                    .join(CAPTURE_SPOOL_READY_SUBDIR)
+                    .join("0001-rb10h-snap.json"),
+                b"CORRUPTED-ORIGINAL-BACKUP",
+            )
+            .expect("corrupt original backup ready file");
+            fs::remove_file(
+                orig_bk_spool
+                    .join(CAPTURE_SPOOL_QUARANTINE_SUBDIR)
+                    .join("q-0001.json"),
+            )
+            .expect("remove original backup quarantine file");
+
+            // Downstream union backup & ingest still succeed with exact original bytes!
+            let dst_gen_dir = sqlite_backup_dir_path(&storage, 9);
+            fs::create_dir_all(&dst_gen_dir).expect("create test dst gen dir");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&dst_gen_dir, fs::Permissions::from_mode(0o700))
+                    .expect("chmod test dst gen dir");
+            }
+            let dst_spool_dir = dst_gen_dir.join(CAPTURE_SPOOL_SUBDIR);
+            let union_ok = backup_capture_spool_union_inner(
+                &storage,
+                &snap,
+                1,
+                &dst_spool_dir,
+                "sqlite-backup/00000009/capture-spool",
+                "sqlite-backup/00000009",
+                #[cfg(unix)]
+                &[],
+                None,
+            )
+            .expect(
+                "union backup must consume authenticated snapshot unaffected by original mutation",
+            );
+            assert_eq!(union_ok.spool_manifest_sha256, expected_spool_sha);
+            assert_eq!(
+                fs::read(
+                    dst_spool_dir
+                        .join(CAPTURE_SPOOL_QUARANTINE_SUBDIR)
+                        .join("q-0001.json")
+                )
+                .expect("read preserved quarantine file"),
+                b"{\"quarantined\":\"orig\"}"
+            );
+
+            let ok_redb_path = dir.path().join("snap-ingest-ok.redb");
+            let ok_redb = RedbDatabase::create(&ok_redb_path).expect("create ok test redb");
+            initialize_capture_export_redb_schema(&ok_redb, true)
+                .expect("init ok capture redb schema");
+            let mut ok_telemetry = ExportStreamTelemetry::new();
+            let ok_ingest = ingest_capture_spool_ready_from_backup_readonly(
+                &storage,
+                &snap,
+                &ok_redb,
+                &mut ok_telemetry,
+                #[cfg(unix)]
+                &[],
+            )
+            .expect("ingest must consume authenticated snapshot unaffected by original mutation");
+            assert_eq!(ok_ingest.files_read, 1);
+            assert_eq!(ok_ingest.applied_events, 1);
+
+            // 2. Tamper `ready/` inside the private snapshot -> BOTH ingest AND
+            //    union backup MUST fail closed `LBR-IO-001`.
+            let snap_ready = snap
+                .snapshot_spool_dir
+                .join(CAPTURE_SPOOL_READY_SUBDIR)
+                .join("0001-rb10h-snap.json");
+            let saved_ready = fs::read(&snap_ready).expect("save snap ready");
+            fs::write(&snap_ready, b"TAMPERED-SNAPSHOT-READY").expect("tamper snap ready");
+
+            let test_redb_path = dir.path().join("snap-ingest-check.redb");
+            let test_redb = RedbDatabase::create(&test_redb_path).expect("create test redb");
+            initialize_capture_export_redb_schema(&test_redb, true)
+                .expect("init capture redb schema");
+            let mut telemetry = ExportStreamTelemetry::new();
+            let ingest_err = ingest_capture_spool_ready_from_backup_readonly(
+                &storage,
+                &snap,
+                &test_redb,
+                &mut telemetry,
+                #[cfg(unix)]
+                &[],
+            )
+            .expect_err("tampered snapshot ready file must fail closed during ingest");
+            assert_eq!(ingest_err.stable_code_str(), "LBR-IO-001");
+
+            let dst_gen_dir2 = sqlite_backup_dir_path(&storage, 10);
+            fs::create_dir_all(&dst_gen_dir2).expect("create test dst gen dir 2");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&dst_gen_dir2, fs::Permissions::from_mode(0o700))
+                    .expect("chmod test dst gen dir 2");
+            }
+            let union_ready_err = backup_capture_spool_union_inner(
+                &storage,
+                &snap,
+                1,
+                &dst_gen_dir2.join(CAPTURE_SPOOL_SUBDIR),
+                "sqlite-backup/00000010/capture-spool",
+                "sqlite-backup/00000010",
+                #[cfg(unix)]
+                &[],
+                None,
+            )
+            .expect_err("tampered snapshot ready file must fail closed during union backup");
+            assert_eq!(union_ready_err.stable_code_str(), "LBR-IO-001");
+
+            // Restore `ready/`, then delete `quarantine/` inside the private
+            // snapshot -> union backup MUST fail closed `LBR-IO-001`.
+            fs::write(&snap_ready, saved_ready).expect("restore snap ready");
+            fs::remove_file(
+                snap.snapshot_spool_dir
+                    .join(CAPTURE_SPOOL_QUARANTINE_SUBDIR)
+                    .join("q-0001.json"),
+            )
+            .expect("delete snap quarantine file");
+            let dst_gen_dir3 = sqlite_backup_dir_path(&storage, 11);
+            fs::create_dir_all(&dst_gen_dir3).expect("create test dst gen dir 3");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&dst_gen_dir3, fs::Permissions::from_mode(0o700))
+                    .expect("chmod test dst gen dir 3");
+            }
+            let union_q_err = backup_capture_spool_union_inner(
+                &storage,
+                &snap,
+                1,
+                &dst_gen_dir3.join(CAPTURE_SPOOL_SUBDIR),
+                "sqlite-backup/00000011/capture-spool",
+                "sqlite-backup/00000011",
+                #[cfg(unix)]
+                &[],
+                None,
+            )
+            .expect_err("deleted snapshot quarantine file must fail closed during union backup");
+            assert_eq!(union_q_err.stable_code_str(), "LBR-IO-001");
         }
     }
 }
