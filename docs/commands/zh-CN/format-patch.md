@@ -14,6 +14,8 @@ libra format-patch [OPTIONS] [revision-range]
 
 封面信仅当系列中任一提交的原始对象缓冲含非 ASCII 字节时才输出 `MIME-Version`/`Content-Type`/`Content-Transfer-Encoding` 头（Git `make_cover_letter` 规则）；全 ASCII 系列不输出 MIME 头。
 
+封面信还会输出系列 diffstat（从唯一边界提交——最旧补丁的父提交——到末个补丁的树差异）；`--no-stat`/`-p` 只抑制逐补丁 diffstat，系列自根提交开始（无唯一边界）时省略封面信 diffstat。
+
 `libra format-patch` 遍历 revision range（`A..B`，或把单个提交视为 `<commit>..HEAD`）；`-1 [commit]` 精确选择一个 commit，`--root [commit]` 则包含 root 及所有可达的非 merge ancestors。命令为每个非 merge commit 生成一个 patch 文件（默认以 `--suffix` 命名，默认 `.patch`，除非设置 `--numbered-files`，此时使用裸序号）。除 `--numbered-files` 外，文件名始终带有补零序号前缀，不受 `-n` 或 `-N` 影响。每个 patch 格式化为 mbox message，包含 RFC 2822 headers、plain-text diffstat 和 unified diff。输出兼容 `git am`。
 
 Merge commits 默认跳过。当 revision range 解析为零个提交时，命令以退出码 0 成功结束，不生成 patch。普通模式不输出内容；使用 `--json` 时，payload 中包含 `"patches": []`。仓库没有任何 commit 或 revision 无法解析时仍会报错。若所有 commit 都已在 upstream 中，`--ignore-if-in-upstream` 也会成功返回空 series。

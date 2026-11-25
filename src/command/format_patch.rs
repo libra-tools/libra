@@ -661,12 +661,14 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     // object/config error therefore cannot leave a partially generated series.
     let mut rendered = Vec::with_capacity(total + usize::from(args.cover_letter));
     if args.cover_letter {
+        let series_stat = cover_letter_series_stat(&commits).await?;
         let cover_body = format_cover_letter(
             &args,
             &commits,
             &thread_id,
             from_identity.as_ref(),
             base_block.as_deref(),
+            series_stat.as_deref(),
         )?;
         rendered.push(RenderedPatch {
             number: 0,
@@ -1496,6 +1498,7 @@ fn format_cover_letter(
     threading: &Option<Threading>,
     from_identity: Option<&(String, String)>,
     base_block: Option<&str>,
+    series_stat: Option<&str>,
 ) -> Result<String, CliError> {
     let now = Utc::now();
 
@@ -1583,6 +1586,19 @@ fn format_cover_letter(
     }
     out.push_str(&commit_list);
 
+    // Series diffstat: Git computes it from the unique boundary commit (the
+    // oldest patch's parent) to the last patch, independent of `--no-stat`/`-p`
+    // (those only affect the individual patches).
+    if let Some(stat) = series_stat {
+        out.push_str(stat);
+        out.push('\n');
+        // Git separates the diffstat from a following base trailer or
+        // signature with a blank line.
+        if !args.no_signature || base_block.is_some() {
+            out.push('\n');
+        }
+    }
+
     // `--base` trailer rides on the cover letter when one is present (the blank
     // line above separates it from the shortlog), before the signature.
     if let Some(block) = base_block {
@@ -1592,6 +1608,39 @@ fn format_cover_letter(
     push_signature(&mut out, args);
 
     Ok(out)
+}
+
+/// Series diffstat for the cover letter: the tree difference from the unique
+/// boundary commit (the oldest patch's parent) to the last patch. Git omits it
+/// when the series starts at a root commit (no boundary) or has no unique one.
+async fn cover_letter_series_stat(commits: &[Commit]) -> Result<Option<String>, CliError> {
+    let Some(first) = commits.first() else {
+        return Ok(None);
+    };
+    let Some(last) = commits.last() else {
+        return Ok(None);
+    };
+    let [origin] = first.parent_commit_ids.as_slice() else {
+        return Ok(None);
+    };
+    if commits.iter().any(|commit| commit.id == *origin) {
+        return Ok(None);
+    }
+    let argv: Vec<String> = vec![
+        "diff".to_string(),
+        "--stat".to_string(),
+        origin.to_string(),
+        last.id.to_string(),
+    ];
+    let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+        .map_err(|error| CliError::command_usage(error.to_string()))?;
+    let output = crate::command::diff::run_diff_for_service(diff_args).await?;
+    let stat = crate::command::diff::render::format_diff_stat_output(&output);
+    if stat.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(stat))
+    }
 }
 
 // ---------------------------------------------------------------------------

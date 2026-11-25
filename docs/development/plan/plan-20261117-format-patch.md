@@ -2628,7 +2628,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：封面信在 commit list 后输出系列 diffstat——由唯一边界提交（最旧补丁父提交）到末个补丁，经共享 `libra diff --stat` 渲染；`--no-stat`/`-p` 仅影响补丁；无唯一边界（root 系列）省略，`--root` 与显式有界范围同用仍输出；diffstat 与签名/`--base` 间补空行。AC1–AC7 由 `format_patch_test::cover_letter_includes_diffstat` 覆盖（默认/`--no-stat`/`-p`/root/签名/root+范围与 Git 黄金逐字，重命名系列 stat 与 `libra diff --stat` 逐字节）；`format_patch_test` 147/147、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`--summary` 行与版式仍按 `DEFER-FPG-03`。
 
 **Description:** 在封面信 commit list 之后输出整套系列的汇总 diffstat：Git 只在存在唯一边界提交（origin）时输出，取 origin 的树到末个提交的树（`git show 6de20f6092:builtin/log.c` 第 1263–1279、1455–1457、2341–2346 行）；系列含根提交（如 `--root <rev>` 自根提交起格式化）或边界不唯一时不输出（`--root` 本身只置 `show_root_diff`，与有唯一边界的显式范围同用时仍输出，`git show 6de20f6092:revision.c` 第 2671–2672 行）；`--no-stat`/`-p` 只影响补丁，封面信仍输出（#905 Expected behavior 第 3 项与验收标准第 2 项称二者抑制 stat 块，与上游不符，本计划以上游为准并在关闭 #905 时于 issue 中说明）。diffstat 由 529 FP-05 起的共享 stat 渲染器产生并继承补丁的 diff 选项（重命名选项的继承由 `FPG-39` AC7/AC8 验收，#905 第 3 项），其版式与 `--summary` 行随 529 `DEFER-FP-02`（`DEFER-FPG-03`）。封面信正文模板（`*** SUBJECT HERE ***` 只在 `Subject:` 头）由自本卡拆出、先于本卡执行的 `FPG-58` 承接，本卡的封面信正文黄金比较以其为前提。AC1、AC3、AC4、AC6、AC7 的夹具为差异隔离夹具：至少 3 个提交，单文件 `f`，补丁 1 把第 2 行由 `a` 改为 `b`、补丁 2 再改为 `c`（系列 diffstat `f | 2 +-` 不同于逐补丁统计之和），命令为 `--cover-letter -2 --stdout`。（自本卡拆出 `FPG-25` 处理 `--cover-from-description`、`FPG-58` 处理正文模板。）
 

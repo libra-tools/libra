@@ -4354,3 +4354,150 @@ fn cover_letter_body_template_matches_git() {
         "AC1 subject placeholder is not repeated in the body: {body:?}"
     );
 }
+
+/// FPG-13: the cover letter carries a series diffstat from the unique boundary
+/// commit to the last patch, independent of `--no-stat`/`-p`; it is omitted when
+/// the series starts at a root commit (#905).
+#[test]
+fn cover_letter_includes_diffstat() {
+    use std::process::Command;
+
+    fn header(libra: bool, root: &std::path::Path, args: &[&str]) -> std::process::Output {
+        if libra {
+            run_libra_command(args, root)
+        } else {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("HOME", root)
+                .output()
+                .expect("git")
+        }
+    }
+    let cover_body = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail[1..]
+            .find("\nFrom ")
+            .map(|idx| idx + 1)
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    let seed = |root: &std::path::Path, libra: bool| {
+        let run = |args: &[&str]| {
+            let out = header(libra, root, args);
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for (content, subject) in [
+            ("a\nb\nc\n", "one"),
+            ("a\nB\nc\n", "two"),
+            ("a\nB\nC\n", "three"),
+        ] {
+            fs::write(root.join("f"), content).unwrap();
+            run(&["add", "f"]);
+            run(&["commit", "-m", subject]);
+        }
+    };
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let cover = |dir: &std::path::Path, libra: bool, flags: &[&str]| -> String {
+        let mut args = vec!["format-patch", "--cover-letter"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread"]);
+        if !flags.iter().any(|flag| flag.starts_with("--signature")) {
+            args.push("--no-signature");
+        }
+        cover_body(&header(libra, dir, &args).stdout)
+    };
+
+    // AC1: default series body matches Git (list + series diffstat).
+    assert_eq!(cover(lp, true, &["-2"]), cover(gp, false, &["-2"]), "AC1");
+    // AC3/AC4: --no-stat and -p only affect the patches.
+    assert_eq!(
+        cover(lp, true, &["-2", "--no-stat"]),
+        cover(gp, false, &["-2", "--no-stat"]),
+        "AC3 no-stat"
+    );
+    assert_eq!(
+        cover(lp, true, &["-2", "-p"]),
+        cover(gp, false, &["-2", "-p"]),
+        "AC4 -p"
+    );
+    // AC5: a series rooted at the root commit has no boundary diffstat.
+    assert_eq!(
+        cover(lp, true, &["--root", "HEAD"]),
+        cover(gp, false, &["--root", "HEAD"]),
+        "AC5 root"
+    );
+    // AC6: the diffstat precedes the signature.
+    assert_eq!(
+        cover(lp, true, &["-2", "--signature=SIG"]),
+        cover(gp, false, &["-2", "--signature=SIG"]),
+        "AC6 signature"
+    );
+    // AC7: --root with an explicit bounded range still has a boundary.
+    assert_eq!(
+        cover(lp, true, &["--root", "HEAD~2..HEAD"]),
+        cover(gp, false, &["--root", "HEAD~2..HEAD"]),
+        "AC7 root range"
+    );
+
+    // AC2: the diffstat is the shared stat renderer over origin..last.
+    let rename_repo = tempdir().expect("rename");
+    let rp = rename_repo.path();
+    assert_cli_success(&run_libra_command(&["init", "."], rp), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], rp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], rp),
+        "email",
+    );
+    fs::write(rp.join("file"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file"], rp), "add");
+    assert_cli_success(&run_libra_command(&["commit", "-m", "base"], rp), "commit");
+    assert_cli_success(&run_libra_command(&["mv", "file", "foo"], rp), "mv");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "rename"], rp),
+        "commit rename",
+    );
+    let stat_out = run_libra_command(&["diff", "--stat", "HEAD~1", "HEAD"], rp);
+    assert_cli_success(&stat_out, "diff stat");
+    let expected_stat = String::from_utf8_lossy(&stat_out.stdout)
+        .trim_end()
+        .to_string();
+    let rename_cover = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        rp,
+    );
+    assert_cli_success(&rename_cover, "rename cover");
+    assert!(
+        cover_body(&rename_cover.stdout).contains(&expected_stat),
+        "AC2 stat renderer: {}",
+        cover_body(&rename_cover.stdout)
+    );
+}
