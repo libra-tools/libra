@@ -282,12 +282,23 @@ pub struct FormatPatchArgs {
 
     /// Create multipart/mixed messages with the commit log in the body and the
     /// patch itself as a separate `attachment` part.
-    #[arg(long = "attach", conflicts_with = "inline")]
-    pub attach: bool,
+    #[arg(
+        long = "attach",
+        value_name = "BOUNDARY",
+        num_args = 0..=1,
+        require_equals = true,
+        conflicts_with = "inline"
+    )]
+    pub attach: Option<Option<String>>,
 
     /// Like `--attach`, but the patch part uses `Content-Disposition: inline`.
-    #[arg(long = "inline")]
-    pub inline: bool,
+    #[arg(
+        long = "inline",
+        value_name = "BOUNDARY",
+        num_args = 0..=1,
+        require_equals = true
+    )]
+    pub inline: Option<Option<String>>,
 
     /// Show full object IDs in diff index header lines.
     #[arg(long = "full-index")]
@@ -1123,15 +1134,22 @@ async fn format_patch_body(
 
     // `--attach`/`--inline` wrap the patch in a MIME multipart: the log message
     // + diffstat go in a `text/plain` part, the diff in a `text/x-patch` part.
-    let attach_disposition = if args.attach {
+    let attach_disposition = if args.attach.is_some() {
         Some("attachment")
-    } else if args.inline {
+    } else if args.inline.is_some() {
         Some("inline")
     } else {
         None
     };
-    // Boundary mirrors Git's: twelve dashes + the tool version string.
-    let boundary = format!("------------libra {}", env!("CARGO_PKG_VERSION"));
+    // A custom `--attach=<boundary>`/`--inline=<boundary>` becomes
+    // `------------<value>`; the default still mirrors the tool version.
+    let boundary = args
+        .attach
+        .as_ref()
+        .and_then(|value| value.as_deref())
+        .or(args.inline.as_ref().and_then(|value| value.as_deref()))
+        .map(|value| format!("------------{value}"))
+        .unwrap_or_else(|| format!("------------libra {}", env!("CARGO_PKG_VERSION")));
 
     // ---- MIME headers ----
     // Git puts only the `Content-Type` at the multipart envelope level; the

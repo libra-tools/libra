@@ -7559,3 +7559,64 @@ fn format_cover_from_description_config() {
     assert!(invalid.stdout.is_empty());
     unset();
 }
+
+/// FPG-18: `--attach[=<boundary>]`/`--inline[=<boundary>]` and the space-form
+/// revision behaviour (#895).
+#[test]
+fn attach_custom_boundary() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    let run = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, "format-patch");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let first_message = |text: &str| -> String {
+        text.split_once("\nFrom ")
+            .map(|(first, _)| first.to_string())
+            .unwrap_or_else(|| text.to_string())
+    };
+
+    // AC1/AC6: custom attach boundary and patch part.
+    let attach = run(&["--attach=mimemime", "-1"]);
+    assert!(attach.contains("boundary=\"------------mimemime\""));
+    assert!(attach.contains("\n--------------mimemime\n"));
+    assert!(attach.contains("Content-Type: text/x-patch"));
+    assert!(attach.contains("Content-Disposition: attachment"));
+    assert!(attach.contains("\ndiff --git "), "AC6 diff part");
+    // AC2: inline disposition with the same boundary.
+    let inline = run(&["--inline=mimemime", "-1"]);
+    assert!(inline.contains("boundary=\"------------mimemime\""));
+    assert!(inline.contains("Content-Disposition: inline"));
+    // AC3: base trailer stays inside the attachment part before the terminator.
+    let base = run(&["--attach=mimemime", "--base=HEAD~", "-1"]);
+    assert!(base.contains("base-commit: "));
+    let terminator = base.find("\n--------------mimemime--").expect("terminator");
+    let base_pos = base.find("base-commit: ").expect("base");
+    assert!(base_pos < terminator, "base inside attachment");
+    // AC4/AC5: cover letters are not multipart.
+    let cover = run(&["--attach", "--cover-letter", "-1"]);
+    assert!(!first_message(&cover).contains("multipart/mixed"));
+    let cover = run(&["--attach=mimemime", "--cover-letter", "-1"]);
+    assert!(!first_message(&cover).contains("multipart/mixed"));
+    // AC7: the space-separated token is a revision, not a boundary value.
+    let spaced = run(&["--attach", "HEAD~1"]);
+    assert!(spaced.contains("boundary=\"------------libra "));
+    let subjects: Vec<&str> = spaced
+        .lines()
+        .filter(|line| line.starts_with("Subject: "))
+        .collect();
+    assert_eq!(subjects.len(), 1, "{subjects:?}");
+    assert!(subjects[0].contains("subject 2"), "{subjects:?}");
+}

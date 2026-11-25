@@ -3592,7 +3592,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--attach`/`--inline` 改为可选 boundary（`require_equals`），自定义值为 `------------<BOUNDARY>`，无值默认既有 boundary；空格形式作为修订参数；base trailer 位于附件内、封面信非 multipart。AC1–AC7 由 `format_patch_test::attach_custom_boundary` 覆盖（boundary、inline disposition、base 与终止行、封面非 multipart、空格修订）；`format_patch_test` 167/167、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.attach`/`--no-attach` 由 `FPG-38` 承接。
 
 **Description:** 将 `--attach` 与 `--inline` 升级为可选值参数 `--attach[=<boundary>]`/`--inline[=<boundary>]`（Git 的 boundary 为 `------------<值>`），保持与 `--base` 组合时 trailer 在附件部分内、封面信仍为非 multipart；`format.attach` 配置与 `--no-attach` 由自本卡拆出的 `FPG-38` 承接。
 

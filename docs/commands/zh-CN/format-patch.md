@@ -60,8 +60,8 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--signoff` | `-s` | 向每个 commit message 追加 `Signed-off-by` trailer | false |
 | `--no-signoff` | | 禁用 signoff，并覆盖 `format.signOff` | false |
 | `--notes[=<REF>]` | | 将每个 commit 的 notes 追加到 `---` 行之后、diffstat 之前。裸 `--notes` 使用默认 ref（`refs/notes/commits`）；`--notes=<ref>` 读取 `<ref>`。渲染为 `Notes:`（默认 ref）或 `Notes (<ref>):`，每行缩进四个空格；没有 note 的 commit 保持不变 | off |
-| `--attach` | | 将每个 patch 作为 `multipart/mixed` MIME message 发出：log message + diffstat 位于 `text/plain` part，diff 位于 `text/x-patch` part 且 `Content-Disposition: attachment`。与 `--inline` 互斥 | off |
-| `--inline` | | 类似 `--attach`，但 patch part 使用 `Content-Disposition: inline` | off |
+| `--attach[=<BOUNDARY>]` | | 生成 multipart/mixed，提交日志在正文、补丁作为独立 `attachment` 部分；可选 boundary 变为 `------------<BOUNDARY>`（空格形式会被当作修订参数，boundary 须用 `=`） | 关闭 |
+| `--inline[=<BOUNDARY>]` | | 同 `--attach`，但补丁部分使用 `Content-Disposition: inline`；可选 boundary 规则相同 | 关闭 |
 | `--base <COMMIT>` | | 记录 `base-commit:` trailer（以及 base 与 series 之间每个非 merge commit 的 `prerequisite-patch-id:` 行，按 oldest-first），使 `git am --base` 可验证 series 可应用。Trailer 位于最后一个 patch，或 `--cover-letter` 下位于 cover letter。Base 必须是 series 的祖先（否则退出 128）。不支持 `--base=auto`（退出 129）。文本 diff 的 patch-id 匹配 `git patch-id --stable`；**binary-file prerequisites 不保证匹配 Git** | off |
 | `--full-index` | | 在 diff index header 行中显示完整 object IDs | false |
 | `-U <N>`, `--unified=<N>` | | 生成 hunk 时使用 `N` 行上下文（Git `-U<n>` / `--unified=<n>`）；默认 3 | 3 |
