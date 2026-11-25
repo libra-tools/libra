@@ -164,3 +164,5 @@ flowchart TD
 - 2026-11-23（LS-26 / #966）：新增 `--word-diff[=<mode>]`/`--word-diff-regex`/`--color-words`；新增 `diff::run_diff_for_service_word_diff(args, color)`（`json_format: None` 且 `quiet: false`，否则 `apply_word_diff` 会跳过重写），log 的 `word_diff_patch` 经 clap 构造 `DiffArgs` 调该入口。回归：`word_diff_and_color_words`（AC1–AC8，含 porcelain/color-words/regex/组合优先级与非法值）。
 
 - 2026-11-23（LS-27 / #973）：新增 `log --diff-filter`，复用 `diff::parse_diff_filter`/`apply_diff_filter`（提升为 `pub(crate)`），提交级过滤经 `commit_diff_output` 应用，根提交按 `A`；非法字母 `LBR-CLI-002`。回归：`log_diff_filter_selects_commits`（AC1–AC4）。
+
+- 2026-11-25（I957-01 / #957）：共享 `CommitFormatter` 新增固定签名日期占位符 `%as/%ai/%ah`（作者）与 `%cs/%ci/%ch`（提交者），按签名自带时区输出（short/ISO/human），不受 `--date` 影响；`%ad/%cd` 改为时区感知并新增 `--date=human`（同日 `Tue 10:00 +0000`、同年 `Tue Nov 10 10:00`、跨年 `Nov 24 2025`），`--date=short/iso/iso-strict/human` 与对应固定 token 逐字一致；`%ad --date=format:` 仍生效，未知 `%q` 保持原样。回归：`formatter::fixed_date_tests`（6 个固定 token、bypass、tformat/reference、日期模式对照）、`compat_pretty_format_placeholders`（log/show/shortlog 与 Git 逐字）；5/5 兼容用例与 15/15 formatter 单测通过。

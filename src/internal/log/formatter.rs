@@ -4,7 +4,7 @@
 //! walking and filtering live elsewhere. Command log tests cover empty history,
 //! decorate modes, date formats, and machine-readable output.
 
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, Utc};
 use colored::Colorize;
 use git_internal::internal::object::commit::Commit;
 
@@ -379,9 +379,46 @@ impl CommitFormatter {
             commit.committer.timestamp as i64,
             &commit.committer.timezone,
         );
-        let author_date = format_timestamp_with(commit.author.timestamp as i64, &self.date_mode);
-        let committer_date =
-            format_timestamp_with(commit.committer.timestamp as i64, &self.date_mode);
+        let author_date = format_timestamp_with_timezone(
+            commit.author.timestamp as i64,
+            &commit.author.timezone,
+            &self.date_mode,
+        );
+        let committer_date = format_timestamp_with_timezone(
+            commit.committer.timestamp as i64,
+            &commit.committer.timezone,
+            &self.date_mode,
+        );
+        let author_short_fixed = format_fixed_signature_date(
+            commit.author.timestamp as i64,
+            &commit.author.timezone,
+            "short",
+        );
+        let committer_short_fixed = format_fixed_signature_date(
+            commit.committer.timestamp as i64,
+            &commit.committer.timezone,
+            "short",
+        );
+        let author_iso_fixed = format_fixed_signature_date(
+            commit.author.timestamp as i64,
+            &commit.author.timezone,
+            "iso",
+        );
+        let committer_iso_fixed = format_fixed_signature_date(
+            commit.committer.timestamp as i64,
+            &commit.committer.timezone,
+            "iso",
+        );
+        let author_human_fixed = format_fixed_signature_date(
+            commit.author.timestamp as i64,
+            &commit.author.timezone,
+            "human",
+        );
+        let committer_human_fixed = format_fixed_signature_date(
+            commit.committer.timestamp as i64,
+            &commit.committer.timezone,
+            "human",
+        );
         let author_ts = commit.author.timestamp.to_string();
         let committer_ts = commit.committer.timestamp.to_string();
         let filename_subject = subject_line.replace(' ', "-");
@@ -432,6 +469,18 @@ impl CommitFormatter {
                 Some((1, "\n"))
             } else if rest.starts_with('%') {
                 Some((1, "%"))
+            } else if rest.starts_with("as") {
+                Some((2, author_short_fixed.as_str()))
+            } else if rest.starts_with("ai") {
+                Some((2, author_iso_fixed.as_str()))
+            } else if rest.starts_with("ah") {
+                Some((2, author_human_fixed.as_str()))
+            } else if rest.starts_with("cs") {
+                Some((2, committer_short_fixed.as_str()))
+            } else if rest.starts_with("ci") {
+                Some((2, committer_iso_fixed.as_str()))
+            } else if rest.starts_with("ch") {
+                Some((2, committer_human_fixed.as_str()))
             } else if rest.starts_with("aI") {
                 Some((2, author_iso.as_str()))
             } else if rest.starts_with("cI") {
@@ -619,6 +668,84 @@ fn format_strict_iso_with_timezone(timestamp: i64, timezone: &str) -> String {
     utc.with_timezone(&offset)
         .format("%Y-%m-%dT%H:%M:%S%:z")
         .to_string()
+}
+
+/// Fixed date format for `%as`/`%ai`/`%ah`/`%cs`/`%ci`/`%ch` (Git's
+/// `show_date` with the signature's own timezone, independent of `--date`).
+fn format_fixed_signature_date(timestamp: i64, timezone: &str, mode: &str) -> String {
+    let Some(utc) = DateTime::<Utc>::from_timestamp(timestamp, 0) else {
+        return timestamp.to_string();
+    };
+    let offset_seconds = parse_timezone_offset(timezone).unwrap_or(0);
+    let Some(offset) = FixedOffset::east_opt(offset_seconds) else {
+        return utc
+            .format(match mode {
+                "short" => "%Y-%m-%d",
+                "iso" => "%Y-%m-%d %H:%M:%S %z",
+                _ => "%a %b %e %H:%M:%S %Y %z",
+            })
+            .to_string();
+    };
+    let local = utc.with_timezone(&offset);
+    match mode {
+        "short" => local.format("%Y-%m-%d").to_string(),
+        "iso" => local.format("%Y-%m-%d %H:%M:%S %z").to_string(),
+        // Git's `--date=human`: same day -> `Tue 10:00 +0000`; same year ->
+        // `Tue Nov 10 10:00`; older -> `Nov 24 2025`.
+        _ => {
+            let now = Utc::now().with_timezone(&offset);
+            if local.format("%Y-%m-%d").to_string() == now.format("%Y-%m-%d").to_string() {
+                local.format("%a %H:%M %z").to_string()
+            } else if local.year() == now.year() {
+                local.format("%a %b %e %H:%M").to_string()
+            } else {
+                local.format("%b %e %Y").to_string()
+            }
+        }
+    }
+}
+
+/// Timezone-aware rendering for `%ad`/`%cd`: Git renders the commit's own
+/// signature timezone, including `--date=human`.
+fn format_timestamp_with_timezone(timestamp: i64, timezone: &str, mode: &str) -> String {
+    let Some(utc) = DateTime::<Utc>::from_timestamp(timestamp, 0) else {
+        return timestamp.to_string();
+    };
+    if mode.is_empty() || mode == "default" {
+        return format_timestamp_with(timestamp, mode);
+    }
+    let offset_seconds = parse_timezone_offset(timezone).unwrap_or(0);
+    let Some(offset) = FixedOffset::east_opt(offset_seconds) else {
+        return format_timestamp_with(timestamp, mode);
+    };
+    let local = utc.with_timezone(&offset);
+    if let Some(spec) = mode.strip_prefix("format:") {
+        if chrono::format::StrftimeItems::new(spec)
+            .any(|item| matches!(item, chrono::format::Item::Error))
+        {
+            return format_timestamp_with(timestamp, mode);
+        }
+        return local.format(spec).to_string();
+    }
+    match mode {
+        "short" => local.format("%Y-%m-%d").to_string(),
+        "iso" | "iso8601" => local.format("%Y-%m-%d %H:%M:%S %z").to_string(),
+        "iso-strict" | "iso8601-strict" => local.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        "rfc" | "rfc2822" => local.format("%a, %d %b %Y %H:%M:%S %z").to_string(),
+        "unix" => timestamp.to_string(),
+        "raw" => format!("{timestamp} {timezone}"),
+        "human" => {
+            let now = Utc::now().with_timezone(&offset);
+            if local.format("%Y-%m-%d").to_string() == now.format("%Y-%m-%d").to_string() {
+                local.format("%a %H:%M %z").to_string()
+            } else if local.year() == now.year() {
+                local.format("%a %b %e %H:%M").to_string()
+            } else {
+                local.format("%b %e %Y").to_string()
+            }
+        }
+        _ => format_timestamp_with(timestamp, mode),
+    }
 }
 
 fn parse_timezone_offset(timezone: &str) -> Option<i32> {
@@ -886,5 +1013,134 @@ mod tests {
         // Unknown / default fall back to the canonical form (same as the wrapper).
         assert_eq!(format_timestamp_with(ts, "bogus"), format_timestamp(ts));
         assert_eq!(format_timestamp_with(ts, ""), format_timestamp(ts));
+    }
+}
+
+#[cfg(test)]
+mod fixed_date_tests {
+    use super::*;
+    use git_internal::hash::ObjectHash;
+
+    fn fixed_commit() -> Commit {
+        let mut commit = Commit::from_tree_id(
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            vec![],
+            "Subject",
+        );
+        commit.author.name = "Alice".into();
+        commit.author.email = "alice@test.com".into();
+        commit.author.timestamp = 1_600_000_000;
+        commit.author.timezone = "+0200".into();
+        commit.committer.name = "Alice".into();
+        commit.committer.email = "alice@test.com".into();
+        commit.committer.timestamp = 1_700_000_000;
+        commit.committer.timezone = "-0330".into();
+        commit
+    }
+
+    fn render(template: &str, date_mode: &str) -> String {
+        let formatter = CommitFormatter::new(FormatType::Custom(template.into()))
+            .with_date_mode(date_mode.to_string());
+        let ctx = FormatContext {
+            graph_prefix: "",
+            decoration: "",
+            decoration_wrapped: "",
+            commit_color: None,
+            abbrev_len: 7,
+            notes: "",
+            extra_hashes: "",
+        };
+        formatter.format(&fixed_commit(), &ctx)
+    }
+
+    #[test]
+    fn fixed_as_short_author() {
+        assert_eq!(render("%as", ""), "2020-09-13");
+    }
+
+    #[test]
+    fn fixed_cs_short_committer() {
+        assert_eq!(render("%cs", ""), "2023-11-14");
+    }
+
+    #[test]
+    fn fixed_ai_iso_author() {
+        assert_eq!(render("%ai", ""), "2020-09-13 14:26:40 +0200");
+    }
+
+    #[test]
+    fn fixed_ci_iso_committer() {
+        assert_eq!(render("%ci", ""), "2023-11-14 18:43:20 -0330");
+    }
+
+    #[test]
+    fn fixed_ah_human_author() {
+        assert_eq!(render("%ah", ""), "Sep 13 2020");
+    }
+
+    #[test]
+    fn fixed_ch_human_committer() {
+        assert_eq!(render("%ch", ""), "Nov 14 2023");
+    }
+
+    #[test]
+    fn fixed_tformat_matches_reference_without_decoration() {
+        let commit = fixed_commit();
+        let ctx = FormatContext {
+            graph_prefix: "",
+            decoration: "HEAD -> main",
+            decoration_wrapped: " (HEAD -> main)",
+            commit_color: None,
+            abbrev_len: 7,
+            notes: "",
+            extra_hashes: "",
+        };
+        let tformat = CommitFormatter::new(crate::command::log::parse_pretty_format(
+            "tformat:%h (%s, %as)".into(),
+        ))
+        .format(&commit, &ctx);
+        let reference =
+            CommitFormatter::new(FormatType::Preset(LogPreset::Reference)).format(&commit, &ctx);
+        assert_eq!(tformat.trim_end(), reference.trim_end());
+        assert!(!tformat.contains("HEAD"), "decoration must not leak");
+    }
+
+    #[test]
+    fn date_modes_match_fixed_signature_tokens() {
+        for (mode, token) in [
+            ("short", "%as"),
+            ("iso", "%ai"),
+            ("human", "%ah"),
+            ("iso-strict", "%aI"),
+        ] {
+            assert_eq!(
+                render("%ad", mode),
+                render(token, ""),
+                "%ad --date={mode} must match {token}"
+            );
+            assert_eq!(
+                render("%cd", mode),
+                render(&token.replace('a', "c"), ""),
+                "%cd --date={mode} must match committer token"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_tokens_bypass_date_mode() {
+        for template in ["%as", "%cs", "%ai", "%ci", "%ah", "%ch"] {
+            assert_eq!(
+                render(template, "raw"),
+                render(template, ""),
+                "{template} must ignore --date"
+            );
+        }
+    }
+
+    #[test]
+    fn ad_cd_respect_date_mode_and_unknown_q_is_literal() {
+        assert_eq!(render("%ad", "format:%Y/%m/%d"), "2020/09/13");
+        assert_eq!(render("%cd", "format:%Y/%m/%d"), "2023/11/14");
+        assert_eq!(render("%q", ""), "%q");
     }
 }

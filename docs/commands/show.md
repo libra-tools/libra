@@ -121,7 +121,7 @@ their terminating newline.
 | `<OBJECT>` | | Object name (commit, tag, tree, blob) or `<object>:<path>`. Defaults to `HEAD`. |
 | `--no-patch` | `-s` | Skip patch output and only show object metadata. |
 | `--oneline` | | Shorthand for `--pretty=oneline` -- prints hash and subject on one line. |
-| `--pretty <FORMAT>` | | Format the commit header with a preset (`oneline`, `short`, `full`, `fuller`, `reference`, `raw`) or a `%`-placeholder template (`format:`/`tformat:`/bare). Uses the same custom placeholders as `libra log --format`, including `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, `%aI`, `%cI`, `%at`, `%ct`, `%D`, `%m`, and color placeholders. |
+| `--pretty <FORMAT>` | | Format the commit header with a preset (`oneline`, `short`, `full`, `fuller`, `reference`, `raw`) or a `%`-placeholder template (`format:`/`tformat:`/bare). Uses the same custom placeholders as `libra log --format`, including fixed signature dates `%as`/`%ai`/`%ah`/`%cs`/`%ci`/`%ch`, `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, `%aI`, `%cI`, `%at`, `%ct`, `%D`, `%m`, and color placeholders. |
 | `--format <FORMAT>` | | Alias for `--pretty=<FORMAT>` (Git's `--format`). `--oneline`, `--pretty`, and `--format` are last-one-wins. |
 | `--date <FORMAT>` | | Select the human date mode (`default`, `short`, `iso`, `iso-strict`, `rfc`, `unix`, or `raw`). Overrides `log.date`. |
 | `--abbrev-commit` | | Abbreviate the commit object name in the default header to a 7-character prefix. |
