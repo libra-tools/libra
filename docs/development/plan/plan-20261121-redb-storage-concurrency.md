@@ -5738,7 +5738,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`resume_forward_migration` 的既有状态机已覆盖本卡全部 fail-closed 分支——`pending` 双源意外缺失、页头撕裂且无热日志/精确哨兵、非 `__libra_migrated_fence__` 的异常 schema、以及已合法摘除源备份缺失/`backup_sha256` 失配，均以 `LBR-IO-001` 立即拒绝；本卡补齐两条卡内回归用例后验收。AC1–AC4 由 `forward_phase2_unexpected_missing_pending_and_corrupt_non_sentinel_reject` 覆盖（缺 `libra.db`、缺 `capture.db`、清零页 1 首 512 字节、`sqlite_master` 注入非哨兵坏 schema），AC5/AC6 由 `forward_phase2_post_unlink_corrupt_backup_fails_closed` 覆盖（双源已摘除后删除 git 备份、篡改备份一个字节）。门禁：发现门精确列出上述 2 条；2 条 2/2 PASS；`--no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'` 11/11；`--features storage-sqlite,storage-redb,storage-queue --lib -E 'test(/^storage::migrate::/)'` 24/25（仅既有 `forward_phase1_streaming_batch_memory_budget` 本机 RSS 预算失败）；`cargo +stable fmt --all --check` 与 `cargo +nightly clippy --all-targets --all-features -- -D warnings` 均 exit 0。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；本卡仅新增测试（`src/storage/migrate.rs`），未修改生产逻辑，因为所需拒收路径已由 RB-10c/RB-10k 实现。
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现正向迁移 Phase 2 的全量 fail-closed 故障拒收（`src/storage/migrate.rs`）：逐项拦截 `pending` 态 `libra.db` 与 `capture.db` 各自意外缺失、受损页头与非 `__libra_migrated_fence__` 精确哨兵的 schema 损坏，以及已摘除源对应 `.libra/sqlite-backup/<gen>/` 备份文件缺失或 `backup_sha256` 失配。
 

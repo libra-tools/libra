@@ -59327,4 +59327,126 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
         rb10k_assert_backup(&storage, 1, false).await;
         rb10k_assert_backup(&storage, 1, true).await;
     }
+
+    /// RB-10d AC1–AC4: unexpected missing pending sources and non-sentinel
+    /// corruption fail closed with `LBR-IO-001`.
+    #[tokio::test]
+    async fn forward_phase2_unexpected_missing_pending_and_corrupt_non_sentinel_reject() {
+        // AC1: pending libra.db unexpectedly missing.
+        {
+            let dir = tempdir().expect("rb10d missing git tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10d-missing-git").await;
+            crash_after_step2_1_pending(&storage, 1).await;
+            fs::remove_file(git_sqlite_db_path(&storage)).expect("remove libra.db");
+            let err = resume_forward_migration(&storage)
+                .await
+                .expect_err("AC1 missing pending libra.db must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC1");
+        }
+
+        // AC2: pending capture.db unexpectedly missing.
+        {
+            let dir = tempdir().expect("rb10d missing cap tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10d-missing-cap").await;
+            crash_after_step2_1_pending(&storage, 1).await;
+            fs::remove_file(capture_sqlite_db_path(&storage)).expect("remove capture.db");
+            let err = resume_forward_migration(&storage)
+                .await
+                .expect_err("AC2 missing pending capture.db must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC2");
+        }
+
+        // AC3: damaged page header without a hot journal or fence sentinel.
+        {
+            let dir = tempdir().expect("rb10d torn header tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10d-torn-header").await;
+            crash_after_step2_1_pending(&storage, 1).await;
+            let git_db = git_sqlite_db_path(&storage);
+            let mut bytes = fs::read(&git_db).expect("read libra.db");
+            for byte in &mut bytes[..512] {
+                *byte = 0;
+            }
+            fs::write(&git_db, bytes).expect("torn page 1");
+            let err = resume_forward_migration(&storage)
+                .await
+                .expect_err("AC3 corrupt page header must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC3");
+        }
+
+        // AC4: malformed schema that is NOT the exact fence sentinel.
+        {
+            let dir = tempdir().expect("rb10d bogus schema tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10d-bogus-schema").await;
+            crash_after_step2_1_pending(&storage, 1).await;
+            let git_db = git_sqlite_db_path(&storage);
+            use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
+            let opts = SqliteConnectOptions::new()
+                .filename(&git_db)
+                .create_if_missing(false)
+                .busy_timeout(Duration::ZERO);
+            let mut conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
+                .await
+                .expect("open libra.db");
+            conn.execute("PRAGMA writable_schema = ON;")
+                .await
+                .expect("writable_schema");
+            conn.execute(
+                "UPDATE sqlite_master SET sql = 'CREATE TABLE bogus (' WHERE name = 'reference';",
+            )
+            .await
+            .expect("inject bogus schema");
+            let _ = conn.close().await;
+            let err = resume_forward_migration(&storage)
+                .await
+                .expect_err("AC4 non-sentinel malformed schema must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC4");
+        }
+    }
+
+    /// RB-10d AC5/AC6: missing or digest-mismatched backups for legally
+    /// unlinked sources fail closed with `LBR-IO-001`.
+    #[tokio::test]
+    async fn forward_phase2_post_unlink_corrupt_backup_fails_closed() {
+        // AC5: missing backup after both sources are legally unlinked.
+        {
+            let dir = tempdir().expect("rb10d missing backup tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10d-missing-backup").await;
+            rb10k_crash_at_point(
+                &storage,
+                Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Capture),
+            )
+            .await;
+            fs::remove_file(sqlite_backup_git_db_path(&storage, 1)).expect("remove git backup");
+            let err = resume_forward_migration(&storage)
+                .await
+                .expect_err("AC5 missing backup must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC5");
+        }
+
+        // AC6: backup digest mismatch after both sources are legally unlinked.
+        {
+            let dir = tempdir().expect("rb10d bad digest tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10d-bad-backup-digest").await;
+            rb10k_crash_at_point(
+                &storage,
+                Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Capture),
+            )
+            .await;
+            let backup = sqlite_backup_git_db_path(&storage, 1);
+            let mut bytes = fs::read(&backup).expect("read git backup");
+            let mid = bytes.len() / 2;
+            bytes[mid] ^= 0xFF;
+            fs::write(&backup, bytes).expect("tamper git backup");
+            let err = resume_forward_migration(&storage)
+                .await
+                .expect_err("AC6 backup digest mismatch must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC6");
+        }
+    }
 }
