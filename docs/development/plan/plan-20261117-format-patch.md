@@ -5045,7 +5045,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：核实 clap 双向 `overrides_with` + CLI 存在即跳过配置，已满足 argv 顺序覆盖：裸 `--thread`=shallow、`--thread=<style>` 按样式、`--no-thread` 关闭，后出现者胜出；无代码改动，补验收门。AC1–AC6 由 `format_patch_test::thread_cli_overrides_config` 覆盖（deep+裸 `--thread`→shallow、deep+`--no-thread`→无头、shallow+`--thread=deep`、deep+`--thread=shallow`、`--thread=deep --no-thread`→无头、`--no-thread --thread=deep`→deep，均与 Git 归一化结构一致）；`format_patch_test` 155/155、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-47` 拆出的独立轴：命令行线程选项按出现顺序覆盖 `format.thread`：裸 `--thread` 为 shallow，`--thread=<style>` 为对应样式，`--no-thread` 关闭；后出现者覆盖先出现者与配置。
 

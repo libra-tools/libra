@@ -5465,3 +5465,166 @@ fn format_thread_config_values() {
     );
     clear();
 }
+
+/// FPG-50: CLI thread flags override `format.thread` in argv order (#917).
+#[test]
+fn thread_cli_overrides_config() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+    }
+    let normalize = |stdout: &[u8]| -> Vec<(Option<usize>, Option<String>, Vec<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        let messages: Vec<(Option<String>, Option<String>, Vec<String>)> = text
+            .split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = None;
+                let mut reply = None;
+                let mut refs = Vec::new();
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        reply = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("References: ") {
+                        refs.push(value.trim().trim_matches(['<', '>']).to_string());
+                    }
+                }
+                (id, reply, refs)
+            })
+            .collect();
+        let ids: Vec<&str> = messages
+            .iter()
+            .filter_map(|(id, _, _)| id.as_deref())
+            .collect();
+        let map = |value: &str| -> String {
+            ids.iter()
+                .position(|id| *id == value)
+                .map(|index| format!("#{index}"))
+                .unwrap_or_else(|| value.to_string())
+        };
+        messages
+            .iter()
+            .map(|(id, reply, refs)| {
+                (
+                    id.as_deref()
+                        .and_then(|id| ids.iter().position(|known| *known == id)),
+                    reply.as_deref().map(map),
+                    refs.iter().map(|value| map(value)).collect(),
+                )
+            })
+            .collect()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let set_config = |value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "format.thread", value], lp),
+            "libra config",
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "format.thread", value])
+                .current_dir(gp)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let compare =
+        |label: &str, flags: &[&str]| -> Vec<(Option<usize>, Option<String>, Vec<String>)> {
+            let mut libra_args = vec!["format-patch"];
+            libra_args.extend_from_slice(flags);
+            libra_args.extend_from_slice(&["-3", "--stdout", "--no-signature"]);
+            let libra_out = run_libra_command(&libra_args, lp);
+            assert_cli_success(&libra_out, label);
+            let git_out = Command::new("git")
+                .args(&libra_args)
+                .current_dir(gp)
+                .env("HOME", gp)
+                .output()
+                .expect("git");
+            assert!(git_out.status.success(), "{label}: {git_out:?}");
+            assert_eq!(
+                normalize(&libra_out.stdout),
+                normalize(&git_out.stdout),
+                "{label}"
+            );
+            normalize(&libra_out.stdout)
+        };
+
+    set_config("deep");
+    let shallow = compare("AC1 bare --thread", &["--thread"]);
+    assert_eq!(shallow[1].1.as_deref(), Some("#0"));
+    assert_eq!(shallow[2].1.as_deref(), Some("#0"));
+    let off = compare("AC2 --no-thread", &["--no-thread"]);
+    assert!(
+        off.iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+
+    set_config("shallow");
+    let deep = compare("AC3 deep override", &["--thread=deep"]);
+    assert_eq!(deep[2].1.as_deref(), Some("#1"));
+
+    set_config("deep");
+    let shallow = compare("AC4 shallow override", &["--thread=shallow"]);
+    assert_eq!(shallow[2].1.as_deref(), Some("#0"));
+
+    set_config("true");
+    let off = compare(
+        "AC5 deep then --no-thread",
+        &["--thread=deep", "--no-thread"],
+    );
+    assert!(
+        off.iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+
+    set_config("false");
+    let deep = compare(
+        "AC6 --no-thread then deep",
+        &["--no-thread", "--thread=deep"],
+    );
+    assert_eq!(deep[2].1.as_deref(), Some("#1"));
+
+    let _ = run_libra_command(&["config", "unset", "format.thread"], lp);
+}
