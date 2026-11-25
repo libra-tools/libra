@@ -7816,3 +7816,139 @@ fn interdiff_multi_patch_cover_letter() {
     assert!(stderr.contains("no-such-rev"), "{stderr}");
     assert!(invalid.stdout.is_empty());
 }
+
+/// FPG-34: a single patch renders `Interdiff` after its diff and before the
+/// signature, or only in an explicitly requested cover letter (#898).
+#[test]
+fn interdiff_single_patch_placement() {
+    use std::process::Command;
+
+    let g = tempdir().unwrap();
+    let gp = g.path();
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    fs::write(gp.join("blorp"), "a1\nold\n").unwrap();
+    git(&["add", "blorp"]);
+    git(&["commit", "-q", "-m", "base"]);
+    git(&["checkout", "-q", "-b", "boop"]);
+    fs::write(gp.join("blorp"), "a1\nfnorp\n").unwrap();
+    git(&["commit", "-qam", "fnorp"]);
+    fs::write(gp.join("blorp"), "a1\nfleep\n").unwrap();
+    git(&["commit", "-qam", "fleep"]);
+
+    let parent = tempdir().unwrap();
+    let lp = parent.path().join("libra");
+    fs::create_dir_all(&lp).unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--from-git-repository", gp.to_str().unwrap(), "."],
+            &lp,
+        ),
+        "import",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], &lp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], &lp),
+        "email",
+    );
+
+    let patch_tail = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        text.find("diff --git ")
+            .map(|start| text[start..].trim_end().to_string())
+            .unwrap_or_default()
+    };
+    let compare_patch = |label: &str, extra: &[&str]| {
+        let mut args = vec!["format-patch", "--interdiff=boop~2", "-1", "boop"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--signature=SIG"]);
+        let libra = run_libra_command(&args, &lp);
+        assert_cli_success(&libra, label);
+        let git_out = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git_out.status.success(), "{label}: {git_out:?}");
+        assert_eq!(
+            patch_tail(&libra.stdout),
+            patch_tail(&git_out.stdout),
+            "{label}"
+        );
+    };
+
+    compare_patch("AC1", &[]);
+    compare_patch("AC2", &["--no-cover-letter"]);
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.coverLetter", "false"], &lp),
+        "cover config",
+    );
+    compare_patch("AC3", &[]);
+
+    // AC4: explicit cover keeps the interdiff in the cover.
+    let cover_tail = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover
+            .lines()
+            .position(|line| line.contains("file changed"))
+            .map(|index| cover.lines().take(index).map(|line| line.len() + 1).sum())
+            .unwrap_or(0);
+        cover[start..].trim_end().to_string()
+    };
+    let flags = [
+        "format-patch",
+        "--cover-letter",
+        "--interdiff=boop~2",
+        "-1",
+        "boop",
+        "--stdout",
+        "--no-thread",
+        "--no-signature",
+    ];
+    let libra = run_libra_command(&flags, &lp);
+    assert_cli_success(&libra, "AC4");
+    let git_out = Command::new("git")
+        .args(flags)
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_out.status.success());
+    assert_eq!(
+        cover_tail(&libra.stdout),
+        cover_tail(&git_out.stdout),
+        "AC4 cover"
+    );
+    // AC5: only the cover carries the interdiff; the patch does not repeat it.
+    let text = String::from_utf8_lossy(&libra.stdout);
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("Interdiff"))
+            .count(),
+        1,
+        "{text}"
+    );
+}

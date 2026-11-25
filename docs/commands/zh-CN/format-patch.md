@@ -40,7 +40,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--no-base` | | 不输出 `base-commit:` 尾注，覆盖 `--base`（Libra 没有 `format.useAutoBase` 配置可重置） | 关闭 |
 | `--start-number <N>` | | 从 `N` 开始编号 | 1 |
 | `--subject-prefix <PREFIX>` | | 在 Subject: 行使用 `PREFIX` 而不是 `PATCH` | `PATCH` |
-| `--interdiff <REV>` | | 在封面信输出 `Interdiff against v<n-1>:`（无 `-v` 时为 `Interdiff:`），直接比较 `<REV>` 的树与末个补丁的树；多补丁系列会隐含封面信 | 关闭 |
+| `--interdiff <REV>` | | 在封面信输出 `Interdiff against v<n-1>:`（无 `-v` 时为 `Interdiff:`），直接比较 `<REV>` 的树与末个补丁的树；多补丁系列会隐含封面信；单补丁且无封面信时区块位于补丁 diff 之后、签名之前并缩进两空格，有封面信时补丁不重复输出 | 关闭 |
 | `--cover-from-description <MODE>` | | 分支描述如何进入封面信：`default`/`message` 整段写入正文，`subject` 把首段（空格拼接）写入 `Subject:`、其余写入正文，`none` 保留占位符，`auto` 仅在格式化首段不超过 100 字节时用 subject；非法模式即使没有 `--cover-letter` 也拒绝 | `default` |
 | `--cover-letter` | | 生成 cover-letter 模板（`0000-cover-letter<suffix>`，或 `--numbered-files` 下的 `0`） | false  覆盖 `format.coverLetter=false`；未给 `--from`/`format.from` 时，封面信 `From:` 默认取执行时提交者身份（`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`，否则 `user.name`/`user.email`）；补丁仍用提交作者。 `format.coverLetter=true|false|auto` 提供默认值（`auto` 仅在多补丁系列生成），`--commit-list-format` 隐含封面信（`--no-cover-letter` 可关闭）。 |
 | `--no-cover-letter` | | 不生成封面信；覆盖 `format.coverLetter` 以及 `--commit-list-format` 隐含的封面信（与 `--cover-letter` 以最后者为准） | — |

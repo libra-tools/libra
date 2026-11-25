@@ -3817,7 +3817,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：单补丁无封面信时 interdiff 位于补丁 diff 之后、签名之前（空行+标题+两空格缩进 diff）；有封面信时只在封面信、补丁不重复；单补丁不再隐含封面信。AC1–AC5 由 `format_patch_test::interdiff_single_patch_placement` 覆盖（补丁 diff 段与同源 Git 逐字、--no-cover-letter、config false、封面区块、补丁无重复）；`format_patch_test` 170/170、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-19` 拆出的独立轴：单补丁系列（`total = 1`）把 `529 FP-10` 的 X 型「不支持」分类（`fp10_interdiff_single_patch` 及单补丁显式启用封面信的组合）替换为实际输出：无封面信时（含被 `--no-cover-letter` 或 `format.coverLetter=false` 禁用）`Interdiff:` 区块位于补丁 diff 之后、签名分隔 `-- ` 之前——先输出一个空行，再输出标题行（整数 `-v` 时为 `Interdiff against v<n-1>:`），其后 interdiff 每行缩进两个空格（`git show 6de20f6092:log-tree.c` 第 695–711、1299–1300 行；t4014「interdiff: solo-patch」）；启用封面信时 interdiff 只出现在封面信、补丁中不重复（`git show 6de20f6092:builtin/log.c` 第 2465–2467 行；t4014「interdiff: cover-letter」）。夹具同 t4014「interdiff: setup」并改为差异隔离形式：`blorp` 在 `main` 上已存在，`boop` 分支依次提交 `fnorp`、`fleep`，均只修改 `blorp` 的既有行；参数 `--interdiff=boop~2 -1 boop`；夹具前置断言 interdiff 文本不同于补丁 diff 文本（不计 AC）。
 

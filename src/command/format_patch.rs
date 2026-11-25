@@ -669,7 +669,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             )?
         };
     }
-    if !no_cover_cli && (commit_list_cli || args.interdiff.is_some()) {
+    if !no_cover_cli && (commit_list_cli || (args.interdiff.is_some() && commits.len() > 1)) {
         // `--commit-list-format` implies a cover letter (Git's `#909`).
         args.cover_letter = true;
     }
@@ -714,17 +714,17 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
 
     // 5. Render the complete series before creating any patch file. A later
     // object/config error therefore cannot leave a partially generated series.
+    let interdiff = if let Some(spec) = args.interdiff.as_deref() {
+        let last = commits
+            .last()
+            .ok_or_else(|| CliError::fatal("no commits to interdiff"))?;
+        Some(interdiff_block(&args, spec, &last.id).await?)
+    } else {
+        None
+    };
     let mut rendered = Vec::with_capacity(total + usize::from(args.cover_letter));
     if args.cover_letter {
         let series_stat = cover_letter_series_stat(&args, &commits).await?;
-        let interdiff = if let Some(spec) = args.interdiff.as_deref() {
-            let last = commits
-                .last()
-                .ok_or_else(|| CliError::fatal("no commits to interdiff"))?;
-            Some(interdiff_block(&args, spec, &last.id).await?)
-        } else {
-            None
-        };
         let description = cover_letter_description(&args).await?;
         let description_mode = args.cover_from_description.as_deref().unwrap_or("default");
         // Git's cover letter defaults `From:` to the execution-time committer
@@ -779,6 +779,11 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             &thread_id,
             from_identity.as_ref(),
             patch_base_block,
+            if !args.cover_letter && total == 1 {
+                interdiff.as_deref()
+            } else {
+                None
+            },
         )
         .await?;
         let slug = patch_slug(commit, &args);
@@ -1062,6 +1067,7 @@ async fn format_patch_body(
     threading: &Option<Threading>,
     from_identity: Option<&(String, String)>,
     base_block: Option<&str>,
+    single_interdiff: Option<&str>,
 ) -> Result<String, CliError> {
     let mut out = String::new();
 
@@ -1286,6 +1292,19 @@ async fn format_patch_body(
         if let Some(block) = base_block {
             out.push('\n');
             out.push_str(block);
+        }
+        if let Some(block) = single_interdiff {
+            out.push('\n');
+            let mut lines = block.lines();
+            if let Some(title) = lines.next() {
+                out.push_str(title);
+                out.push('\n');
+            }
+            for line in lines {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
         }
         push_signature(&mut out, args);
         // Git ends a patch message with exactly one newline; the diff engine's
