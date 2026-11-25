@@ -40960,6 +40960,8 @@ pub enum ReversePhase1QuiesceStage {
     CaptureQueueAppendLock,
     /// In-place exclusive advisory lock on `<common_storage>/private/capture-spool/capacity.lock`.
     CaptureSpoolCapacityLock,
+    /// In-flight `<common_storage>/private/capture-spool/tmp/` publisher check (`RB-11z`).
+    CaptureSpoolInFlightTmp,
     /// Exclusive uncommitted redb `WriteTransaction` on `redb/git.gen-<id>.redb`.
     GitRedbWriteTransaction,
     /// Exclusive uncommitted redb `WriteTransaction` on `private/capture.gen-<id>.redb`.
@@ -40979,6 +40981,7 @@ impl ReversePhase1QuiesceStage {
             Self::CaptureQueueWriterLock => "capture-queue/writer.lock",
             Self::CaptureQueueAppendLock => "capture-queue/append.lock",
             Self::CaptureSpoolCapacityLock => "capture-spool/capacity.lock",
+            Self::CaptureSpoolInFlightTmp => "capture-spool/tmp in-flight check",
             Self::GitRedbWriteTransaction => "git.redb WriteTransaction",
             Self::CaptureRedbWriteTransaction => "capture.redb WriteTransaction",
         }
@@ -42096,6 +42099,11 @@ fn quiesce_reverse_repository_phase1_inner(
     )
     .map_err(normalize_reverse_quiesce_err)?;
 
+    // Reject active in-flight `capture-spool/tmp/` publishers (`spool.rs:119-145`)
+    // BEFORE creating any absent lock file so AC5–AC8 leave source redb,
+    // `capture-spool/`, and `capture-queue/` 100% byte-for-byte untouched (`RB-11z`).
+    verify_no_inflight_spool_tmp_files(common_storage).map_err(normalize_reverse_quiesce_err)?;
+
     // If any of the 6 lock files is not yet materialized on disk, run a
     // non-creating redb writer contention probe BEFORE materializing any
     // missing lock file so active redb writer rejection leaves disk 100%
@@ -42218,6 +42226,12 @@ fn quiesce_reverse_repository_phase1_inner(
         _maintenance_lock: maintenance_lock,
         _migration_lock: migration_lock,
     };
+
+    // Re-check `capture-spool/tmp/` strictly AFTER acquiring all 6 advisory
+    // locks (including `capture-spool/capacity.lock`) to catch any publisher
+    // that passed `spool.rs:112` before our lock acquisition and staged an
+    // in-flight file between `spool.rs:119` and `spool.rs:145` (`RB-11z`).
+    verify_no_inflight_spool_tmp_files(common_storage).map_err(normalize_reverse_quiesce_err)?;
 
     // Re-read and verify `storage-format.json` strictly AFTER holding
     // `migration.lock .. capacity.lock` to close any pre-lock manifest TOCTOU.
@@ -65998,5 +66012,373 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
         let sqlite_err = quiesce_reverse_repository_phase1(&storage)
             .expect_err("sqlite manifest must fail closed for reverse migration");
         assert_eq!(sqlite_err.stable_code_str(), "LBR-IO-001");
+    }
+
+    /// `RB-11z` AC1–AC8: symmetric reverse migration Phase 1 rejects active
+    /// external queue producers holding in-place `capture-queue/append.lock`
+    /// AND active in-flight `capture-spool/tmp/` publishers (`spool.rs:119-145`),
+    /// returning fail-closed `LBR-IO-001` with 1:1 single-domain byte-identical
+    /// snapshots across source redb (`git.redb`/`capture.redb`),
+    /// `capture-queue/`, and `capture-spool/` (both when all optional lock files
+    /// already exist AND when optional lock files are initially absent).
+    #[tokio::test]
+    async fn reverse_phase1_rejects_queue_producer_and_inflight_spool_tmp() {
+        use crate::storage::{
+            CaptureQueueLane, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, append_frame,
+        };
+
+        /// Seed a finalized Redb repo with real queued frames in BOTH
+        /// `capture-queue/{priority,normal}/` and a populated `capture-spool/`
+        /// (`ready/` + `tmp/` directory mode when `use_active_spool_dirs`, or
+        /// `0400` tombstones otherwise).
+        async fn setup_rb11z_fixture(
+            storage: &Path,
+            create_optional_locks: bool,
+            use_active_spool_dirs: bool,
+        ) -> (PathBuf, PathBuf) {
+            let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(storage).await;
+
+            // Append real capture-queue frames to BOTH `priority` and `normal` lanes!
+            append_frame(
+                storage,
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_PRIORITY,
+                "rb11z-prio-1",
+                b"{\"session\":\"s-prio\",\"event\":\"start\"}",
+            )
+            .expect("append priority queue frame");
+            append_frame(
+                storage,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb11z-norm-1",
+                b"{\"session\":\"s-norm\",\"event\":\"tool\"}",
+            )
+            .expect("append normal queue frame");
+
+            let spool_dir = capture_spool_dir_path(storage);
+            if use_active_spool_dirs {
+                // Replace `0400` tombstones with active legacy `ready/`/`tmp/`/`quarantine/`
+                // directories to simulate an unfenced/in-flight `spool.rs` publisher.
+                for name in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                    let p = spool_dir.join(name);
+                    if p.exists() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt as _;
+                            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+                        }
+                        #[cfg(windows)]
+                        {
+                            if let Ok(mut perms) = fs::metadata(&p).map(|m| m.permissions()) {
+                                perms.set_readonly(false);
+                                let _ = fs::set_permissions(&p, perms);
+                            }
+                        }
+                        fs::remove_file(&p).expect("remove tombstone for active spool dir fixture");
+                    }
+                    fs::create_dir_all(&p).expect("create active spool subdir");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))
+                            .expect("chmod 0700 active spool subdir");
+                    }
+                }
+                fs::write(
+                    spool_dir.join("ready").join("0001-rb11z-ready.json"),
+                    b"{\"event\":\"ready\"}",
+                )
+                .expect("seed ready spool file");
+            }
+
+            let writer_lock = capture_queue_writer_lock_path(storage);
+            let capacity_lock = capture_spool_capacity_lock_path(storage);
+            let consumer_lock = capture_spool_consumer_lock_path(storage);
+            if create_optional_locks {
+                for p in [&writer_lock, &capacity_lock, &consumer_lock] {
+                    if !p.exists() {
+                        fs::write(p, b"").expect("create optional lock file");
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt as _;
+                            fs::set_permissions(p, fs::Permissions::from_mode(0o600))
+                                .expect("chmod 0600 optional lock");
+                        }
+                    }
+                }
+            } else {
+                for p in [&writer_lock, &capacity_lock, &consumer_lock] {
+                    if p.exists() {
+                        fs::remove_file(p).expect("remove optional lock for absent-lock variant");
+                    }
+                }
+            }
+
+            (git_path, cap_path)
+        }
+
+        for (create_optional_locks, variant) in [
+            (true, "all-locks-present"),
+            (false, "optional-locks-absent"),
+        ] {
+            // ================================================================
+            // AC1–AC4: External OS-process queue producer holding in-place
+            // `capture-queue/append.lock` (both exclusive & shared flock).
+            // ================================================================
+            for (lock_mode, mode_label) in [
+                ("hold_flock_exclusive", "exclusive-append-lock"),
+                ("hold_flock_shared", "shared-append-lock"),
+            ] {
+                let dir = tempdir().expect("rb11z append.lock tempdir");
+                let storage = dir.path().join(".libra");
+                let (git_path, cap_path) =
+                    setup_rb11z_fixture(&storage, create_optional_locks, false).await;
+
+                let queue_dir = capture_queue_dir_path(&storage);
+                let spool_dir = capture_spool_dir_path(&storage);
+                let append_lock = capture_queue_append_lock_path(&storage);
+
+                let before_git = fs::read(&git_path).expect("snapshot git.redb before AC1");
+                let before_cap = fs::read(&cap_path).expect("snapshot capture.redb before AC1");
+                let before_queue = snapshot_directory_tree(&queue_dir);
+                let before_spool = snapshot_directory_tree(&spool_dir);
+
+                let holder = ChildLockHolder::spawn(lock_mode, &append_lock);
+
+                // AC1: fail-closed `LBR-IO-001` (and zero private path leak).
+                let err = quiesce_reverse_repository_phase1(&storage).expect_err(&format!(
+                    "AC1 ({variant}/{mode_label}): held append.lock must fail closed"
+                ));
+                assert_eq!(
+                    err.stable_code_str(),
+                    "LBR-IO-001",
+                    "AC1 ({variant}/{mode_label}): expected LBR-IO-001, got {err}"
+                );
+                assert!(
+                    !err.to_string().contains(&storage.display().to_string()),
+                    "AC1 ({variant}/{mode_label}): error message must not leak private path: {err}"
+                );
+
+                // AC2: source redb (`git.redb` & `capture.redb`) byte-identical.
+                assert_eq!(
+                    fs::read(&git_path).expect("read git.redb after AC1"),
+                    before_git,
+                    "AC2 ({variant}/{mode_label}): git.redb must remain byte-identical"
+                );
+                assert_eq!(
+                    fs::read(&cap_path).expect("read capture.redb after AC1"),
+                    before_cap,
+                    "AC2 ({variant}/{mode_label}): capture.redb must remain byte-identical"
+                );
+
+                // AC3: `capture-queue/` ALL files byte-identical (no new locks/files).
+                assert_eq!(
+                    snapshot_directory_tree(&queue_dir),
+                    before_queue,
+                    "AC3 ({variant}/{mode_label}): capture-queue/ must remain byte-identical"
+                );
+
+                // AC4: `capture-spool/` ALL files byte-identical.
+                assert_eq!(
+                    snapshot_directory_tree(&spool_dir),
+                    before_spool,
+                    "AC4 ({variant}/{mode_label}): capture-spool/ must remain byte-identical"
+                );
+                assert!(
+                    !migration_lock_path(&storage).exists(),
+                    "AC1–AC4 ({variant}/{mode_label}): must not create stray migration.lock"
+                );
+
+                holder.release_and_wait();
+            }
+
+            // ================================================================
+            // AC5–AC8: Unexpired in-flight `capture-spool/tmp/` file (and
+            // future-mtime staging file) simulating `spool.rs:119-145`.
+            // ================================================================
+            for (use_future_mtime, tmp_label) in
+                [(false, "fresh-unexpired-tmp"), (true, "future-mtime-tmp")]
+            {
+                let dir = tempdir().expect("rb11z spool tmp tempdir");
+                let storage = dir.path().join(".libra");
+                let (git_path, cap_path) =
+                    setup_rb11z_fixture(&storage, create_optional_locks, true).await;
+
+                let queue_dir = capture_queue_dir_path(&storage);
+                let spool_dir = capture_spool_dir_path(&storage);
+                let inflight_tmp =
+                    capture_spool_tmp_dir_path(&storage).join("1-0000000000000099-0001~inflight");
+                fs::write(&inflight_tmp, b"{\"partial_envelope\":true}")
+                    .expect("write in-flight capture-spool/tmp file");
+                if use_future_mtime {
+                    let f = OpenOptions::new()
+                        .write(true)
+                        .open(&inflight_tmp)
+                        .expect("open inflight tmp for future mtime");
+                    f.set_modified(SystemTime::now() + Duration::from_secs(3600))
+                        .expect("set future mtime on inflight tmp");
+                }
+
+                let before_git = fs::read(&git_path).expect("snapshot git.redb before AC5");
+                let before_cap = fs::read(&cap_path).expect("snapshot capture.redb before AC5");
+                let before_spool = snapshot_directory_tree(&spool_dir);
+                let before_queue = snapshot_directory_tree(&queue_dir);
+
+                // AC5: fail-closed `LBR-IO-001` (and zero private path leak).
+                let err = quiesce_reverse_repository_phase1(&storage).expect_err(&format!(
+                    "AC5 ({variant}/{tmp_label}): in-flight capture-spool/tmp must fail closed"
+                ));
+                assert_eq!(
+                    err.stable_code_str(),
+                    "LBR-IO-001",
+                    "AC5 ({variant}/{tmp_label}): expected LBR-IO-001, got {err}"
+                );
+                assert!(
+                    !err.to_string().contains(&storage.display().to_string()),
+                    "AC5 ({variant}/{tmp_label}): error message must not leak private path: {err}"
+                );
+
+                // AC6: source redb (`git.redb` & `capture.redb`) byte-identical.
+                assert_eq!(
+                    fs::read(&git_path).expect("read git.redb after AC5"),
+                    before_git,
+                    "AC6 ({variant}/{tmp_label}): git.redb must remain byte-identical"
+                );
+                assert_eq!(
+                    fs::read(&cap_path).expect("read capture.redb after AC5"),
+                    before_cap,
+                    "AC6 ({variant}/{tmp_label}): capture.redb must remain byte-identical"
+                );
+
+                // AC7: `capture-spool/` ALL files byte-identical.
+                assert_eq!(
+                    snapshot_directory_tree(&spool_dir),
+                    before_spool,
+                    "AC7 ({variant}/{tmp_label}): capture-spool/ must remain byte-identical"
+                );
+
+                // AC8: `capture-queue/` ALL files byte-identical.
+                assert_eq!(
+                    snapshot_directory_tree(&queue_dir),
+                    before_queue,
+                    "AC8 ({variant}/{tmp_label}): capture-queue/ must remain byte-identical"
+                );
+                assert!(
+                    !migration_lock_path(&storage).exists(),
+                    "AC5–AC8 ({variant}/{tmp_label}): must not create stray migration.lock"
+                );
+            }
+        }
+
+        // ====================================================================
+        // Deterministic post-lock TOCTOU regression: an in-flight publisher
+        // writes a staging file into `capture-spool/tmp/` AFTER Phase 0
+        // preflight passed and AFTER `capacity.lock` was acquired (the real
+        // `spool.rs:119-145` window!). Post-lock `verify_no_inflight_spool_tmp_files`
+        // MUST reject with `LBR-IO-001` before touching redb, preserving all 3
+        // domains and releasing all 6 locks cleanly!
+        // ====================================================================
+        {
+            struct PostLockInflightTmpInjector {
+                tmp_file: PathBuf,
+                injected: bool,
+            }
+            impl ReversePhase1LockObserver for PostLockInflightTmpInjector {
+                fn on_stage_acquired(&mut self, stage: ReversePhase1QuiesceStage) {
+                    if stage == ReversePhase1QuiesceStage::CaptureSpoolCapacityLock {
+                        fs::write(&self.tmp_file, b"{\"late_inflight\":true}")
+                            .expect("inject late in-flight capture-spool/tmp file");
+                        self.injected = true;
+                    }
+                }
+            }
+
+            let dir = tempdir().expect("rb11z post-lock TOCTOU tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_path, cap_path) = setup_rb11z_fixture(&storage, true, true).await;
+            let queue_dir = capture_queue_dir_path(&storage);
+            let late_tmp = capture_spool_tmp_dir_path(&storage).join("2-late-inflight~tmp");
+
+            let before_git = fs::read(&git_path).expect("snapshot git before post-lock TOCTOU");
+            let before_cap = fs::read(&cap_path).expect("snapshot cap before post-lock TOCTOU");
+            let before_queue = snapshot_directory_tree(&queue_dir);
+
+            let mut injector = PostLockInflightTmpInjector {
+                tmp_file: late_tmp.clone(),
+                injected: false,
+            };
+            let err = quiesce_reverse_repository_phase1_inner(&storage, Some(&mut injector))
+                .expect_err("post-lock in-flight tmp must fail closed");
+            assert!(injector.injected, "TOCTOU injector hook must have fired");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(fs::read(&git_path).expect("git after TOCTOU"), before_git);
+            assert_eq!(fs::read(&cap_path).expect("cap after TOCTOU"), before_cap);
+            assert_eq!(snapshot_directory_tree(&queue_dir), before_queue);
+            assert!(
+                late_tmp.exists(),
+                "rejected post-lock check must not delete in-flight tmp file"
+            );
+
+            // Now age the abandoned tmp file past `CAPTURE_SPOOL_TMP_MAX_AGE` (25h)
+            // -> uncontended quiescence MUST succeed within `<= 50ms` budget AND
+            // preserve the expired tmp file untouched across `abort_and_release()`!
+            let f = OpenOptions::new()
+                .write(true)
+                .open(&late_tmp)
+                .expect("open tmp file to age past 24h");
+            f.set_modified(SystemTime::now() - Duration::from_secs(25 * 3600))
+                .expect("set expired mtime > 24h");
+            drop(f);
+
+            let spool_dir = capture_spool_dir_path(&storage);
+            let before_spool_expired = snapshot_directory_tree(&spool_dir);
+            let started = Instant::now();
+            let guard = quiesce_reverse_repository_phase1(&storage)
+                .expect("expired >24h capture-spool/tmp file must allow reverse quiescence");
+            let elapsed = started.elapsed();
+            guard
+                .abort_and_release()
+                .expect("abort and release after expired tmp check");
+            assert!(
+                elapsed <= Duration::from_millis(50),
+                "RB-11z uncontended quiescence budget exceeded: {elapsed:?} > 50ms"
+            );
+            assert_eq!(fs::read(&git_path).expect("git after expired"), before_git);
+            assert_eq!(fs::read(&cap_path).expect("cap after expired"), before_cap);
+            assert_eq!(
+                snapshot_directory_tree(&spool_dir),
+                before_spool_expired,
+                "expired >24h tmp file must be preserved untouched during Phase 1 quiescence"
+            );
+            assert_eq!(snapshot_directory_tree(&queue_dir), before_queue);
+        }
+
+        // ====================================================================
+        // Unix safety regression: tampered / symlinked / hard-linked
+        // `capture-spool/tmp` tombstones MUST fail closed `LBR-IO-001`.
+        // ====================================================================
+        #[cfg(unix)]
+        {
+            let dir = tempdir().expect("rb11z symlink/hardlink tombstone tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = setup_rb11z_fixture(&storage, true, true).await;
+            let tmp_path = capture_spool_tmp_dir_path(&storage);
+            fs::remove_dir(&tmp_path).expect("remove empty tmp dir");
+
+            let decoy = dir.path().join("tombstone-decoy");
+            fs::write(&decoy, CAPTURE_SPOOL_TOMBSTONE_SENTINEL).expect("write decoy tombstone");
+
+            fs::hard_link(&decoy, &tmp_path).expect("plant hard-linked tmp tombstone");
+            let hl_err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("hard-linked capture-spool/tmp tombstone must fail closed");
+            assert_eq!(hl_err.stable_code_str(), "LBR-IO-001");
+            fs::remove_file(&tmp_path).expect("remove hard-linked tmp");
+
+            std::os::unix::fs::symlink(&decoy, &tmp_path).expect("plant symlinked tmp tombstone");
+            let sym_err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("symlinked capture-spool/tmp must fail closed");
+            assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
+        }
     }
 }
