@@ -1,16 +1,29 @@
 //! `tests/agent_bridge_checkpoint_test.rs` — bridge checkpoint create then
 //! list/show round-trip (plan-20260818 LB-05).
 
-use libra::internal::{
-    ai::agent_bridge::{
-        ingress::{BridgeContext, dispatch as ingress_dispatch},
-        methods::dispatch as read_dispatch,
-        mutations::dispatch as mutation_dispatch,
-        protocol::{BridgeRequest, parse_request_line},
+use libra::{
+    internal::{
+        ai::agent_bridge::{
+            ingress::{BridgeContext, dispatch as ingress_dispatch},
+            methods::dispatch as read_dispatch,
+            mutations::dispatch as mutation_dispatch,
+            protocol::{BridgeRequest, parse_request_line},
+        },
+        db::migration::run_builtin_migrations,
     },
-    db::migration::run_builtin_migrations,
+    utils::test::ChangeDirGuard,
 };
 use sea_orm::Database;
+use serial_test::serial;
+
+fn temp_storage_cwd() -> (tempfile::TempDir, ChangeDirGuard) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let storage = dir.path().join(".libra");
+    std::fs::create_dir_all(&storage).expect("create .libra storage dir");
+    std::fs::write(storage.join("libra.db"), []).expect("materialize .libra/libra.db");
+    let guard = ChangeDirGuard::new(dir.path());
+    (dir, guard)
+}
 
 async fn ctx() -> BridgeContext {
     let conn = Database::connect("sqlite::memory:").await.expect("connect");
@@ -30,7 +43,9 @@ fn request(line: &str) -> BridgeRequest {
 }
 
 #[tokio::test]
+#[serial(cwd)]
 async fn checkpoint_create_list_show_round_trip() {
+    let _storage = temp_storage_cwd();
     let c = ctx().await;
     ingress_dispatch(
         &c,
@@ -101,7 +116,9 @@ async fn checkpoint_create_requires_open_session_in_repo() {
 /// repository identity is invisible to a query scoped to a different
 /// repository on the same database (GC-LB-06 / R3-P1-2 regression guard).
 #[tokio::test]
+#[serial(cwd)]
 async fn checkpoint_reads_are_repository_scoped() {
+    let _storage = temp_storage_cwd();
     let conn = Database::connect("sqlite::memory:").await.expect("connect");
     run_builtin_migrations(&conn)
         .await

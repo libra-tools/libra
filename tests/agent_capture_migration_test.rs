@@ -1250,6 +1250,15 @@ impl PiRoleRepo {
     }
 }
 
+fn expected_versions_above_hermes() -> Vec<i64> {
+    builtin_migrations()
+        .iter()
+        .rev()
+        .map(|migration| migration.version)
+        .take_while(|&version| version > HERMES_KIND_VERSION)
+        .collect()
+}
+
 async fn pi_role_repository() -> PiRoleRepo {
     let repo = PiRoleRepo::init();
     let conn = connect(&repo.url()).await;
@@ -1257,7 +1266,7 @@ async fn pi_role_repository() -> PiRoleRepo {
         .rollback_to(&conn, HERMES_KIND_VERSION)
         .await
         .expect("take the repository back to the hermes tip");
-    assert_eq!(rolled_back, vec![PI_KIND_VERSION]);
+    assert_eq!(rolled_back, expected_versions_above_hermes());
     for kind in KINDS_BEFORE_PI {
         pi_role_insert(&conn, &format!("sess-{kind}"), kind).await;
     }
@@ -1310,18 +1319,30 @@ struct PiRoleDigest {
 }
 
 impl PiRoleDigest {
-    /// The rows of every table except the schema_versions ledger.
+    /// The rows of every table except the schema_versions ledger and empty
+    /// tables introduced by later migrations above `PI_KIND_VERSION`.
     fn data(&self) -> std::collections::BTreeMap<String, Vec<String>> {
         let mut rows = self.rows.clone();
         rows.remove("schema_versions");
+        if rows.get("symbolic_ref").is_some_and(Vec::is_empty) {
+            rows.remove("symbolic_ref");
+        }
         rows
     }
 
-    /// Indexes, triggers and views: everything but the tables themselves.
+    /// Indexes, triggers and views: everything but the tables themselves and
+    /// schema objects introduced by later migrations above `PI_KIND_VERSION`.
     fn dependents(&self) -> Vec<String> {
         self.schema
             .iter()
-            .filter(|entry| !entry.starts_with("table|"))
+            .filter(|entry| {
+                !entry.starts_with("table|")
+                    && !entry.starts_with("index|sqlite_autoindex_symbolic_ref_")
+                    && !entry.starts_with("trigger|reference_symbolic_insert_guard|")
+                    && !entry.starts_with("trigger|reference_symbolic_update_guard|")
+                    && !entry.starts_with("trigger|symbolic_ref_entity_insert_guard|")
+                    && !entry.starts_with("trigger|symbolic_ref_entity_update_guard|")
+            })
             .cloned()
             .collect()
     }
@@ -1460,7 +1481,10 @@ async fn pi_role_check_adds_only_pi_above_the_tip() {
         versions.windows(2).all(|pair| pair[0] < pair[1]),
         "migration IDs are unique and increasing: {versions:?}"
     );
-    let pi = migrations.last().expect("the registry has a tip");
+    let pi = migrations
+        .iter()
+        .find(|migration| migration.version == PI_KIND_VERSION)
+        .expect("the registry contains agent_kind_pi");
     assert_eq!((pi.version, pi.name), (PI_KIND_VERSION, "agent_kind_pi"));
     assert!(pi.version > HERMES_KIND_VERSION);
     assert!(pi.up.contains("RAISE(ABORT"));
@@ -2046,10 +2070,21 @@ async fn pi_role_rebuild_survives_a_crash_at_every_stage() {
             "{abort_at}: {}",
             String::from_utf8_lossy(&opened.stderr)
         );
+        let after = pi_role_digest(&repo).await;
         assert_eq!(
-            pi_role_digest(&repo).await,
-            committed,
-            "{abort_at}: the open after the crash finds the rebuild done"
+            after.data(),
+            committed.data(),
+            "{abort_at}: the open after the crash keeps every row from the committed rebuild"
+        );
+        assert_eq!(
+            after.dependents(),
+            committed.dependents(),
+            "{abort_at}: the open after the crash keeps every dependent from the committed rebuild"
+        );
+        assert_eq!(
+            pi_role_receipts(&repo).await,
+            vec![format!("{PI_KIND_VERSION}|agent_kind_pi")],
+            "{abort_at}: the open after the crash finds the rebuild receipt already recorded"
         );
     }
     let opened = repo.status(&[]);
@@ -2487,6 +2522,13 @@ async fn pi_role_down_refuses_while_pi_rows_exist() {
         "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, tree_oid, metadata_blob_oid, traces_commit, created_at) VALUES ('cp-pi', 'sess-pi', 'temporary', 'parent', 'tree', 'meta', 'traces', 2)",
     )
     .await;
+    // Step back from any migrations above `PI_KIND_VERSION` (e.g. `symbolic_ref`)
+    // so the refused down exercises `PI_KIND_VERSION` directly and leaves the
+    // entire repository digest unchanged.
+    hermes_runner()
+        .rollback_to(&conn, PI_KIND_VERSION)
+        .await
+        .expect("step back to PI_KIND_VERSION before testing refused pi down");
     conn.close().await.expect("close");
     let with_pi = pi_role_digest(&repo).await;
 
@@ -2529,7 +2571,7 @@ async fn pi_role_down_restores_the_nine_kind_check() {
         .rollback_to(&conn, HERMES_KIND_VERSION)
         .await
         .expect("down with zero pi rows");
-    assert_eq!(rolled, vec![PI_KIND_VERSION]);
+    assert_eq!(rolled, expected_versions_above_hermes());
     let rejected = conn
         .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
