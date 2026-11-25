@@ -1892,3 +1892,134 @@ epilogue is ignored\n";
         "empty-header part body survives: {text}"
     );
 }
+
+fn latin1_patch(subject: &str, body_line: &str, charset: &str) -> String {
+    format!(
+        "From 0123456789 Mon Sep 17 00:00:00 2001\n\
+From: Alice Example <alice@example.com>\n\
+Date: Tue, 14 Jul 2026 10:00:00 +0800\n\
+Subject: {subject}\n\
+Content-Type: text/plain; charset={charset}\n\
+Content-Transfer-Encoding: quoted-printable\n\
+\n\
+{body_line}\n\
+\n\
+---\n\
+ latin1.txt | 1 +\n\
+ 1 file changed, 1 insertion(+)\n\
+\n\
+diff --git a/latin1.txt b/latin1.txt\n\
+new file mode 100644\n\
+index 0000000..e69de29\n\
+--- /dev/null\n\
++++ b/latin1.txt\n\
+@@ -0,0 +1 @@\n\
++hello\n"
+    )
+}
+
+fn apply_latin1_patch(fixture: &CliFixture, patch_body: &str) -> Output {
+    fs::write(fixture.root.join("mail.patch"), patch_body).expect("write patch");
+    fixture.am(&[fixture.root.join("mail.patch")])
+}
+
+/// I672-01 AC3/AC4: am accepts a latin-1 quoted-printable body and commits the
+/// transcoded UTF-8 message.
+#[test]
+fn am_accepts_latin1_body() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("base.txt", "base\n", "base");
+    let out = apply_latin1_patch(
+        &fixture,
+        &latin1_patch("[PATCH] latin1 body", "caf=E9 body", "ISO-8859-1"),
+    );
+    assert_success(&["am"], &out);
+    let raw = String::from_utf8(
+        fixture
+            .success(&fixture.repo, &["cat-file", "-p", "HEAD"])
+            .stdout,
+    )
+    .expect("utf8 commit");
+    assert!(
+        raw.contains("café body"),
+        "AC4 latin1 body transcoded: {raw}"
+    );
+}
+
+/// I672-01 AC7/AC8: am accepts a latin-1 RFC 2047 Subject.
+#[test]
+fn am_accepts_latin1_subject() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("base.txt", "base\n", "base");
+    let out = apply_latin1_patch(
+        &fixture,
+        &latin1_patch("=?ISO-8859-1?Q?caf=E9?=", "plain body", "ISO-8859-1"),
+    );
+    assert_success(&["am"], &out);
+    let subject = stdout_trim(&fixture.success(&fixture.repo, &["log", "-1", "--pretty=%s"]));
+    assert_eq!(subject, "café", "AC8 latin1 Subject transcoded");
+}
+
+/// I672-01 AC9/AC10 + AC13/AC14: NUL in the decoded body or Subject is rejected.
+#[test]
+fn am_rejects_nul_body_and_subject() {
+    // Body NUL.
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("base.txt", "base\n", "base");
+    let out = apply_latin1_patch(
+        &fixture,
+        &latin1_patch("[PATCH] nul body", "caf=E9=00 body", "ISO-8859-1"),
+    );
+    assert_failure(&out, "a NUL byte in commit log message not allowed");
+    assert_eq!(out.status.code(), Some(129), "AC9 exit code");
+
+    // Subject NUL.
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("base.txt", "base\n", "base");
+    let out = apply_latin1_patch(
+        &fixture,
+        &latin1_patch("=?ISO-8859-1?Q?caf=E9=00?=", "plain body", "ISO-8859-1"),
+    );
+    assert_failure(&out, "a NUL byte in 'Subject' is not allowed");
+    assert_eq!(out.status.code(), Some(129), "AC13 exit code");
+}
+
+/// I672-01 AC16/AC18: UTF-8 and us-ascii baselines keep their committed message.
+#[test]
+fn am_utf8_and_us_ascii_baselines_unchanged() {
+    for charset in ["UTF-8", "us-ascii"] {
+        let fixture = CliFixture::new();
+        fixture.init_repo();
+        fixture.commit_file("base.txt", "base\n", "base");
+        let out = apply_latin1_patch(
+            &fixture,
+            &latin1_patch("[PATCH] baseline", "plain body", charset),
+        );
+        assert_success(&["am"], &out);
+        let raw = String::from_utf8(
+            fixture
+                .success(&fixture.repo, &["cat-file", "-p", "HEAD"])
+                .stdout,
+        )
+        .expect("utf8 commit");
+        assert!(raw.contains("plain body"), "{charset} baseline: {raw}");
+    }
+}
+
+/// I672-01 AC21/AC22: am still rejects Shift_JIS with the existing diagnostic.
+#[test]
+fn am_rejects_shift_jis_charset() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("base.txt", "base\n", "base");
+    let out = apply_latin1_patch(
+        &fixture,
+        &latin1_patch("[PATCH] sjis", "plain body", "Shift_JIS"),
+    );
+    assert_failure(&out, "unsupported text charset 'Shift_JIS'");
+    assert_eq!(out.status.code(), Some(129), "Shift_JIS exit code");
+}

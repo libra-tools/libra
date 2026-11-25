@@ -64,5 +64,5 @@ libra --json mailinfo message.txt patch.diff < 0001-fix.patch
 
 P2-02 最小 surface 不提供 Git `mailinfo` 的 `-k`、`-b`、`-m`、`-u`、
 `--encoding`、`--scissors`、`--quoted-cr` 等选项。MIME multipart、
-attachment、非 UTF-8 charset、多消息 mbox、binary patch，以及没有
+attachment、UTF-8/US-ASCII/ISO-8859-1 之外的 charset、多消息 mbox、binary patch，以及没有
 `diff --git` section 的 patch 文本都会被拒绝。
