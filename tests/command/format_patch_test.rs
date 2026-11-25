@@ -7620,3 +7620,65 @@ fn attach_custom_boundary() {
     assert_eq!(subjects.len(), 1, "{subjects:?}");
     assert!(subjects[0].contains("subject 2"), "{subjects:?}");
 }
+
+/// FPG-38: `format.attach` boundary/empty semantics and `--no-attach` (#912).
+#[test]
+fn format_attach_config() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("extra"), "extra\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "extra"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "extra", "--no-verify"], p),
+        "commit",
+    );
+    let out = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["-1", "--stdout", "--no-thread", "--no-signature"]);
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, "format-patch");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let set = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], p),
+            "config",
+        );
+    };
+    let unset = |key: &str| {
+        let _ = run_libra_command(&["config", "unset", key], p);
+    };
+
+    set("format.attach", "true");
+    assert!(out(&[]).contains("Content-Type: multipart/mixed; boundary=\"------------true\""));
+    set("format.attach", "attachment-separator");
+    assert!(
+        out(&[]).contains(
+            "Content-Type: multipart/mixed; boundary=\"------------attachment-separator\""
+        )
+    );
+    set("format.attach", "");
+    assert!(!out(&[]).contains("multipart/"), "AC3 empty disables");
+    // AC4: a local empty value overrides a global boundary.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "--global",
+                "set",
+                "format.attach",
+                "attachment-separator",
+            ],
+            p,
+        ),
+        "global",
+    );
+    set("format.attach", "");
+    assert!(!out(&[]).contains("multipart/"), "AC4 local empty");
+    let _ = run_libra_command(&["config", "--global", "unset", "format.attach"], p);
+    // AC5: --no-attach overrides the configured boundary.
+    set("format.attach", "true");
+    assert!(!out(&["--no-attach"]).contains("multipart/"), "AC5");
+    unset("format.attach");
+}

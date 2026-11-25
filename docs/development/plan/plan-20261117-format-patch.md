@@ -3668,7 +3668,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.attach`——非空值（含字面 `true`）作为 boundary、空值关闭；本地空值覆盖全局；新增 `--no-attach` 覆盖配置与 `--attach`/`--inline`。AC1–AC5 由 `format_patch_test::format_attach_config` 覆盖（true 字面 boundary、自定义、空值关闭、全局+本地空值、--no-attach）；`format_patch_test` 168/168、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过（含新 flag）；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；无值配置形式仍未排期。
 
 **Description:** 自 `FPG-18` 拆出的独立轴：经 `read_format_config` 严格级联读取 `format.attach`，按 Git 语义：非空值（含字面 `true`）作为 boundary，空值关闭，本地空值覆盖全局值；新增 `--no-attach` 覆盖配置。Git 的无值形式（等价默认 boundary）在 Libra 配置中不可表达（尚未排期，重启条件：配置支持无值键）。
 

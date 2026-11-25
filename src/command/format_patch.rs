@@ -291,6 +291,11 @@ pub struct FormatPatchArgs {
     )]
     pub attach: Option<Option<String>>,
 
+    /// Do not create a multipart message, overriding `format.attach` and
+    /// `--attach`/`--inline`.
+    #[arg(long = "no-attach", overrides_with_all = ["attach", "inline"])]
+    pub no_attach: bool,
+
     /// Like `--attach`, but the patch part uses `Content-Disposition: inline`.
     #[arg(
         long = "inline",
@@ -2800,6 +2805,17 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
             if enabled {
                 args.base = Some("auto".to_string());
             }
+        }
+    }
+    // `format.attach` supplies the boundary: a non-empty value (including the
+    // literal `true`) is the boundary, an empty value disables multipart, and
+    // the strict cascade makes local override global. CLI flags win.
+    let attach_cli = args.attach.is_some() || args.inline.is_some() || args.no_attach;
+    if !attach_cli && let Some(value) = read_format_config("format.attach").await? {
+        if value.is_empty() {
+            args.attach = None;
+        } else {
+            args.attach = Some(Some(value));
         }
     }
     // Git validates `format.coverFromDescription` in the config callback, even

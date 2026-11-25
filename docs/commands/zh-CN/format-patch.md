@@ -45,6 +45,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--no-cover-letter` | | 不生成封面信；覆盖 `format.coverLetter` 以及 `--commit-list-format` 隐含的封面信（与 `--cover-letter` 以最后者为准） | — |
 | `--thread[=<STYLE>]` | | 添加生成的 `Message-ID`/`In-Reply-To`/`References` headers（默认关闭）。裸 `--thread` 或 `--thread=shallow` 使每封补丁回复封面信/首补丁；`--thread=deep` 使每封补丁回复前一封，`References` 指向线程根 | false |
 | `--no-thread` | | 禁用生成的 threading headers；显式 `--in-reply-to` 仍会为每封邮件添加外部父邮件头 | false |
+| `format.attach`（配置） | | 非空值作为 multipart boundary（字面 `true` 即 boundary `true`），空值关闭；本地空值覆盖全局值，`--no-attach` 优先 | — |
 | `format.coverFromDescription`（配置） | | 封面信描述默认模式（取值同 `--cover-from-description`，CLI 优先）。配置值非法时即使 CLI 给出合法模式、即使未启用封面信，也以 `invalid cover from description mode` 拒绝 | `default` |
 | `branch.<name>.description`（配置） | | 用该分支描述替换封面信正文的 `*** BLURB HERE ***`。分支选择遵循 Git：无修订或单一裸修订取当前分支，否则取唯一正向修订对应的分支 | — |
 | `format.useAutoBase`（配置） | | `true` 等价 `--base=auto`；`whenAble` 仅在能确定唯一上游 merge base 时自动取基线、否则静默省略 base 区块；`false` 关闭。`--no-base` 与显式 `--base` 覆盖配置 | — |
@@ -61,6 +62,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--no-signoff` | | 禁用 signoff，并覆盖 `format.signOff` | false |
 | `--notes[=<REF>]` | | 将每个 commit 的 notes 追加到 `---` 行之后、diffstat 之前。裸 `--notes` 使用默认 ref（`refs/notes/commits`）；`--notes=<ref>` 读取 `<ref>`。渲染为 `Notes:`（默认 ref）或 `Notes (<ref>):`，每行缩进四个空格；没有 note 的 commit 保持不变 | off |
 | `--attach[=<BOUNDARY>]` | | 生成 multipart/mixed，提交日志在正文、补丁作为独立 `attachment` 部分；可选 boundary 变为 `------------<BOUNDARY>`（空格形式会被当作修订参数，boundary 须用 `=`） | 关闭 |
+| `--no-attach` | | 不生成 multipart；覆盖 `format.attach` 与 `--attach`/`--inline` | 关闭 |
 | `--inline[=<BOUNDARY>]` | | 同 `--attach`，但补丁部分使用 `Content-Disposition: inline`；可选 boundary 规则相同 | 关闭 |
 | `--base <COMMIT>` | | 记录 `base-commit:` trailer（以及 base 与 series 之间每个非 merge commit 的 `prerequisite-patch-id:` 行，按 oldest-first），使 `git am --base` 可验证 series 可应用。Trailer 位于最后一个 patch，或 `--cover-letter` 下位于 cover letter。Base 必须是 series 的祖先（否则退出 128）。不支持 `--base=auto`（退出 129）。文本 diff 的 patch-id 匹配 `git patch-id --stable`；**binary-file prerequisites 不保证匹配 Git** | off |
 | `--full-index` | | 在 diff index header 行中显示完整 object IDs | false |
