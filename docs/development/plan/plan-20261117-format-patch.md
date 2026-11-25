@@ -3301,7 +3301,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：封面信正文读取 `branch.<name>.description` 替换 `*** BLURB HERE ***`；无修订/单一裸修订取当前分支，范围/`^<rev>`/多修订取唯一正向分支，多条正向省略，空描述回退占位符。AC1–AC3 由 `format_patch_test::cover_letter_branch_description` 覆盖（当前 topic 描述、`^main rebuild-1` 选 rebuild 且不含 side、无修订 `-2` 用当前分支，均与 Git 描述段逐字）；`format_patch_test` 163/163、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；默认封面信 `From:` 由 `FPG-60`、`--cover-from-description` 由 `FPG-25` 承接。
 
 **Description:** 自 `FPG-12` 拆出的独立轴：封面信按 Git 选分支读取 `branch.<name>.description`：单一 revision（隐含 `..HEAD`）或无 revision 时取当前分支（`git show 6de20f6092:builtin/log.c` 第 2288–2320 行 `check_head`），其余写法（`^main rebuild-1`、`main..topic`，由 `FPG-15` 先行支持）按 `find_branch_name`（第 1233–1261 行）取唯一正向 revision 对应的分支（#892 第 4 项）。封面信默认 `From:` 身份由自本卡拆出的 `FPG-60` 承接。
 

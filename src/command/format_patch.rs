@@ -677,6 +677,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     let mut rendered = Vec::with_capacity(total + usize::from(args.cover_letter));
     if args.cover_letter {
         let series_stat = cover_letter_series_stat(&args, &commits).await?;
+        let description = cover_letter_description(&args).await?;
         let cover_body = format_cover_letter(
             &args,
             &commits,
@@ -684,6 +685,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             from_identity.as_ref(),
             base_block.as_deref(),
             series_stat.as_deref(),
+            description.as_deref(),
         )?;
         rendered.push(RenderedPatch {
             number: 0,
@@ -1780,6 +1782,58 @@ fn push_threading_headers(
 // Cover letter
 // ---------------------------------------------------------------------------
 
+/// Read `branch.<name>.description` for the branch Git would use: the current
+/// branch for an empty selector or a single bare revision (which implies
+/// `<rev>..HEAD`), otherwise the unique positive revision's branch.
+async fn cover_letter_description(args: &FormatPatchArgs) -> Result<Option<String>, CliError> {
+    use crate::internal::{branch::Branch, config::ConfigKv, head::Head};
+
+    let mut positive: Vec<&str> = Vec::new();
+    let mut special = false;
+    for spec in &args.revisions {
+        if let Some(rest) = spec.strip_prefix('^') {
+            let _ = rest;
+            special = true;
+        } else if let Some((_, right)) = spec.split_once("..") {
+            let right = if right.is_empty() { "HEAD" } else { right };
+            positive.push(right);
+            special = true;
+        } else {
+            positive.push(spec);
+        }
+    }
+    let branch_name = if args.revisions.is_empty() || (!special && positive.len() == 1) {
+        match Head::current().await {
+            Head::Branch(name) => Some(name),
+            Head::Detached(_) => None,
+        }
+    } else if positive.len() == 1 {
+        let spec = positive[0];
+        Branch::find_branch_result(spec, None)
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to resolve branch: {error}")))?
+            .map(|_| spec.to_string())
+    } else {
+        None
+    };
+    let Some(branch_name) = branch_name else {
+        return Ok(None);
+    };
+    let key = format!("branch.{branch_name}.description");
+    let Some(config) = ConfigKv::get(&key)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to read {key}: {error}")))?
+    else {
+        return Ok(None);
+    };
+    let value = config.value.trim_end_matches('\n').to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
 /// Generate a cover-letter template (named `0000-cover-letter<suffix>`, or `0`
 /// under `--numbered-files`).
 fn format_cover_letter(
@@ -1789,6 +1843,7 @@ fn format_cover_letter(
     from_identity: Option<&(String, String)>,
     base_block: Option<&str>,
     series_stat: Option<&str>,
+    description: Option<&str>,
 ) -> Result<String, CliError> {
     let now = Utc::now();
 
@@ -1864,8 +1919,10 @@ fn format_cover_letter(
     out.push('\n');
 
     // Git's `prepare_cover_text` writes the subject placeholder only into the
-    // `Subject:` header; the body starts with the blurb placeholder.
-    out.push_str("*** BLURB HERE ***\n\n");
+    // `Subject:` header; the body starts with the branch description when one
+    // is configured, otherwise the blurb placeholder.
+    out.push_str(description.unwrap_or("*** BLURB HERE ***"));
+    out.push_str("\n\n");
 
     // Commit list. Git's default is a shortlog grouped by author
     // (`Name (N):` + indented subjects); `--commit-list-format=modern` uses

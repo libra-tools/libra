@@ -7038,3 +7038,124 @@ fn format_use_auto_base() {
     assert!(stderr.contains("failed to get upstream"), "{stderr}");
     assert!(true_no_up.stdout.is_empty());
 }
+
+/// FPG-24: the cover-letter body uses `branch.<name>.description` for the
+/// branch Git selects (#891, #892).
+#[test]
+fn cover_letter_branch_description() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        fs::write(root.join("base"), "base\n").unwrap();
+        run(&["add", "base"]);
+        run(&["commit", "-m", "base"]);
+        for (branch, file) in [
+            ("topic", "topic"),
+            ("side", "side"),
+            ("rebuild-1", "rebuild"),
+        ] {
+            if libra {
+                run(&["checkout", "-b", branch, "main"]);
+            } else {
+                run(&["checkout", "-q", "-b", branch, "main"]);
+            }
+            fs::write(root.join(file), format!("{file}\n")).unwrap();
+            run(&["add", file]);
+            run(&["commit", "-m", branch]);
+        }
+        if libra {
+            run(&["checkout", "topic"]);
+        } else {
+            run(&["checkout", "-q", "topic"]);
+        }
+        for (key, value) in [
+            ("branch.main.description", "main-desc"),
+            ("branch.topic.description", "topic-desc"),
+            ("branch.side.description", "side-desc"),
+            ("branch.rebuild-1.description", "rebuild-desc"),
+        ] {
+            if libra {
+                let _ = run_libra_command(&["config", "set", key, value], root);
+            } else {
+                let _ = Command::new("git")
+                    .args(["config", key, value])
+                    .current_dir(root)
+                    .status();
+            }
+        }
+    }
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let description = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover.find("Subject:").expect("subject");
+        let tail = &cover[start..];
+        let end = tail
+            .find("\nT (")
+            .or_else(|| tail.find("\n\nT ("))
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+    let compare = |label: &str, flags: &[&str]| {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let libra = run_libra_command(&args, lp);
+        assert_cli_success(&libra, label);
+        let git = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git.status.success(), "{label}: {git:?}");
+        assert_eq!(
+            description(&libra.stdout),
+            description(&git.stdout),
+            "{label}"
+        );
+        description(&libra.stdout)
+    };
+
+    assert!(compare("AC1 current branch", &["main"]).contains("topic-desc"));
+    assert!(compare("AC2 positive branch", &["^main", "rebuild-1"]).contains("rebuild-desc"));
+    assert!(!compare("AC2 positive branch", &["^main", "rebuild-1"]).contains("side-desc"));
+    assert!(compare("AC3 default", &["-2"]).contains("topic-desc"));
+}
