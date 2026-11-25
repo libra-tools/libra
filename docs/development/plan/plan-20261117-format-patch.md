@@ -4971,7 +4971,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.thread`——`deep`/`shallow` 不区分大小写，`true` 为 shallow，`false`/空值关闭；本地覆盖全局、同层后写者生效；命令行 flag 覆盖配置。AC1–AC6 由 `format_patch_test::format_thread_config_values` 覆盖（true/Shallow/deep、全局 deep+本地 false/空值、同层 `--add deep` 后 `false`，均与 Git 归一化结构一致）；`format_patch_test` 154/154、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；命令行覆盖配置由 `FPG-50` 承接。
 
 **Description:** 自 `FPG-23` 拆出的独立轴：读取 `format.thread`：`deep`（不区分大小写）为 deep，`shallow`（不区分大小写）与布尔真值（`true` 等）为 shallow，布尔假值与空值关闭（`git show 6de20f6092:builtin/log.c` 第 1030–1040 行，关键字以 `strcasecmp` 比较）；每个取值完全决定线程样式，按 Git 后出现者生效（跨层即 local 优先，同层取最后写入者，`read_format_config` 的单值严格级联即可表达）。关闭取值以「另一层或同层先前取值为启用」的夹具验收，使忽略配置的实现不能通过；全局层经临时 `LIBRA_CONFIG_GLOBAL_DB` 隔离（GC-13）。命令行覆盖由自本卡拆出的 `FPG-50` 承接。
 

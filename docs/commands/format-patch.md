@@ -52,6 +52,7 @@ body, and series metadata.
 | `--no-cover-letter` | | Do not generate a cover letter; overrides `format.coverLetter` and the implicit cover letter requested by `--commit-list-format` (last of `--cover-letter`/`--no-cover-letter` wins) | — |
 | `--thread[=<STYLE>]` | | Add generated `Message-ID`/`In-Reply-To`/`References` headers (default off). Bare `--thread` or `--thread=shallow` makes every patch reply to the cover letter/first patch; `--thread=deep` chains each patch as a reply to its predecessor, with `References` pointing at the thread root | false |
 | `--no-thread` | | Disable generated threading headers; an explicit `--in-reply-to` still adds the external parent to every mail | false |
+| `format.thread` (config) | | `true`/`shallow` (case-insensitive) select shallow threading, `deep` selects deep threading, and `false`/empty disable it. The local layer wins over global and a later same-layer value wins; CLI flags override the config | — |
 | `--in-reply-to <MESSAGE_ID>` | | Make the first mail a reply to the given Message-ID | none |
 | `--to <ADDRESS>` | | Add a `To:` header (repeatable; multiple addresses fold like git). Placed after the MIME headers, on each patch and the cover letter | none |
 | `--cc <ADDRESS>` | | Add a `Cc:` header (repeatable; folds like git) | none |

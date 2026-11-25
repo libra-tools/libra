@@ -5288,3 +5288,180 @@ fn format_thread_default_off() {
         "AC2 in-reply-to only"
     );
 }
+
+/// FPG-47: `format.thread` accepts true/false/shallow/deep/empty with Git's
+/// cascade semantics (#917).
+#[test]
+fn format_thread_config_values() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+    }
+
+    let parse = |stdout: &[u8]| -> Vec<(Option<String>, Option<String>, Vec<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = None;
+                let mut reply = None;
+                let mut refs = Vec::new();
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        reply = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("References: ") {
+                        refs.push(value.trim().trim_matches(['<', '>']).to_string());
+                    }
+                }
+                (id, reply, refs)
+            })
+            .collect()
+    };
+    let normalize = |stdout: &[u8]| -> Vec<(Option<usize>, Option<String>, Vec<String>)> {
+        let messages = parse(stdout);
+        let ids: Vec<&str> = messages
+            .iter()
+            .filter_map(|(id, _, _)| id.as_deref())
+            .collect();
+        let map = |value: &str| -> String {
+            ids.iter()
+                .position(|id| *id == value)
+                .map(|index| format!("#{index}"))
+                .unwrap_or_else(|| value.to_string())
+        };
+        messages
+            .iter()
+            .map(|(id, reply, refs)| {
+                (
+                    id.as_deref()
+                        .and_then(|id| ids.iter().position(|known| *known == id)),
+                    reply.as_deref().map(map),
+                    refs.iter().map(|value| map(value)).collect(),
+                )
+            })
+            .collect()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let libra_config = |args: &[&str]| {
+        let _ = run_libra_command(args, lp);
+    };
+    let git_config = |args: &[&str]| {
+        let _ = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .status();
+    };
+    let clear = || {
+        libra_config(&["config", "unset", "format.thread"]);
+        libra_config(&["config", "--global", "unset", "format.thread"]);
+        git_config(&["config", "--unset", "format.thread"]);
+        git_config(&["config", "--global", "--unset", "format.thread"]);
+    };
+    let set_both = |value: &str| {
+        libra_config(&["config", "set", "format.thread", value]);
+        git_config(&["config", "format.thread", value]);
+    };
+    let compare = |label: &str| {
+        let libra_out =
+            run_libra_command(&["format-patch", "-3", "--stdout", "--no-signature"], lp);
+        assert_cli_success(&libra_out, label);
+        let git_out = Command::new("git")
+            .args(["format-patch", "-3", "--stdout", "--no-signature"])
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git_out.status.success(), "{label}: {git_out:?}");
+        assert_eq!(
+            normalize(&libra_out.stdout),
+            normalize(&git_out.stdout),
+            "{label}"
+        );
+        normalize(&libra_out.stdout)
+    };
+
+    clear();
+    set_both("true");
+    assert!(compare("AC1 true").iter().any(|(id, _, _)| id.is_some()));
+    set_both("Shallow");
+    assert!(compare("AC2 Shallow").iter().any(|(id, _, _)| id.is_some()));
+    set_both("deep");
+    let deep = compare("AC3 deep");
+    assert_eq!(deep[0].0, Some(0));
+    assert_eq!(deep[1].1.as_deref(), Some("#0"));
+    assert_eq!(deep[2].1.as_deref(), Some("#1"));
+
+    clear();
+    libra_config(&["config", "--global", "set", "format.thread", "deep"]);
+    git_config(&["config", "--global", "format.thread", "deep"]);
+    set_both("false");
+    let off = compare("AC4 local false");
+    assert!(
+        off.iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+
+    clear();
+    libra_config(&["config", "--global", "set", "format.thread", "deep"]);
+    git_config(&["config", "--global", "format.thread", "deep"]);
+    set_both("");
+    let empty = compare("AC5 local empty");
+    assert!(
+        empty
+            .iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+
+    clear();
+    libra_config(&["config", "--add", "format.thread", "deep"]);
+    libra_config(&["config", "--add", "format.thread", "false"]);
+    git_config(&["config", "--add", "format.thread", "deep"]);
+    git_config(&["config", "--add", "format.thread", "false"]);
+    let last = compare("AC6 same-layer last wins");
+    assert!(
+        last.iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+    clear();
+}

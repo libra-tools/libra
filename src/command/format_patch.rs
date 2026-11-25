@@ -2357,10 +2357,32 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
             },
         )?;
     }
-    // `format.from` is applied only when no command-line `--from` was given:
-    // `true` uses the committer identity, `false` leaves the author untouched,
-    // and any other value is used as an ident line (validated after this
-    // resolve pass, so a CLI override wins over an invalid config value).
+    // `format.thread` applies only when the CLI says nothing about threading.
+    // Each value fully determines the style; the strict cascade already gives
+    // local-over-global and last-write-wins at the same layer.
+    let thread_cli = args.thread.is_some() || args.no_thread;
+    if !thread_cli && let Some(value) = read_format_config("format.thread").await? {
+        let trimmed = value.trim();
+        args.thread = if trimmed.is_empty() {
+            None
+        } else if trimmed.eq_ignore_ascii_case("deep") {
+            Some("deep".to_string())
+        } else if trimmed.eq_ignore_ascii_case("shallow") {
+            Some("shallow".to_string())
+        } else {
+            match crate::internal::config::parse_git_config_bool(trimmed) {
+                Some(true) => Some("shallow".to_string()),
+                Some(false) => None,
+                None => {
+                    return Err(FormatPatchError::InvalidConfig {
+                        key: "format.thread",
+                        value,
+                        expected: "true, false, shallow, deep, or empty",
+                    });
+                }
+            }
+        };
+    }
     if args.relative.is_none()
         && !args.no_relative
         && let Some(value) = read_format_config("diff.relative").await?
@@ -2376,6 +2398,10 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
             args.relative = Some(None);
         }
     }
+    // `format.from` is applied only when no command-line `--from` was given:
+    // `true` uses the committer identity, `false` leaves the author untouched,
+    // and any other value is used as an ident line (validated after this
+    // resolve pass, so a CLI override wins over an invalid config value).
     if args.from.is_none()
         && !args.no_from
         && let Some(value) = read_format_config("format.from").await?
