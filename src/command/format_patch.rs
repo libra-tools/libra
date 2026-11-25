@@ -8,7 +8,7 @@
 //! email-based patch review and is compatible with `git am`.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -105,8 +105,8 @@ pub struct FormatPatchArgs {
         not(doc),
         doc = " from that commit are included (equivalent to <commit>..HEAD)."
     )]
-    #[arg(value_name = "revision-range")]
-    pub revision_range: Option<String>,
+    #[arg(value_name = "revision-range", num_args = 0..)]
+    pub revisions: Vec<String>,
 
     /// Generate only the named commit, or HEAD when no revision is given.
     #[arg(short = '1')]
@@ -789,84 +789,174 @@ struct RenderedPatch {
 /// from the included side (`B`); commits equal to or reachable from `A` are
 /// stripped.
 async fn resolve_range_commits(args: &FormatPatchArgs) -> Result<Vec<Commit>, CliError> {
-    let spec = args.revision_range.as_deref().unwrap_or("HEAD");
-
-    // Parse A..B notation
-    let (exclude_tip_opt, include_tip) = if let Some((left, right)) = spec.split_once("..") {
-        // Both empty sides default to HEAD (Git-compatible: ..HEAD equals
-        // HEAD..HEAD producing zero patches).
-        let left_spec = if left.is_empty() { "HEAD" } else { left };
-        let right_spec = if right.is_empty() { "HEAD" } else { right };
-        (
-            Some(resolve_single_rev(left_spec).await?),
-            resolve_single_rev(right_spec).await?,
-        )
-    } else if args.root || args.last_one || args.last_n.is_some() {
-        // `--root [REV]` walks from REV through the root. `-1 [REV]` names the
-        // one commit to emit rather than retaining the usual `<REV>..HEAD`
-        // single-revision interpretation.
-        (None, resolve_single_rev(spec).await?)
+    let mut specs: Vec<String> = if args.revisions.is_empty() {
+        vec!["HEAD".to_string()]
     } else {
-        // Single revision: range is <spec>..HEAD
-        let head = resolve_current_head().await?;
-        (Some(resolve_single_rev(spec).await?), head)
+        args.revisions.clone()
     };
+    let mut includes: Vec<String> = Vec::new();
+    let mut excludes: Vec<String> = Vec::new();
+    let mut range_mode = false;
+    for spec in specs.drain(..) {
+        if let Some(rest) = spec.strip_prefix('^') {
+            excludes.push(if rest.is_empty() {
+                "HEAD".to_string()
+            } else {
+                rest.to_string()
+            });
+            range_mode = true;
+        } else if let Some((left, right)) = spec.split_once("..") {
+            includes.push(if right.is_empty() {
+                "HEAD".to_string()
+            } else {
+                right.to_string()
+            });
+            excludes.push(if left.is_empty() {
+                "HEAD".to_string()
+            } else {
+                left.to_string()
+            });
+            range_mode = true;
+        } else {
+            includes.push(spec);
+        }
+    }
 
-    // Collect the set of excluded OIDs (the exclude tip and all its ancestors)
-    let (excluded, upstream_commits): (HashSet<ObjectHash>, Vec<Commit>) =
-        if let Some(exclude_tip) = exclude_tip_opt {
-            let ancestors = log::get_reachable_commits(exclude_tip.to_string(), None)
+    // Preserve the classic single-revision semantics (`<rev>..HEAD`) unless a
+    // range, caret exclusion, root walk, or `-<n>` changes the selector.
+    if !range_mode && includes.len() == 1 && !args.root && !args.last_one && args.last_n.is_none() {
+        let spec = &includes[0];
+        excludes.push(spec.clone());
+        includes[0] = "HEAD".to_string();
+    }
+
+    // `--root`/`-<n>` with a single revision keep the classic newest-first
+    // walk and truncation order; only range/multi-revision selectors need the
+    // union + timestamp sort below.
+    if !range_mode && includes.len() == 1 && (args.root || args.last_one || args.last_n.is_some()) {
+        let spec = &includes[0];
+        let tip = resolve_single_rev(spec).await?;
+        let mut commits: Vec<Commit> = log::get_reachable_commits(tip.to_string(), None)
+            .await
+            .map_err(|error| {
+                FormatPatchError::InvalidTarget(format!(
+                    "failed to walk commits from '{spec}': {error}"
+                ))
+            })?
+            .into_iter()
+            .filter(|commit| commit.parent_commit_ids.len() <= 1)
+            .collect();
+        if args.last_one {
+            commits.truncate(1);
+        } else if let Some(limit) = args.last_n {
+            commits.truncate(limit);
+        }
+        commits.reverse();
+        return Ok(commits);
+    }
+
+    let excluded: HashSet<ObjectHash> = {
+        let mut set = HashSet::new();
+        for spec in &excludes {
+            let tip = resolve_single_rev(spec).await?;
+            set.insert(tip);
+            let ancestors = log::get_reachable_commits(tip.to_string(), None)
                 .await
                 .map_err(|error| {
                     FormatPatchError::InvalidTarget(format!(
                         "failed to walk excluded commits from '{spec}': {error}"
                     ))
                 })?;
-            let mut s = HashSet::new();
-            s.insert(exclude_tip);
-            for commit in &ancestors {
-                s.insert(commit.id);
+            set.extend(ancestors.into_iter().map(|commit| commit.id));
+        }
+        set
+    };
+
+    let mut by_id: HashMap<ObjectHash, Commit> = HashMap::new();
+    for spec in &includes {
+        let tip = resolve_single_rev(spec).await?;
+        let reachable = log::get_reachable_commits(tip.to_string(), None)
+            .await
+            .map_err(|error| {
+                FormatPatchError::InvalidTarget(format!(
+                    "failed to walk commits from '{spec}': {error}"
+                ))
+            })?;
+        for commit in reachable {
+            if excluded.contains(&commit.id) || commit.parent_commit_ids.len() > 1 {
+                continue;
             }
-            (s, ancestors)
-        } else {
-            (HashSet::new(), Vec::new())
+            by_id.entry(commit.id).or_insert(commit);
+        }
+    }
+    let mut commits: Vec<Commit> = by_id.into_values().collect();
+    // Emit parents before children, breaking ties by commit timestamp (Git's
+    // revision walk order for the linear fixtures). A plain timestamp sort is
+    // non-deterministic when commits share a timestamp and can reverse a
+    // two-commit range.
+    let mut remaining: Vec<Commit> = std::mem::take(&mut commits);
+    let mut remaining_ids: HashSet<ObjectHash> = remaining.iter().map(|commit| commit.id).collect();
+    while !remaining.is_empty() {
+        let mut best: Option<usize> = None;
+        for (index, commit) in remaining.iter().enumerate() {
+            if commit
+                .parent_commit_ids
+                .iter()
+                .any(|parent| remaining_ids.contains(parent))
+            {
+                continue;
+            }
+            best = match best {
+                None => Some(index),
+                Some(current) => {
+                    let candidate = &remaining[index];
+                    let incumbent = &remaining[current];
+                    let candidate_key = (candidate.committer.timestamp, candidate.id.to_string());
+                    let incumbent_key = (incumbent.committer.timestamp, incumbent.id.to_string());
+                    if candidate_key < incumbent_key {
+                        Some(index)
+                    } else {
+                        Some(current)
+                    }
+                }
+            };
+        }
+        let Some(index) = best else {
+            // Defensive: a cycle cannot occur in commit ancestry, but keep a
+            // deterministic fallback instead of looping forever.
+            break;
         };
-
-    // Walk from the included tip.  get_reachable_commits performs a BFS
-    // traversal, returning commits in newest-first order (tip, then
-    // parents, then grandparents, …).
-    let all_reachable = log::get_reachable_commits(include_tip.to_string(), None)
-        .await
-        .map_err(|e| {
-            FormatPatchError::InvalidTarget(format!("failed to walk commits from '{spec}': {e}"))
-        })?;
-
-    // Filter, deduplicate, then reverse so patches are numbered oldest-first.
-    let mut commits: Vec<Commit> = all_reachable
-        .into_iter()
-        .filter(|c| !excluded.contains(&c.id))
-        .filter(|c| c.parent_commit_ids.len() <= 1) // skip merge commits
-        .collect();
-
-    // Deduplicate (reachable set may already include the tip).
-    let mut seen = HashSet::new();
-    commits.retain(|c| seen.insert(c.id));
-
-    // `-1` / `-<n>` limit the newest-first walk before output ordering is
-    // reversed (`-<n>` is Git's "last n commits" shorthand).
+        let commit = remaining.remove(index);
+        remaining_ids.remove(&commit.id);
+        commits.push(commit);
+    }
+    commits.extend(remaining);
     if args.last_one {
-        commits.truncate(1);
-    } else if let Some(limit) = args.last_n {
-        commits.truncate(limit);
+        let keep = commits.len().saturating_sub(1);
+        commits = commits.split_off(keep);
+    } else if let Some(limit) = args.last_n
+        && commits.len() > limit
+    {
+        commits = commits.split_off(commits.len() - limit);
     }
 
-    if args.ignore_if_in_upstream && !upstream_commits.is_empty() {
+    if args.ignore_if_in_upstream && !excludes.is_empty() {
         let mut upstream_patch_ids = HashSet::new();
-        for commit in upstream_commits
-            .iter()
-            .filter(|commit| commit.parent_commit_ids.len() <= 1)
-        {
-            upstream_patch_ids.insert(git_patch_id_for_commit(commit).await?);
+        for spec in &excludes {
+            let tip = resolve_single_rev(spec).await?;
+            let reachable = log::get_reachable_commits(tip.to_string(), None)
+                .await
+                .map_err(|error| {
+                    FormatPatchError::InvalidTarget(format!(
+                        "failed to walk upstream commits from '{spec}': {error}"
+                    ))
+                })?;
+            for commit in reachable
+                .iter()
+                .filter(|commit| commit.parent_commit_ids.len() <= 1)
+            {
+                upstream_patch_ids.insert(git_patch_id_for_commit(commit).await?);
+            }
         }
         let mut retained = Vec::with_capacity(commits.len());
         for commit in commits {
@@ -877,9 +967,6 @@ async fn resolve_range_commits(args: &FormatPatchArgs) -> Result<Vec<Commit>, Cl
         commits = retained;
     }
 
-    // BFS returns newest-first; reverse gives oldest-first for linear history.
-    commits.reverse();
-
     Ok(commits)
 }
 
@@ -887,17 +974,6 @@ async fn resolve_range_commits(args: &FormatPatchArgs) -> Result<Vec<Commit>, Cl
 async fn resolve_single_rev(spec: &str) -> Result<ObjectHash, CliError> {
     util::get_commit_base_typed(spec).await.map_err(|e| {
         FormatPatchError::InvalidTarget(format!("cannot resolve '{spec}': {e}")).into()
-    })
-}
-
-/// Return the OID of `HEAD`.
-async fn resolve_current_head() -> Result<ObjectHash, CliError> {
-    use crate::internal::head::Head;
-    Head::current_commit().await.ok_or_else(|| {
-        FormatPatchError::InvalidTarget(
-            "HEAD does not point to a commit (unborn branch?)".to_string(),
-        )
-        .into()
     })
 }
 
@@ -987,7 +1063,9 @@ async fn format_patch_body(
     );
 
     let numbering_enabled = !args.no_numbered;
-    let num_str = if numbering_enabled && (args.numbered || args.cover_letter) {
+    // Git's `format.numbered=auto`: number multi-patch series and any series
+    // with a cover letter, but a lone patch stays `[PATCH]`.
+    let num_str = if numbering_enabled && (args.numbered || args.cover_letter || total > 1) {
         let displayed_total = total + start_num - 1;
         let width = subject_counter_width(displayed_total);
         format!(" {:0width$}/{displayed_total}", patch_num)

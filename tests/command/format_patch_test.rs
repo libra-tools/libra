@@ -6279,3 +6279,159 @@ fn commit_list_format_config_and_full() {
     assert!(names7.iter().all(|name| name.starts_with("0001-")));
     unset_both("format.commitListFormat");
 }
+
+/// FPG-15: multiple revision arguments and `^<rev>` exclusions select the same
+/// patch set as Git, without changing single-revision semantics (#892).
+#[test]
+fn revision_range_caret_exclusion() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run_env = |args: &[&str], date: &str| {
+            let out = if libra {
+                run_libra_command_with_env(
+                    args,
+                    root,
+                    &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+                )
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .env("GIT_AUTHOR_DATE", date)
+                    .env("GIT_COMMITTER_DATE", date)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        let dates = [
+            "2005-04-07 15:11:00 +0800",
+            "2005-04-07 15:12:00 +0800",
+            "2005-04-07 15:13:00 +0800",
+            "2005-04-07 15:14:00 +0800",
+            "2005-04-07 15:15:00 +0800",
+        ];
+        fs::write(root.join("f"), "base\n").unwrap();
+        run(&["add", "f"]);
+        run_env(&["commit", "-m", "base"], dates[0]);
+        for (index, subject) in ["m1", "m2"].iter().enumerate() {
+            fs::write(root.join("f"), format!("{subject}\n")).unwrap();
+            run(&["add", "f"]);
+            run_env(&["commit", "-m", subject], dates[index + 1]);
+        }
+        run(&["branch", "rebuild-1"]);
+        run(&["checkout", "rebuild-1"]);
+        for (index, subject) in ["r1", "r2"].iter().enumerate() {
+            fs::write(root.join("r"), format!("{subject}\n")).unwrap();
+            run(&["add", "r"]);
+            run_env(&["commit", "-m", subject], dates[index + 3]);
+        }
+        run(&["branch", "r1", "rebuild-1~1"]);
+        run(&["checkout", "main"]);
+    }
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let output = |libra: bool, flags: &[&str]| -> String {
+        if libra {
+            let out = run_libra_command(flags, lp);
+            assert_cli_success(&out, "libra");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        } else {
+            let out = Command::new("git")
+                .args(flags)
+                .current_dir(gp)
+                .env("HOME", gp)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{flags:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        }
+    };
+    let subjects = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.starts_with("Subject: "))
+            .map(str::to_string)
+            .collect()
+    };
+    let cover_list = |text: &str| -> String {
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail
+            .lines()
+            .scan(0usize, |offset, line| {
+                let start = *offset;
+                *offset += line.len() + 1;
+                Some((start, line))
+            })
+            .find(|(_, line)| line.contains(" | ") && line.starts_with(' '))
+            .map(|(offset, _)| offset)
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+    let run_case = |_label: &str, args: &[&str]| -> (String, String) {
+        let mut flags = vec!["format-patch"];
+        flags.extend_from_slice(args);
+        flags.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let libra = output(true, &flags);
+        let git = output(false, &flags);
+        (libra, git)
+    };
+
+    // AC1: cover-letter list with a caret exclusion.
+    let (libra, git) = run_case("AC1", &["--cover-letter", "^main", "rebuild-1"]);
+    assert_eq!(cover_list(&libra), cover_list(&git), "AC1 cover list");
+    // AC2/AC3: no cover; the exclusion equals the explicit range.
+    let (libra_a, git_a) = run_case("AC2", &["^main", "rebuild-1"]);
+    assert_eq!(subjects(&libra_a), subjects(&git_a), "AC2 subjects");
+    let (libra_b, _) = run_case("AC3", &["main..rebuild-1"]);
+    let normalize = |text: &str| -> String {
+        text.lines()
+            .filter(|line| !line.starts_with("Date: ") && !line.starts_with("From "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(normalize(&libra_a), normalize(&libra_b), "AC3 range equals");
+
+    // AC4: two positive revisions union all reachable commits.
+    let (libra, git) = run_case("AC4", &["main", "rebuild-1"]);
+    assert_eq!(subjects(&libra), subjects(&git), "AC4 two positives");
+    // AC5: an inner commit is excluded by `^r1`.
+    let (libra, git) = run_case("AC5", &["main~2..rebuild-1", "^r1"]);
+    assert_eq!(subjects(&libra), subjects(&git), "AC5 inner caret");
+    assert_eq!(subjects(&libra).len(), 1, "AC5 only r2");
+    // AC6/AC7: single-revision and `a~n..b` semantics are unchanged.
+    let (libra, git) = run_case("AC6", &["HEAD~2"]);
+    assert_eq!(subjects(&libra), subjects(&git), "AC6 single revision");
+    let (libra, git) = run_case("AC7", &["rebuild-1~2..rebuild-1"]);
+    assert_eq!(subjects(&libra), subjects(&git), "AC7 a~n..b");
+}

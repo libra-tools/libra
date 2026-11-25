@@ -5,7 +5,7 @@
 ## 概要
 
 ```bash
-libra format-patch [OPTIONS] [revision-range]
+libra format-patch [OPTIONS] [<revision>...]
 ```
 
 ## 说明
@@ -16,7 +16,7 @@ libra format-patch [OPTIONS] [revision-range]
 
 封面信还会输出系列 diffstat（从唯一边界提交——最旧补丁的父提交——到末个补丁的树差异）；`--no-stat`/`-p` 只抑制逐补丁 diffstat，系列自根提交开始（无唯一边界）时省略封面信 diffstat；封面信 diffstat 继承补丁的重命名选项（`-M`/`--find-renames`/`--no-renames`，以最后者为准）。
 
-`libra format-patch` 遍历 revision range（`A..B`，或把单个提交视为 `<commit>..HEAD`）；`-1 [commit]` 精确选择一个 commit，`--root [commit]` 则包含 root 及所有可达的非 merge ancestors。命令为每个非 merge commit 生成一个 patch 文件（默认以 `--suffix` 命名，默认 `.patch`，除非设置 `--numbered-files`，此时使用裸序号）。除 `--numbered-files` 外，文件名始终带有补零序号前缀，不受 `-n` 或 `-N` 影响。每个 patch 格式化为 mbox message，包含 RFC 2822 headers、plain-text diffstat 和 unified diff。输出兼容 `git am`。
+`libra format-patch` 遍历 revision range（`A..B`，或把单个提交视为 `<commit>..HEAD`）；`-1 [commit]` 精确选择一个 commit，`--root [commit]` 则包含 root 及所有可达的非 merge ancestors。多个位置修订取并集，`^<rev>` 排除其可达提交，`A..B` 排除 `A` 并包含 `B`。命令为每个非 merge commit 生成一个 patch 文件（默认以 `--suffix` 命名，默认 `.patch`，除非设置 `--numbered-files`，此时使用裸序号）。除 `--numbered-files` 外，文件名始终带有补零序号前缀，不受 `-n` 或 `-N` 影响。每个 patch 格式化为 mbox message，包含 RFC 2822 headers、plain-text diffstat 和 unified diff。输出兼容 `git am`。
 
 Merge commits 默认跳过。当 revision range 解析为零个提交时，命令以退出码 0 成功结束，不生成 patch。普通模式不输出内容；使用 `--json` 时，payload 中包含 `"patches": []`。仓库没有任何 commit 或 revision 无法解析时仍会报错。若所有 commit 都已在 upstream 中，`--ignore-if-in-upstream` 也会成功返回空 series。
 
@@ -24,12 +24,12 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 
 | 标志 | 短参数 | 说明 | 默认值 |
 |------|--------|------|--------|
-| `[revision-range]` | | `A..B` range 或单个 commit；单个 commit 表示 `<commit>..HEAD` | `HEAD` |
+| `[<revision>...]` | | 一个或多个修订：单个提交等价 `<commit>..HEAD`；`A..B` 排除 `A`；`^<rev>` 排除其可达提交；多个正向修订取并集 | `HEAD` |
 | `-1` | `-1` | 只生成指定 commit；未给 revision 时生成 `HEAD` | false |
 | `--root` | | 包含 root commit 和所有可达的非 merge ancestors | false |
 | `--output-directory <DIR>` | `-o` | 将 patch 文件写入 `DIR` | 当前目录 |
 | `--stdout` | | 将所有 patches 打印到 stdout | false |
-| `--numbered` | `-n` | 在 commit patch 的 Subject 行中加入 `[PATCH n/m]` 计数 | false |
+| `--numbered` | `-n` | 在 commit patch 的 Subject 行中加入 `[PATCH n/m]` 计数 | auto（多补丁或封面信） |
 | `--no-numbered` | `-N` | 不在 commit patch 或 cover-letter 的 Subject 行中加入 `[PATCH n/m]` 计数 | 关闭 |
 | `--rfc[=<text>]` | | 在主题前缀中加入 `RFC`（`[RFC PATCH]`）；给出值时用该文本替代（`--rfc=WIP` → `[WIP PATCH]`）。值必须用 `=` 紧跟，避免吞掉版本参数 | 关闭 |
 | `--no-rfc` | | 取消此前的 `--rfc`（后写者生效） | 关闭 |

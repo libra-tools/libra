@@ -5,14 +5,17 @@ Generate mbox-formatted email patch files from commits.
 ## Synopsis
 
 ```bash
-libra format-patch [OPTIONS] [revision-range]
+libra format-patch [OPTIONS] [<revision>...]
 ```
 
 ## Description
 
 `libra format-patch` walks a revision range (`A..B` or a single commit treated
 as `<commit>..HEAD`), while `-1 [commit]` selects exactly one commit and
-`--root [commit]` includes the root and every reachable non-merge ancestor. It
+`--root [commit]` includes the root and every reachable non-merge ancestor.
+Multiple positional revisions are combined as a union, `^<rev>` excludes the
+commits reachable from `<rev>`, and `A..B` excludes `A` while including `B`
+(`<rev> main`-style selections use Git's revision-set semantics). It
 produces one patch file per non-merge commit (named with the `--suffix`,
 default `.patch`, unless `--numbered-files` is set, which uses bare sequence
 numbers). Filenames include a zero-padded sequence prefix regardless of `-n`
@@ -32,12 +35,12 @@ body, and series metadata.
 
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
-| `[revision-range]` | | `A..B` range or single commit; single commit means `<commit>..HEAD` | `HEAD` |
+| `[<revision>...]` | | One or more revisions: a single commit means `<commit>..HEAD`, `A..B` excludes `A`, `^<rev>` excludes everything reachable from `<rev>`, and multiple positive revisions are unioned | `HEAD` |
 | `-1` | `-1` | Generate only the named commit, or `HEAD` when no revision is given | false |
 | `--root` | | Include the root commit and all reachable non-merge ancestors | false |
 | `--output-directory <DIR>` | `-o` | Write patch files into `DIR` | current directory |
 | `--stdout` | | Print all patches to stdout | false |
-| `--numbered` | `-n` | Add the `[PATCH n/m]` counter to commit patch Subject lines | false |
+| `--numbered` | `-n` | Add the `[PATCH n/m]` counter to commit patch Subject lines | auto (multi-patch or cover letter) |
 | `--no-numbered` | `-N` | Do not add `[PATCH n/m]` counters to commit patch or cover-letter Subject lines | off |
 | `--rfc[=<text>]` | | Prefix the subject with `RFC` (`[RFC PATCH]`); with a value, that text is used instead (`--rfc=WIP` → `[WIP PATCH]`). The value must be attached with `=` so a revision argument is never swallowed | off |
 | `--no-rfc` | | Cancel a preceding `--rfc` (last flag wins) | off |
@@ -193,8 +196,10 @@ number `0` before the commit patch records. Its filename is
 under `--numbered-files`.
 
 `-N` keeps the `NNNN-` sequence prefix in filenames and suppresses `[PATCH n/m]`
-counters on commit patch and cover-letter Subject lines. Without `-N`, a
-requested cover letter has a `[PATCH 0/N]` counter. Counter width follows the
+counters on commit patch and cover-letter Subject lines. By default Git's
+`format.numbered=auto` semantics apply: a multi-patch series and any requested
+cover letter get counters (the cover letter uses `[PATCH 0/N]`), while a lone
+patch stays `[PATCH]`. Counter width follows the
 displayed final number, including `--start-number`: a single patch uses
 `[PATCH 1/1]`; two patches starting at 9 use `[PATCH 00/10]` on the cover
 letter and `[PATCH 09/10]` / `[PATCH 10/10]` on the patches. A ten-patch

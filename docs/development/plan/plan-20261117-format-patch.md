@@ -2858,7 +2858,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：位置参数改为 `Vec<String>`，支持多修订与 `^<rev>` 排除；单裸修订仍 `<rev>..HEAD`，`--root`/`-1`/`-<n>` 保留 newest-first 截断；多修订/范围按 Git 修订集合取并集、减去所有排除 tip 祖先，并按拓扑+提交时间排序。为满足 AC4，默认多补丁/带封面单补丁按 `format.numbered=auto` 输出 `[PATCH n/m]`。AC1–AC7 由 `format_patch_test::revision_range_caret_exclusion` 覆盖（`^main rebuild-1`、显式范围等价、两个正向修订、内部 `^r1`、单修订、`a~n..b`）；`format_patch_test` 160/160、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.numbered` 配置/CLI 覆盖仍由 `FPG-01`/`FPG-32` 承接（`FPG-01` 外部 `CLOSE-529` 门未解除）。
 
 **Description:** 将 `FormatPatchArgs::revision_range` 扩展为支持多个位置修订参数（`Vec<String>`），并解析 `^<rev>` 排除语义（如 `topic ^main` 等价于 `main..topic`）。 夹具（全部提交以逐个递增的固定 `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` 创建，标题互不相同）：`main` 上 `base` → `m1` → `m2`；`rebuild-1` 自 `base` 分出 `r1` → `r2`；各 AC 执行时 HEAD 位于 `main`（使 `^main rebuild-1` 不等于 `main..HEAD`）。各 AC 只比较补丁选择结果（`Subject:` 行序列或封面信列表段），不比较 diff 字节（AC4 含根提交，见「验证执行协议」第 3 项差异隔离）。
 
