@@ -5,6 +5,9 @@
 //! manifest (`MANIFEST.md`) — assertion failures should be triaged against
 //! that table (implementation regression vs upstream format drift).
 
+#[path = "helpers/workspace_sources.rs"]
+mod workspace_sources;
+
 use libra::internal::ai::observed_agents::{
     AgentKind, agent_for,
     coverage::{Completeness, SemanticRecord, normalize_opencode_export},
@@ -4420,31 +4423,20 @@ const PI_PINNED_FILES: &[&str] = &[
     "src/internal/ai/observed_agents/reasoning.rs",
 ];
 
-/// Every `.rs` file under `src/`, as (path relative to the root, text).
+/// Every `.rs` file under `src/` and `crates/*/src/`, as (path relative to the root, text).
 fn pi_src_files(root: &std::path::Path) -> Vec<(String, String)> {
-    let mut found = Vec::new();
-    let mut pending = vec![root.join("src")];
-    while let Some(path) = pending.pop() {
-        if path.is_dir() {
-            for entry in std::fs::read_dir(&path).expect("read src directory") {
-                pending.push(entry.expect("src entry").path());
-            }
-            continue;
-        }
-        if path.extension().is_some_and(|extension| extension == "rs") {
+    workspace_sources::collect_workspace_rust_files(root)
+        .into_iter()
+        .map(|path| {
             let relative = path
                 .strip_prefix(root)
                 .expect("under the root")
-                .display()
-                .to_string();
-            found.push((
-                relative,
-                std::fs::read_to_string(&path).expect("read source file"),
-            ));
-        }
-    }
-    found.sort();
-    found
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            (relative, text)
+        })
+        .collect()
 }
 
 /// The types (structs, enums, unions, traits, aliases) that items declare
@@ -5475,17 +5467,7 @@ fn pi_bounded_capture_wiring_reads_no_file_sql_or_lease() {
         // no trait.
         let mut impls = BTreeSet::new();
         let mut traits = Vec::new();
-        let mut files = vec![root.join("src")];
-        while let Some(path) = files.pop() {
-            if path.is_dir() {
-                for entry in std::fs::read_dir(&path).expect("read src directory") {
-                    files.push(entry.expect("src entry").path());
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
+        for path in workspace_sources::collect_workspace_rust_files(root) {
             let text = std::fs::read_to_string(&path).expect("read source file");
             if !text.contains("CaptureSnapshot") {
                 continue;
@@ -5493,8 +5475,8 @@ fn pi_bounded_capture_wiring_reads_no_file_sql_or_lease() {
             let relative = path
                 .strip_prefix(root)
                 .expect("under the root")
-                .display()
-                .to_string();
+                .to_string_lossy()
+                .replace('\\', "/");
             let file = syn::parse_file(&text).expect("parse source file");
             struct Impls<'a> {
                 relative: &'a str,
@@ -5584,23 +5566,13 @@ fn pi_bounded_capture_wiring_reads_no_file_sql_or_lease() {
             .expect("rename pattern");
         let mut headers = BTreeSet::new();
         let mut renamed = Vec::new();
-        let mut files = vec![root.join("src")];
-        while let Some(path) = files.pop() {
-            if path.is_dir() {
-                for entry in std::fs::read_dir(&path).expect("read src directory") {
-                    files.push(entry.expect("src entry").path());
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
+        for path in workspace_sources::collect_workspace_rust_files(root) {
             let text = std::fs::read_to_string(&path).expect("read source file");
             let relative = path
                 .strip_prefix(root)
                 .expect("under the root")
-                .display()
-                .to_string();
+                .to_string_lossy()
+                .replace('\\', "/");
             for found in impl_header.find_iter(&text) {
                 headers.insert(format!(
                     "{relative}: {}",
@@ -5655,17 +5627,7 @@ fn pi_bounded_capture_wiring_reads_no_file_sql_or_lease() {
             }
         }
         let mut naming = Vec::new();
-        let mut files = vec![root.join("src")];
-        while let Some(path) = files.pop() {
-            if path.is_dir() {
-                for entry in std::fs::read_dir(&path).expect("read src directory") {
-                    files.push(entry.expect("src entry").path());
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
+        for path in workspace_sources::collect_workspace_rust_files(root) {
             let text = std::fs::read_to_string(&path).expect("read source file");
             if !text.contains("CaptureSnapshot") {
                 continue;
@@ -5673,8 +5635,8 @@ fn pi_bounded_capture_wiring_reads_no_file_sql_or_lease() {
             let relative = path
                 .strip_prefix(root)
                 .expect("under the root")
-                .display()
-                .to_string();
+                .to_string_lossy()
+                .replace('\\', "/");
             let mut scan = NamingMacros {
                 relative: &relative,
                 found: Vec::new(),
@@ -5716,23 +5678,13 @@ fn pi_bounded_capture_wiring_reads_no_file_sql_or_lease() {
             .expect("macro definition pattern");
         let mut shadowing = Vec::new();
         let mut poll_definitions = 0;
-        let mut files = vec![root.join("src")];
-        while let Some(path) = files.pop() {
-            if path.is_dir() {
-                for entry in std::fs::read_dir(&path).expect("read src directory") {
-                    files.push(entry.expect("src entry").path());
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
+        for path in workspace_sources::collect_workspace_rust_files(root) {
             let text = std::fs::read_to_string(&path).expect("read source file");
             let relative = path
                 .strip_prefix(root)
                 .expect("under the root")
-                .display()
-                .to_string();
+                .to_string_lossy()
+                .replace('\\', "/");
             if text.contains("#[macro_use]") {
                 shadowing.push(format!("{relative}: #[macro_use]"));
             }
@@ -5916,22 +5868,13 @@ fn pi_bounded_capture_wiring_reads_no_file_sql_or_lease() {
             let extern_crate =
                 regex::Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?extern\s+crate\b")
                     .expect("extern crate pattern");
-            let mut files = vec![root.join("src")];
-            while let Some(path) = files.pop() {
-                if path.is_dir() {
-                    for entry in std::fs::read_dir(&path).expect("read src directory") {
-                        files.push(entry.expect("src entry").path());
-                    }
-                    continue;
-                }
-                if path.extension().is_some_and(|extension| extension == "rs") {
-                    let text = std::fs::read_to_string(&path).expect("read source file");
-                    assert!(
-                        !extern_crate.is_match(&text),
-                        "{} uses `extern crate`",
-                        path.display()
-                    );
-                }
+            for path in workspace_sources::collect_workspace_rust_files(root) {
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                assert!(
+                    !extern_crate.is_match(&text),
+                    "{} uses `extern crate`",
+                    path.display()
+                );
             }
             let mut helper_pins = std::collections::BTreeMap::new();
             for (relative, helpers, definitions) in [

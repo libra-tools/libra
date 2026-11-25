@@ -79,7 +79,7 @@ cd "$ROOT" || { echo "FAIL: cannot reach the repository root" >&2; exit 2; }
 [ -f COMPATIBILITY.md ] && { [ -d .libra ] || [ -e .git ]; } || { echo "FAIL: not at the repository root" >&2; exit 2; }
 
 python3 - <<'CLASSIFY_PY'
-import os, re, sys, time
+import glob, os, re, sys, time
 _T0 = time.time()
 _TM = {}
 
@@ -90,6 +90,11 @@ if TREE not in ('tests', 'src'):
     print('FAIL: SERIAL_CLASSIFY_TREE must be tests or src, got %r' % TREE,
           file=sys.stderr)
     sys.exit(2)
+SOURCE_ROOTS = (
+    ['src'] + sorted(p for p in glob.glob('crates/*/src') if os.path.isdir(p))
+    if TREE == 'src'
+    else [TREE]
+)
 
 
 def _tmark(tag):
@@ -592,7 +597,8 @@ def _load_rs(p):
     return lines, blanked
 
 
-for root, dirs, files in os.walk(TREE):
+for src_root in SOURCE_ROOTS:
+  for root, dirs, files in os.walk(src_root):
     dirs[:] = sorted(d for d in dirs if d not in ('data', 'fixtures'))
     for name in sorted(files):
         if not name.endswith('.rs'):
@@ -627,7 +633,7 @@ for root, dirs, files in os.walk(TREE):
                         cand = os.path.normpath(
                             os.path.join(os.path.dirname(ipath), tgt))
                     if not (cand and cand.endswith('.rs')
-                            and cand.startswith(TREE + os.sep)
+                            and any(cand.startswith(r + os.sep) for r in SOURCE_ROOTS)
                             and os.path.isfile(cand)):
                         UNRESOLVED_INCLUDES.add(path)
                         continue

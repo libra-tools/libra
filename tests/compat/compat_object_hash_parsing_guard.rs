@@ -7,7 +7,7 @@
 //! appear in the allowlist table below (path + symbol + reason).
 
 use std::{
-    fs, io,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -79,12 +79,13 @@ const EXTERNAL_TEST_PATH_FILES: &[&str] = &[
     "src/command/ls_remote_tests.rs",
 ];
 
+#[path = "../helpers/workspace_sources.rs"]
+mod workspace_sources;
+
 #[test]
 fn production_oid_parsing_uses_object_format_helpers() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let src = root.join("src");
-    let mut files = Vec::new();
-    collect_rust_files(&src, &mut files).expect("collect src");
+    let files = workspace_sources::collect_workspace_rust_files(&root);
 
     let mut offenders = Vec::new();
     for path in &files {
@@ -279,19 +280,6 @@ fn item_attrs(item: &Item) -> &[syn::Attribute] {
         Item::Macro(i) => &i.attrs,
         _ => &[],
     }
-}
-
-fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rust_files(&path, files)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn is_dedicated_test_file(path: &Path) -> bool {

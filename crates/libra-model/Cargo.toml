@@ -1,0 +1,17 @@
+[package]
+name = "libra-model"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+sea-orm = { version = "2.0.0", features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+    "macros",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { version = "1.0.149", features = ["raw_value"] }

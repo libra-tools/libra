@@ -1564,32 +1564,26 @@ mod bounded_read_tests {
             );
         }
 
-        fn scan(directory: &std::path::Path, calls: &mut Vec<(String, String)>) {
-            for entry in std::fs::read_dir(directory).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    scan(&path, calls);
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    let source = std::fs::read_to_string(&path).unwrap();
-                    let ast = syn::parse_file(&source).unwrap();
-                    let mut visitor = Calls::default();
-                    visitor.visit_file(&ast);
-                    assert!(
-                        visitor.violations.is_empty(),
-                        "{}: {:?}",
-                        path.display(),
-                        visitor.violations
-                    );
-                    for function in visitor.calls {
-                        calls.push((path.to_string_lossy().into_owned(), function));
-                    }
-                }
-            }
-        }
-
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut calls = Vec::new();
-        scan(&root.join("src"), &mut calls);
+        for path in crate::internal::source_scan::collect_workspace_rust_files(root) {
+            let source = std::fs::read_to_string(&path).expect("read source file");
+            if !source.contains("write_opaque_blob_with_status") {
+                continue;
+            }
+            let ast = syn::parse_file(&source).expect("parse Rust source");
+            let mut visitor = Calls::default();
+            visitor.visit_file(&ast);
+            assert!(
+                visitor.violations.is_empty(),
+                "{}: {:?}",
+                path.display(),
+                visitor.violations
+            );
+            for function in visitor.calls {
+                calls.push((path.to_string_lossy().into_owned(), function));
+            }
+        }
         calls.sort();
         let history = root
             .join("src/internal/ai/history.rs")
