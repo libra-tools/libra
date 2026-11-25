@@ -7159,3 +7159,83 @@ fn cover_letter_branch_description() {
     assert!(!compare("AC2 positive branch", &["^main", "rebuild-1"]).contains("side-desc"));
     assert!(compare("AC3 default", &["-2"]).contains("topic-desc"));
 }
+
+/// FPG-60: the cover letter's default `From:` is the execution-time committer
+/// identity, not the patch author (#891).
+#[test]
+fn cover_letter_default_from_identity() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("second"), "second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], p),
+        "commit",
+    );
+    let cover_from = |stdout: &[u8]| -> Vec<String> {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let headers = cover
+            .split_once("\n\n")
+            .map(|(headers, _)| headers)
+            .unwrap_or(cover);
+        headers
+            .lines()
+            .filter(|line| line.starts_with("From: "))
+            .map(str::to_string)
+            .collect()
+    };
+
+    // AC1: GIT_COMMITTER_* wins over the configured identity/author.
+    let out = run_libra_command_with_env(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+        &[
+            ("GIT_COMMITTER_NAME", "Env Name"),
+            ("GIT_COMMITTER_EMAIL", "env@example.com"),
+        ],
+    );
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        cover_from(&out.stdout),
+        ["From: Env Name <env@example.com>"],
+        "AC1 committer env"
+    );
+
+    // AC2: no env identity -> the configured user.name/user.email.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "Config User"], p),
+        "config name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "config@example.com"], p),
+        "config email",
+    );
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        cover_from(&out.stdout),
+        ["From: Config User <config@example.com>"],
+        "AC2 config identity"
+    );
+}

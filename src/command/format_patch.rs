@@ -678,11 +678,23 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     if args.cover_letter {
         let series_stat = cover_letter_series_stat(&args, &commits).await?;
         let description = cover_letter_description(&args).await?;
+        // Git's cover letter defaults `From:` to the execution-time committer
+        // identity when no `--from`/`format.from` overrides it; patches keep
+        // their author.
+        let cover_committer = if from_identity.is_none() {
+            let (_, identity) = crate::command::commit::create_committer_signature()
+                .await
+                .map_err(|error| FormatPatchError::IdentityMissing(error.to_string()))?;
+            Some((identity.name, identity.email))
+        } else {
+            None
+        };
+        let cover_from = from_identity.as_ref().or(cover_committer.as_ref());
         let cover_body = format_cover_letter(
             &args,
             &commits,
             &thread_id,
-            from_identity.as_ref(),
+            cover_from,
             base_block.as_deref(),
             series_stat.as_deref(),
             description.as_deref(),

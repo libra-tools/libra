@@ -3369,7 +3369,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：未传 `--from`/`format.from` 时封面信 `From:` 取执行时提交者身份（`GIT_COMMITTER_*` 优先，其次 `user.name`/`user.email`），补丁仍用作者。AC1/AC2 由 `format_patch_test::cover_letter_default_from_identity` 覆盖（环境身份覆盖、配置身份且与全部提交作者不同）；`format_patch_test` 164/164、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-24` 拆出的独立轴：未传 `--from` 时以执行时的提交者身份（Git `git_committer_info`，`git show 6de20f6092:builtin/log.c` 第 1411 行；`GIT_COMMITTER_*` 优先，其次 `user.name`/`user.email`）填入封面信 `From:`，而非现行的空值；补丁邮件的 `From:` 不变（仍为作者）。
 
