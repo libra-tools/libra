@@ -920,6 +920,16 @@ async fn format_patch_body(
     };
     out.push_str(&format!("From {} {MBOX_FIXED_DATE}\n", envelope_hash));
 
+    // ---- Threading headers (Git emits them before `From:`) ----
+    push_threading_headers(
+        &mut out,
+        threading,
+        patch_num,
+        start_num,
+        total,
+        args.cover_letter,
+    );
+
     // ---- From: ----
     // The header shows the `--from` identity when given (else the commit
     // author). If it differs from the author, the original author is preserved
@@ -981,16 +991,6 @@ async fn format_patch_body(
     } else {
         out.push_str(&format!("Subject: [{prefix}{num_str}] {subject}\n"));
     }
-
-    // ---- Threading headers ----
-    push_threading_headers(
-        &mut out,
-        threading,
-        patch_num,
-        start_num,
-        total,
-        args.cover_letter,
-    );
 
     // `--attach`/`--inline` wrap the patch in a MIME multipart: the log message
     // + diffstat go in a `text/plain` part, the diff in a `text/x-patch` part.
@@ -1519,6 +1519,15 @@ fn format_cover_letter(
     );
     out.push_str(&format!("From {envelope_hash} {MBOX_FIXED_DATE}\n"));
 
+    // Cover thread headers also follow the envelope, before `From:`.
+    if let Some(threading) = threading {
+        out.push_str(&format!("Message-ID: <{}-cover>\n", threading.series_id));
+        if let Some(parent) = threading.external_reply_to.as_deref() {
+            out.push_str(&format!("In-Reply-To: <{parent}>\n"));
+            out.push_str(&format!("References: <{parent}>\n"));
+        }
+    }
+
     let version = args
         .reroll_count
         .map(|v| format!(" v{v}"))
@@ -1549,13 +1558,6 @@ fn format_cover_letter(
     out.push_str(&format!(
         "Subject: [{prefix}{counter}] *** SUBJECT HERE ***\n"
     ));
-    if let Some(threading) = threading {
-        out.push_str(&format!("Message-ID: <{}-cover>\n", threading.series_id));
-        if let Some(parent) = threading.external_reply_to.as_deref() {
-            out.push_str(&format!("In-Reply-To: <{parent}>\n"));
-            out.push_str(&format!("References: <{parent}>\n"));
-        }
-    }
     // Git's `make_cover_letter` emits MIME headers only when any commit's raw
     // object buffer (headers + message) contains non-ASCII bytes.
     if commits.iter().any(|commit| {

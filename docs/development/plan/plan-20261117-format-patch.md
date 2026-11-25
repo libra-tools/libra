@@ -4693,7 +4693,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：线程头 `Message-ID:`/`In-Reply-To:`/`References:` 移至信封行之后、`From:` 之前，补丁与封面信一致；仅改位置，取值仍由 `FPG-28` 承接。AC1 由 `format_patch_test::thread_headers_follow_envelope` 覆盖（4 封邮件逐封与 Git 头字段名序列逐字一致，含封面外部父邮件与补丁回复头）；`format_patch_test` 150/150、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；开发文档已记录核对结论。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-28` 拆出的独立轴（先于 `FPG-28` 执行，使其后的 `check_threading` 式黄金比较不因头区位置不同而失败）：把补丁与封面信的 `Message-ID:`/`In-Reply-To:`/`References:` 移到信封行之后、`From:` 之前（Git `log_write_email_headers`，`git show 6de20f6092:log-tree.c` 第 508–522 行；现行在 `Subject:` 之后输出，`src/command/format_patch.rs:866-879,1404-1413`）。本卡只改头的位置，不改 Message-ID 取值（由 `FPG-28` 承接）。
 

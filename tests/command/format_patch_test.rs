@@ -4768,3 +4768,104 @@ fn cover_letter_write_failure_leaves_no_partial_output() {
         "AC2 snapshot is only the pre-created directory"
     );
 }
+
+/// FPG-63: threading headers sit between the envelope line and `From:`, in the
+/// same field order as Git (values intentionally not compared).
+#[test]
+fn thread_headers_follow_envelope() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("变更{i}")]);
+        }
+    }
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let fields = |stdout: &[u8]| -> Vec<Vec<String>> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        let mut messages = Vec::new();
+        for segment in text.split("\nFrom ").skip(1) {
+            let headers = segment
+                .split_once("\n\n")
+                .map(|(headers, _)| headers)
+                .unwrap_or(segment);
+            let mut lines = headers.lines();
+            lines.next(); // envelope remainder
+            let mut names = Vec::new();
+            for line in lines {
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    continue; // folded continuation
+                }
+                if let Some((name, _)) = line.split_once(':') {
+                    names.push(name.to_string());
+                }
+            }
+            messages.push(names);
+        }
+        messages
+    };
+    let flags = [
+        "format-patch",
+        "--thread",
+        "--cover-letter",
+        "--in-reply-to=<test.message>",
+        "-3",
+        "--stdout",
+        "--no-signature",
+    ];
+    let libra_out = run_libra_command(&flags, lp);
+    assert_cli_success(&libra_out, "libra");
+    let git_out = Command::new("git")
+        .args(flags)
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_out.status.success(), "{git_out:?}");
+    let libra_fields = fields(&libra_out.stdout);
+    assert_eq!(libra_fields.len(), 4, "cover + three patches");
+    assert_eq!(libra_fields, fields(&git_out.stdout), "AC1 field order");
+    // The threading headers are the first fields after the envelope, before
+    // `From:`, for every message including the cover.
+    for message in &libra_fields {
+        assert_eq!(message[0], "Message-ID", "{message:?}");
+        assert!(message.iter().position(|name| name == "From").is_some());
+        let from = message.iter().position(|name| name == "From").unwrap();
+        assert!(
+            message[..from]
+                .iter()
+                .all(|name| matches!(name.as_str(), "Message-ID" | "In-Reply-To" | "References"))
+        );
+    }
+}
