@@ -3189,3 +3189,70 @@ fn full_diff_accepted_without_pathspec() {
         "AC1 byte-identical without pathspec"
     );
 }
+
+/// FPG-42: cover-letter MIME headers appear only when a commit's raw buffer
+/// contains non-ASCII bytes.
+#[test]
+fn cover_letter_mime_on_demand() {
+    fn cover_of(stdout: &str) -> String {
+        stdout.split("\nFrom ").next().unwrap_or(stdout).to_string()
+    }
+    fn commit_file(repo: &std::path::Path, name: &str, body: &str, msg: &str) {
+        fs::write(repo.join(name), body).unwrap();
+        assert_cli_success(&run_libra_command(&["add", name], repo), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], repo),
+            "commit",
+        );
+    }
+
+    // AC1: an all-ASCII series emits no cover-letter MIME headers.
+    let ascii = create_committed_repo_via_cli();
+    commit_file(ascii.path(), "a.txt", "a\n", "ascii one");
+    commit_file(ascii.path(), "b.txt", "b\n", "ascii two");
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-signature",
+        ],
+        ascii.path(),
+    );
+    assert_cli_success(&out, "AC1 cover letter");
+    let cover = cover_of(&String::from_utf8_lossy(&out.stdout));
+    assert!(!cover.contains("MIME-Version"), "AC1 ASCII cover: {cover}");
+
+    // AC2: only the second commit's committer name is non-ASCII.
+    let mixed = create_committed_repo_via_cli();
+    commit_file(mixed.path(), "a.txt", "a\n", "first");
+    fs::write(mixed.path().join("b.txt"), "b\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "b.txt"], mixed.path()),
+        "add second",
+    );
+    let commit = run_libra_command_with_env(
+        &["commit", "-m", "second", "--no-verify"],
+        mixed.path(),
+        &[("GIT_COMMITTER_NAME", "Cömmitter")],
+    );
+    assert_cli_success(&commit, "non-ascii committer commit");
+    commit_file(mixed.path(), "c.txt", "c\n", "third");
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-3",
+            "--stdout",
+            "--no-signature",
+        ],
+        mixed.path(),
+    );
+    assert_cli_success(&out, "AC2 cover letter");
+    let cover = cover_of(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        cover.contains("MIME-Version"),
+        "AC2 non-ASCII cover: {cover}"
+    );
+}

@@ -1979,7 +1979,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`format_cover_letter` 仅在系列任一提交的原始对象缓冲（headers+message）含非 ASCII 字节时输出 MIME 头（Git `make_cover_letter` 规则）；全 ASCII 系列不再输出 MIME 头。AC1/AC2 由 `format_patch_test::cover_letter_mime_on_demand` 覆盖（纯 ASCII 封面无 MIME；3 提交中仅第 2 提交 committer 为 `Cömmitter` 时输出 MIME）；`format_patch_test` 136/136、`compat_format_patch_mail_roundtrip` 14/14；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-30` 拆出的独立轴：`format_cover_letter` 不再无条件输出 MIME 头，仅当系列中任一提交的原始对象缓冲区（含 author/committer 头与提交说明）含非 ASCII 字节时输出（Git `make_cover_letter` 对 `repo_get_commit_buffer` 调用 `has_non_ascii`，`git show 6de20f6092:builtin/log.c` 第 1417–1425 行）；补丁邮件的判定仍按 `FPG-30`。
 

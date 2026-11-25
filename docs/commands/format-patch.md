@@ -174,6 +174,10 @@ config knob); Git derives its default from that config, which is itself off
 unless set.
 
 With `--json` or `--machine`, `data.patches` lists every generated output.
+The cover letter emits `MIME-Version`/`Content-Type`/`Content-Transfer-Encoding`
+headers only when at least one commit's raw object buffer contains non-ASCII
+bytes (Git's `make_cover_letter` rule); an all-ASCII series has no MIME headers.
+
 When `--cover-letter` is set, the list includes the cover letter as record
 number `0` before the commit patch records. Its filename is
 `0000-cover-letter` with the configured suffix (default `.patch`), or just `0`

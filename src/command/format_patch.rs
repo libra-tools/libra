@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use git_internal::{
     hash::{HashKind, ObjectHash},
-    internal::object::commit::Commit,
+    internal::object::{ObjectTrait, commit::Commit},
 };
 use serde::Serialize;
 
@@ -1453,9 +1453,17 @@ fn format_cover_letter(
             out.push_str(&format!("References: <{parent}>\n"));
         }
     }
-    out.push_str("MIME-Version: 1.0\n");
-    out.push_str("Content-Type: text/plain; charset=UTF-8\n");
-    out.push_str("Content-Transfer-Encoding: 8bit\n");
+    // Git's `make_cover_letter` emits MIME headers only when any commit's raw
+    // object buffer (headers + message) contains non-ASCII bytes.
+    if commits.iter().any(|commit| {
+        commit
+            .to_data()
+            .map_or(true, |data| data.iter().any(|byte| !byte.is_ascii()))
+    }) {
+        out.push_str("MIME-Version: 1.0\n");
+        out.push_str("Content-Type: text/plain; charset=UTF-8\n");
+        out.push_str("Content-Transfer-Encoding: 8bit\n");
+    }
     let (to, cc) = resolve_recipients(args);
     push_recipient_headers(&mut out, &to, &cc);
     out.push('\n');

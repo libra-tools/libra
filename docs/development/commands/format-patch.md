@@ -105,3 +105,5 @@ flowchart TD
 - 2026-11-25（FPG-22 / #904）：新增 `-U<n>`/`--unified=<n>`：`FormatPatchArgs.unified` 经 `CommitDiffOptions.context_lines` 与 `DiffArgs --unified=<n>` 透传到共享 diff 渲染引擎；默认仍为 3，`CommitDiffOptions::default()` 的 histogram/full_index/prefix 字段不变。回归：`format_patch_test::unified_context_lines`（`-U1`/`--unified=5` 与 Git 黄金 diff 段逐字、两两不同）与 `commit_diff_options_tests::defaults_keep_three_context_lines_and_prefixes`；`format_patch_test` 134/134。
 
 - 2026-11-25（FPG-61 / #904）：新增可见 `--full-diff`：`FormatPatchArgs.full_diff` 仅被接受；由于 Libra `format-patch` 不接受 `-- <path>` pathspec，无 pathspec 时输出与不带该 flag 逐字节相同（Git 同语义）。回归：`format_patch_test::full_diff_accepted_without_pathspec`、`compat_format_patch_flag_surface`（help 必列 `--full-diff`）、`format_patch_test` 135/135、`compat_format_patch_mail_roundtrip`。
+
+- 2026-11-25（FPG-42 / #897）：`format_cover_letter` 仅在系列任一提交的原始对象缓冲（headers+message）含非 ASCII 字节时输出 MIME 头，对齐 Git `make_cover_letter`；全 ASCII 系列不再输出 MIME 头。回归：`format_patch_test::cover_letter_mime_on_demand`（AC1 ASCII、AC2 仅第 2 提交 committer 为 `Cömmitter`）；`format_patch_test` 136/136、`compat_format_patch_mail_roundtrip` 14/14。
