@@ -107,3 +107,5 @@ flowchart TD
 - 2026-11-25（FPG-61 / #904）：新增可见 `--full-diff`：`FormatPatchArgs.full_diff` 仅被接受；由于 Libra `format-patch` 不接受 `-- <path>` pathspec，无 pathspec 时输出与不带该 flag 逐字节相同（Git 同语义）。回归：`format_patch_test::full_diff_accepted_without_pathspec`、`compat_format_patch_flag_surface`（help 必列 `--full-diff`）、`format_patch_test` 135/135、`compat_format_patch_mail_roundtrip`。
 
 - 2026-11-25（FPG-42 / #897）：`format_cover_letter` 仅在系列任一提交的原始对象缓冲（headers+message）含非 ASCII 字节时输出 MIME 头，对齐 Git `make_cover_letter`；全 ASCII 系列不再输出 MIME 头。回归：`format_patch_test::cover_letter_mime_on_demand`（AC1 ASCII、AC2 仅第 2 提交 committer 为 `Cömmitter`）；`format_patch_test` 136/136、`compat_format_patch_mail_roundtrip` 14/14。
+
+- 2026-11-25（FPG-16 / #893）：普通补丁与封面信首行 mbox `From <oid> <date>` 的时间戳统一为 Git 固定 `Mon Sep 17 00:00:00 2001`；补丁使用该提交完整 oid，封面信使用系列末个提交 oid，`--zero-commit` 时按哈希长度补零；补丁 `Date:` 仍取作者时间。回归：`format_patch_test::mbox_envelope_fixed_2001_timestamp`（AC1–AC4：固定信封、zero-commit、封面信、`libra am` 拆分应用）、`compat_format_patch_mail_roundtrip::fixed_envelope_mbox_applies_with_git_am`（AC5）；`format_patch_test` 138/138、`compat_format_patch_mail_roundtrip` 15/15。

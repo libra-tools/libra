@@ -174,6 +174,10 @@ config knob); Git derives its default from that config, which is itself off
 unless set.
 
 With `--json` or `--machine`, `data.patches` lists every generated output.
+Each patch's mbox separator is `From <commit oid> Mon Sep 17 00:00:00 2001` (Git's
+fixed envelope timestamp); `--zero-commit` zeroes that hash. The cover letter's
+separator uses the series' last commit oid and the same fixed timestamp.
+
 The cover letter emits `MIME-Version`/`Content-Type`/`Content-Transfer-Encoding`
 headers only when at least one commit's raw object buffer contains non-ASCII
 bytes (Git's `make_cover_letter` rule); an all-ASCII series has no MIME headers.

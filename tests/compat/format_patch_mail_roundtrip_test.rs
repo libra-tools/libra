@@ -744,3 +744,62 @@ fn rename_patch_applies_with_libra_am() {
         "lorem\nipsum\ndolor\nsit\namet\n"
     );
 }
+
+/// FPG-16 AC5: the fixed `Mon Sep 17 00:00:00 2001` mbox envelope from
+/// `libra format-patch --stdout` applies with real `git am`.
+#[test]
+fn fixed_envelope_mbox_applies_with_git_am() {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| !out.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipped (install git to run the format-patch mbox round-trip gate)");
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.init_libra("fixed-envelope-source");
+    fixture.libra_commit(&source, "base\n", "base");
+    fixture.libra_commit(&source, "base\none\n", "fixed envelope one");
+    fixture.libra_commit(&source, "base\none\ntwo\n", "fixed envelope two");
+    let mbox = fixture.libra_success(&source, &["format-patch", "--stdout", "HEAD~2..HEAD"]);
+    let mbox_text = String::from_utf8_lossy(&mbox.stdout);
+    assert!(
+        mbox_text
+            .lines()
+            .filter(|line| line.starts_with("From "))
+            .all(|line| line.ends_with("Mon Sep 17 00:00:00 2001")),
+        "fixed envelope timestamps: {mbox_text}"
+    );
+
+    let target = fixture.init_git("git-fixed-envelope-target");
+    fixture.git_commit(&target, "base\n", "base");
+
+    use std::{io::Write, process::Stdio};
+    let mut command = Command::new("git");
+    command
+        .args(["am"])
+        .current_dir(&target)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &fixture.home)
+        .env("GIT_AUTHOR_NAME", "Mail Tester")
+        .env("GIT_AUTHOR_EMAIL", "mail-tester@example.com")
+        .env("GIT_COMMITTER_NAME", "Mail Tester")
+        .env("GIT_COMMITTER_EMAIL", "mail-tester@example.com")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn git am");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(&mbox.stdout)
+        .expect("write mbox to stdin");
+    let out = child.wait_with_output().expect("wait for git am");
+    assert_success("git", &["am"], &out);
+    let subjects = stdout_trim(&fixture.git_success(&target, &["log", "-2", "--format=%s"]));
+    assert_eq!(subjects, "fixed envelope two\nfixed envelope one");
+}

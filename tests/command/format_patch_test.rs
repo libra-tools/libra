@@ -3288,3 +3288,91 @@ fn keep_subject_and_prefix_alone_succeed() {
         "AC4 lone --rfc"
     );
 }
+
+/// FPG-16: mbox separators use Git's fixed `Mon Sep 17 00:00:00 2001`
+/// timestamp; `--zero-commit` zeroes the hash; the cover letter uses the
+/// series' last commit oid; the resulting mbox applies with `libra am`.
+#[test]
+fn mbox_envelope_fixed_2001_timestamp() {
+    let repo = repo_with_patch_subjects(&["first subject", "second subject"]);
+    let p = repo.path();
+    let newest = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let older = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD~1"], p).stdout)
+        .trim()
+        .to_string();
+
+    let out = run_libra_command(&["format-patch", "-2", "--stdout", "--no-thread"], p);
+    assert_cli_success(&out, "AC1 format-patch -2");
+    let mbox = String::from_utf8_lossy(&out.stdout).to_string();
+    let envelopes: Vec<&str> = mbox
+        .lines()
+        .filter(|line| line.starts_with("From "))
+        .collect();
+    // Patches are emitted oldest-first.
+    assert_eq!(
+        envelopes,
+        vec![
+            format!("From {older} Mon Sep 17 00:00:00 2001").as_str(),
+            format!("From {newest} Mon Sep 17 00:00:00 2001").as_str(),
+        ],
+        "AC1 fixed separator timestamps"
+    );
+
+    let zero = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--zero-commit",
+            "--no-thread",
+        ],
+        p,
+    );
+    assert_cli_success(&zero, "AC2 --zero-commit");
+    for line in String::from_utf8_lossy(&zero.stdout)
+        .lines()
+        .filter(|line| line.starts_with("From "))
+    {
+        assert_eq!(
+            line, "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001",
+            "AC2 zero envelope"
+        );
+    }
+
+    let cover = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+        ],
+        p,
+    );
+    assert_cli_success(&cover, "AC3 cover letter");
+    let first = String::from_utf8_lossy(&cover.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        first,
+        format!("From {newest} Mon Sep 17 00:00:00 2001"),
+        "AC3 cover envelope uses series last oid"
+    );
+
+    // AC4: the fixed-envelope mbox splits and applies with `libra am`.
+    let receiver = create_committed_repo_via_cli();
+    let applied = run_libra_command_with_stdin(&["am", "-"], receiver.path(), &mbox);
+    assert_cli_success(&applied, "AC4 libra am");
+    let subjects = String::from_utf8_lossy(
+        &run_libra_command(&["log", "-2", "--format=%s"], receiver.path()).stdout,
+    )
+    .to_string();
+    assert_eq!(
+        subjects, "second subject\nfirst subject\n",
+        "AC4 applied subjects"
+    );
+}

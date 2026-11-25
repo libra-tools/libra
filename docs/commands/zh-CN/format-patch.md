@@ -10,6 +10,8 @@ libra format-patch [OPTIONS] [revision-range]
 
 ## 说明
 
+每封补丁的 mbox 分隔行为 `From <提交 oid> Mon Sep 17 00:00:00 2001`（Git 固定信封时间戳）；`--zero-commit` 时哈希全零。封面信分隔行使用系列末个提交 oid 与同一固定时间戳。
+
 封面信仅当系列中任一提交的原始对象缓冲含非 ASCII 字节时才输出 `MIME-Version`/`Content-Type`/`Content-Transfer-Encoding` 头（Git `make_cover_letter` 规则）；全 ASCII 系列不输出 MIME 头。
 
 `libra format-patch` 遍历 revision range（`A..B`，或把单个提交视为 `<commit>..HEAD`）；`-1 [commit]` 精确选择一个 commit，`--root [commit]` 则包含 root 及所有可达的非 merge ancestors。命令为每个非 merge commit 生成一个 patch 文件（默认以 `--suffix` 命名，默认 `.patch`，除非设置 `--numbered-files`，此时使用裸序号）。除 `--numbered-files` 外，文件名始终带有补零序号前缀，不受 `-n` 或 `-N` 影响。每个 patch 格式化为 mbox message，包含 RFC 2822 headers、plain-text diffstat 和 unified diff。输出兼容 `git am`。

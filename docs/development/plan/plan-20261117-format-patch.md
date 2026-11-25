@@ -2934,7 +2934,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：普通补丁与封面信首行 mbox `From <oid> <date>` 的时间戳统一为 Git 固定 `Mon Sep 17 00:00:00 2001`；补丁用该提交完整 oid，封面信用系列末个提交 oid，`--zero-commit` 按哈希长度补零；补丁 `Date:` 仍取作者时间。AC1–AC4 由 `format_patch_test::mbox_envelope_fixed_2001_timestamp` 覆盖（固定信封、zero-commit、封面信封、`libra am` 拆分应用两封），AC5 由 `compat_format_patch_mail_roundtrip::fixed_envelope_mbox_applies_with_git_am` 覆盖（真实 `git am` 应用）；`format_patch_test` 138/138、`compat_format_patch_mail_roundtrip` 全绿；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 将普通补丁与封面信首行 mbox `"From <oid> ..."` 分隔符的时间戳统一为 Git 固定的 `Mon Sep 17 00:00:00 2001`（封面信信封按 Git 使用系列末个提交的 oid，`git show 6de20f6092:builtin/log.c` 第 1403、1416 行 `log_write_email_headers(rev, head, …)`；`--zero-commit` 时为全零）。#893 第 3 项（补丁 `Date:` 取作者时间与作者时区）由自本卡拆出的 `FPG-59` 承接。夹具为两补丁系列（标题互不相同）；AC4、AC5 对 AC1 的同一 `-2 --stdout` mbox 分别在独立的临时接收仓库中应用。
 

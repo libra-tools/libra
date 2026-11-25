@@ -833,6 +833,8 @@ async fn format_patch_body(
 
     // ---- "From " mbox envelope ----
     let ts = timestamp_from_commit(commit);
+    // Git's fixed mbox separator timestamp (`builtin/log.c`).
+    const MBOX_FIXED_DATE: &str = "Mon Sep 17 00:00:00 2001";
     // `--zero-commit` zeroes only this envelope hash (matching its hex length),
     // leaving the rest of the patch untouched, like `git format-patch`.
     let envelope_hash = if args.zero_commit {
@@ -840,11 +842,7 @@ async fn format_patch_body(
     } else {
         commit.id.to_string()
     };
-    out.push_str(&format!(
-        "From {} {}\n",
-        envelope_hash,
-        ts.format("%a %b %e %H:%M:%S %Y")
-    ));
+    out.push_str(&format!("From {} {MBOX_FIXED_DATE}\n", envelope_hash));
 
     // ---- From: ----
     // The header shows the `--from` identity when given (else the commit
@@ -1410,11 +1408,20 @@ fn format_cover_letter(
 
     let mut out = String::new();
 
-    // "From " envelope
-    out.push_str(&format!(
-        "From 0000000000000000000000000000000000000000 {}\n",
-        now.format("%a %b %e %H:%M:%S %Y")
-    ));
+    // "From " envelope: Git uses the series' last commit oid and the fixed
+    // separator timestamp; `--zero-commit` zeroes that hash.
+    const MBOX_FIXED_DATE: &str = "Mon Sep 17 00:00:00 2001";
+    let envelope_hash = commits.last().map_or_else(
+        || "0".repeat(40),
+        |commit| {
+            if args.zero_commit {
+                "0".repeat(commit.id.to_string().len())
+            } else {
+                commit.id.to_string()
+            }
+        },
+    );
+    out.push_str(&format!("From {envelope_hash} {MBOX_FIXED_DATE}\n"));
 
     let version = args
         .reroll_count
