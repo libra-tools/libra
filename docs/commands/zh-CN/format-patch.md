@@ -51,6 +51,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--base <COMMIT>` | | 记录 `base-commit:` trailer（以及 base 与 series 之间每个非 merge commit 的 `prerequisite-patch-id:` 行，按 oldest-first），使 `git am --base` 可验证 series 可应用。Trailer 位于最后一个 patch，或 `--cover-letter` 下位于 cover letter。Base 必须是 series 的祖先（否则退出 128）。不支持 `--base=auto`（退出 129）。文本 diff 的 patch-id 匹配 `git patch-id --stable`；**binary-file prerequisites 不保证匹配 Git** | off |
 | `--full-index` | | 在 diff index header 行中显示完整 object IDs | false |
 | `-U <N>`, `--unified=<N>` | | 生成 hunk 时使用 `N` 行上下文（Git `-U<n>` / `--unified=<n>`）；默认 3 | 3 |
+| `--full-diff` | | 为 Git 兼容而接受；Libra 此处不接受 `-- <path>` pathspec，因此无 pathspec 时输出不变 | false |
 | `--minimal` | | 请求最小 Myers edit script；Libra 默认 Myers backend 已保证最短脚本，因此输出与默认相同 | false |
 | `--histogram` | | 使用 Histogram diff algorithm 生成文本 hunks | false |
 | `--ignore-if-in-upstream` | | 抑制 stable patch-id 已出现在 range 排除侧的 commits | false |

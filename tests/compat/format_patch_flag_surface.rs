@@ -52,6 +52,7 @@ fn format_patch_help_lists_expected_flags() {
         "--signoff",
         "--no-signoff",
         "--full-index",
+        "--full-diff",
         "--minimal",
         "--histogram",
         "--numstat",

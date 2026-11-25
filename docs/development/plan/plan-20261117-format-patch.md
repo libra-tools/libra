@@ -4412,7 +4412,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增可见 `--full-diff`，`FormatPatchArgs.full_diff` 仅被接受；Libra `format-patch` 不接受 `-- <path>` pathspec，故无 pathspec 时输出与不带该 flag 逐字节相同（与 Git 同语义）。AC1 由 `format_patch_test::full_diff_accepted_without_pathspec` 覆盖，`compat_format_patch_flag_surface` 的 help 必列清单已加入 `--full-diff`；`format_patch_test` 135/135、`compat_format_patch_mail_roundtrip` 13/13。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-22` 拆出的独立轴：`FormatPatchArgs` 新增 `--full-diff` 并按 Git 接受（现行以 clap `unexpected argument` 拒绝）；Libra `format-patch` 不接受 `-- <path>` pathspec，Git 在无 pathspec 时该选项不改变输出，故接受后输出与不带该 flag 时相同；新增可见 flag 同卡加入 `tests/compat/format_patch_flag_surface.rs` 必列清单。
 

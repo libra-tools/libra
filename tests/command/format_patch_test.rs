@@ -3154,3 +3154,38 @@ fn unified_context_lines() {
         );
     }
 }
+
+/// FPG-61 AC1: `--full-diff` is accepted and, without a pathspec, leaves the
+/// output byte-identical.
+#[test]
+fn full_diff_accepted_without_pathspec() {
+    let repo = repo_with_commits(2);
+    let p = repo.path();
+    let base = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&base, "baseline format-patch");
+    let with_full = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--full-diff",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&with_full, "AC1 --full-diff accepted");
+    assert_eq!(
+        with_full.stdout, base.stdout,
+        "AC1 byte-identical without pathspec"
+    );
+}

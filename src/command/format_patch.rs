@@ -263,6 +263,11 @@ pub struct FormatPatchArgs {
     #[arg(short = 'U', long = "unified", value_name = "N")]
     pub unified: Option<usize>,
 
+    /// Show the full diff of each commit (accepted; without a pathspec Git's
+    /// output is unchanged, and Libra accepts no `-- <path>` pathspec here).
+    #[arg(long = "full-diff")]
+    pub full_diff: bool,
+
     /// Spend extra time finding the smallest Myers diff. Libra's default Myers
     /// backend already guarantees a shortest edit script, so this is output-
     /// equivalent to the default.
