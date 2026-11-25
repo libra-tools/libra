@@ -1597,12 +1597,17 @@ fn base_auto_is_rejected() {
         &["format-patch", "--base=auto", "--stdout", "HEAD~1..HEAD"],
         repo.path(),
     );
+    // Without branch tracking `--base=auto` cannot infer the upstream.
     assert_eq!(
         out.status.code(),
-        Some(129),
-        "--base=auto is a usage error: {}",
+        Some(128),
+        "missing upstream: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("failed to get upstream"), "{stderr}");
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(out.stdout.is_empty());
 }
 
 #[test]
@@ -6434,4 +6439,335 @@ fn revision_range_caret_exclusion() {
     assert_eq!(subjects(&libra), subjects(&git), "AC6 single revision");
     let (libra, git) = run_case("AC7", &["rebuild-1~2..rebuild-1"]);
     assert_eq!(subjects(&libra), subjects(&git), "AC7 a~n..b");
+}
+
+/// FPG-17: `--base=auto` resolves the unique merge base between the branch's
+/// upstream and the whole revision list (#894).
+#[test]
+fn base_auto_cli() {
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+    fn import(git_dir: &std::path::Path, parent: &std::path::Path) -> std::path::PathBuf {
+        let target = parent.join("libra");
+        fs::create_dir_all(&target).unwrap();
+        let out = run_libra_command(
+            &[
+                "init",
+                "--from-git-repository",
+                git_dir.to_str().unwrap(),
+                ".",
+            ],
+            &target,
+        );
+        assert_cli_success(&out, "import");
+        target
+    }
+    fn configure(lp: &std::path::Path, upstream_oid: &str) {
+        assert_cli_success(
+            &run_libra_command(&["branch", "upstream", upstream_oid], lp),
+            "branch upstream",
+        );
+        let branch = String::from_utf8_lossy(
+            &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], lp).stdout,
+        )
+        .trim()
+        .to_string();
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "set", &format!("branch.{branch}.remote"), "."],
+                lp,
+            ),
+            "remote",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "config",
+                    "set",
+                    &format!("branch.{branch}.merge"),
+                    "refs/heads/upstream",
+                ],
+                lp,
+            ),
+            "merge",
+        );
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "user.name", "T"], lp),
+            "name",
+        );
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "user.email", "t@t"], lp),
+            "email",
+        );
+    }
+    let base_block = |stdout: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter(|line| {
+                line.starts_with("base-commit:") || line.starts_with("prerequisite-patch-id:")
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let stderr_error = |label: &str, out: &std::process::Output, phrase: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"),
+            "{label}: {stderr}"
+        );
+        assert!(
+            stderr.contains(phrase),
+            "{label}: missing {phrase:?}: {stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{label} stdout: {out:?}");
+    };
+
+    // AC1/AC2: upstream advanced after the fork; auto picks the old merge base
+    // and records the intervening prerequisite commit.
+    let g1 = tempdir().unwrap();
+    let gp = g1.path();
+    git(gp, &["init", "-q", "-b", "main", "."]);
+    git(gp, &["config", "user.name", "T"]);
+    git(gp, &["config", "user.email", "t@t"]);
+    fs::write(gp.join("f"), "base\n").unwrap();
+    git(gp, &["add", "f"]);
+    git(gp, &["commit", "-q", "-m", "base"]);
+    git(gp, &["branch", "upstream"]);
+    fs::write(gp.join("f"), "prereq\n").unwrap();
+    git(gp, &["add", "f"]);
+    git(gp, &["commit", "-q", "-m", "prereq"]);
+    for subject in ["m1", "m2"] {
+        fs::write(gp.join("f"), format!("{subject}\n")).unwrap();
+        git(gp, &["add", "f"]);
+        git(gp, &["commit", "-q", "-m", subject]);
+    }
+    git(gp, &["checkout", "-q", "upstream"]);
+    fs::write(gp.join("u"), "u2\n").unwrap();
+    git(gp, &["add", "u"]);
+    git(gp, &["commit", "-q", "-m", "u2"]);
+    let upstream_oid = git(gp, &["rev-parse", "HEAD"]);
+    git(gp, &["checkout", "-q", "main"]);
+    git(gp, &["config", "branch.main.remote", "."]);
+    git(gp, &["config", "branch.main.merge", "refs/heads/upstream"]);
+    let parent = tempdir().unwrap();
+    let lp = import(gp, parent.path());
+    configure(&lp, &upstream_oid);
+    let libra = run_libra_command(
+        &[
+            "format-patch",
+            "--base=auto",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&libra, "AC1 auto");
+    let git_out = Command::new("git")
+        .args([
+            "format-patch",
+            "--base=auto",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .unwrap();
+    assert!(git_out.status.success(), "{git_out:?}");
+    assert_eq!(
+        base_block(&libra.stdout),
+        base_block(&git_out.stdout),
+        "AC1/AC2"
+    );
+    assert_eq!(
+        base_block(&libra.stdout)
+            .iter()
+            .filter(|line| line.starts_with("base-commit:"))
+            .count(),
+        1
+    );
+    assert!(
+        base_block(&libra.stdout)
+            .iter()
+            .any(|line| line.starts_with("prerequisite-patch-id:"))
+    );
+
+    // AC3: no upstream tracking fails.
+    let no_up = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init", "."], no_up.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], no_up.path()),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], no_up.path()),
+        "email",
+    );
+    fs::write(no_up.path().join("f"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], no_up.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "one", "--no-verify"], no_up.path()),
+        "commit",
+    );
+    let out = run_libra_command(
+        &["format-patch", "--base=auto", "-1", "--stdout"],
+        no_up.path(),
+    );
+    assert!(!out.status.success());
+    stderr_error("AC3", &out, "failed to get upstream");
+
+    // AC4: criss-cross merge bases are ambiguous.
+    let g4 = tempdir().unwrap();
+    let g4p = g4.path();
+    git(g4p, &["init", "-q", "-b", "main", "."]);
+    git(g4p, &["config", "user.name", "T"]);
+    git(g4p, &["config", "user.email", "t@t"]);
+    fs::write(g4p.join("f"), "base\n").unwrap();
+    git(g4p, &["add", "f"]);
+    git(g4p, &["commit", "-q", "-m", "base"]);
+    git(g4p, &["branch", "a"]);
+    git(g4p, &["branch", "b"]);
+    git(g4p, &["checkout", "-q", "a"]);
+    fs::write(g4p.join("a"), "a\n").unwrap();
+    git(g4p, &["add", "a"]);
+    git(g4p, &["commit", "-q", "-m", "a"]);
+    let a1_oid = git(g4p, &["rev-parse", "HEAD"]);
+    git(g4p, &["checkout", "-q", "b"]);
+    fs::write(g4p.join("b"), "b\n").unwrap();
+    git(g4p, &["add", "b"]);
+    git(g4p, &["commit", "-q", "-m", "b"]);
+    git(g4p, &["checkout", "-q", "a"]);
+    git(g4p, &["merge", "-q", "--no-edit", "b"]);
+    git(g4p, &["checkout", "-q", "b"]);
+    git(g4p, &["merge", "-q", "--no-edit", &a1_oid]);
+    // Advance both sides past their merge commits; the merge bases of the two
+    // tips remain the criss-cross pair.
+    git(g4p, &["checkout", "-q", "a"]);
+    fs::write(g4p.join("a2"), "a2\n").unwrap();
+    git(g4p, &["add", "a2"]);
+    git(g4p, &["commit", "-q", "-m", "a2"]);
+    let a2_oid = git(g4p, &["rev-parse", "HEAD"]);
+    git(g4p, &["checkout", "-q", "b"]);
+    fs::write(g4p.join("b2"), "b2\n").unwrap();
+    git(g4p, &["add", "b2"]);
+    git(g4p, &["commit", "-q", "-m", "b2"]);
+    let crisscross_upstream = git(g4p, &["rev-parse", "HEAD"]);
+    git(g4p, &["checkout", "-q", "a"]);
+    let parent4 = tempdir().unwrap();
+    let lp4 = import(g4p, parent4.path());
+    configure(&lp4, &crisscross_upstream);
+    let out = run_libra_command(
+        &["format-patch", "--base=auto", "-1", "--stdout", &a2_oid],
+        &lp4,
+    );
+    assert!(!out.status.success(), "AC4 should fail: {out:?}");
+    stderr_error("AC4", &out, "exact merge base");
+
+    // AC6: the whole-list merge base must be an ancestor of every tip.
+    let g6 = tempdir().unwrap();
+    let g6p = g6.path();
+    git(g6p, &["init", "-q", "-b", "main", "."]);
+    git(g6p, &["config", "user.name", "T"]);
+    git(g6p, &["config", "user.email", "t@t"]);
+    fs::write(g6p.join("root"), "root\n").unwrap();
+    git(g6p, &["add", "root"]);
+    git(g6p, &["commit", "-q", "-m", "A"]);
+    let a_oid = git(g6p, &["rev-parse", "HEAD"]);
+    fs::write(g6p.join("b"), "b\n").unwrap();
+    git(g6p, &["add", "b"]);
+    git(g6p, &["commit", "-q", "-m", "B"]);
+    let b_oid = git(g6p, &["rev-parse", "HEAD"]);
+    let mut side6 = Vec::new();
+    for (branch, from) in [
+        ("side1", a_oid.as_str()),
+        ("side3", a_oid.as_str()),
+        ("side2", b_oid.as_str()),
+    ] {
+        git(g6p, &["checkout", "-q", "-b", branch, from]);
+        fs::write(g6p.join(branch), format!("{branch}\n")).unwrap();
+        git(g6p, &["add", branch]);
+        git(g6p, &["commit", "-q", "-m", branch]);
+        side6.push((branch, git(g6p, &["rev-parse", "HEAD"])));
+    }
+    git(g6p, &["checkout", "-q", "main"]);
+    let parent6 = tempdir().unwrap();
+    let lp6 = import(g6p, parent6.path());
+    configure(&lp6, &b_oid);
+    for (branch, oid) in &side6 {
+        let _ = run_libra_command(&["branch", branch, oid], &lp6);
+    }
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--base=auto",
+            "--stdout",
+            &format!("^{b_oid}"),
+            "side1",
+            "side2",
+            "side3",
+        ],
+        &lp6,
+    );
+    assert!(!out.status.success(), "AC6 should fail: {out:?}");
+    stderr_error("AC6", &out, "should be the ancestor of revision list");
+
+    // AC7: the merge base itself is inside the selected revision list.
+    let g7 = tempdir().unwrap();
+    let g7p = g7.path();
+    git(g7p, &["init", "-q", "-b", "main", "."]);
+    git(g7p, &["config", "user.name", "T"]);
+    git(g7p, &["config", "user.email", "t@t"]);
+    fs::write(g7p.join("root"), "root\n").unwrap();
+    git(g7p, &["add", "root"]);
+    git(g7p, &["commit", "-q", "-m", "A"]);
+    let a7 = git(g7p, &["rev-parse", "HEAD"]);
+    fs::write(g7p.join("u"), "u\n").unwrap();
+    git(g7p, &["add", "u"]);
+    git(g7p, &["commit", "-q", "-m", "U"]);
+    let u7 = git(g7p, &["rev-parse", "HEAD"]);
+    let mut side7 = Vec::new();
+    for branch in ["side1", "side2"] {
+        git(g7p, &["checkout", "-q", "-b", branch, &u7]);
+        fs::write(g7p.join(branch), format!("{branch}\n")).unwrap();
+        git(g7p, &["add", branch]);
+        git(g7p, &["commit", "-q", "-m", branch]);
+        side7.push((branch, git(g7p, &["rev-parse", "HEAD"])));
+    }
+    let parent7 = tempdir().unwrap();
+    let lp7 = import(g7p, parent7.path());
+    configure(&lp7, &u7);
+    for (branch, oid) in &side7 {
+        let _ = run_libra_command(&["branch", branch, oid], &lp7);
+    }
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--base=auto",
+            "--stdout",
+            &format!("^{a7}"),
+            "side1",
+            "side2",
+        ],
+        &lp7,
+    );
+    assert!(!out.status.success(), "AC7 should fail: {out:?}");
+    stderr_error("AC7", &out, "shouldn't be in revision list");
 }

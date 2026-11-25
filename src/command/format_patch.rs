@@ -1434,6 +1434,133 @@ async fn git_patch_id_for_commit(commit: &Commit) -> Result<String, CliError> {
 /// between the base and the parent of the first patch, oldest-first — each
 /// rendered as its Git patch-id. Returns a usage/fatal error for a non-ancestor
 /// base or the unsupported `auto` form, matching Git's diagnostics.
+/// Resolve `--base=auto`: the unique merge base between the current branch's
+/// upstream and every positive revision. Each revision's own merge base with
+/// the upstream is reduced so that criss-cross/ambiguous lists fail instead of
+/// silently picking a less specific ancestor.
+async fn auto_base_commit(
+    args: &FormatPatchArgs,
+    commits: &[Commit],
+) -> Result<ObjectHash, CliError> {
+    use crate::internal::{branch::Branch, config::ConfigKv, head::Head};
+
+    let branch_name = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => {
+            return Err(CliError::fatal(
+                "failed to get upstream, please specify the base commit with --base=<commit>",
+            )
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::CliInvalidTarget));
+        }
+    };
+    let Some(branch_config) = ConfigKv::branch_config(&branch_name)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to read branch config: {error}")))?
+    else {
+        return Err(CliError::fatal(
+            "failed to get upstream, please specify the base commit with --base=<commit>",
+        )
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::CliInvalidTarget));
+    };
+    let tracking = if branch_config.remote == "." {
+        Branch::find_branch_result(&branch_config.merge, None)
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to resolve upstream: {error}")))?
+    } else {
+        let full = format!(
+            "refs/remotes/{}/{}",
+            branch_config.remote, branch_config.merge
+        );
+        Branch::find_branch_result(&full, Some(&branch_config.remote))
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to resolve upstream: {error}")))?
+    };
+    let Some(tracking) = tracking else {
+        return Err(CliError::fatal(
+            "failed to get upstream, please specify the base commit with --base=<commit>",
+        )
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::CliInvalidTarget));
+    };
+    let upstream = tracking.commit;
+
+    let mut tips = Vec::new();
+    for spec in &args.revisions {
+        if let Some(rest) = spec.strip_prefix('^') {
+            let _ = rest;
+            continue;
+        }
+        let positive = spec
+            .split_once("..")
+            .map_or(spec.as_str(), |(_, right)| right);
+        let positive = if positive.is_empty() {
+            "HEAD"
+        } else {
+            positive
+        };
+        tips.push(resolve_single_rev(positive).await?);
+    }
+    if tips.is_empty() {
+        tips.push(resolve_single_rev("HEAD").await?);
+    }
+
+    let mut bases = Vec::new();
+    for tip in &tips {
+        let pair = crate::internal::merge_base::merge_bases(&upstream, tip)
+            .map_err(|error| CliError::fatal(format!("failed to find merge base: {error}")))?;
+        if pair.len() != 1 {
+            return Err(CliError::fatal("could not find exact merge base")
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::CliInvalidTarget));
+        }
+        bases.push(pair[0]);
+    }
+    // Keep only the most specific bases: drop any base that is an ancestor of
+    // another candidate. More than one survivor means the list is ambiguous.
+    bases.sort_by_key(|id| id.to_string());
+    bases.dedup();
+    let mut reduced = Vec::new();
+    for candidate in &bases {
+        let mut dominated = false;
+        for other in &bases {
+            if candidate != other
+                && crate::internal::merge_base::is_ancestor(candidate, other).unwrap_or(false)
+            {
+                dominated = true;
+                break;
+            }
+        }
+        if !dominated {
+            reduced.push(*candidate);
+        }
+    }
+    if reduced.len() != 1 {
+        return Err(CliError::fatal("could not find exact merge base")
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::CliInvalidTarget));
+    }
+    let base = reduced[0];
+    for tip in &tips {
+        if !crate::internal::merge_base::is_ancestor(&base, tip)
+            .map_err(|error| CliError::fatal(format!("failed to check merge base: {error}")))?
+        {
+            return Err(
+                CliError::fatal("base commit should be the ancestor of revision list")
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::CliInvalidTarget),
+            );
+        }
+    }
+    if commits.iter().any(|commit| commit.id == base) {
+        return Err(CliError::fatal("base commit shouldn't be in revision list")
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::CliInvalidTarget));
+    }
+    Ok(base)
+}
+
 async fn build_base_block(
     args: &FormatPatchArgs,
     commits: &[Commit],
@@ -1445,17 +1572,11 @@ async fn build_base_block(
         return Ok(None);
     };
 
-    // `--base=auto` infers the base from the upstream of the range; that requires
-    // upstream tracking Libra does not resolve here, so it is rejected (matching
-    // Git, which also fails when it cannot determine the upstream).
-    if base_spec == "auto" {
-        return Err(CliError::command_usage(
-            "--base=auto is not supported; specify the base commit explicitly with \
-             --base=<commit>",
-        ));
-    }
-
-    let base = resolve_single_rev(base_spec).await?;
+    let base = if base_spec == "auto" {
+        auto_base_commit(args, commits).await?
+    } else {
+        resolve_single_rev(base_spec).await?
+    };
 
     // The series applies on top of the first patch's parent.
     let Some(series_parent) = commits[0].parent_commit_ids.first().copied() else {

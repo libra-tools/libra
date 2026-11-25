@@ -3145,7 +3145,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：实现 `--base=auto`——上游跟踪 ref 与每个正向修订的 merge base 归约后要求唯一；无上游/歧义/非祖先/base 在列表内分别以 `LBR-CLI-003`/128 失败；显式 `--base` 与首封邮件位置不变。AC1–AC7 由 `format_patch_test::base_auto_cli`（同源 Git 夹具逐字、无上游、criss-cross、whole-list 祖先、base 在列表内）与既有 `base_records_base_commit_and_prerequisite_patch_ids` 覆盖；`base_auto_is_rejected` 已迁移；`format_patch_test` 161/161、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.useAutoBase` 由 `FPG-43` 承接。
 
 **Description:** 实现 `--base=auto`：按 Git `get_base_commit`（`git show 6de20f6092:builtin/log.c` 第 1702 行起）取当前分支上游跟踪分支与**整个修订列表**的唯一 merge-base（不唯一即 `could not find exact merge base`），再要求修订列表两两求得的公共祖先唯一（否则 `failed to find exact merge base`）、base 是其祖先（否则 `base commit should be the ancestor of revision list`）且不在修订列表内（否则 `base commit shouldn't be in revision list`），输出 `base-commit:` / `prerequisite-patch-id:`；无上游时失败；显式 `--base=<commit>` 不变。多个正向 revision 由 `FPG-15` 先行支持。`format.useAutoBase` 由自本卡拆出的 `FPG-43` 承接。 base 区块只放在第一封邮件（对显式 `--base` 与 `--base=auto` 相同）由自本卡拆出、先于本卡执行的 `FPG-64` 承接。
 
