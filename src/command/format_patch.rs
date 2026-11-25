@@ -461,6 +461,9 @@ enum FormatPatchError {
     #[error("invalid ident line: {0}")]
     InvalidFromIdent(String),
 
+    #[error("invalid cover from description mode '{0}'")]
+    InvalidCoverMode(String),
+
     #[error("failed to write patch file '{}': {detail}", .path.display())]
     OutputWrite { path: PathBuf, detail: String },
 
@@ -486,6 +489,9 @@ impl From<FormatPatchError> for CliError {
                 .with_stable_code(StableErrorCode::CliInvalidTarget),
             FormatPatchError::InvalidFromIdent(_) => CliError::failure(err.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments),
+            FormatPatchError::InvalidCoverMode(_) => {
+                CliError::fatal(err.to_string()).with_stable_code(StableErrorCode::CliInvalidTarget)
+            }
             FormatPatchError::IdentityMissing(_) => CliError::fatal(err.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint(
@@ -2776,6 +2782,17 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
             if enabled {
                 args.base = Some("auto".to_string());
             }
+        }
+    }
+    // Git validates `format.coverFromDescription` in the config callback, even
+    // when the CLI supplies a valid mode and even without a cover letter.
+    if let Some(value) = read_format_config("format.coverFromDescription").await? {
+        let trimmed = value.trim();
+        if !matches!(trimmed, "default" | "none" | "message" | "subject" | "auto") {
+            return Err(FormatPatchError::InvalidCoverMode(trimmed.to_string()));
+        }
+        if args.cover_from_description.is_none() {
+            args.cover_from_description = Some(trimmed.to_string());
         }
     }
     if args.commit_list_format.is_none()

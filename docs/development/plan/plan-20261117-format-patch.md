@@ -3514,7 +3514,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：严格级联读取 `format.coverFromDescription`，配置回调阶段校验；非法值即使 CLI 合法/无封面信也报 `invalid cover from description mode` + `LBR-CLI-003`；合法配置作为默认模式，CLI 覆盖。AC1–AC8 由 `format_patch_test::format_cover_from_description_config` 覆盖（五模式与 CLI 逐字节、auto 阈值、CLI none 覆盖、无封面非法配置、合法 CLI 不掩盖非法配置）；`format_patch_test` 166/166、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-25` 拆出的独立轴：经 `read_format_config` 严格级联读取 `format.coverFromDescription`（与 CLI 同一取值集），非法值在读取配置时即拒绝并报 `invalid cover from description mode`（`LBR-CLI-003`；不论命令行是否给出合法 `--cover-from-description`、是否启用封面信，`git show 6de20f6092:builtin/log.c` 第 1101–1103 行在配置回调中 `die`，先于参数解析），CLI `--cover-from-description` 覆盖配置。
 

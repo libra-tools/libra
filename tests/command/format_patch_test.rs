@@ -7410,3 +7410,152 @@ fn cover_from_description() {
     );
     assert!(invalid.stdout.is_empty());
 }
+
+/// FPG-33: `format.coverFromDescription` is validated on read, supplies the
+/// default mode, and is overridden by the CLI (#906).
+#[test]
+fn format_cover_from_description_config() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "branch.main.description",
+                "Short subject\n\nbody one\nbody two",
+            ],
+            p,
+        ),
+        "desc",
+    );
+    let segment = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover.find("Subject:").expect("subject");
+        let tail = &cover[start..];
+        let end = tail
+            .find("\nT (")
+            .or_else(|| tail.find("\n\nT ("))
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+    let cli = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, "cli");
+        segment(&out.stdout)
+    };
+    let config_run = |value: &str, flags: &[&str]| -> String {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "format.coverFromDescription", value], p),
+            "config",
+        );
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, "config run");
+        segment(&out.stdout)
+    };
+    let unset = || {
+        let _ = run_libra_command(&["config", "unset", "format.coverFromDescription"], p);
+    };
+
+    assert_eq!(
+        config_run("subject", &[]),
+        cli(&["--cover-from-description=subject"]),
+        "AC1 subject"
+    );
+    assert_eq!(
+        config_run("default", &[]),
+        cli(&["--cover-from-description=default"]),
+        "AC2 default"
+    );
+    let auto = config_run("auto", &[]);
+    assert_eq!(auto, cli(&["--cover-from-description=auto"]), "AC3 auto");
+    assert!(
+        auto.contains("Short subject") && !auto.contains("BLURB"),
+        "AC3 threshold"
+    );
+    assert_eq!(
+        config_run("none", &[]),
+        cli(&["--cover-from-description=none"]),
+        "AC4 none"
+    );
+    assert_eq!(
+        config_run("message", &[]),
+        cli(&["--cover-from-description=message"]),
+        "AC5 message"
+    );
+    // AC7: CLI none wins over the configured subject.
+    assert_eq!(
+        config_run("subject", &["--cover-from-description=none"]),
+        cli(&["--cover-from-description=none"]),
+        "AC7 CLI wins"
+    );
+    unset();
+
+    // AC6: an invalid configured mode is rejected without a cover letter.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "format.coverFromDescription", "garbage"],
+            p,
+        ),
+        "garbage config",
+    );
+    let invalid = run_libra_command(&["format-patch", "-1", "--stdout"], p);
+    assert!(!invalid.status.success(), "AC6");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(
+        stderr.contains("invalid cover from description mode"),
+        "{stderr}"
+    );
+    assert!(invalid.stdout.is_empty());
+    // AC8: a valid CLI mode does not mask the invalid config.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--cover-from-description=subject",
+            "-2",
+            "--stdout",
+        ],
+        p,
+    );
+    assert!(!invalid.status.success(), "AC8");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(
+        stderr.contains("invalid cover from description mode"),
+        "{stderr}"
+    );
+    assert!(invalid.stdout.is_empty());
+    unset();
+}
