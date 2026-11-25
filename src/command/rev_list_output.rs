@@ -124,6 +124,9 @@ pub(super) struct RevListOutput {
     /// rows. The `commits`/`entries` fields are already reversed upstream; this flag
     /// lets `human_lines` place boundary rows on the correct end.
     pub(super) reverse: bool,
+    /// `--objects-edge`: Git emits the `-<oid>` boundary lines before the
+    /// commit lines (unlike plain `--boundary`).
+    pub(super) objects_edge: bool,
     pub(super) first_parent: bool,
     pub(super) author: Option<String>,
     pub(super) committer: Option<String>,
@@ -184,6 +187,11 @@ impl RevListOutput {
             boundary.reverse();
             boundary.extend(listed);
             boundary
+        } else if self.objects_edge {
+            // `--objects-edge` places the edge markers before the commit rows.
+            let mut lines = boundary;
+            lines.extend(listed);
+            lines
         } else {
             let mut lines = listed;
             lines.extend(boundary);
