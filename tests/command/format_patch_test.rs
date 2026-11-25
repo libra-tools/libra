@@ -4113,3 +4113,195 @@ fn relative_outside_and_missing_prefix() {
         "AC2 missing prefix"
     );
 }
+
+/// FPG-12: `format.coverLetter` (true/false/auto) and CLI overrides, plus the
+/// implicit cover letter requested by `--commit-list-format` (#900, #909).
+#[test]
+fn format_cover_letter_auto_config() {
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+    }
+
+    let repo = tempdir().expect("libra");
+    let lp = repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let config = |value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "format.coverLetter", value], lp),
+            "config",
+        );
+    };
+    let names = |dir: &str| -> BTreeSet<String> {
+        fs::read_dir(lp.join(dir))
+            .expect("output dir")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect()
+    };
+    let patch = |dir: &str, flags: &[&str]| {
+        let mut args = vec![
+            "format-patch",
+            "-o",
+            dir,
+            "HEAD~2",
+            "--no-thread",
+            "--no-signature",
+        ];
+        args.extend_from_slice(flags);
+        let out = run_libra_command(&args, lp);
+        assert_cli_success(&out, "format-patch");
+    };
+    let cover = "0000-cover-letter.patch".to_string();
+    let two_patches = BTreeSet::from([
+        cover.clone(),
+        "0001-subject-2.patch".to_string(),
+        "0002-subject-3.patch".to_string(),
+    ]);
+
+    // AC1: format.coverLetter=true.
+    config("true");
+    patch("d", &[]);
+    assert_eq!(names("d"), two_patches, "AC1 true writes cover");
+    // AC2: auto with two commits writes a cover.
+    config("auto");
+    patch("a2", &[]);
+    assert!(names("a2").contains(&cover), "AC2 auto two patches");
+    // AC3: auto with one commit does not.
+    let one = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "a1",
+            "HEAD~1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&one, "AC3");
+    assert_eq!(names("a1").len(), 1, "AC3 auto single patch");
+    // AC4: --no-cover-letter overrides format.coverLetter=true.
+    config("true");
+    patch("d2", &["--no-cover-letter"]);
+    assert!(!names("d2").contains(&cover), "AC4 no-cover-letter");
+    // AC8: --cover-letter overrides format.coverLetter=false.
+    config("false");
+    patch("d3", &["--cover-letter"]);
+    assert_eq!(names("d3"), two_patches, "AC8 CLI enables cover");
+
+    // AC5: --commit-list-format=modern implies a cover for one commit.
+    let modern = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p",
+            "HEAD~1",
+            "--no-thread",
+            "--no-signature",
+            "--commit-list-format=modern",
+        ],
+        lp,
+    );
+    assert_cli_success(&modern, "AC5");
+    let modern_cover = fs::read_to_string(lp.join("p/0000-cover-letter.patch")).unwrap();
+    assert!(
+        modern_cover.lines().any(|line| line == "[1/1] subject 3"),
+        "AC5 modern list: {modern_cover}"
+    );
+    // AC7: --no-cover-letter overrides the implicit modern cover.
+    let suppressed = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "mn",
+            "HEAD~1",
+            "--no-thread",
+            "--no-signature",
+            "--commit-list-format=modern",
+            "--no-cover-letter",
+        ],
+        lp,
+    );
+    assert_cli_success(&suppressed, "AC7");
+    assert_eq!(names("mn").len(), 1, "AC7 no implicit cover");
+
+    // AC6: shortlog cover list matches Git's golden list segment.
+    let shortlog = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p2",
+            "HEAD~1",
+            "--no-thread",
+            "--no-signature",
+            "--commit-list-format=shortlog",
+        ],
+        lp,
+    );
+    assert_cli_success(&shortlog, "AC6");
+    let git_cover_out = Command::new("git")
+        .args([
+            "format-patch",
+            "-o",
+            "p",
+            "HEAD~1",
+            "--no-thread",
+            "--no-signature",
+            "--commit-list-format=shortlog",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_cover_out.status.success(), "{git_cover_out:?}");
+    let git_cover = fs::read_to_string(gp.join("p/0000-cover-letter.patch")).unwrap();
+    let libra_cover = fs::read_to_string(lp.join("p2/0000-cover-letter.patch")).unwrap();
+    let segment = |text: &str| -> String {
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        // Cover diffstat is out of scope for this card (FPG-13); compare the
+        // list segment ending at the first diffstat line.
+        let end = tail.find("\n f1 |").or_else(|| tail.find("\n f3 |"));
+        match end {
+            Some(end) => tail[..end].trim_end().to_string(),
+            None => tail.trim_end().to_string(),
+        }
+    };
+    assert_eq!(
+        segment(&libra_cover),
+        segment(&git_cover),
+        "AC6 shortlog cover list"
+    );
+}

@@ -42,13 +42,14 @@ body, and series metadata.
 | `--rfc[=<text>]` | | Prefix the subject with `RFC` (`[RFC PATCH]`); with a value, that text is used instead (`--rfc=WIP` → `[WIP PATCH]`). The value must be attached with `=` so a revision argument is never swallowed | off |
 | `--no-rfc` | | Cancel a preceding `--rfc` (last flag wins) | off |
 | `--filename-max-length <N>` | | Truncate output filenames to at most `N` bytes, counting the `0001-` prefix and the suffix; the stem may collapse to just the sequence number, matching Git's cut points | unlimited |
-| `--commit-list-format <FMT>` | | Cover-letter commit list. Default (or `short`) is Git's author-grouped shortlog (`Name (N):` + subjects wrapped at 72 columns); `modern` renders `[i/N] subject`; any other value is a pretty-format string supporting `%h`, `%H`, `%s`, `%an`, `%ae`, `%n` and `%%` (unsupported conversions fail with `'<fmt>' is not a valid format string`) | `short` |
+| `--commit-list-format <FMT>` | | Cover-letter commit list and an implicit cover letter (unless `--no-cover-letter`). Default (or `short`/`shortlog`) is Git's author-grouped shortlog (`Name (N):` + subjects wrapped at 72 columns); `modern` renders `[i/N] subject`; any other value is a pretty-format string supporting `%h`, `%H`, `%s`, `%an`, `%ae`, `%n` and `%%` (unsupported conversions fail with `'<fmt>' is not a valid format string`) | `short` |
 | `--relative[=<path>]` | | Restrict the series to a directory and strip that prefix from diffstat and patch paths. With a value, `<path>` is resolved from the repository root (unlike `libra diff --relative`, which resolves from the current directory); bare `--relative` uses the current directory. `diff.relative=true` applies the same view when the flag is absent; `--no-relative` restores repository-relative paths (last of `--relative`/`--no-relative` wins). A prefix that is missing inside the repository or escapes it (`../outside`) produces Git's empty patch body (headers and message only, no `---` separator/diffstat/diff), writes no files, and never prints the outside path | off |
 | `--all` (unsupported) | | Accepted only to name the gap: Libra's revision grammar has no all-refs selector; name branches explicitly (`main..topic`) | — |
 | `--no-base` | | Do not emit the `base-commit:` trailer, overriding `--base` (Libra has no `format.useAutoBase` config to reset) | off |
 | `--start-number <N>` | | Start numbering at `N` | 1 |
 | `--subject-prefix <PREFIX>` | | Use `PREFIX` instead of `PATCH` in the Subject: line | `PATCH` |
-| `--cover-letter` | | Generate a cover-letter template (`0000-cover-letter<suffix>`, or `0` under `--numbered-files`) | false |
+| `--cover-letter` | | Generate a cover-letter template (`0000-cover-letter<suffix>`, or `0` under `--numbered-files`). Overrides `format.coverLetter=false` | false |
+| `--no-cover-letter` | | Do not generate a cover letter; overrides `format.coverLetter` and the implicit cover letter requested by `--commit-list-format` (last of `--cover-letter`/`--no-cover-letter` wins) | — |
 | `--thread` | | Add `In-Reply-To` and `References` headers (default on) | true |
 | `--no-thread` | | Disable threading headers | false |
 | `--in-reply-to <MESSAGE_ID>` | | Make the first mail a reply to the given Message-ID | none |
@@ -184,7 +185,7 @@ The cover letter emits `MIME-Version`/`Content-Type`/`Content-Transfer-Encoding`
 headers only when at least one commit's raw object buffer contains non-ASCII
 bytes (Git's `make_cover_letter` rule); an all-ASCII series has no MIME headers.
 
-When `--cover-letter` is set, the list includes the cover letter as record
+`format.coverLetter=true|false|auto` supplies the default (`auto` = only for series with more than one patch); `--cover-letter`/`--no-cover-letter` override it, and `--commit-list-format` implies a cover letter unless `--no-cover-letter` is given. When `--cover-letter` is set, the list includes the cover letter as record
 number `0` before the commit patch records. Its filename is
 `0000-cover-letter` with the configured suffix (default `.patch`), or just `0`
 under `--numbered-files`.

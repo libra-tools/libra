@@ -175,8 +175,13 @@ pub struct FormatPatchArgs {
 
     /// Generate a cover-letter template before the actual patches (named
     /// `0000-cover-letter<suffix>`, or `0` under `--numbered-files`).
-    #[arg(long = "cover-letter")]
+    #[arg(long = "cover-letter", overrides_with = "no_cover_letter")]
     pub cover_letter: bool,
+
+    /// Do not generate a cover letter (overrides `format.coverLetter` and the
+    /// implicit cover letter requested by `--commit-list-format`).
+    #[arg(long = "no-cover-letter", overrides_with = "cover_letter")]
+    pub no_cover_letter: bool,
 
     /// Add In-Reply-To and References headers so mailers thread the series
     /// (default on).
@@ -540,6 +545,10 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     }
 
     validate_cli_args(&args)?;
+    // CLI `--cover-letter`/`--no-cover-letter` override both the config and the
+    // implicit cover letter requested by `--commit-list-format`.
+    let cover_cli = args.cover_letter;
+    let no_cover_cli = args.no_cover_letter;
     // Git validates `--from=<ident>` before revision parsing and the empty-series
     // check, so a malformed identity wins over an empty range.
     if let Some(Some(ident)) = args.from.as_ref()
@@ -588,6 +597,27 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
 
     // 2. Resolve revision range
     let commits = resolve_range_commits(&args).await?;
+    if !cover_cli
+        && !no_cover_cli
+        && let Some(value) = read_format_config("format.coverLetter").await?
+    {
+        let trimmed = value.trim();
+        args.cover_letter = if trimmed.eq_ignore_ascii_case("auto") {
+            commits.len() > 1
+        } else {
+            crate::internal::config::parse_git_config_bool(trimmed).ok_or(
+                FormatPatchError::InvalidConfig {
+                    key: "format.coverLetter",
+                    value,
+                    expected: "true, false, or auto",
+                },
+            )?
+        };
+    }
+    if !no_cover_cli && args.commit_list_format.is_some() {
+        // `--commit-list-format` implies a cover letter (Git's `#909`).
+        args.cover_letter = true;
+    }
     if args.all_refs {
         return Err(CliError::failure(
             "format-patch --all is not supported: Libra's revision grammar does not expose the all-refs selector",
@@ -1646,7 +1676,7 @@ fn clean_subject(subject: &str, keep: bool) -> String {
 /// Build a safe filename slug from the commit subject.
 /// Render the cover letter's commit list the way Git does.
 ///
-/// * default / `--commit-list-format=short`: shortlog grouped by author, in
+/// * default / `--commit-list-format=short`/`shortlog`: grouped by author, in
 ///   first-appearance order, subjects wrapped at 72 columns with a 4-space
 ///   continuation indent.
 /// * `--commit-list-format=modern`: `[i/N] subject` per commit.
@@ -1655,7 +1685,7 @@ fn render_commit_list(args: &FormatPatchArgs, commits: &[Commit]) -> String {
     let format = args.commit_list_format.as_deref().unwrap_or("short");
     let mut out = String::new();
     match format {
-        "short" => {
+        "short" | "shortlog" => {
             // Group consecutive first-appearance authors, like `git shortlog`.
             let mut groups: Vec<(String, Vec<&Commit>)> = Vec::new();
             for commit in commits {

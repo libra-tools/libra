@@ -38,7 +38,8 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--no-base` | | 不输出 `base-commit:` 尾注，覆盖 `--base`（Libra 没有 `format.useAutoBase` 配置可重置） | 关闭 |
 | `--start-number <N>` | | 从 `N` 开始编号 | 1 |
 | `--subject-prefix <PREFIX>` | | 在 Subject: 行使用 `PREFIX` 而不是 `PATCH` | `PATCH` |
-| `--cover-letter` | | 生成 cover-letter 模板（`0000-cover-letter<suffix>`，或 `--numbered-files` 下的 `0`） | false |
+| `--cover-letter` | | 生成 cover-letter 模板（`0000-cover-letter<suffix>`，或 `--numbered-files` 下的 `0`） | false  覆盖 `format.coverLetter=false`；`format.coverLetter=true|false|auto` 提供默认值（`auto` 仅在多补丁系列生成），`--commit-list-format` 隐含封面信（`--no-cover-letter` 可关闭）。 |
+| `--no-cover-letter` | | 不生成封面信；覆盖 `format.coverLetter` 以及 `--commit-list-format` 隐含的封面信（与 `--cover-letter` 以最后者为准） | — |
 | `--thread` | | 添加 `In-Reply-To` 和 `References` headers（默认开启） | true |
 | `--no-thread` | | 禁用 threading headers | false |
 | `--in-reply-to <MESSAGE_ID>` | | 让第一封邮件回复给定 Message-ID | 无 |

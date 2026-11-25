@@ -2484,7 +2484,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.coverLetter`（`true`/`false`/`auto`；`auto` 在 `total > 1` 生成），新增 `--no-cover-letter` 并与 `--cover-letter` 双向 last-wins、命令行覆盖配置；`--commit-list-format` 隐含封面信但可被 `--no-cover-letter` 抑制；`shortlog` 识别为 Git 默认作者分组列表。AC1–AC8 由 `format_patch_test::format_cover_letter_auto_config` 覆盖（true/auto 双补丁、auto 单补丁、--no-cover-letter、modern 隐含 `[1/1]`、shortlog 列表段与 Git 黄金逐字、--no-cover-letter 抑制隐含、false+--cover-letter）；`format_patch_test` 145/145、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；封面信 diffstat 仍由 `FPG-13` 承接。
 
 **Description:** 读取 `format.coverLetter`（`true`/`false`/`auto`，其中 `auto` 在 `total > 1` 时生成封面信），CLI `--cover-letter`/`--no-cover-letter` 覆盖配置；并按 GC-01 核实 `529 FP-13` 合入的 `--commit-list-format` 隐含启用封面信行为（自本卡拆出 `FPG-24` 处理 `branch.<name>.description`，其后 `FPG-24` 再拆出 `FPG-60` 处理封面信默认 `From:`）。
 
