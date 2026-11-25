@@ -414,6 +414,9 @@ enum FormatPatchError {
     #[error("identity unknown: {0}")]
     IdentityMissing(String),
 
+    #[error("invalid ident line: {0}")]
+    InvalidFromIdent(String),
+
     #[error("failed to write patch file '{}': {detail}", .path.display())]
     OutputWrite { path: PathBuf, detail: String },
 
@@ -437,6 +440,8 @@ impl From<FormatPatchError> for CliError {
             FormatPatchError::NotInRepo => CliError::repo_not_found(),
             FormatPatchError::InvalidTarget(_) => CliError::failure(err.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget),
+            FormatPatchError::InvalidFromIdent(_) => CliError::failure(err.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
             FormatPatchError::IdentityMissing(_) => CliError::fatal(err.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint(
@@ -514,6 +519,16 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     }
 
     validate_cli_args(&args)?;
+    // Git validates `--from=<ident>` before revision parsing and the empty-series
+    // check, so a malformed identity wins over an empty range.
+    if let Some(Some(ident)) = args.from.as_ref()
+        && !ident.trim().is_empty()
+        && parse_from_ident(ident).is_err()
+    {
+        return Err(CliError::from(FormatPatchError::InvalidFromIdent(
+            ident.clone(),
+        )));
+    }
     // A malformed `-M` threshold is a usage error before any patch is written.
     if let Some(raw) = args.find_renames.as_deref()
         && crate::command::diff::options::parse_rename_score(raw).is_err()
@@ -2138,16 +2153,16 @@ fn encode_email_header(value: &str, enable: bool) -> String {
 
 /// Parse a `Name <email>` identity into `(name, email)`; a string without
 /// angle brackets is treated as a bare name with an empty email.
-fn parse_from_ident(ident: &str) -> (String, String) {
+fn parse_from_ident(ident: &str) -> Result<(String, String), FormatPatchError> {
     if let (Some(lt), Some(gt)) = (ident.find('<'), ident.rfind('>'))
         && lt < gt
     {
-        return (
+        return Ok((
             ident[..lt].trim().to_string(),
             ident[lt + 1..gt].trim().to_string(),
-        );
+        ));
     }
-    (ident.trim().to_string(), String::new())
+    Err(FormatPatchError::InvalidFromIdent(ident.to_string()))
 }
 
 /// Resolve the `--from` identity: `--from=<ident>` is parsed; bare `--from`
@@ -2158,8 +2173,16 @@ async fn resolve_from_identity(
 ) -> Result<Option<(String, String)>, FormatPatchError> {
     match &args.from {
         None => Ok(None),
-        Some(Some(ident)) => Ok(Some(parse_from_ident(ident))),
-        Some(None) => Ok(Some(resolve_signoff_identity().await?)),
+        Some(Some(ident)) => Ok(Some(parse_from_ident(ident)?)),
+        Some(None) => {
+            // Bare `--from` uses the execution-time committer identity (Git's
+            // GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL aware resolution), not
+            // `format.from`.
+            let (_, identity) = crate::command::commit::create_committer_signature()
+                .await
+                .map_err(|error| FormatPatchError::IdentityMissing(error.to_string()))?;
+            Ok(Some((identity.name, identity.email)))
+        }
     }
 }
 

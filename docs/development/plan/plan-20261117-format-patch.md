@@ -2117,7 +2117,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--from=<ident>` 严格校验——必须含成对 `<`/`>`（`Name <>` 空邮箱合法），否则 `invalid ident line: <input>` + `LBR-CLI-002`；校验在 revision 解析与空系列判定之前，`--from=foo HEAD..HEAD` 同样失败；裸 `--from` 改用执行时（`GIT_COMMITTER_*` 感知）提交者身份。AC1–AC6 由 `format_patch_test::from_invalid_ident_rejected` 覆盖（非法 ident 及空范围、合法身份改写与 in-body 原作者、裸 `--from` 的 C O Mitter 身份、`Name <>`）；`format_patch_test` 140/140、`compat_format_patch_mail_roundtrip` 15/15；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 校验 `--from=<ident>` 必须能按 Git 拆分为 ident：`<` 与其后的 `>` 成对即合法（`Name <>` 的空邮箱合法），对不含 `<…>` 的字符串（如 `--from=foo`）报 `invalid ident line: foo` 并失败，而非输出 `From: foo <>`；校验在修订解析与空系列判定之前进行（`git show 6de20f6092:builtin/log.c` 第 2195–2198 行先于 `setup_revisions`；现行 `resolve_from_identity` 在 `src/command/format_patch.rs:540` 调用，晚于区间解析与空系列返回）（自本卡拆出 `FPG-31` 处理 `--no-from` 与 `format.from`）。
 

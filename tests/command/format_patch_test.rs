@@ -3438,3 +3438,112 @@ fn diff_filter() {
     assert!(stderr.contains("diff-filter"), "AC3 phrase: {stderr}");
     assert!(invalid.stdout.is_empty(), "AC3 stdout empty");
 }
+
+/// FPG-10: `--from=<ident>` must be a valid ident line, validated before
+/// revision parsing; bare `--from` uses the execution committer identity.
+#[test]
+fn from_invalid_ident_rejected() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "Bob"], p),
+        "author name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "bob@example.com"], p),
+        "author email",
+    );
+    fs::write(p.join("f.txt"), "f\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "subject", "--no-verify"], p),
+        "commit",
+    );
+
+    let invalid = run_libra_command(&["format-patch", "-1", "--stdout", "--from=foo"], p);
+    assert!(!invalid.status.success(), "AC1 invalid ident");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"));
+    assert!(stderr.contains("invalid ident line"), "{stderr}");
+    assert!(invalid.stdout.is_empty(), "AC1 stdout empty");
+
+    let valid = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--from=Alice <alice@example.com>",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&valid, "AC2 valid --from");
+    let body = String::from_utf8_lossy(&valid.stdout).to_string();
+    let headers = body
+        .split_once("\n\n")
+        .map(|(headers, _)| headers)
+        .unwrap_or(&body);
+    let from_lines: Vec<&str> = headers
+        .lines()
+        .filter(|line| line.starts_with("From: "))
+        .collect();
+    assert_eq!(
+        from_lines,
+        ["From: Alice <alice@example.com>"],
+        "AC2 From header"
+    );
+    assert!(
+        body.contains("\n\nFrom: Bob <bob@example.com>\n"),
+        "AC3 in-body original author: {body}"
+    );
+
+    let bare = run_libra_command_with_env(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--from",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+        &[
+            ("GIT_COMMITTER_NAME", "C O Mitter"),
+            ("GIT_COMMITTER_EMAIL", "committer@example.com"),
+        ],
+    );
+    assert_cli_success(&bare, "AC4 bare --from");
+    let bare_body = String::from_utf8_lossy(&bare.stdout).to_string();
+    assert!(
+        bare_body
+            .lines()
+            .any(|line| line == "From: C O Mitter <committer@example.com>"),
+        "AC4 committer identity: {bare_body}"
+    );
+
+    let empty = run_libra_command(&["format-patch", "--from=foo", "--stdout", "HEAD..HEAD"], p);
+    assert!(!empty.status.success(), "AC5 empty range still validates");
+    let stderr = String::from_utf8_lossy(&empty.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"));
+    assert!(stderr.contains("invalid ident line"));
+
+    let empty_email = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--from=Name <>",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&empty_email, "AC6 empty email");
+    assert!(
+        String::from_utf8_lossy(&empty_email.stdout)
+            .lines()
+            .any(|line| line == "From: Name <>"),
+        "AC6 From: Name <>"
+    );
+}

@@ -55,7 +55,7 @@ body, and series metadata.
 | `--to <ADDRESS>` | | Add a `To:` header (repeatable; multiple addresses fold like git). Placed after the MIME headers, on each patch and the cover letter | none |
 | `--cc <ADDRESS>` | | Add a `Cc:` header (repeatable; folds like git) | none |
 | `--no-to` / `--no-cc` | | Suppress the `To:` / `Cc:` headers (Libra has no `format.to`/`format.cc` config to reset) | false |
-| `--from[=<IDENT>]` | | Use `<IDENT>` in the `From:` header instead of the commit author (bare `--from` uses the committer's configured identity). When it differs from the author, the original author is preserved as an in-body `From:` line so `git am` can restore it | author |
+| `--from[=<IDENT>]` | | Use `<IDENT>` in the `From:` header instead of the commit author (bare `--from` uses the execution-time committer identity, honouring `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`). `<IDENT>` must be a valid ident line (a `<` paired with a later `>`; `Name <>` is valid) and is validated before revision parsing, so `--from=foo` fails even on an empty range. When it differs from the author, the original author is preserved as an in-body `From:` line so `git am` can restore it | author |
 | `--reroll-count <N>` | `-v` | Mark as version `N` (changes `[PATCH]` to `[PATCH vN]`) | none |
 | `--signoff` | `-s` | Append a `Signed-off-by` trailer to each commit message | false |
 | `--no-signoff` | | Disable signoff, overriding `format.signOff` | false |
