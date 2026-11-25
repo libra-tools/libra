@@ -8364,3 +8364,138 @@ fn reroll_non_integer() {
             .all(|name| name.starts_with("v4-.-.-.-1-.2-"))
     );
 }
+
+/// FPG-52: non-integer reroll versions stay verbatim in `Subject:` and use the
+/// generic `Interdiff:` title (#903).
+#[test]
+fn reroll_non_integer_subjects() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["branch", "v1", "HEAD~1"], p),
+        "v1 branch",
+    );
+    let subject_of = |path: &std::path::Path| -> String {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("Subject: "))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let weird = "4---..././../--1/.2//";
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p1",
+            &format!("--reroll-count={weird}"),
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC1");
+    let name = fs::read_dir(p.join("p1"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        subject_of(&p.join("p1").join(name)).starts_with(&format!("Subject: [PATCH v{weird}] ")),
+        "AC1 raw subject"
+    );
+
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p2",
+            "-v4rev2",
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC2");
+    let name = fs::read_dir(p.join("p2"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        subject_of(&p.join("p2").join(name)).starts_with("Subject: [PATCH v4rev2] "),
+        "AC2 raw subject"
+    );
+
+    // AC3: a fractional version keeps the generic interdiff title.
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--interdiff=v1",
+            "-2",
+            "-v2.2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC3");
+    let text = String::from_utf8_lossy(&res.stdout);
+    let interdiff: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("Interdiff"))
+        .collect();
+    assert_eq!(interdiff, ["Interdiff:"], "AC3 title");
+
+    // AC4–AC6: the 4.4 version is shared by filenames and Subjects.
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p4",
+            "--cover-letter",
+            "-v4.4",
+            "-2",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC4");
+    assert!(
+        subject_of(&p.join("p4/v4.4-0000-cover-letter.patch"))
+            .starts_with("Subject: [PATCH v4.4 0/2] ")
+    );
+    for (prefix, counter) in [("v4.4-0001-", "1"), ("v4.4-0002-", "2")] {
+        let name = fs::read_dir(p.join("p4"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .find(|name| name.starts_with(prefix))
+            .expect("patch file");
+        assert!(
+            subject_of(&p.join("p4").join(name))
+                .starts_with(&format!("Subject: [PATCH v4.4 {counter}/2] ")),
+            "AC c{counter}"
+        );
+    }
+}

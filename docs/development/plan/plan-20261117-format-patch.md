@@ -4106,7 +4106,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：核实 `Subject:` 保留命令行 reroll 原样字符串，非整数版本 interdiff 标题为通用 `Interdiff:`（不递减）；文件名前缀仍按 FPG-26 清洗。无代码改动，补验收门。AC1–AC6 由 `format_patch_test::reroll_non_integer_subjects` 覆盖（异常值/v4rev2 原样 Subject、v2.2 Interdiff、v4.4 封面/两补丁 Subject）；`format_patch_test` 174/174、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-26` 拆出的独立轴：`Subject:` 使用命令行给出的原样 reroll 字符串（不清洗、不补零），非整数版本的 interdiff 标题按 Git `diff_title` 为不带版本的 `Interdiff:`。 #898 Expected behavior 第 2 项称 `-v2.2` → `Interdiff against v1.2:`，与 `git show 6de20f6092:builtin/log.c` 第 1915–1928 行 `diff_title`（非整数版本输出 `Interdiff:`）不符；本计划以上游为准，并在关闭 #898 时于 issue 中说明。
 

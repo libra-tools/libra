@@ -19,7 +19,7 @@ commits reachable from `<rev>`, and `A..B` excludes `A` while including `B`
 produces one patch file per non-merge commit (named with the `--suffix`,
 default `.patch`, unless `--numbered-files` is set, which uses bare sequence
 numbers). Filenames include a zero-padded sequence prefix regardless of `-n`
-or `-N`; under `-v <N>` every generated file also gets a `v<N>-` prefix (`v4-0000-cover-letter.patch`, `v4-0001-…`); non-integer or non-alphanumeric versions are accepted and sanitized like Git (`--reroll-count=4.4` → `v4.4-…`, `4---..././../--1/.2//` → `v4-.-.-.-1-.2-…`, always confined to the output directory). Each patch is formatted as an mbox message with RFC 2822 headers, a
+or `-N`; under `-v <N>` every generated file also gets a `v<N>-` prefix (`v4-0000-cover-letter.patch`, `v4-0001-…`); non-integer or non-alphanumeric versions are accepted and sanitized like Git for the filename while `Subject:` keeps the raw version (a fractional reroll uses the plain `Interdiff:` title) (`--reroll-count=4.4` → `v4.4-…`, `4---..././../--1/.2//` → `v4-.-.-.-1-.2-…`, always confined to the output directory). Each patch is formatted as an mbox message with RFC 2822 headers, a
 plain-text diffstat, and a unified diff. Without `--stdout`, the generated
 paths are printed one per line to stdout (bare file names when `-o` is absent,
 the given path when `-o` is relative/absolute); `--quiet` and `--json` suppress
