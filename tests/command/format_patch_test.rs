@@ -5172,3 +5172,119 @@ fn thread_shallow_and_deep() {
         );
     }
 }
+
+/// FPG-23: threading is off by default, while `--in-reply-to` alone keeps the
+/// external parent on every mail (#917).
+#[test]
+fn format_thread_default_off() {
+    use std::process::Command;
+
+    let repo = create_committed_repo_via_cli();
+    let lp = repo.path();
+    for i in 1..=2 {
+        fs::write(lp.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", &format!("extra{i}")], lp),
+            "add",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", &format!("subject {i}"), "--no-verify"],
+                lp,
+            ),
+            "commit",
+        );
+    }
+
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    for name in ["first", "extra1", "extra2"] {
+        fs::write(gp.join(name), format!("{name}\n")).unwrap();
+        git(&["add", name]);
+        git(&["commit", "-q", "-m", &format!("subject {name}")]);
+    }
+
+    let headers = |stdout: &[u8]| -> Vec<(Option<String>, Option<String>, Vec<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = None;
+                let mut reply = None;
+                let mut refs = Vec::new();
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        reply = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("References: ") {
+                        refs.push(value.trim().trim_matches(['<', '>']).to_string());
+                    }
+                }
+                (id, reply, refs)
+            })
+            .collect()
+    };
+
+    // AC1: no thread headers by default, matching Git.
+    let libra = run_libra_command(&["format-patch", "-3", "--stdout", "--no-signature"], lp);
+    assert_cli_success(&libra, "AC1 libra");
+    let git_out = git(&["format-patch", "-3", "--stdout", "--no-signature"]);
+    let libra_default = headers(&libra.stdout);
+    assert_eq!(libra_default.len(), 3, "three patches");
+    assert!(
+        libra_default
+            .iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+    assert_eq!(libra_default, headers(&git_out.stdout), "AC1 default off");
+
+    // AC2: --in-reply-to alone adds the external parent everywhere, no IDs.
+    let libra = run_libra_command(
+        &[
+            "format-patch",
+            "--in-reply-to=<test.message>",
+            "-3",
+            "--stdout",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra, "AC2 libra");
+    let git_out = git(&[
+        "format-patch",
+        "--in-reply-to=<test.message>",
+        "-3",
+        "--stdout",
+        "--no-signature",
+    ]);
+    let with_parent = headers(&libra.stdout);
+    assert_eq!(with_parent.len(), 3);
+    for (id, reply, refs) in &with_parent {
+        assert!(id.is_none(), "no generated Message-ID");
+        assert_eq!(reply.as_deref(), Some("test.message"));
+        assert_eq!(refs, &["test.message".to_string()]);
+    }
+    assert_eq!(
+        with_parent,
+        headers(&git_out.stdout),
+        "AC2 in-reply-to only"
+    );
+}

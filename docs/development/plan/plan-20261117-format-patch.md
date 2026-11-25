@@ -4904,7 +4904,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--thread` 默认关闭；无 flag 时三补丁系列不输出线程头；单独 `--in-reply-to` 仅逐封添加外部父头、不生成 Message-ID。`format.thread` 取值仍由 `FPG-47` 承接。AC1/AC2 由 `format_patch_test::format_thread_default_off` 覆盖（默认无头与 Git 一致、外部父邮件逐封保留且与 Git 一致）；`format_patch_test` 153/153、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 将 `--thread` 默认行为对齐 Git：默认不输出系列线程头；`--in-reply-to` 单独使用时只为每封邮件添加外部父邮件头、不启用系列线程。`format.thread` 的全部取值（含 `false`/空值关闭，#917 第 2 项）由自本卡拆出的 `FPG-47` 承接——默认关闭之后 `false`/空值与未配置不可区分，须在启用取值已实现时以跨层与同层夹具验收；`--thread=shallow|deep` 与 deep 链式线程由 `FPG-35` 承接，Message-ID 去重由 `FPG-28` 承接。
 

@@ -1450,7 +1450,8 @@ fn build_thread_id(
         ThreadMode::None
     } else {
         match args.thread.as_deref() {
-            None | Some("shallow") => ThreadMode::Shallow,
+            None => ThreadMode::None,
+            Some("shallow") => ThreadMode::Shallow,
             Some("deep") => ThreadMode::Deep,
             Some(other) => {
                 return Err(CliError::failure(format!(

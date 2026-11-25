@@ -42,7 +42,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--subject-prefix <PREFIX>` | | 在 Subject: 行使用 `PREFIX` 而不是 `PATCH` | `PATCH` |
 | `--cover-letter` | | 生成 cover-letter 模板（`0000-cover-letter<suffix>`，或 `--numbered-files` 下的 `0`） | false  覆盖 `format.coverLetter=false`；`format.coverLetter=true|false|auto` 提供默认值（`auto` 仅在多补丁系列生成），`--commit-list-format` 隐含封面信（`--no-cover-letter` 可关闭）。 |
 | `--no-cover-letter` | | 不生成封面信；覆盖 `format.coverLetter` 以及 `--commit-list-format` 隐含的封面信（与 `--cover-letter` 以最后者为准） | — |
-| `--thread[=<STYLE>]` | | 添加 `In-Reply-To` 和 `References` headers（默认开启）。裸 `--thread` 或 `--thread=shallow` 使每封补丁回复封面信/首补丁；`--thread=deep` 使每封补丁回复前一封，`References` 指向线程根 | true |
+| `--thread[=<STYLE>]` | | 添加生成的 `Message-ID`/`In-Reply-To`/`References` headers（默认关闭）。裸 `--thread` 或 `--thread=shallow` 使每封补丁回复封面信/首补丁；`--thread=deep` 使每封补丁回复前一封，`References` 指向线程根 | false |
 | `--no-thread` | | 禁用生成的 threading headers；显式 `--in-reply-to` 仍会为每封邮件添加外部父邮件头 | false |
 | `--in-reply-to <MESSAGE_ID>` | | 让第一封邮件回复给定 Message-ID | 无 |
 | `--to <ADDRESS>` | | 添加 `To:` header（可重复；多个地址像 git 一样折叠）。放在 MIME headers 之后，应用于每个 patch 和 cover letter | 无 |
