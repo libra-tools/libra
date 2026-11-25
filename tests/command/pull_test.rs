@@ -2136,3 +2136,91 @@ fn eol_pull_fast_forward_accepts_clean_representation_and_preserves_edits(auto: 
         }
     }
 }
+
+fn pull_tag_fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let root = tempdir().expect("root");
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    init_repo_via_cli(&source);
+    configure_identity_via_cli(&source);
+    fs::write(source.join("f.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &source), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], &source),
+        "base",
+    );
+    let dest = root.path().join("dest");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                source.to_str().expect("utf8"),
+                dest.to_str().expect("utf8"),
+            ],
+            root.path(),
+        ),
+        "clone source",
+    );
+    configure_identity_via_cli(&dest);
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "vault.signing", "false"], &dest),
+        "disable vault signing in dest",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "commit.gpgSign", "false"], &dest),
+        "disable gpg sign in dest",
+    );
+    fs::write(source.join("f.txt"), "advanced\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "f.txt"], &source),
+        "add advanced",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "advanced", "--no-verify"], &source),
+        "advanced",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "-a", "v1", "-m", "tag v1"], &source),
+        "tag v1",
+    );
+    let peeled = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "refs/tags/v1^{}"], &source).stdout,
+    )
+    .trim()
+    .to_string();
+    (root, dest, peeled)
+}
+
+/// I997-01 AC4: `pull <tag>:<branch>` fast-forwards to the peeled commit.
+#[test]
+fn tag_refspec_ff_uses_peeled_commit() {
+    let (_root, dest, peeled) = pull_tag_fixture();
+    let out = run_libra_command(&["pull", "origin", "refs/tags/v1:refs/heads/tmp"], &dest);
+    assert_cli_success(&out, "pull tag fast-forward");
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &dest).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(head, peeled, "AC4 HEAD is the peeled commit");
+}
+
+/// I997-01 AC4: a conflicting tag pull keeps the existing conflict error code.
+#[test]
+fn tag_refspec_conflict_keeps_existing_error_code() {
+    let (_root, dest, peeled) = pull_tag_fixture();
+    // A divergent local change to the same file forces a merge conflict.
+    fs::write(dest.join("f.txt"), "local\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &dest), "add local");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "local", "--no-verify"], &dest),
+        "local commit",
+    );
+    let out = run_libra_command(&["pull", "origin", "refs/tags/v1:refs/heads/tmp"], &dest);
+    assert!(!out.status.success(), "conflicting pull must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert!(
+        report.error_code.starts_with("LBR-CONFLICT-"),
+        "AC4 existing conflict code, got {}",
+        report.error_code
+    );
+    assert!(!peeled.is_empty());
+}

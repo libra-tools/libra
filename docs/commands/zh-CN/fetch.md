@@ -10,7 +10,7 @@ libra fetch [OPTIONS] [<repository> [<refspec>]]
 
 ## 说明
 
-命令行 refspec 的目标按 Git `get_local_ref` 规则补全：`refs/…` 原样，`heads/`、`tags/`、`remotes/` 前缀补 `refs/`，其余补为 `refs/heads/<name>`（因此 `main:origin` 写入 `refs/heads/origin`）。匿名 fetch（路径、`./dir` 或裸目录名）会写入该显式目标；不带目标时仍只写 `FETCH_HEAD`；`refs/tags/…` 目标继续拒绝（`LBR-CLI-002`，请用 `--tags`）。
+命令行 refspec 的目标按 Git `get_local_ref` 规则补全：`refs/…` 原样，`heads/`、`tags/`、`remotes/` 前缀补 `refs/`，其余补为 `refs/heads/<name>`（因此 `main:origin` 写入 `refs/heads/origin`）。匿名 fetch（路径、`./dir` 或裸目录名）会写入该显式目标；不带目标时仍只写 `FETCH_HEAD`；`refs/tags/…` 目标现已支持：tag source 写入 tag object，branch 目标写入 peeled commit；短 source 依次按同名分支、同名 tag、广告的完整对象 id 解析。
 
 未配置为 remote、且指向一个 Libra 仓库的**裸目录名**会按匿名本地仓库解析：先看当前目录，再看其父目录（同级仓库）。此时与 `libra fetch ./<dir>` 完全一致——只写 `FETCH_HEAD`，不创建远端跟踪引用、不写 `remote.<name>` 配置；既非配置 remote 也不是 Libra 仓库的名字仍以 `remote '<name>' not found`（`LBR-CLI-003`）拒绝。
 
@@ -46,7 +46,7 @@ libra config set --add remote.origin.fetch \
   +refs/heads/*:refs/remotes/origin/*
 ```
 
-显式 refspec 覆盖配置映射。形如 `fetch origin dev` 的裸源仍会下载该引用并写入 `FETCH_HEAD`；若已配置的 `remote.<name>.fetch` 并不映射 `dev`，则不会新建远程跟踪分支（对齐单分支克隆；issues/474 CL-05）。`remote add -t` 与 `remote set-branches` 写入的具体 `remote.<name>.fetch` 会被后续 fetch 严格执行；配置变量名大小写不敏感，因此 `remote.origin.Fetch` 之类的拼写也会生效。目标目前仅限 `refs/heads/*` 与 `refs/remotes/<remote>/*`（保留 `HEAD` 目标会被拒绝）；`+refs/*:refs/*` 的 mirror refspec 还会映射其它合法的 `refs/*` 名称。多个目标引用、对应 reflog 与 `refs/remotes/<name>/HEAD` 在同一个 SQLite 事务中提交；任何目标被拒绝都会回滚整批引用更新。非快进需要映射前导 `+` 或 `--force`；写入任一 linked worktree 正在 checkout 的本地分支会被拒绝（`core.bare=true` 的裸仓库跳过该检查）。完整 fetch 的有效映射不再包含远端默认 source 分支时，会删除失效的缓存 remote HEAD。标签目标继续由 `--tags` / `--no-tags` 管理，不通过 fetch refspec 写入。
+显式 refspec 覆盖配置映射。形如 `fetch origin dev` 的裸源仍会下载该引用并写入 `FETCH_HEAD`；若已配置的 `remote.<name>.fetch` 并不映射 `dev`，则不会新建远程跟踪分支（对齐单分支克隆；issues/474 CL-05）。`remote add -t` 与 `remote set-branches` 写入的具体 `remote.<name>.fetch` 会被后续 fetch 严格执行；配置变量名大小写不敏感，因此 `remote.origin.Fetch` 之类的拼写也会生效。目标可为 `refs/heads/*`、`refs/remotes/<remote>/*` 或其它合法 `refs/*`（如 `refs/tags/*`；保留 `HEAD` 目标会被拒绝）；`+refs/*:refs/*` 的 mirror refspec 还会映射其它合法的 `refs/*` 名称。多个目标引用、对应 reflog 与 `refs/remotes/<name>/HEAD` 在同一个 SQLite 事务中提交；任何目标被拒绝都会回滚整批引用更新。非快进需要映射前导 `+` 或 `--force`；写入任一 linked worktree 正在 checkout 的本地分支会被拒绝（`core.bare=true` 的裸仓库跳过该检查）。完整 fetch 的有效映射不再包含远端默认 source 分支时，会删除失效的缓存 remote HEAD。显式 `refs/tags/…:<dst>` refspec 会抓取 tag object（及 peeled commit）；全局标签自动跟随仍由 `--tags` / `--no-tags` 控制。
 
 ## 选项
 
@@ -58,7 +58,7 @@ libra config set --add remote.origin.fetch \
 
 `--multiple`/`-m` 把每个位置参数都当作 remote 名，按顺序逐个抓取（任一名字不是已配置 remote 时在任何传输前以 `LBR-CLI-003` 整体拒绝）。未给 `--append` 时先截断 `FETCH_HEAD` 再按 remote 顺序追加；给出 `--append` 时保留旧记录后追加。`--jobs`/`-j <n>` 为 Git 兼容而接受——Libra 串行抓取，取值只影响写入绝对路径 `GIT_TRACE` 的 `preparing to run up to <n> tasks` 行（`0` 取 CPU 核数，未给或负值为 1）。
 
-refspec 目标可位于任意 `refs/<命名空间>/...`（例如 `+refs/heads/*:refs/rd/*`），不再限于 `refs/heads/` 与 `refs/remotes/<remote>/`；这类引用可被 `show-ref` 列出、也可用 `rev-parse` 解析。若 `refs/remotes/<name>/...` 的 `<name>` 不是已配置 remote，则按全名存储（保持可见），不再挂到未配置的 remote 名下。`refs/tags/*` 目标仍拒绝，保留名 `refs/heads/HEAD` / `refs/remotes/<remote>/HEAD` 仍拒绝。
+refspec 目标可位于任意 `refs/<命名空间>/...`（例如 `+refs/heads/*:refs/rd/*`），不再限于 `refs/heads/` 与 `refs/remotes/<remote>/`；这类引用可被 `show-ref` 列出、也可用 `rev-parse` 解析。若 `refs/remotes/<name>/...` 的 `<name>` 不是已配置 remote，则按全名存储（保持可见），不再挂到未配置的 remote 名下。`refs/tags/*` 目标现已支持（tag source 写 tag object，branch 目标写 peeled commit），保留名 `refs/heads/HEAD` / `refs/remotes/<remote>/HEAD` 仍拒绝。
 
 一次可给多个 refspec（`libra fetch origin left right`）：全部 refspec 在抓取前先解析，随后按命令行顺序逐个抓取，`FETCH_HEAD` 也按该顺序记录。命令行 refspec 选中的引用是可合并条目（不带 `not-for-merge`），由配置 refspec 或自动跟随带回的引用仍带该标记。`--json` 的 `refspec` 字段为空格连接的全部 refspec；`--set-upstream` 与多于一个 refspec 同用时输出 `multiple branches detected, incompatible with --set-upstream` 且不写 upstream。
 

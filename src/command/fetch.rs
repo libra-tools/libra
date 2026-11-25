@@ -993,6 +993,12 @@ struct FetchRefspec {
     source: String,
     destination: String,
     force: bool,
+    /// The user wrote a short source name (no `refs/` prefix); resolve it as
+    /// branch, then tag, then advertised full OID (ADR-I997-01).
+    source_was_short: bool,
+    /// The user wrote a short destination (`heads/`, `tags/`, `remotes/`, or a
+    /// bare name); a tag source maps a bare destination into `refs/tags/`.
+    destination_was_short: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1000,6 +1006,9 @@ struct FetchRefPlan {
     reference: DiscRef,
     destination: String,
     force: bool,
+    /// Extra objects to want alongside `reference` (e.g. the annotated tag
+    /// object when a tag source targets a branch destination).
+    extra_wants: Vec<String>,
     /// When false, objects and FETCH_HEAD still update, but no tracking ref is
     /// written. `git fetch <remote> <ref>` does this when the remote's
     /// configured refspec does not map the requested ref (single-branch clone).
@@ -2272,12 +2281,6 @@ fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), Fe
     {
         return Ok(());
     }
-    if destination.starts_with("refs/tags/") {
-        return Err(FetchError::InvalidRefspec {
-            refspec: refspec.to_string(),
-            reason: "tag destinations are not supported by fetch refspecs; use --tags".to_string(),
-        });
-    }
     // `refs/heads/<branch>` and `refs/remotes/<remote>/<branch>` keep their
     // reserved `HEAD` restriction; every other `refs/<ns>/...` destination is a
     // custom namespace and is accepted as long as the refname itself is valid.
@@ -2372,7 +2375,18 @@ fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchErr
         }
         None => (body, None),
     };
-    let source = normalize_branch_ref(source_raw);
+    // Keep a short source verbatim: `resolve_refspec_source` tries branch, then
+    // tag, then the advertised full OID (ADR-I997-01).
+    let source = if source_raw.starts_with("refs/")
+        || source_raw == "HEAD"
+        || (destination_raw.is_none() && !source_raw.contains('*'))
+    {
+        // A branch-only source keeps its historical `refs/heads/` completion;
+        // tag DWIM is only needed with an explicit destination (I997-01).
+        normalize_branch_ref(source_raw)
+    } else {
+        source_raw.to_string()
+    };
     let destination = match destination_raw {
         // Git's `get_local_ref` completes a short destination: `heads/`,
         // `tags/` and `remotes/` gain a `refs/` prefix, anything else becomes a
@@ -2383,7 +2397,11 @@ fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchErr
 
     let source_wildcards = source.matches('*').count();
     let destination_wildcards = destination.matches('*').count();
-    if !refspec_ref_is_valid(&source)
+    let short_source_ok = !source_raw.starts_with("refs/")
+        && source_raw != "HEAD"
+        && !source_raw.contains('*')
+        && refspec_ref_is_valid(&format!("refs/heads/{source_raw}"));
+    if !(refspec_ref_is_valid(&source) || short_source_ok)
         || !refspec_ref_is_valid(&destination)
         || source_wildcards != destination_wildcards
     {
@@ -2399,6 +2417,15 @@ fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchErr
             source,
             destination,
             force,
+            source_was_short: !source_raw.starts_with("refs/") && source_raw != "HEAD",
+            destination_was_short: destination_raw.is_none_or(|value| {
+                !value.starts_with("refs/")
+                    && value != "HEAD"
+                    && !value.contains('*')
+                    && !["heads/", "tags/", "remotes/"]
+                        .iter()
+                        .any(|prefix| value.starts_with(prefix))
+            }),
         });
     }
     validate_fetch_destination(&destination, raw)?;
@@ -2407,6 +2434,15 @@ fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchErr
         source,
         destination,
         force,
+        source_was_short: !source_raw.starts_with("refs/") && source_raw != "HEAD",
+        destination_was_short: destination_raw.is_none_or(|value| {
+            !value.starts_with("refs/")
+                && value != "HEAD"
+                && !value.contains('*')
+                && !["heads/", "tags/", "remotes/"]
+                    .iter()
+                    .any(|prefix| value.starts_with(prefix))
+        }),
     })
 }
 
@@ -2427,6 +2463,38 @@ async fn configured_fetch_refspecs(remote: &str) -> Result<Vec<FetchRefspec>, Fe
 
 pub(crate) async fn validate_configured_fetch_refspecs(remote: &str) -> Result<(), FetchError> {
     configured_fetch_refspecs(remote).await.map(|_| ())
+}
+
+/// Resolve a non-wildcard refspec source (ADR-I997-01): explicit `refs/*`,
+/// short name (branch then tag then advertised full OID), returning the base
+/// ref and its peeled commit (annotated tags only).
+fn resolve_refspec_source<'a>(
+    spec: &FetchRefspec,
+    refs: &'a [DiscRef],
+) -> Result<(&'a DiscRef, Option<String>), FetchError> {
+    let base = if spec.source_was_short && !spec.source.starts_with("refs/") {
+        let branch = format!("refs/heads/{}", spec.source);
+        let tag = format!("refs/tags/{}", spec.source);
+        refs.iter()
+            .find(|reference| reference._ref == branch)
+            .or_else(|| refs.iter().find(|reference| reference._ref == tag))
+            .or_else(|| {
+                refs.iter().find(|reference| {
+                    !reference._ref.ends_with("^{}") && reference._hash == spec.source
+                })
+            })
+    } else {
+        refs.iter().find(|reference| reference._ref == spec.source)
+    }
+    .ok_or_else(|| FetchError::RemoteBranchNotFound {
+        branch: short_remote_ref(&spec.source).to_string(),
+        remote: String::new(),
+    })?;
+    let peeled = refs
+        .iter()
+        .find(|reference| reference._ref == format!("{}^{{}}", base._ref))
+        .map(|reference| reference._hash.clone());
+    Ok((base, peeled))
 }
 
 fn expand_refspec(
@@ -2474,21 +2542,53 @@ fn expand_refspec(
                     reference: reference.clone(),
                     destination,
                     force: spec.force,
+                    extra_wants: Vec::new(),
                     update_tracking: true,
                 });
             }
         }
-    } else if let Some(reference) = refs.iter().find(|reference| reference._ref == spec.source) {
-        plans.push(FetchRefPlan {
-            reference: reference.clone(),
-            destination: spec.destination.clone(),
-            force: spec.force,
-            update_tracking: true,
-        });
     } else {
-        return Err(FetchError::RemoteBranchNotFound {
-            branch: short_remote_ref(&spec.source).to_string(),
-            remote: remote.to_string(),
+        let (base, peeled) = resolve_refspec_source(spec, refs).map_err(|err| match err {
+            FetchError::RemoteBranchNotFound { branch, .. } => FetchError::RemoteBranchNotFound {
+                branch,
+                remote: remote.to_string(),
+            },
+            other => other,
+        })?;
+        let is_tag = base._ref.starts_with("refs/tags/");
+        let mut destination = spec.destination.clone();
+        if is_tag && spec.destination_was_short {
+            let short = destination
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&destination)
+                .to_string();
+            destination = format!("refs/tags/{short}");
+        }
+        let tag_destination = destination.starts_with("refs/tags/");
+        let effective_hash = if is_tag && !tag_destination {
+            peeled.clone().unwrap_or_else(|| base._hash.clone())
+        } else {
+            base._hash.clone()
+        };
+        let mut extra_wants = Vec::new();
+        if is_tag {
+            if tag_destination {
+                if let Some(peeled_hash) = peeled {
+                    extra_wants.push(peeled_hash);
+                }
+            } else {
+                extra_wants.push(base._hash.clone());
+            }
+        }
+        plans.push(FetchRefPlan {
+            reference: DiscRef {
+                _ref: base._ref.clone(),
+                _hash: effective_hash,
+            },
+            destination,
+            force: spec.force,
+            extra_wants,
+            update_tracking: true,
         });
     }
     Ok(plans)
@@ -2519,6 +2619,7 @@ async fn build_fetch_ref_plans(
                         reference: reference.clone(),
                         destination,
                         force: true,
+                        extra_wants: Vec::new(),
                         update_tracking: true,
                     })
             })
@@ -2602,6 +2703,7 @@ async fn single_branch_fetch_plans(
             reference,
             destination: parsed.destination,
             force: false,
+            extra_wants: Vec::new(),
             update_tracking: false,
         });
     }
@@ -2653,6 +2755,7 @@ pub(crate) async fn configured_remote_tracking_branch_names(
                         reference: reference.clone(),
                         destination,
                         force: true,
+                        extra_wants: Vec::new(),
                         update_tracking: true,
                     })
             })
@@ -2999,6 +3102,12 @@ async fn fetch_repository_with_result_reusing(
         .iter()
         .map(|plan| plan.reference.clone())
         .collect::<Vec<_>>();
+    refs.extend(ref_plans.iter().flat_map(|plan| {
+        plan.extra_wants.iter().map(|hash| DiscRef {
+            _ref: String::new(),
+            _hash: hash.clone(),
+        })
+    }));
     if tag_mode == TagFetchMode::All {
         refs.extend(
             discovery
@@ -3321,6 +3430,51 @@ async fn fetch_repository_with_result_reusing(
         write_shallow_boundaries(&BTreeSet::new())?;
     } else if !shallow_updates.is_empty() || !fetch_data.unshallow.is_empty() {
         write_shallow_boundaries(&final_boundaries)?;
+    }
+
+    /// Reject a tag source whose peeled chain ends at a non-commit when the
+    /// destination is branch-like (`RB/I997-01` AC5): a tag may name a tree/blob,
+    /// but a branch ref may not point at one.
+    async fn ensure_tag_plan_targets_commit(plan: &FetchRefPlan) -> Result<(), FetchError> {
+        if plan.destination.starts_with("refs/tags/") {
+            return Ok(());
+        }
+        let Some(mut oid) =
+            crate::internal::object_format::parse_repo_oid(&plan.reference._hash).ok()
+        else {
+            return Err(FetchError::InvalidRefspec {
+                refspec: format!("{}:{}", plan.reference._ref, plan.destination),
+                reason: "tag source resolved to an unparseable object id".to_string(),
+            });
+        };
+        for _ in 0..32 {
+            match tag::load_object_trait(&oid).await {
+                Ok(TagObject::Commit(_)) => return Ok(()),
+                Ok(TagObject::Tag(tag_object)) => oid = tag_object.object_hash,
+                Ok(TagObject::Tree(_) | TagObject::Blob(_)) => {
+                    return Err(FetchError::InvalidRefspec {
+                        refspec: format!("{}:{}", plan.reference._ref, plan.destination),
+                        reason: "annotated tag does not peel to a commit".to_string(),
+                    });
+                }
+                Err(_) => {
+                    return Err(FetchError::UpdateRefs {
+                        message: format!(
+                            "cannot verify peeled target for '{}'",
+                            plan.reference._ref
+                        ),
+                    });
+                }
+            }
+        }
+        Err(FetchError::InvalidRefspec {
+            refspec: format!("{}:{}", plan.reference._ref, plan.destination),
+            reason: "annotated tag chain is too deep or cyclic".to_string(),
+        })
+    }
+
+    for plan in &ref_plans {
+        ensure_tag_plan_targets_commit(plan).await?;
     }
 
     let mut refs_updated = update_references(
@@ -5466,6 +5620,84 @@ async fn update_references(
                 }
                 let (storage_name, remote_scope) =
                     fetch_destination_storage(&plan.destination, &remote_config.name).await?;
+                let tag_destination = plan.destination.starts_with("refs/tags/");
+                if tag_destination {
+                    use sea_orm::{ColumnTrait as _, EntityTrait as _, QueryFilter as _};
+                    let existing = ref_model::Entity::find()
+                        .filter(ref_model::Column::Name.eq(Some(storage_name.clone())))
+                        .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Tag))
+                        .one(txn)
+                        .await
+                        .map_err(|error| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to inspect fetch destination '{}': {error}",
+                                plan.destination
+                            ),
+                        })?;
+                    let old_oid = existing.as_ref().and_then(|row| row.commit.clone());
+                    if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
+                        continue;
+                    }
+                    let forced =
+                        fetch_update_is_forced(old_oid.as_deref(), &plan.reference._hash);
+                    if forced && !force_override && !plan.force {
+                        return Err(FetchError::RefUpdateRejected {
+                            message: format!(
+                                "non-fast-forward update to '{}' requires '+' in the refspec or --force",
+                                plan.destination
+                            ),
+                        });
+                    }
+                    match existing {
+                        Some(row) => {
+                            let mut active: ref_model::ActiveModel = row.into();
+                            active.commit = Set(Some(plan.reference._hash.clone()));
+                            active.update(txn).await.map_err(|source| FetchError::UpdateRefs {
+                                message: format!(
+                                    "failed to persist fetch destination '{}': {source}",
+                                    plan.destination
+                                ),
+                            })?;
+                        }
+                        None => {
+                            let new_row = ref_model::ActiveModel {
+                                name: Set(Some(storage_name.clone())),
+                                kind: Set(ref_model::ConfigKind::Tag),
+                                commit: Set(Some(plan.reference._hash.clone())),
+                                ..Default::default()
+                            };
+                            new_row.insert(txn).await.map_err(|source| FetchError::UpdateRefs {
+                                message: format!(
+                                    "failed to persist fetch destination '{}': {source}",
+                                    plan.destination
+                                ),
+                            })?;
+                        }
+                    }
+                    let context = ReflogContext {
+                        old_oid: old_oid.clone().unwrap_or_else(|| {
+                            ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string()
+                        }),
+                        new_oid: plan.reference._hash.clone(),
+                        action: ReflogAction::Fetch,
+                    };
+                    Reflog::insert_single_entry(txn, &context, &plan.destination)
+                        .await
+                        .map_err(|source| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to record reflog for fetch destination '{}': {source}",
+                                plan.destination
+                            ),
+                        })?;
+                    updates.push(FetchRefUpdate {
+                        remote_ref: plan.destination.clone(),
+                        forced,
+                        old_oid,
+                        new_oid: plan.reference._hash.clone(),
+                    });
+                    continue;
+                }
+
                 let old_oid = Branch::find_branch_result_with_conn(
                     txn,
                     &storage_name,

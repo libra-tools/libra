@@ -101,7 +101,7 @@ When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
 | `<repository>` | Remote name to pull from. When omitted, uses the current branch's configured upstream. | `libra pull origin` |
-| `<refspec>` | Branch name on the remote. Requires `<repository>`. When omitted, uses the current branch name. | `libra pull origin main` |
+| `<refspec>` | Branch name or explicit refspec on the remote (including `refs/tags/<tag>:<branch>` / `<tag>:<branch>`). Requires `<repository>`. When omitted, uses the current branch name. | `libra pull origin main` / `libra pull origin v1:refs/heads/from-tag` |
 | `--ff-only` | Refuse to create a merge commit; permits only fast-forward or already-up-to-date integration; unresolved index entries still refuse the merge phase. Conflicts with `--rebase`, `--ff`, and `--no-ff`. | `libra pull --ff-only` |
 | `--ff` | Explicitly allow a fast-forward merge, overriding `pull.ff=false|only`. Conflicts with `--no-ff`, `--ff-only`, and `--rebase`. | `libra pull --ff` |
 | `--no-ff` | Always create a merge commit even when a fast-forward is possible. Conflicts with `--ff`, `--ff-only`, and `--rebase`. | `libra pull --no-ff` |

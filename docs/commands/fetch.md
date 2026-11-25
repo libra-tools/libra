@@ -29,7 +29,7 @@ does: `refs/…` is kept, `heads/`, `tags/` and `remotes/` gain a `refs/` prefix
 anything else becomes `refs/heads/<name>` (so `main:origin` writes `refs/heads/origin`).
 An anonymous fetch (a path, `./dir`, or a bare repository directory name) writes that
 explicit destination; without a destination it still writes only `FETCH_HEAD`.
-`refs/tags/…` destinations stay refused (`LBR-CLI-002`, use `--tags`).
+`refs/tags/…` destinations are supported: a tag source writes the tag object there, while a branch destination receives the peeled commit. A short source resolves a branch first, then a tag, then an advertised full object id.
 
 A bare directory name is resolved as an anonymous local repository when it is not a
 configured remote and it names a Libra repository: the current directory is checked
@@ -145,7 +145,14 @@ System defaults. Known Repository receipts and valid barriers remain readable.
 Short source names such as `main` mean `refs/heads/main` and default to
 `refs/remotes/<remote>/main`. Full mappings and the common wildcard form are supported:
 
+Explicit tag sources are supported (`refs/tags/v1` or the short name `v1`): a tag
+destination stores the tag object, a branch destination stores its peeled commit;
+`pull` integrates the peeled commit. Short sources prefer a branch over an equally
+named tag, and fall back to an advertised full object id when neither exists.
+
 ```bash
+libra fetch origin refs/tags/v1:refs/tags/v1
+libra fetch origin refs/tags/v1:refs/heads/from-tag
 libra fetch origin refs/heads/main:refs/remotes/origin/release
 libra config set --add remote.origin.fetch \
   +refs/heads/*:refs/remotes/origin/*
@@ -157,8 +164,7 @@ is already set and does not map `dev`, no new remote-tracking branch is created
 (matching a single-branch clone; issues/474 CL-05). `remote add -t` and `remote
 set-branches` write concrete `remote.<name>.fetch` values that later fetches now enforce.
 Config variable names are case-insensitive, so spellings such as
-`remote.origin.Fetch` are honored. Destinations are currently limited to
-`refs/heads/*` and `refs/remotes/<remote>/*` (reserved `HEAD` is refused);
+`remote.origin.Fetch` are honored. Destinations may be `refs/heads/*`, `refs/remotes/<remote>/*`, or another legal `refs/*` name such as `refs/tags/*` (reserved `HEAD` is refused);
 `+refs/*:refs/*` mirror refspecs also map other legal `refs/*` names.
 Multiple destination updates, their reflogs, and `refs/remotes/<name>/HEAD` are committed
 in one SQLite transaction; any rejected destination rolls back the complete ref update.
@@ -166,8 +172,7 @@ Non-fast-forward updates require `+` on that mapping or `--force`. Fetching into
 local branch checked out by any linked worktree is rejected (bare repositories with
 `core.bare=true` skip that check). On a full fetch, a cached
 remote HEAD is removed when the effective mapping no longer includes the remote's default
-source branch. Tag destinations remain controlled by `--tags` / `--no-tags`, not fetch
-refspec mappings.
+source branch. An explicit `refs/tags/…:<dst>` refspec fetches the tag object (and peeled commit); global tag auto-following remains controlled by `--tags` / `--no-tags`.
 
 ```bash
 libra config fetch.prune true           # prune on every fetch
