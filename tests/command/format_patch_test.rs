@@ -7682,3 +7682,137 @@ fn format_attach_config() {
     assert!(!out(&["--no-attach"]).contains("multipart/"), "AC5");
     unset("format.attach");
 }
+
+/// FPG-19: multi-patch `--interdiff` renders the tree difference in the cover
+/// letter (#898).
+#[test]
+fn interdiff_multi_patch_cover_letter() {
+    use std::process::Command;
+
+    let g = tempdir().unwrap();
+    let gp = g.path();
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    fs::write(gp.join("f"), "a1\nold\n").unwrap();
+    git(&["add", "f"]);
+    git(&["commit", "-q", "-m", "base"]);
+    fs::write(gp.join("f"), "a1\na2\n").unwrap();
+    git(&["commit", "-qam", "m1"]);
+    let v1 = git(&["rev-parse", "HEAD"]);
+    git(&["branch", "v1"]);
+    fs::write(gp.join("f"), "a1\na2\na3\n").unwrap();
+    git(&["commit", "-qam", "m2"]);
+
+    let parent = tempdir().unwrap();
+    let lp = parent.path().join("libra");
+    fs::create_dir_all(&lp).unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--from-git-repository", gp.to_str().unwrap(), "."],
+            &lp,
+        ),
+        "import",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "v1", &v1], &lp), "v1 branch");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], &lp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], &lp),
+        "email",
+    );
+
+    let cover_tail = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover
+            .lines()
+            .position(|line| line.contains("file changed"))
+            .and_then(|index| {
+                cover
+                    .lines()
+                    .take(index)
+                    .map(|line| line.len() + 1)
+                    .sum::<usize>()
+                    .checked_sub(0)
+            })
+            .unwrap_or(0);
+        let tail = &cover[start..];
+        // Skip the summary line itself; the mapping compares from it onward.
+        tail.trim_end().to_string()
+    };
+    let compare = |label: &str, flags: &[&str]| {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let libra = run_libra_command(&args, &lp);
+        assert_cli_success(&libra, label);
+        let git_out = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git_out.status.success(), "{label}: {git_out:?}");
+        assert_eq!(
+            cover_tail(&libra.stdout),
+            cover_tail(&git_out.stdout),
+            "{label}"
+        );
+    };
+
+    compare("AC1 implicit cover", &["--interdiff=v1", "-2", "-v3"]);
+    compare(
+        "AC2 explicit cover",
+        &["--cover-letter", "--interdiff=v1", "-2", "-v2"],
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.coverLetter", "false"], &lp),
+        "cover config",
+    );
+    compare(
+        "AC3 config false",
+        &["--cover-letter", "--interdiff=v1", "-2", "-v2"],
+    );
+    compare(
+        "AC4 spaced value",
+        &["--cover-letter", "--interdiff", "v1", "-2", "-v2"],
+    );
+    compare("AC5 no reroll", &["--cover-letter", "--interdiff=v1", "-2"]);
+
+    // AC6: an unknown revision is rejected with the stable code.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--interdiff=no-such-rev",
+            "-2",
+            "--stdout",
+        ],
+        &lp,
+    );
+    assert!(!invalid.status.success(), "AC6");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(stderr.contains("no-such-rev"), "{stderr}");
+    assert!(invalid.stdout.is_empty());
+}

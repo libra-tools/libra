@@ -187,6 +187,11 @@ pub struct FormatPatchArgs {
     #[arg(long = "cover-from-description", value_name = "MODE")]
     pub cover_from_description: Option<String>,
 
+    /// Show the difference between REV's tree and the last patch's tree in the
+    /// cover letter (`--interdiff`).
+    #[arg(long = "interdiff", value_name = "REV")]
+    pub interdiff: Option<String>,
+
     /// Thread the series: bare `--thread` (or `--thread=shallow`) makes every
     /// patch a reply to the cover letter/first patch; `--thread=deep` chains
     /// each patch as a reply to its predecessor.
@@ -664,7 +669,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             )?
         };
     }
-    if !no_cover_cli && commit_list_cli {
+    if !no_cover_cli && (commit_list_cli || args.interdiff.is_some()) {
         // `--commit-list-format` implies a cover letter (Git's `#909`).
         args.cover_letter = true;
     }
@@ -712,6 +717,14 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     let mut rendered = Vec::with_capacity(total + usize::from(args.cover_letter));
     if args.cover_letter {
         let series_stat = cover_letter_series_stat(&args, &commits).await?;
+        let interdiff = if let Some(spec) = args.interdiff.as_deref() {
+            let last = commits
+                .last()
+                .ok_or_else(|| CliError::fatal("no commits to interdiff"))?;
+            Some(interdiff_block(&args, spec, &last.id).await?)
+        } else {
+            None
+        };
         let description = cover_letter_description(&args).await?;
         let description_mode = args.cover_from_description.as_deref().unwrap_or("default");
         // Git's cover letter defaults `From:` to the execution-time committer
@@ -733,6 +746,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             cover_from,
             base_block.as_deref(),
             series_stat.as_deref(),
+            interdiff.as_deref(),
             description_mode,
             description.as_deref(),
         )?;
@@ -1890,6 +1904,31 @@ async fn cover_letter_description(args: &FormatPatchArgs) -> Result<Option<Strin
     }
 }
 
+/// Render `--interdiff`: Git compares `<rev>`'s tree directly with the last
+/// patch's tree, and titles the block after the previous reroll version.
+async fn interdiff_block(
+    args: &FormatPatchArgs,
+    spec: &str,
+    last: &ObjectHash,
+) -> Result<String, CliError> {
+    let rev = resolve_single_rev(spec).await?;
+    let argv: Vec<String> = vec!["diff".to_string(), rev.to_string(), last.to_string()];
+    let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+        .map_err(|error| CliError::command_usage(error.to_string()))?;
+    let output = crate::command::diff::run_diff_for_service(diff_args).await?;
+    let patch = crate::command::diff::render::format_unified_diff(&output);
+    let title = match args.reroll_count {
+        Some(version) if version > 1 => format!("Interdiff against v{}:", version - 1),
+        _ => "Interdiff:".to_string(),
+    };
+    let mut block = format!("{title}\n");
+    if !patch.is_empty() {
+        block.push_str(patch.trim_end_matches('\n'));
+        block.push('\n');
+    }
+    Ok(block)
+}
+
 /// Split a branch description into Git's cover `Subject:` text and remaining
 /// body according to `--cover-from-description`.
 fn cover_text(mode: &str, description: Option<&str>) -> (String, String) {
@@ -1935,6 +1974,7 @@ fn format_cover_letter(
     from_identity: Option<&(String, String)>,
     base_block: Option<&str>,
     series_stat: Option<&str>,
+    interdiff: Option<&str>,
     description_mode: &str,
     description: Option<&str>,
 ) -> Result<String, CliError> {
@@ -2035,9 +2075,13 @@ fn format_cover_letter(
         out.push('\n');
         // Git separates the diffstat from a following base trailer or
         // signature with a blank line.
-        if !args.no_signature || base_block.is_some() {
+        if !args.no_signature || base_block.is_some() || interdiff.is_some() {
             out.push('\n');
         }
+    }
+
+    if let Some(interdiff) = interdiff {
+        out.push_str(interdiff);
     }
 
     // `--base` trailer rides on the cover letter when one is present (the blank

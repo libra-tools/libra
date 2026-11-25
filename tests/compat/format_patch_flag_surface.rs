@@ -46,6 +46,7 @@ fn format_patch_help_lists_expected_flags() {
         "--subject-prefix",
         "--cover-letter",
         "--cover-from-description",
+        "--interdiff",
         "--attach",
         "--inline",
         "--no-attach",

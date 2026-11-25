@@ -3740,7 +3740,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增多补丁 `--interdiff=<REV>`（空格形式亦可），封面信 diffstat 后输出 `Interdiff against v<n-1>:`（无 `-v` 为 `Interdiff:`）及 `<REV>` 树与末补丁树的统一 diff；未显式关闭封面信时隐含封面信；非法 revision `LBR-CLI-003`。AC1–AC6 由 `format_patch_test::interdiff_multi_patch_cover_letter` 覆盖（AC1–AC5 封面 diffstat 后段与同源 Git 逐字、AC6 非法 revision）；`format_patch_test` 169/169、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过（含新 flag）；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；单补丁位置由 `FPG-34` 承接。
 
 **Description:** 在 `529 FP-10` 已落地的封面信三态与前置诊断基础上，保留其 U 型拒绝（多补丁且封面信被显式禁用），把多补丁场景的 X 型「不支持」分类（`fp10_interdiff_implied_cover`、`fp10_interdiff_spaced_value`）替换为实际 series interdiff 输出：按 `git@6de20f6092` 语义直接对比 `<rev>` 的树与当前系列末个提交的树（`builtin/log.c` 令 `idiff_oid1 = <rev>`、`idiff_oid2` 为末个提交的树，`diff-lib.c` `show_interdiff` 以 `diff_tree_oid` 求差；R5 曾误改为两系列各自组合变更之差，R25 按上游源码更正），在封面信中输出 `Interdiff:` 区块（有 `-v` 时为 Git 的 `Interdiff against v<n-1>:`）。单补丁位置由自本卡拆出的 `FPG-34` 承接。 `#898` 第 3 项（`--no-cover-letter` 与 `format.coverLetter=no` 时拒绝）由 `issues/529#FP-10` 的 U 型门族交付并在 529 计划内验收，本卡不改变其契约，其门族在本卡共享回归组中运行（不计本卡 AC）；不带 `--stdout` 时 `v23-0000-cover-letter.patch` 的文件输出组合由 `FPG-20` 验收。 夹具为差异隔离夹具：被比较的文件在 `main` 上已存在，新旧系列只修改其既有行（使 interdiff 不含空旧侧 hunk，见「验证执行协议」第 3 项）。
 
