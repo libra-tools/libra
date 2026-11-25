@@ -99,3 +99,26 @@ fn legacy_separate_layout_repo_is_no_longer_detected() {
     let sanity = run_libra_command(&["status"], &storage_holder);
     assert_cli_success(&sanity, "storage-holder repo should remain healthy");
 }
+
+#[test]
+fn test_init_bare_and_separate_git_dir_rejected() {
+    let temp_root = tempdir().unwrap();
+    let repo = temp_root.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let storage = temp_root.path().join("storage");
+
+    let output = run_libra_command(
+        &[
+            "init",
+            "--bare",
+            "--separate-git-dir",
+            storage.to_str().unwrap(),
+        ],
+        &repo,
+    );
+    assert_eq!(output.status.code(), Some(129));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not implemented"), "{stderr}");
+    assert!(stderr.contains("from-git-repository"), "{stderr}");
+    assert!(!repo.join(".libra").exists());
+}
