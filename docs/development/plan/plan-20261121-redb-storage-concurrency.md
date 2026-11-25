@@ -5802,7 +5802,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：为 `gen+1` 漂移重导补齐跨源备份对账——当某源已合法 `unlinked`（或围栏后缺席）而另一源/spool/queue 仍漂移时，先以该代已验 `sqlite-backup/<gen>/<db>`（`backup_sha256` + `integrity_check`）还原为活源并重新通过 Phase A 取得 `EXCLUSIVE` 连接，再走既有流式重导（capture 活库 post-crash 写入、`capture-queue` 追加帧、`capture-spool` 备份∪活目录漂移）到 `gen+1`，随后复用既有 fence/unlink 与 Step 2.3/2.4 终态发布。AC1/AC4 由 `forward_phase2_crash_capture_db_and_queue_post_crash_reexport` 覆盖（`libra.db` 已 unlinked 后写 `capture.db` + 追加 queue 帧，恢复 `gen+1`、`capture_recovery_state=DriftedLivePending`、`queue_drift_detected`，post-crash session 与 usage 帧均在 gen2 capture redb），AC2/AC3 由 `forward_phase2_spool_tombstone_gap_crash_and_concurrent_hook_reconcile` 覆盖（`AfterRmdirBeforeLinkTombstone(ready)` 间隙崩溃：无 Hook 时重装三枚 0400 墓碑并 finalize；并发 Hook 重建 `ready/` 写入新事件时并集重导，新事件在 gen2 capture redb 且三枚墓碑就位）。门禁：发现门精确列出上述 2 条；2 条 2/2 PASS；`--no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'` 11/11；`--features storage-sqlite,storage-redb,storage-queue --lib -E 'test(/^storage::migrate::/)'` 26/27（仅既有 `forward_phase1_streaming_batch_memory_budget` 本机 RSS 预算失败）；`cargo +stable fmt --all --check` 与 `cargo +nightly clippy --all-targets --all-features -- -D warnings` 均 exit 0。偏差（记录）：①用户已取消独立 Claude/Codex 审计与全量测试；②AC3 的「pre-crash spool 事件」由 AC2 的备份-only 路径覆盖，测试直接断言并发 Hook 新事件与最终墓碑/终态（旧事件未单独按键断言）；③仅改 `src/storage/migrate.rs`（卡面白名单内）。
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现正向迁移 Phase 2 的多源组合漂移对账（`src/storage/migrate.rs`）：处理 `libra.db` 已合法摘除后 `capture.db` 漂移的备份+活库合并重导、`capture-spool` 子目录移除与 `0400` 墓碑安装间隙崩溃（含无并发 Hook 重建及并发旧 Hook 重建并写入新已确认事件的**备份 ∪ 活目录**并集去重重导），以及 `capture-queue/` 清理前追加新帧的漂移并入。
 

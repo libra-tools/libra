@@ -36696,6 +36696,103 @@ fn prepare_exact_next_forward_generation_for_reexport(
 /// lock-safe `VACUUM INTO` backups, in-place `capture-spool` backup, queue
 /// manifest digest, and durability verification onto `target_generation` under
 /// an already-locked [`ForwardPhase1QuiesceGuard`] (`ADR-RB-07` #1, `RB-10c` AC4).
+/// Restore a legally unlinked source from its verified lock-safe backup so the
+/// regular drift re-export pipeline can use it again (`RB-10h`).
+async fn restore_unlinked_source_for_reexport(
+    common_storage: &Path,
+    backup_rel_dir: &str,
+    role: DatabaseRole,
+    live_path: &Path,
+    expected_backup_sha256: &str,
+    #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
+) -> StorageResult<QuiescedSqliteConnection> {
+    if path_exists_no_open(live_path)? {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration drift re-export expected {role} source to be absent before backup restore"
+            ),
+        });
+    }
+    let backup_path = verify_sqlite_backup_for_recovery(
+        common_storage,
+        backup_rel_dir,
+        role,
+        expected_backup_sha256,
+        #[cfg(unix)]
+        protected_live_inodes,
+    )
+    .await?;
+    fs::copy(&backup_path, live_path).map_err(|err| StorageBackendError::Io {
+        context: "restore verified backup for drift re-export",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    let restored = File::open(live_path).map_err(|err| StorageBackendError::Io {
+        context: "open restored source for fsync",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    restored.sync_all().map_err(|err| StorageBackendError::Io {
+        context: "fsync restored source",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    drop(restored);
+    if let Some(parent) = live_path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            let dir = File::open(parent).map_err(|err| StorageBackendError::Io {
+                context: "open restored source parent directory",
+                kind: err.kind(),
+                raw_os_error: err.raw_os_error(),
+            })?;
+            // SAFETY: `dir` is a valid open directory descriptor.
+            if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+                return Err(StorageBackendError::io(
+                    "fsync restored source parent directory",
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = parent;
+    }
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(live_path, suffix);
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(StorageBackendError::Io {
+                    context: "remove stale sidecar of restored source",
+                    kind: err.kind(),
+                    raw_os_error: err.raw_os_error(),
+                });
+            }
+        }
+    }
+    let meta = fs::symlink_metadata(live_path).map_err(|err| StorageBackendError::Io {
+        context: "stat restored source",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    let (prepared, _hot) = prepare_recovery_sqlite_source(
+        live_path,
+        role,
+        &meta,
+        #[cfg(unix)]
+        protected_live_inodes,
+    )
+    .await?;
+    #[cfg(test)]
+    let result =
+        finalize_prepared_sqlite_quiescence_inner(prepared, &QuiesceTestHooks::default()).await;
+    #[cfg(not(test))]
+    let result = finalize_prepared_sqlite_quiescence(prepared).await;
+    result
+}
+
 async fn run_forward_drift_reexport_to_next_generation(
     guard: &mut ForwardPhase1QuiesceGuard,
     common_storage: &Path,
@@ -37737,6 +37834,57 @@ async fn resume_forward_migration_inner(
     // publish the refreshed `finalized = false` manifest for `gen + 1`), OR
     // resume directly on `manifest.generation` with the already-verified targets!
     let (locks, git_stage, cap_stage) = if needs_reexport {
+        // RB-10h cross-source reconciliation: a source that was already legally
+        // unlinked still has a verified VACUUM INTO backup. Restore that backup
+        // as the live source so the regular re-export pipeline re-exports it
+        // alongside the still-live drifted source (zero data loss).
+        let mut git_classified = git_classified;
+        let mut cap_classified = cap_classified;
+        if matches!(
+            git_classified,
+            ClassifiedRecoverySource::LegallyAbsentPostUnlink
+        ) {
+            let conn = restore_unlinked_source_for_reexport(
+                common_storage,
+                &backup_rel_dir,
+                DatabaseRole::Repository,
+                &git_db_path,
+                &git_expected_backup_sha,
+                #[cfg(unix)]
+                &protected_live_inodes,
+            )
+            .await?;
+            git_classified = ClassifiedRecoverySource::CleanMatchedPending {
+                conn,
+                hot_journal_recovered: false,
+            };
+        }
+        if matches!(
+            cap_classified,
+            ClassifiedRecoverySource::LegallyAbsentPostUnlink
+        ) && cap_manifest_state != Phase2DbState::Absent
+        {
+            let cap_sha = cap_expected_backup_sha.as_deref().ok_or_else(|| {
+                StorageBackendError::BackendInternal {
+                    detail: "unfinalized forward manifest missing cap_backup_sha256".to_string(),
+                }
+            })?;
+            let conn = restore_unlinked_source_for_reexport(
+                common_storage,
+                &backup_rel_dir,
+                DatabaseRole::Capture,
+                &cap_db_path,
+                cap_sha,
+                #[cfg(unix)]
+                &protected_live_inodes,
+            )
+            .await?;
+            cap_classified = ClassifiedRecoverySource::CleanMatchedPending {
+                conn,
+                hot_journal_recovered: false,
+            };
+        }
+
         // When both present sources are still live `Pending` (the `RB-10c` AC4
         // path), re-run the exact streaming Phase 1 export + verify + atomic
         // promote + `VACUUM INTO` backup pipeline onto `gen + 1`.
@@ -59447,6 +59595,255 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
                 .await
                 .expect_err("AC6 backup digest mismatch must fail closed");
             assert_eq!(err.stable_code_str(), "LBR-IO-001", "AC6");
+        }
+    }
+
+    /// RB-10h AC1/AC4: after `libra.db` is legally unlinked, post-crash
+    /// `capture.db` writes and appended queue frames are merged into `gen+1`.
+    #[tokio::test]
+    async fn forward_phase2_crash_capture_db_and_queue_post_crash_reexport() {
+        use crate::storage::{
+            FRAME_FLAG_NONE, RedbCaptureStore, append_postcard_frame,
+            capture_store::CaptureStore as _,
+        };
+
+        let dir = tempdir().expect("rb10h capture/queue drift tempdir");
+        let storage = dir.path().join(".libra");
+        build_rb10c_layout_c_fixture(&storage, "rb10h-drift").await;
+        let git_db = git_sqlite_db_path(&storage);
+        let cap_db = capture_sqlite_db_path(&storage);
+
+        let prepared = prepare_forward_phase1(&storage, 1)
+            .await
+            .expect("Phase 1 prepare");
+        let mut hook = |point: Phase2TestPoint, _root: &Path| -> StorageResult<()> {
+            if point == Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Repository) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "RB-10h injected repo-unlinked crash".to_string(),
+                });
+            }
+            Ok(())
+        };
+        execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut hook))
+            .await
+            .expect_err("injected RB-10h crash");
+        assert!(!git_db.exists(), "libra.db must already be unlinked");
+        assert!(cap_db.exists(), "capture.db is still pending");
+
+        // Post-crash legacy capture write.
+        {
+            use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
+            let opts = SqliteConnectOptions::new()
+                .filename(&cap_db)
+                .create_if_missing(false)
+                .busy_timeout(Duration::ZERO);
+            let mut conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
+                .await
+                .expect("open capture.db");
+            conn.execute(
+                "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, thread_id, state, working_dir, worktree_id, parent_commit, parent_session_id, metadata_json, redaction_report, started_at, last_event_at, stopped_at, schema_version, sync_revision, repo_id, workspace_id, workspace_fence, scope_state) VALUES ('sess-rb10h-post', 'codex', 'prov-rb10h-post', NULL, 'active', '/work/rb10h', 'wt-1', NULL, NULL, '{}', '{}', 1795402000, 1795402010, NULL, 1, 1, 'repo-1', 'ws-1', 1, 'scoped');",
+            )
+            .await
+            .expect("post-crash capture insert");
+            let _ = conn.close().await;
+        }
+
+        // Post-crash queue append.
+        let usage = AgentUsageStatsRecord {
+            id: "usage-rb10h-post".to_string(),
+            session_id: None,
+            thread_id: None,
+            agent_run_id: None,
+            run_id: None,
+            provider: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            request_kind: "chat".to_string(),
+            intent: None,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 2,
+            tool_call_count: 0,
+            wall_clock_ms: 1,
+            provider_latency_ms: None,
+            cost_estimate_micro_dollars: None,
+            cost_usd: None,
+            usage_estimated: false,
+            started_at: None,
+            finished_at: None,
+            success: true,
+            error_kind: None,
+            schema_version: 1,
+            created_at: "2026-11-24T02:00:00Z".to_string(),
+            agent_name: Some("codex".to_string()),
+            repo_id: Some("repo-1".to_string()),
+            turn_id: Some("turn-rb10h-post".to_string()),
+            event_id: Some("evt-rb10h-post".to_string()),
+        };
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "dedup:rb10h:q-post",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::InsertUsageStats(usage),
+        )
+        .expect("append post-crash queue frame");
+
+        let resumed = resume_forward_migration(&storage)
+            .await
+            .expect("resume must merge capture/queue drift into gen+1");
+        assert_eq!(resumed.initial_generation, 1);
+        assert_eq!(resumed.final_generation, 2, "AC1 gen+1");
+        assert!(resumed.reexported_due_to_drift, "AC1 drift re-export");
+        assert_eq!(
+            resumed.capture_recovery_state,
+            ForwardSourceRecoveryState::DriftedLivePending,
+            "AC1 capture drift"
+        );
+        assert!(resumed.queue_drift_detected, "AC4 queue drift");
+        assert!(resumed.finalized.manifest.finalized);
+        assert!(!cap_db.exists(), "capture.db unlinked after finalize");
+
+        let cap_store = RedbCaptureStore::open_read_only(&resumed.finalized.capture_redb_path)
+            .await
+            .expect("open capture.gen-00000002.redb");
+        assert!(
+            cap_store
+                .get_session("sess-rb10h-post")
+                .await
+                .expect("get session")
+                .is_some(),
+            "AC1 post-crash capture row preserved"
+        );
+        assert!(
+            cap_store
+                .get_usage_stats("usage-rb10h-post")
+                .await
+                .expect("get usage")
+                .is_some(),
+            "AC4 post-crash queue frame preserved"
+        );
+    }
+
+    /// RB-10h AC2/AC3: a crash between spool rmdir and tombstone installation is
+    /// reconciled; a concurrent legacy hook re-creating the directory merges the
+    /// backup ∪ live spool events into `gen+1` with zero loss.
+    #[tokio::test]
+    async fn forward_phase2_spool_tombstone_gap_crash_and_concurrent_hook_reconcile() {
+        use crate::storage::{RedbCaptureStore, capture_store::CaptureStore as _};
+
+        // AC2: no concurrent hook -> reacquire lock, install tombstones, finalize.
+        {
+            let dir = tempdir().expect("rb10h spool gap tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10h-gap").await;
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let fenced = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("fence + unlink");
+            let mut hook = |point: Phase2FinalizeTestPoint, _root: &Path| -> StorageResult<()> {
+                if point == Phase2FinalizeTestPoint::AfterRmdirBeforeLinkTombstone("ready") {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "RB-10h injected spool tombstone gap".to_string(),
+                    });
+                }
+                Ok(())
+            };
+            finalize_forward_phase2_spool_tombstones_and_manifest_inner(fenced, Some(&mut hook))
+                .expect_err("injected spool gap crash");
+            let manifest = read_storage_manifest(&storage)
+                .expect("read manifest")
+                .expect("unfinalized manifest survives spool gap");
+            assert!(!manifest.finalized);
+
+            let resumed = resume_forward_migration(&storage)
+                .await
+                .expect("AC2 resume must install tombstones and finalize");
+            assert!(resumed.finalized.manifest.finalized, "AC2 finalized");
+            for slot in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                let path = capture_spool_dir_path(&storage).join(slot);
+                assert_eq!(
+                    fs::read(&path).expect("read tombstone"),
+                    CAPTURE_SPOOL_TOMBSTONE_SENTINEL,
+                    "AC2 tombstone {slot}"
+                );
+            }
+        }
+
+        // AC3: concurrent hook re-creates `ready/` and publishes a new event.
+        {
+            let dir = tempdir().expect("rb10h concurrent hook tempdir");
+            let storage = dir.path().join(".libra");
+            build_rb10c_layout_c_fixture(&storage, "rb10h-hook").await;
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let fenced = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("fence + unlink");
+            let mut hook = |point: Phase2FinalizeTestPoint, _root: &Path| -> StorageResult<()> {
+                if point == Phase2FinalizeTestPoint::AfterRmdirBeforeLinkTombstone("ready") {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "RB-10h injected spool tombstone gap".to_string(),
+                    });
+                }
+                Ok(())
+            };
+            finalize_forward_phase2_spool_tombstones_and_manifest_inner(fenced, Some(&mut hook))
+                .expect_err("injected spool gap crash");
+
+            // Concurrent legacy hook re-creates the directory and publishes a
+            // new already-confirmed event.
+            let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+            fs::create_dir_all(&ready).expect("recreate ready dir");
+            fs::write(
+                ready.join("0002-rb10h-hook.json"),
+                build_spool_envelope_bytes(
+                    "codex",
+                    "codex",
+                    "33333333-3333-4333-8333-333333333399",
+                    Some("dedup:rb10h:hook-1"),
+                    "prov-rb10h-hook",
+                    "/work/rb10h-hook",
+                    &storage,
+                    "session_start",
+                    "2026-11-24T03:00:00Z",
+                    "",
+                ),
+            )
+            .expect("write concurrent hook event");
+
+            let resumed = resume_forward_migration(&storage)
+                .await
+                .expect("AC3 resume must merge backup ∪ live spool events");
+            assert!(resumed.finalized.manifest.finalized, "AC3 finalized");
+            for slot in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                let path = capture_spool_dir_path(&storage).join(slot);
+                assert_eq!(
+                    fs::read(&path).expect("read tombstone"),
+                    CAPTURE_SPOOL_TOMBSTONE_SENTINEL,
+                    "AC3 tombstone {slot}"
+                );
+            }
+            let cap_store = RedbCaptureStore::open_read_only(&resumed.finalized.capture_redb_path)
+                .await
+                .expect("open capture redb");
+            let sessions = cap_store
+                .list_sessions_by_started_desc()
+                .await
+                .expect("list capture sessions");
+            let provider_ids: Vec<&str> = sessions
+                .iter()
+                .map(|s| s.provider_session_id.as_str())
+                .collect();
+            assert!(
+                provider_ids.contains(&"prov-rb10h-hook"),
+                "AC3 concurrent-hook spool event preserved: {provider_ids:?}"
+            );
         }
     }
 }
