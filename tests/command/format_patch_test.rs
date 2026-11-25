@@ -8121,3 +8121,122 @@ fn reroll_filename_prefix() {
     let git_cover = fs::read_to_string(gout.join("v23-0000-cover-letter.patch")).unwrap();
     assert_eq!(tail(&libra_cover), tail(&git_cover), "AC6 interdiff file");
 }
+
+/// FPG-45: generated file paths print to stdout (or stay silent for
+/// --quiet/--json/--stdout) (#901).
+#[test]
+fn generated_paths_on_stdout() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    let names = |dir: &std::path::Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    let lines = |stdout: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+
+    let out = p.join("out");
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "-o",
+            "out",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC1");
+    let expected: Vec<String> = names(&out)
+        .into_iter()
+        .map(|name| format!("out/{name}"))
+        .collect();
+    assert_eq!(lines(&res.stdout), expected, "AC1 stdout paths");
+    assert!(
+        !String::from_utf8_lossy(&res.stderr)
+            .lines()
+            .any(|line| line.starts_with("out/")),
+        "AC2 stderr has no paths"
+    );
+
+    let quiet = run_libra_command(
+        &[
+            "--quiet",
+            "format-patch",
+            "-2",
+            "-o",
+            "out2",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&quiet, "AC3");
+    assert!(quiet.stdout.is_empty(), "AC3 quiet");
+
+    let json = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "-o",
+            "out3",
+            "--json",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&json, "AC4");
+    serde_json::from_slice::<serde_json::Value>(&json.stdout).expect("AC4 JSON only");
+
+    // AC5: no -o prints bare file names in the cwd.
+    let no_dir = run_libra_command(&["format-patch", "-2", "--no-thread", "--no-signature"], p);
+    assert_cli_success(&no_dir, "AC5");
+    let expected_bare = names(p)
+        .into_iter()
+        .filter(|name| name.starts_with("0001-") || name.starts_with("0002-"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines(&no_dir.stdout), expected_bare, "AC5 bare names");
+    for name in &expected_bare {
+        let _ = fs::remove_file(p.join(name));
+    }
+
+    // AC6: an absolute -o prints absolute paths.
+    let abs = tempdir().unwrap();
+    let abs_path = abs.path().to_string_lossy().to_string();
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "-o",
+            &abs_path,
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC6");
+    let expected: Vec<String> = names(abs.path())
+        .into_iter()
+        .map(|name| format!("{abs_path}/{name}"))
+        .collect();
+    assert_eq!(lines(&res.stdout), expected, "AC6 absolute paths");
+}

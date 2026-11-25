@@ -20,7 +20,10 @@ produces one patch file per non-merge commit (named with the `--suffix`,
 default `.patch`, unless `--numbered-files` is set, which uses bare sequence
 numbers). Filenames include a zero-padded sequence prefix regardless of `-n`
 or `-N`; under `-v <N>` every generated file also gets a `v<N>-` prefix (`v4-0000-cover-letter.patch`, `v4-0001-…`). Each patch is formatted as an mbox message with RFC 2822 headers, a
-plain-text diffstat, and a unified diff. The output is compatible with `git am`.
+plain-text diffstat, and a unified diff. Without `--stdout`, the generated
+paths are printed one per line to stdout (bare file names when `-o` is absent,
+the given path when `-o` is relative/absolute); `--quiet` and `--json` suppress
+that path list. The output is compatible with `git am`.
 
 Merge commits are skipped by default. When the revision range resolves to zero
 commits, the command exits successfully without generating patches. Plain output

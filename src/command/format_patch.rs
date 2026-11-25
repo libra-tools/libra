@@ -810,8 +810,19 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             &patch.slug,
             &patch.body,
         )?;
-        if !output.quiet {
-            eprintln!("{}", path.display());
+        if !output.quiet && !output.is_json() && !args.stdout {
+            // Git prints generated paths to stdout; without an explicit output
+            // directory only the bare file name is printed.
+            let shown = if args.output_directory.is_some() {
+                path.display().to_string()
+            } else {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            };
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{shown}")
+                .map_err(|error| stdout_write_error("write generated path", error))?;
         }
         records.push(PatchRecord {
             number: patch.number,

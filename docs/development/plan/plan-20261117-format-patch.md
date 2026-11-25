@@ -3964,7 +3964,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：非 `--stdout`/`--json`/全局 `--quiet` 时生成路径逐行写 stdout；绝对 `-o` 绝对路径、相对 `-o` 相对 cwd、无 `-o` 裸文件名；`--quiet`/`--json` 抑制。AC1–AC6 由 `format_patch_test::generated_paths_on_stdout` 覆盖（相对/绝对/裸文件名、stderr 无路径、quiet、JSON-only）；`format_patch_test` 172/172、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-20` 拆出的独立轴：非 `--stdout`、非 `--json`、非全局 `--quiet` 时把生成的文件路径逐行写到 stdout（不再写 stderr），`--quiet` 抑制，`--json` 只输出 JSON。 打印形式按 Git `set_outdir`/`outdir_offset`（`git show 6de20f6092:builtin/log.c` 第 1140–1158、1510–1527 行）：绝对 `-o` 打印绝对路径；相对 `-o` 打印相对当前工作目录的路径；未指定输出目录时只打印文件名；现行 `resolve_output_dir` 以 `current_dir()` 拼出绝对路径（`src/command/format_patch.rs:1772-1789`）。
 
