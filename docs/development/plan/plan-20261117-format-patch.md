@@ -2045,7 +2045,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`529 FP-03` 已交付 `-k` 与 `--subject-prefix`/`--rfc` 的互斥拒绝；本卡补齐 #888 第 5 项的单独成功路径：`-k`、`--subject-prefix=X`、`--rfc` 各自成功且 `Subject:` 行恰为一行（`rename` / `[X] rename` / `[RFC PATCH] rename`），`--rfc= -k` 与 Git 一致（既有 `fp03_empty_rfc_with_k`）。AC1 由 `fp03_empty_rfc_with_k` 覆盖，AC2–AC4 由新增 `keep_subject_and_prefix_alone_succeed` 覆盖；`format_patch_test` 137/137。文档核对：EN/zh/开发 format-patch 文档与 `COMPATIBILITY.md` 已包含 `-k`/`--subject-prefix`/`--rfc` 互斥说明，本卡无新增标记。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** `#888` 第 1–4 项（`-k` 与 `--subject-prefix`/`--rfc` 互斥拒绝及诊断）由 `issues/529#FP-03` 的拒绝门族交付并在 529 计划内验收（其门族在本卡共享回归组中运行，不计本卡 AC）；本卡按 GC-01 核实 `--rfc= -k` 与 `git@6de20f6092` 一致，并为 #888 第 5 项补齐单独 `-k`、`--subject-prefix`、`--rfc` 的成功路径断言（既有用例在输出目录为空时也会通过，不足以证明）。
 

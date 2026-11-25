@@ -3256,3 +3256,35 @@ fn cover_letter_mime_on_demand() {
         "AC2 non-ASCII cover: {cover}"
     );
 }
+
+/// FPG-09 (#888 item 5): lone `-k`, `--subject-prefix`, and `--rfc` succeed and
+/// produce exactly one `Subject:` line with the expected prefix.
+#[test]
+fn keep_subject_and_prefix_alone_succeed() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let p = repo.path();
+    let subjects = |args: &[&str]| -> Vec<String> {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "format-patch success path");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.starts_with("Subject:"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        subjects(&["format-patch", "-k", "-1", "--stdout"]),
+        ["Subject: rename"],
+        "AC2 lone -k"
+    );
+    assert_eq!(
+        subjects(&["format-patch", "--subject-prefix=X", "-1", "--stdout"]),
+        ["Subject: [X] rename"],
+        "AC3 lone --subject-prefix"
+    );
+    assert_eq!(
+        subjects(&["format-patch", "--rfc", "-1", "--stdout"]),
+        ["Subject: [RFC PATCH] rename"],
+        "AC4 lone --rfc"
+    );
+}
