@@ -4693,3 +4693,78 @@ fn rename_options_and_cover_inherit() {
         "AC7 cover inherits --no-renames"
     );
 }
+
+/// FPG-62: a cover-letter path occupied by a directory fails with the write
+/// error and leaves no patch or temporary files behind (#904).
+#[test]
+fn cover_letter_write_failure_leaves_no_partial_output() {
+    use std::collections::BTreeSet;
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("second.txt"), "second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], p),
+        "commit",
+    );
+    fs::create_dir_all(p.join("d/0000-cover-letter.patch")).unwrap();
+    let snapshot = |root: &std::path::Path| -> BTreeSet<String> {
+        let mut entries = BTreeSet::new();
+        let base = root.join("d");
+        let mut stack = vec![base.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(&base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let kind = if entry.file_type().unwrap().is_dir() {
+                    "dir"
+                } else {
+                    "file"
+                };
+                entries.insert(format!("{relative}:{kind}"));
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        entries
+    };
+    let before = snapshot(p);
+
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--no-renames",
+            "--cover-letter",
+            "-1",
+            "-o",
+            "d",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert!(!out.status.success(), "AC1 write failure");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.lines().any(|line| line == "Error-Code: LBR-IO-002"),
+        "AC1 stable code: {stderr}"
+    );
+    assert!(
+        stderr.contains("0000-cover-letter.patch"),
+        "AC1 path in message: {stderr}"
+    );
+    assert!(out.stdout.is_empty(), "AC1 stdout empty");
+    assert_eq!(snapshot(p), before, "AC2 no partial output");
+    assert_eq!(
+        before,
+        BTreeSet::from(["0000-cover-letter.patch:dir".to_string()]),
+        "AC2 snapshot is only the pre-created directory"
+    );
+}

@@ -4627,7 +4627,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：核实封面信先于补丁写出且单文件原子写；`d/0000-cover-letter.patch` 被目录占用时以 `LBR-IO-002`/128 失败、stdout 为空、不留下补丁或临时文件，既有实现已满足，无需代码改动。AC1/AC2 由 `format_patch_test::cover_letter_write_failure_leaves_no_partial_output` 覆盖（稳定码与路径短语；全量目录快照前后相同）；`format_patch_test` 149/149、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；开发文档已记录核对结论。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；数值退出码仍按 `DEFER-FPG-04`。
 
 **Description:** 自 `FPG-39` 拆出的独立轴：按 GC-01 核实并补门：`-o d` 下 `d/0000-cover-letter.patch` 被目录占用时，`format-patch` 以写入失败（`LBR-IO-002`，而非 CLI 拒绝）退出，且不留下任何部分输出（Git t4014「failure to write cover-letter aborts gracefully」）；现行 `write_patch_file` 为单文件原子写、封面信先于补丁写出（`src/command/format_patch.rs:1795-1836`），开工按 GC-01 核实失败时后续补丁不再写出，不满足即在本卡修复。
 
