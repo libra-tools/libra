@@ -2077,6 +2077,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                 &mut index,
                 target_mode,
                 &validated.pathspecs,
+                &std::collections::HashSet::new(),
                 true,
                 &mut add_output,
             )?;
@@ -2209,10 +2210,29 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // `--chmod=(+|-)x`: force the executable bit on the matched regular files'
     // index entries, even ones with no content change (Git's `--chmod`).
     if let Some(target_mode) = chmod_mode {
+        // ADR-CHM-02: the real mutation candidates reuse the validation's
+        // stage-0 skip-worktree set; without an explicit `--sparse` those
+        // entries are excluded so the sparse refusal leaves the index intact.
+        let excluded: std::collections::HashSet<String> = if args.sparse {
+            std::collections::HashSet::new()
+        } else {
+            index
+                .tracked_entries(0)
+                .into_iter()
+                .filter(|entry| entry.flags.skip_worktree)
+                .map(|entry| entry.name.clone())
+                .filter(|name| {
+                    validated
+                        .pathspecs
+                        .matches_path(std::path::Path::new(name.as_str()))
+                })
+                .collect()
+        };
         apply_chmod(
             &mut index,
             target_mode,
             &validated.pathspecs,
+            &excluded,
             false,
             &mut add_output,
         )?;
@@ -2262,6 +2282,7 @@ fn apply_chmod(
     index: &mut Index,
     target_mode: u32,
     pathspecs: &PathspecSet,
+    excluded: &std::collections::HashSet<String>,
     dry_run: bool,
     out: &mut AddOutput,
 ) -> Result<(), AddError> {
@@ -2271,6 +2292,9 @@ fn apply_chmod(
         let file_str = file
             .to_str()
             .ok_or_else(|| AddError::InvalidPathEncoding { path: file.clone() })?;
+        if excluded.contains(file_str) {
+            continue;
+        }
         let Some(current_mode) = index.get(file_str, 0).map(|e| e.mode) else {
             continue;
         };
@@ -3293,7 +3317,15 @@ mod test {
         )
         .expect("pathspec compiles");
         let mut out = AddOutput::empty(false);
-        apply_chmod(&mut index, 0o100755, &specs, true, &mut out).expect("apply_chmod");
+        apply_chmod(
+            &mut index,
+            0o100755,
+            &specs,
+            &std::collections::HashSet::new(),
+            true,
+            &mut out,
+        )
+        .expect("apply_chmod");
 
         let rejected: Vec<&str> = out.chmod_rejected.iter().map(|r| r.path.as_str()).collect();
         assert!(

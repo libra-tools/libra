@@ -5490,3 +5490,111 @@ fn i861_failure_renormalize_unreadable_or_symlink_parent_never_stages_deletion()
     assert_eq!(fs::read(saved.join("probe.txt")).unwrap(), b"original\n");
     assert!(fs::read_dir(&outside).unwrap().next().is_none());
 }
+
+fn sparse_chmod_fixture() -> tempfile::TempDir {
+    let repo = tempdir().expect("repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("sparse_entry"), "a").unwrap();
+    std::fs::write(p.join("dense_entry"), "b").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add fixture");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--skip-worktree", "sparse_entry"], p),
+        "skip-worktree",
+    );
+    repo
+}
+
+fn file_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// I667-01 AC1–AC8 (TC-0052): a sparse `--chmod` refusal leaves the index,
+/// worktree mode and staged diff untouched.
+#[test]
+fn test_add_chmod_sparse_rejection_is_atomic_tc0052() {
+    let repo = sparse_chmod_fixture();
+    let p = repo.path();
+    let before_stage =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "-s"], p).stdout).to_string();
+    let before_verbose =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "-v"], p).stdout).to_string();
+    let before_mode = file_mode(&p.join("sparse_entry"));
+
+    let out = run_libra_command(&["add", "--chmod=+x", "sparse_entry"], p);
+    assert_eq!(out.status.code(), Some(1), "AC1 rc=1");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("matched paths that exist outside of your sparse-checkout definition"),
+        "AC2 header"
+    );
+    assert!(stderr.contains("    sparse_entry"), "AC2 path line");
+    assert!(
+        stderr.contains("hint: use 'libra add --sparse <path>'"),
+        "AC2 hint1"
+    );
+    assert!(
+        stderr.contains("hint: or clear the skip-worktree bit"),
+        "AC2 hint2"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "-s"], p).stdout),
+        before_stage,
+        "AC3/AC4/AC5 mode+blob+stage unchanged"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "-v"], p).stdout),
+        before_verbose,
+        "AC6 skip-worktree stays S"
+    );
+    assert_eq!(
+        file_mode(&p.join("sparse_entry")),
+        before_mode,
+        "AC7 mode 0644"
+    );
+    let diff = run_libra_command(&["diff", "--staged", "--", "sparse_entry"], p);
+    assert_cli_success(&diff, "AC8 diff --staged");
+    assert!(
+        String::from_utf8_lossy(&diff.stdout).is_empty(),
+        "AC8 empty"
+    );
+}
+
+/// I667-01 AC9/AC10: explicit `--sparse` chmod and dense chmod still apply.
+#[test]
+fn test_add_sparse_chmod_opt_out_tc0052() {
+    let repo = sparse_chmod_fixture();
+    let p = repo.path();
+    let blob_before =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "-s", "sparse_entry"], p).stdout)
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_string();
+
+    let out = run_libra_command(&["add", "--sparse", "--chmod=+x", "sparse_entry"], p);
+    assert_cli_success(&out, "AC9 add --sparse --chmod");
+    let staged =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "-s", "sparse_entry"], p).stdout)
+            .to_string();
+    assert!(staged.starts_with("100755 "), "AC9 mode 100755: {staged}");
+    assert_eq!(
+        staged.split_whitespace().nth(1).unwrap(),
+        blob_before,
+        "AC9 blob unchanged"
+    );
+    assert!(staged.contains(" 0\tsparse_entry"), "AC9 stage 0");
+
+    let dense = run_libra_command(&["add", "--chmod=+x", "dense_entry"], p);
+    assert_cli_success(&dense, "AC10 dense chmod");
+    let dense_stage =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "-s", "dense_entry"], p).stdout)
+            .to_string();
+    assert!(dense_stage.starts_with("100755 "), "AC10 dense mode");
+}
