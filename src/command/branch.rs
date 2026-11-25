@@ -2710,20 +2710,36 @@ async fn run_branch(args: &BranchArgs) -> Result<BranchOutput, BranchError> {
 /// `git branch --column`. Column mode uses plain (uncolored) names so the width
 /// calculation is accurate.
 fn format_branch_columns(entries: &[String], width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+
     if entries.is_empty() {
         return String::new();
     }
-    let max_len = entries.iter().map(|e| e.chars().count()).max().unwrap_or(0);
-    let col_width = max_len + 2;
-    let cols = std::cmp::max(1, width / col_width);
+    // Git's `--column=column` uses one padding space after the widest rendered
+    // entry (display width, so CJK/combining names align) and packs as many
+    // slots per line as fit in `COLUMNS`.
+    let max_len = entries
+        .iter()
+        .map(|entry| UnicodeWidthStr::width(entry.as_str()))
+        .max()
+        .unwrap_or(0);
+    let col_width = max_len + 1;
+    let cols = std::cmp::max(1, width / col_width).min(entries.len());
     let rows = entries.len().div_ceil(cols);
     let mut out = String::new();
     for r in 0..rows {
         let mut line = String::new();
         for c in 0..cols {
             let idx = c * rows + r;
-            if idx < entries.len() {
-                line.push_str(&format!("{:<col_width$}", entries[idx]));
+            if idx >= entries.len() {
+                continue;
+            }
+            let entry = &entries[idx];
+            line.push_str(entry);
+            let is_last_on_row = (c + 1 == cols) || (c + 1) * rows + r >= entries.len();
+            if !is_last_on_row {
+                let pad = col_width.saturating_sub(UnicodeWidthStr::width(entry.as_str()));
+                line.push_str(&" ".repeat(pad));
             }
         }
         out.push_str(line.trim_end());

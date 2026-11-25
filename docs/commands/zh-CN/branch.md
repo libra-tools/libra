@@ -62,7 +62,7 @@ branch 的**查询**形态（裸列表、`-l`/`-r`/`-a`、`--show-current`、`-v
 | | `--no-merged` | `[commit]`（默认 HEAD） | 只列出尚未合并入该提交的分支 |
 | | `--sort` | `<key>` | 按 `refname`、`version:refname`（`v:refname`）、`committerdate`/`creatordate`/`authordate`（tip 提交的 committer 日期，`authordate` 为 author 日期）、`objectsize`（tip 对象字节大小）或 `objectname`（tip 提交的对象 id）排序；前导 `-` 反转（dash 形式用 `--sort=-committerdate`）。优先于 `branch.sort` 配置默认 |
 | | `--format` | `<format>` | 以 for-each-ref 格式串渲染每个分支（如 `%(refname:short)`、`%(objectname)`、`%(HEAD)`、`%(upstream)`、`%(if)`…`%(end)`）。取代默认 `* name` 列表（及 `-v`/`--column`），复用 for-each-ref atom 引擎 |
-| | `--column[=<mode>]` | `always` / `auto` / `never` | 将分支列表按列布局而非每行一个（bare `--column` 即 `always`；`auto` 仅在 stdout 为终端时）。列模式显示纯文本无颜色的名称。列模式实际启用时与 `-v`/`--verbose` 同时使用会以 exit 128 拒绝，并输出 `options '--column' and '--verbose' cannot be used together`；`--no-column`、`--column=never` 与非 TTY 的 `--column=auto` 不触发。 |
+| | `--column[=<mode>]` | `always` / `auto` / `never` | 将分支列表按列布局而非每行一个（bare `--column` 即 `always`；`auto` 仅在 stdout 为终端时）。列模式显示纯文本无颜色的名称。列布局按 Git 语义：槽宽为最宽渲染条目 + 1 个填充空格（按终端显示宽度计算，CJK/组合字符对齐），列数受 `COLUMNS`（默认 80）与条目数约束；单条目宽于 `COLUMNS` 时退化为每行一个完整名称，不截断。列模式实际启用时与 `-v`/`--verbose` 同时使用会以 exit 128 拒绝，并输出 `options '--column' and '--verbose' cannot be used together`；`--no-column`、`--column=never` 与非 TTY 的 `--column=auto` 不触发。 |
 | | `--no-column` | | 不按列布局列出分支（等价于 `--column=never`），撤销先前的 `--column`（最后出现者生效）。分支默认每行一个，故单独使用时为 no-op。 |
 | `-v` | `--verbose` | | 每个分支附带其 tip 的短 sha 与提交 subject。重复（`-vv`）时额外显示上游 tracking 段 `[<upstream>: ahead N, behind M]`（计数与 `status` 相同；remote-tracking ref 未 fetch 或计数无法计算时省略计数，后者会发出 warning；无配置上游的分支不显示）。与真正启用的 `--column` 同时使用会以 exit 128 拒绝；`--no-column`、`--column=never` 与非 TTY 的 `--column=auto` 仍有效。 |
 
