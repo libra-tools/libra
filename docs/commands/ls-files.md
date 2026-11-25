@@ -21,8 +21,10 @@ filtering via `--others --exclude-standard`, ignored-only listing via `-i`/`--ig
 (`-i -o` for ignored untracked files, `-i -c` for tracked files matching an
 exclude pattern), repository-local pathspec filtering, `--error-unmatch`,
 NUL-delimited text output via `-z`, status tags via `-t`, and unmerged-only
-listing via `-u` / `--unmerged`. `--full-name` is accepted as a no-op (Libra
-always prints repo-root-relative paths).
+listing via `-u` / `--unmerged`. Without an explicit pathspec the listing is scoped to the current directory and
+paths are printed relative to it; `--full-name` switches the representation to
+repo-root-relative paths without widening that scope. An explicitly selected
+entry outside the cwd is printed as `../…`.
 
 Tracked symlinks are inspected as symlinks for `--deleted` and `--modified`:
 a dangling symlink still exists and is not listed as deleted, while a changed
@@ -59,7 +61,7 @@ without printing panic/backtrace or `Broken pipe` diagnostics.
 | `-t` | Prefix each path with a status tag: `H` (cached), `R` (removed/deleted), `C` (modified/changed), `?` (other/untracked), `M` (unmerged), `S` (skip-worktree). Unmerged paths are not hidden; each stage 1/2/3 entry is printed as `M <path>`, matching Git's conflict visibility. A skip-worktree entry always tags `S` and is never reported deleted/modified. |
 | `-v` | Like `-t`: prefix each path with a status tag. Git's `-v` spells assume-unchanged files in lowercase, which Libra does not support, so `-v` output equals `-t` output.  Plain `ls-files`, `-c`, `-z` and `--json` walk every index stage, so an unmerged path prints one row per conflict stage (stage 1/2/3) exactly like Git's `show_files`; `-v` tags those rows `M`. |
 | `-u`, `--unmerged` | Show only unmerged (conflict) entries — index stages 1/2/3 — in stage-style output. |
-| `--full-name` | Accepted for Git compatibility. Libra always prints repo-root-relative paths (the `git --full-name` form), so this is a no-op. |
+| `--full-name` | Print repo-root-relative paths instead of cwd-relative ones (the implicit cwd scope is unchanged). |
 | `--others`, `-o` | Show untracked working-tree files. A path present in the index at **any stage** — including an unmerged conflict stage — is tracked, never "other" (Git's `index_name_is_other`), so conflict paths (`f`, `g.log` above) are excluded even while the merge is unresolved. |
 | `--cached`, `-c` | Show files staged in the index. |
 | `-i`, `--ignored` | Show only the ignored set: `-i -o` lists ignored untracked files (the inverse of `-o`), `-i -c` lists tracked files matching an exclude pattern. Must be combined with `-o`/`-c` and needs an exclude source — `--exclude-standard` or an explicit `-x`/`-X` pattern (exit 128 otherwise), matching Git. |
@@ -179,4 +181,4 @@ entries use `null` for fields that do not apply:
 | NUL output | `-z` (text mode only) | `-z` | Different model |
 | Status tags | `-t` / `-v` (H/R/C/?/M/S) | `-t` / `-v` (H/S/M/R/C/K/?) | Different model (`-v` lowercase assume-unchanged unsupported; `K`/`U` unsupported) |
 | Unmerged entries | `-u` / `--unmerged` | `-u` / `--unmerged` | Different model |
-| Root-relative paths | `--full-name` (always; no-op flag) | `--full-name` (opt-in) | Different model |
+| Path basis | `--full-name` (opt-in; cwd-relative by default) | `--full-name` | Same |

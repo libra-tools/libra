@@ -449,6 +449,19 @@ fn run_ls_files(
         entries.retain(|entry| entry.stage.unwrap_or(0) > 0 || view.contains_str(&entry.path));
     }
 
+    // Git scopes a pathspec-less listing to the current directory (I668-01);
+    // explicit pathspecs keep their own cwd-relative resolution and may select
+    // entries outside the implicit cwd tree.
+    if pathspecs.is_empty() {
+        let relative = util::cur_dir()
+            .strip_prefix(&workdir)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        if !relative.as_os_str().is_empty() {
+            entries.retain(|entry| Path::new(&entry.path).starts_with(&relative));
+        }
+    }
+
     entries = filter_entries_by_pathspec(entries, &pathspecs);
     if _args.error_unmatch {
         ensure_error_unmatch(&pathspecs, &entries)?;
@@ -567,6 +580,21 @@ fn status_tag(status: &str) -> char {
     }
 }
 
+/// Project a repo-root path for text output: cwd-relative by default,
+/// repo-root-relative with `--full-name`, and a `../`-prefixed path for an
+/// explicitly selected entry outside the cwd (never silently falling back to the
+/// root form).
+fn display_path(path: &str, cwd_relative: &Path, full_name: bool) -> String {
+    if full_name || cwd_relative.as_os_str().is_empty() {
+        return path.to_string();
+    }
+    if let Ok(rest) = Path::new(path).strip_prefix(cwd_relative) {
+        return rest.to_string_lossy().into_owned();
+    }
+    let depth = cwd_relative.components().count();
+    format!("{}{}", "../".repeat(depth), path)
+}
+
 fn render_output(
     entries: &[FileEntry],
     args: &LsFilesArgs,
@@ -590,9 +618,14 @@ fn render_output(
     // immediately before the path. It composes with `-t`/`-s`/`--stage` exactly
     // like Git: the column sits after any tag/stage prefix and before the path.
     let workdir = util::working_dir();
+    let cwd_relative = util::cur_dir()
+        .strip_prefix(&workdir)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
 
     let mut stdout = std::io::stdout().lock();
     for entry in entries {
+        let display = display_path(&entry.path, &cwd_relative, args.full_name);
         let eol_col = if args.eol {
             eol_column(entry, &workdir)
         } else {
@@ -614,10 +647,10 @@ fn render_output(
                 hash,
                 entry.stage.unwrap_or(0),
                 eol_col,
-                entry.path
+                display
             )
         } else {
-            format!("{}{}", eol_col, entry.path)
+            format!("{}{}", eol_col, display)
         };
         // `-t`/`-v` prefix a status tag (matching `git ls-files -t`).
         // Unmerged wins over skip-worktree, which wins over the worktree-state
