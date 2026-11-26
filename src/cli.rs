@@ -2234,6 +2234,10 @@ fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<C
         Commands::Agent(command::agent::AgentArgs {
             command: command::agent::AgentSubcommand::Doctor(_),
             ..
+        })
+        | Commands::Agent(command::agent::AgentArgs {
+            command: command::agent::AgentSubcommand::Daemon(_),
+            ..
         }) => {
             utils::util::try_get_storage_path(None)
                 .map_err(|error| repo_resolution_error(error, None))?;
@@ -3750,6 +3754,64 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
                     )
                 }
             });
+    }
+    if argv.get(1).and_then(|arg| arg.to_str())
+        == Some(crate::internal::ai::capture::spool::QUEUE_DRAIN_ARG)
+    {
+        if argv.len() != 2 {
+            return Err(CliError::fatal(
+                "capture queue drain does not accept arguments".to_string(),
+            ));
+        }
+        #[cfg(feature = "storage-redb")]
+        {
+            return crate::internal::ai::capture::drain::run_queue_from_repository()
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    if error.chain().any(|cause| {
+                        cause.is::<crate::internal::ai::capture::drain::CaptureDatabaseBusy>()
+                    }) {
+                        CliError::fatal(
+                            crate::internal::ai::capture::drain::CaptureDatabaseBusy.to_string(),
+                        )
+                        .with_stable_code(crate::utils::error::StableErrorCode::CaptureDatabaseBusy)
+                    } else if error.chain().any(|cause| {
+                        cause.is::<crate::internal::ai::capture::drain::CaptureSchemaTooNew>()
+                    }) {
+                        CliError::fatal(
+                            crate::internal::ai::capture::drain::CaptureSchemaTooNew.to_string(),
+                        )
+                        .with_stable_code(crate::utils::error::StableErrorCode::CaptureSchemaTooNew)
+                    } else if let Some(storage_err) =
+                        error.downcast_ref::<crate::storage::StorageBackendError>()
+                    {
+                        CliError::fatal(storage_err.to_string())
+                            .with_stable_code(storage_err.stable_error_code())
+                    } else if let Some(class) =
+                        crate::internal::ai::capture::scope_binding::active_repository_failure_class(
+                            &error,
+                        )
+                    {
+                        crate::command::hooks::active_repository_failure_error(
+                            class,
+                            "capture queue drain failed",
+                        )
+                    } else {
+                        CliError::fatal(
+                            "capture queue drain could not store queued events; queued events stay in place, run `libra agent doctor`".to_string(),
+                        )
+                    }
+                });
+        }
+        #[cfg(not(feature = "storage-redb"))]
+        {
+            return Err(crate::storage::StorageBackendError::UnsupportedBackend {
+                requested: "redb".to_string(),
+                detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+            }
+            .into_cli_error());
+        }
     }
     // MCP read worker (MC-29): before clap, schema migration, object-index
     // repair, and the auto-upgrade check. It only reads one server-built

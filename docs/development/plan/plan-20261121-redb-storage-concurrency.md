@@ -8982,7 +8982,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区于 `live_pipeline.rs`/`drain.rs`/`spool.rs`/`src/cli.rs` 按 `ADR-RB-01` #4 落实运行时队列分派（因 `storage-redb` 自动启用 `storage-queue`，任何含 `storage-redb` 的构建含纯 `--no-default-features --features storage-redb` 在选定仓库后端 == `Redb` 时均恒走双通道 `capture-queue/{priority,normal}/`；SQLite 仓库即便在 `--all-features` 二进制下仍严格走 `capture-spool/`），并新增内部排空命令 `libra __capture-queue-drain`。
 
@@ -8998,16 +8998,16 @@
 | `ADR-RB-01` #1 规定 `storage-redb` 自动蕴含 `storage-queue`，SQLite 仓与 Redb 仓须按选定后端严格分流 `capture-spool/` vs `capture-queue/` | `src/internal/ai/capture/drain.rs:15`；`ADR-RB-01`、`ADR-RB-05` |
 
 **Acceptance criteria:**
-- [ ] 在 `--all-features` 二进制中，选定后端为 `Sqlite` 的仓库执行实时 Hook 仍写入 `capture-spool/ready/`，绝不写入 `capture-queue/`。
-- [ ] 在纯 `--no-default-features --features storage-redb` 构建（不显式传 `storage-queue`）下，红库仓库实时 Hook 仅写入 `capture-queue/{priority,normal}/`（绝不直接打开 `capture.redb`）。
-- [ ] 在上述纯 `--no-default-features --features storage-redb` 构建下，`libra __capture-queue-drain` 将队列帧无损落库 `capture.redb`。
-- [ ] `SessionEnd` 钩子路由至 `priority/` 通道（普通事件路由至 `normal/`）。
-- [ ] `libra __capture-queue-drain` 严格先将 `priority/` 落库再消费 `normal/`。
+- [x] 在 `--all-features` 二进制中，选定后端为 `Sqlite` 的仓库执行实时 Hook 仍写入 `capture-spool/ready/`，绝不写入 `capture-queue/`。
+- [x] 在纯 `--no-default-features --features storage-redb` 构建（不显式传 `storage-queue`）下，红库仓库实时 Hook 仅写入 `capture-queue/{priority,normal}/`（绝不直接打开 `capture.redb`）。
+- [x] 在上述纯 `--no-default-features --features storage-redb` 构建下，`libra __capture-queue-drain` 将队列帧无损落库 `capture.redb`。
+- [x] `SessionEnd` 钩子路由至 `priority/` 通道（普通事件路由至 `normal/`）。
+- [x] `libra __capture-queue-drain` 严格先将 `priority/` 落库再消费 `normal/`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=internal::ai::capture::live_pipeline::tests::backend_aware_hook_dispatch_sqlite_vs_redb) | test(=internal::ai::capture::live_pipeline::tests::redb_only_feature_implies_queue_hook_to_capture_e2e)'`（new，lib 发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=internal::ai::capture::live_pipeline::tests::backend_aware_hook_dispatch_sqlite_vs_redb)'`（new，覆盖 AC1、AC4、AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=internal::ai::capture::live_pipeline::tests::redb_only_feature_implies_queue_hook_to_capture_e2e)'`（new，覆盖 AC2、AC3）
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=internal::ai::capture::live_pipeline::tests::backend_aware_hook_dispatch_sqlite_vs_redb) | test(=internal::ai::capture::live_pipeline::tests::redb_only_feature_implies_queue_hook_to_capture_e2e)'`（new，lib 发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=internal::ai::capture::live_pipeline::tests::backend_aware_hook_dispatch_sqlite_vs_redb)'`（new，覆盖 AC1、AC4、AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=internal::ai::capture::live_pipeline::tests::redb_only_feature_implies_queue_hook_to_capture_e2e)'`（new，覆盖 AC2、AC3）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -9043,7 +9043,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区于 `src/cli.rs`、`src/command/agent/mod.rs`、`src/command/agent/doctor.rs` 新增可选预览守护进程 `libra agent daemon`（活跃时 Hook 跳过 `spawn`、无守护时仅首帧触发单次分离式 `__capture-queue-drain`）与 `agent doctor` 双通道高水位/积压字节/`quarantine/` 诊断面板，并按 `ER-06a` 随附更新 `docs/commands/agent.md`、`docs/commands/zh-CN/agent.md` 与 `docs/error-codes.md`（登记 `LBR-AGENT-050`）。
 
@@ -9057,16 +9057,16 @@
 | `docs/error-codes.md:166-169` 已登记 `LBR-AGENT-046..049`，`LBR-AGENT-050` 空闲可用；`command/agent/mod.rs` 尚无 `daemon` 子命令 | `docs/error-codes.md:166-169`；`src/command/agent/mod.rs`；`ADR-RB-05` |
 
 **Acceptance criteria:**
-- [ ] 活跃 `libra agent daemon` 存在时，实时 Hook 跳过 `spawn` 后台排空进程。
-- [ ] 无活跃 `libra agent daemon` 时，仅由首帧触发单次分离式 `__capture-queue-drain`。
-- [ ] `libra agent doctor` 输出 `priority/` 与 `normal/` 各自高水位与积压字节数。
-- [ ] `libra agent doctor` 输出 `quarantine/` 计数与诊断码 `LBR-AGENT-050`。（注：`docs/commands/agent.md`、`docs/commands/zh-CN/agent.md` 与 `docs/error-codes.md` 同步属 `ER-06a` 同卡必需文档门，按 `G-03` 不占本卡特有 AC 配额。）
+- [x] 活跃 `libra agent daemon` 存在时，实时 Hook 跳过 `spawn` 后台排空进程。
+- [x] 无活跃 `libra agent daemon` 时，仅由首帧触发单次分离式 `__capture-queue-drain`。
+- [x] `libra agent doctor` 输出 `priority/` 与 `normal/` 各自高水位与积压字节数。
+- [x] `libra agent doctor` 输出 `quarantine/` 计数与诊断码 `LBR-AGENT-050`。（注：`docs/commands/agent.md`、`docs/commands/zh-CN/agent.md` 与 `docs/error-codes.md` 同步属 `ER-06a` 同卡必需文档门，按 `G-03` 不占本卡特有 AC 配额。）
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=command::agent::doctor::tests::redb_daemon_drain_priority_and_doctor_queue_telemetry)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=command::agent::doctor::tests::redb_daemon_drain_priority_and_doctor_queue_telemetry)'`（new，覆盖 AC1–AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_agent_docs_contract`（`ER-06a` 随附文档契约）
-- [ ] `rg -q "LBR-AGENT-050" docs/error-codes.md`（`ER-06a` 错误码登记核验）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=command::agent::doctor::tests::redb_daemon_drain_priority_and_doctor_queue_telemetry)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=command::agent::doctor::tests::redb_daemon_drain_priority_and_doctor_queue_telemetry)'`（new，覆盖 AC1–AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_agent_docs_contract`（`ER-06a` 随附文档契约）
+- [x] `rg -q "LBR-AGENT-050" docs/error-codes.md`（`ER-06a` 错误码登记核验）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -9100,7 +9100,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区（全部 146 文件接线与队列接入已就绪后）将 `src/storage/backend.rs` 编译期常量 `REDB_RUNTIME_UNLOCKED` 从 `false` 翻为 `true`（同步更新 `src/storage/backend.rs` 门控单测并新增解锁态与未迁移 SQLite 拒绝测试），联合解锁 CLI `LIBRA_STORAGE_BACKEND=redb` 路径与 `libra-migrate --to redb` 实盘切换入口。
 
@@ -9115,15 +9115,15 @@
 | `RB-01c` 与 `RB-11t` 将 `REDB_RUNTIME_UNLOCKED = false` 设为唯一编译期门控点；全部 146 文件与队列接线完成后于同家族内解锁 | `ADR-RB-01`、`ADR-RB-08`；`RB-01c`、`RB-11t` |
 
 **Acceptance criteria:**
-- [ ] `src/storage/backend.rs` 将 `REDB_RUNTIME_UNLOCKED` 翻为 `true` 并更新编译期门控单元测试断言。
-- [ ] 解锁后已编译 CLI 在显式 `LIBRA_STORAGE_BACKEND=redb` 下正常选用 `StorageBackendKind::Redb`。
-- [ ] 解锁后 `libra-migrate --to redb` 实盘切换入口解除 `LBR-CLI-003` 预集成阻断且 `--bin libra-migrate` 单测全绿。
-- [ ] 未迁移旧 SQLite 仓库在纯 `storage-redb` 二进制上 fail-closed 输出 `libra-migrate` 升级指引。
+- [x] `src/storage/backend.rs` 将 `REDB_RUNTIME_UNLOCKED` 翻为 `true` 并更新编译期门控单元测试断言。
+- [x] 解锁后已编译 CLI 在显式 `LIBRA_STORAGE_BACKEND=redb` 下正常选用 `StorageBackendKind::Redb`。
+- [x] 解锁后 `libra-migrate --to redb` 实盘切换入口解除 `LBR-CLI-003` 预集成阻断且 `--bin libra-migrate` 单测全绿。
+- [x] 未迁移旧 SQLite 仓库在纯 `storage-redb` 二进制上 fail-closed 输出 `libra-migrate` 升级指引。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::unlocked_cli_and_migrate_cutover_with_unmigrated_sqlite_fail_closed)'`（new，lib 发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::unlocked_cli_and_migrate_cutover_with_unmigrated_sqlite_fail_closed)'`（new，覆盖 AC1、AC2、AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --bin libra-migrate`（覆盖 AC3）
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::unlocked_cli_and_migrate_cutover_with_unmigrated_sqlite_fail_closed)'`（new，lib 发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::unlocked_cli_and_migrate_cutover_with_unmigrated_sqlite_fail_closed)'`（new，覆盖 AC1、AC2、AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --bin libra-migrate`（覆盖 AC3）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`；随 `RB-30` 承接 `T-2` 与远端 `base.yml` CI）
 
@@ -9157,7 +9157,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区紧接 `RB-29a` 解锁之后，将 `tests/storage_concurrency_stress_test.rs` 中的预解锁二进制用例 `pre_unlock_libra_migrate_binary_rejects_cutover_with_libra_test_env` 替换为真实解锁态双向往返用例 `post_unlock_libra_migrate_binary_bidirectional_roundtrip`，并同步原子更新 `.github/workflows/base.yml` 的 `compat-redb-storage` 步骤 ⑥ 选测过滤器（精确作用域 `diff -u` 证明 `compat-offline-core` 零修改），确保 `RB-30` 推送集成树触发远端 `base.yml` CI 时精确执行解锁态二进制门并全绿。
 
@@ -9171,17 +9171,17 @@
 | `RB-12` 在 `base.yml` 步骤 ⑥ 显式选择 `pre_unlock_libra_migrate_binary_rejects_cutover_with_libra_test_env`；解锁后必须在同家族内同步更新 `base.yml`，否则 `RB-30` 推送门禁会找不到旧测试名而失败 | `RB-12`；`RB-29a`；`ADR-RB-08` |
 
 **Acceptance criteria:**
-- [ ] `tests/storage_concurrency_stress_test.rs` 将锁定态二进制用例替换为 `post_unlock_libra_migrate_binary_bidirectional_roundtrip`，拉起真实 `env!("CARGO_BIN_EXE_libra-migrate")` 完成 `SQLite → redb → 新写入 → SQLite` 端到端双向往返且 100% 一致。
-- [ ] `.github/workflows/base.yml` 的 `compat-redb-storage` 步骤 ⑥ 已原子更新为 `test(=dual_feature_migration_and_stress_roundtrip) | test(=post_unlock_libra_migrate_binary_bidirectional_roundtrip)`。
-- [ ] `.github/workflows/base.yml` 零残留 `pre_unlock_libra_migrate_binary_rejects_cutover_with_libra_test_env`。
-- [ ] 既有 `compat-offline-core` job（`jobs.test`）步骤相对前置基线逐行零修改。
+- [x] `tests/storage_concurrency_stress_test.rs` 将锁定态二进制用例替换为 `post_unlock_libra_migrate_binary_bidirectional_roundtrip`，拉起真实 `env!("CARGO_BIN_EXE_libra-migrate")` 完成 `SQLite → redb → 新写入 → SQLite` 端到端双向往返且 100% 一致。
+- [x] `.github/workflows/base.yml` 的 `compat-redb-storage` 步骤 ⑥ 已原子更新为 `test(=dual_feature_migration_and_stress_roundtrip) | test(=post_unlock_libra_migrate_binary_bidirectional_roundtrip)`。
+- [x] `.github/workflows/base.yml` 零残留 `pre_unlock_libra_migrate_binary_rejects_cutover_with_libra_test_env`。
+- [x] 既有 `compat-offline-core` job（`jobs.test`）步骤相对前置基线逐行零修改。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --test storage_concurrency_stress_test -E 'test(=dual_feature_migration_and_stress_roundtrip) | test(=post_unlock_libra_migrate_binary_bidirectional_roundtrip)'`（new，integration 发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --test storage_concurrency_stress_test -E 'test(=dual_feature_migration_and_stress_roundtrip) | test(=post_unlock_libra_migrate_binary_bidirectional_roundtrip)'`（new，覆盖 AC1）
-- [ ] `rg -q "post_unlock_libra_migrate_binary_bidirectional_roundtrip" .github/workflows/base.yml`（覆盖 AC2）
-- [ ] `bash -euo pipefail -c 'if rg -n "pre_unlock_libra_migrate_binary_rejects_cutover_with_libra_test_env" .github/workflows/base.yml; then echo "FAIL: stale pre-unlock test"; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then exit "$rc"; fi; fi'`（遵循 `plan-template.md:591` 区分退出码 `1` 与 `>1`，覆盖 AC3）
-- [ ] `python3 -c 'import os, re, subprocess; from pathlib import Path; run=lambda c: subprocess.check_output(c, text=True); extract=lambda t: (lambda ls: "".join(ls))([l for l in (lambda a: a[next(i for i,x in enumerate(a) if x.startswith("  test:")):])(t.splitlines(True))][:next((j for j,x in enumerate((lambda a: a[next(i for i,x in enumerate(a) if x.startswith("  test:")):])(t.splitlines(True))[1:],1) if re.match(r"^  [^ ]",x)), None)]); st=run(["libra","status","--porcelain=v1","--",".github/workflows/base.yml"]).strip(); base_ref=os.environ.get("PRE_CARD_BASE") or ("HEAD" if st else "HEAD~1"); old=extract(run(["libra","--no-pager","show",f"{base_ref}:.github/workflows/base.yml"])); wt=extract(Path(".github/workflows/base.yml").read_text(encoding="utf-8")); assert "name: compat-offline-core" in old and old==wt, "compat-offline-core modified"'`（零临时文件纯内存精确作用域逐字节比对，覆盖 AC4）
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --test storage_concurrency_stress_test -E 'test(=dual_feature_migration_and_stress_roundtrip) | test(=post_unlock_libra_migrate_binary_bidirectional_roundtrip)'`（new，integration 发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --test storage_concurrency_stress_test -E 'test(=dual_feature_migration_and_stress_roundtrip) | test(=post_unlock_libra_migrate_binary_bidirectional_roundtrip)'`（new，覆盖 AC1）
+- [x] `rg -q "post_unlock_libra_migrate_binary_bidirectional_roundtrip" .github/workflows/base.yml`（覆盖 AC2）
+- [x] `bash -euo pipefail -c 'if rg -n "pre_unlock_libra_migrate_binary_rejects_cutover_with_libra_test_env" .github/workflows/base.yml; then echo "FAIL: stale pre-unlock test"; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then exit "$rc"; fi; fi'`（遵循 `plan-template.md:591` 区分退出码 `1` 与 `>1`，覆盖 AC3）
+- [x] `python3 -c 'import os, re, subprocess; from pathlib import Path; run=lambda c: subprocess.check_output(c, text=True); extract=lambda t: (lambda ls: "".join(ls))([l for l in (lambda a: a[next(i for i,x in enumerate(a) if x.startswith("  test:")):])(t.splitlines(True))][:next((j for j,x in enumerate((lambda a: a[next(i for i,x in enumerate(a) if x.startswith("  test:")):])(t.splitlines(True))[1:],1) if re.match(r"^  [^ ]",x)), None)]); st=run(["libra","status","--porcelain=v1","--",".github/workflows/base.yml"]).strip(); base_ref=os.environ.get("PRE_CARD_BASE") or ("HEAD" if st else "HEAD~1"); old=extract(run(["libra","--no-pager","show",f"{base_ref}:.github/workflows/base.yml"])); wt=extract(Path(".github/workflows/base.yml").read_text(encoding="utf-8")); assert "name: compat-offline-core" in old and old==wt, "compat-offline-core modified"'`（零临时文件纯内存精确作用域逐字节比对，覆盖 AC4）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`；随 `RB-30` 承接 `T-2` 与远端 `base.yml` CI）
 

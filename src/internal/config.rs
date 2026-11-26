@@ -2927,9 +2927,6 @@ async fn global_env_value(name: &str, vault_key: &str) -> Result<Option<String>>
     let Some(global_path) = global_config_path_for_read().await else {
         return Ok(None);
     };
-    if !global_path.exists() {
-        return Ok(None);
-    }
 
     let Some(entry) =
         read_config_entry_from_db_path(&global_path, vault_key, DatabaseRole::GlobalConfig).await?
@@ -2983,9 +2980,6 @@ async fn global_config_value(key: &str) -> Result<Option<String>> {
     let Some(db_path) = global_config_path_for_read().await else {
         return Ok(None);
     };
-    if !db_path.exists() {
-        return Ok(None);
-    }
     global_config_value_at(&db_path, key).await
 }
 
@@ -3261,11 +3255,71 @@ async fn read_config_value_from_db_path(
 /// Returns `Ok(None)` when the file does not exist (so callers can probe
 /// optional config locations cheaply). Errors are wrapped with the path so
 /// the user can diagnose `permission denied`/`schema mismatch` problems.
+#[cfg(feature = "storage-redb")]
+async fn open_redb_config_reader_for_db_path(
+    db_path: &Path,
+    role: DatabaseRole,
+) -> Result<Option<std::sync::Arc<dyn crate::storage::ConfigStore>>> {
+    let Some(parent) = db_path.parent() else {
+        return Ok(None);
+    };
+    match role {
+        DatabaseRole::Repository => {
+            if let Ok(crate::storage::StorageBackendKind::Redb) =
+                crate::storage::runtime::detect_repo_backend(parent)
+            {
+                let store = crate::storage::runtime::open_repo_config_store_read_only(parent)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to open redb repository config store at '{}'",
+                            parent.display()
+                        )
+                    })?;
+                return Ok(Some(store));
+            }
+            Ok(None)
+        }
+        DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => {
+            if let Ok(crate::storage::config_store::ConfigScopeAuthority::Manifest {
+                manifest, ..
+            }) = crate::storage::config_store::inspect_config_scope_authority(parent, role)
+                && manifest.backend == crate::storage::StorageBackendKind::Redb
+            {
+                let store = crate::storage::config_store::open_config_scope_for_read(
+                    parent,
+                    role,
+                    crate::storage::StorageBackendKind::Redb,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to open redb config scope at '{}'", parent.display())
+                })?;
+                return Ok(Some(store));
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
 async fn read_config_entry_from_db_path(
     db_path: &Path,
     key: &str,
     role: DatabaseRole,
 ) -> Result<Option<ConfigKvEntry>> {
+    #[cfg(feature = "storage-redb")]
+    if let Some(store) = open_redb_config_reader_for_db_path(db_path, role).await? {
+        return ConfigKv::get_with_store(store.as_ref(), key)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query '{key}' from redb config store '{}'",
+                    db_path.display()
+                )
+            });
+    }
+
     if !db_path
         .try_exists()
         .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?
@@ -3302,6 +3356,26 @@ async fn read_config_entry_from_db_path_case_insensitive(
     key: &str,
     role: DatabaseRole,
 ) -> Result<Option<ConfigKvEntry>> {
+    #[cfg(feature = "storage-redb")]
+    if let Some(store) = open_redb_config_reader_for_db_path(db_path, role).await? {
+        let entries = ConfigKv::list_all_with_store(store.as_ref())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query '{key}' from redb config store '{}'",
+                    db_path.display()
+                )
+            })?;
+        if let Some(entry) = entries
+            .into_iter()
+            .rev()
+            .find(|entry| git_config_key_matches(&entry.key, key))
+        {
+            return Ok(Some(entry));
+        }
+        return Ok(None);
+    }
+
     let exists = db_path
         .try_exists()
         .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?;

@@ -1,5 +1,9 @@
 //! Provider-neutral live capture pipeline for validated AgentTraces hooks
 //! (ADR-ACF-10, ACF-19).
+#![cfg_attr(
+    not(feature = "storage-sqlite"),
+    allow(dead_code, unused_imports, unused_variables)
+)]
 //!
 //! `hooks::runtime` dispatches a validated ingress command here. This module
 //! opens the bounded hook database, resolves the trusted capture scope,
@@ -272,8 +276,9 @@ pub(super) mod test_support {
 
 /// External-Agent capture ingest (`refs/libra/traces`).
 ///
-/// The realtime hook redacts the validated command and publishes one spool
-/// file. It does not open a database. A later consumer commits the catalog.
+/// The realtime hook redacts the validated command and publishes one queued
+/// entry (`capture-spool/ready/` on SQLite, `capture-queue/{priority,normal}/`
+/// on Redb). It does not open a database. A later consumer commits the catalog.
 pub(crate) async fn ingest_agent_traces(
     ingress_command: Box<CaptureIngressCommand>,
     binding: LiveCaptureBinding,
@@ -281,18 +286,49 @@ pub(crate) async fn ingest_agent_traces(
 ) -> Result<()> {
     let _ = ingest_span;
     let queued = enqueue_validated_capture(ingress_command, binding)?;
-    if super::spool::try_spawn_consumer(&queued.worktree).is_err() {
-        tracing::warn!(
-            target: "agent.capture.spool",
-            reason = "consumer_spawn_failed",
-            "queued capture event is durable; the consumer will retry"
-        );
+    match queued.backend {
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                if super::spool::try_spawn_consumer(&queued.worktree).is_err() {
+                    tracing::warn!(
+                        target: "agent.capture.spool",
+                        reason = "consumer_spawn_failed",
+                        "queued capture event is durable; the consumer will retry"
+                    );
+                }
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (&queued.storage, &queued.worktree);
+            }
+        }
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-queue")]
+            {
+                if super::spool::try_spawn_queue_consumer(&queued.storage, &queued.worktree)
+                    .is_err()
+                {
+                    tracing::warn!(
+                        target: "agent.capture.queue",
+                        reason = "consumer_spawn_failed",
+                        "queued capture event is durable; the consumer will retry"
+                    );
+                }
+            }
+            #[cfg(not(feature = "storage-queue"))]
+            {
+                let _ = (&queued.storage, &queued.worktree);
+            }
+        }
     }
     Ok(())
 }
 
 struct QueuedCapture {
+    storage: std::path::PathBuf,
     worktree: std::path::PathBuf,
+    backend: crate::storage::StorageBackendKind,
 }
 
 fn enqueue_validated_capture(
@@ -302,50 +338,210 @@ fn enqueue_validated_capture(
     let storage = ingress_command.runtime_scope().storage_path.clone();
     let worktree = ingress_command.runtime_scope().worktree_root.clone();
     let hook_deadline = ingress_command.deadline();
-    // Pre-enqueue validation keeps the repository presence contract without
-    // opening SQLite: a missing database is `LBR-REPO-002`, a database path
-    // that is not a regular file is `LBR-IO-001`. Schema compatibility needs
-    // the database itself, so the consumer reports it.
-    match std::fs::metadata(storage.join(util::DATABASE)) {
-        Ok(metadata) if metadata.is_file() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(active_repository_failure(
-                ActiveRepositoryFailureClass::DatabaseMissing,
-            ));
+    let backend = crate::storage::runtime::detect_repo_backend(&storage).map_err(|_| {
+        active_repository_failure(ActiveRepositoryFailureClass::DatabaseUnavailable)
+    })?;
+    match backend {
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                // Pre-enqueue validation keeps the repository presence contract without
+                // opening SQLite: a missing database is `LBR-REPO-002`, a database path
+                // that is not a regular file is `LBR-IO-001`. Schema compatibility needs
+                // the database itself, so the consumer reports it.
+                match std::fs::metadata(storage.join(util::DATABASE)) {
+                    Ok(metadata) if metadata.is_file() => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(active_repository_failure(
+                            ActiveRepositoryFailureClass::DatabaseMissing,
+                        ));
+                    }
+                    _ => {
+                        return Err(active_repository_failure(
+                            ActiveRepositoryFailureClass::DatabaseUnavailable,
+                        ));
+                    }
+                }
+                let terminal = ingress_command.event_kind() == LifecycleEventKind::SessionEnd;
+                let display_batch_limit = ingress_command
+                    .display_batch_budget()
+                    .map(|(_, limit)| limit);
+                let tool_link = ingress_command.tool_link().cloned();
+                let mut parts = (*ingress_command).into_parts();
+                let redaction = redact_lifecycle_event(&mut parts.event);
+                let dedup_key = parts
+                    .dedup_key
+                    .clone()
+                    .unwrap_or_else(|| parts.event_id.to_string());
+                let body = encode_spool_envelope(
+                    &parts,
+                    binding,
+                    display_batch_limit,
+                    tool_link.as_ref(),
+                    &redaction,
+                )?;
+                super::spool::publish(
+                    &storage,
+                    terminal,
+                    &dedup_key,
+                    &body,
+                    hook_deadline.map(|deadline| deadline.monotonic()),
+                )
+                .context(super::spool::CaptureEnqueueFailed)?;
+                Ok(QueuedCapture {
+                    storage,
+                    worktree,
+                    backend,
+                })
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (worktree, hook_deadline, ingress_command, binding);
+                bail!("this Libra binary was compiled without `storage-sqlite`");
+            }
         }
-        _ => {
-            return Err(active_repository_failure(
-                ActiveRepositoryFailureClass::DatabaseUnavailable,
-            ));
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                // Pre-enqueue validation verifies the finalized Redb repository
+                // presence via metadata stat ONLY without opening `git.redb` or
+                // `capture.redb` (`RB-29` AC2).
+                let paths = crate::storage::manifest::resolve_redb_generation_paths(&storage)
+                    .map_err(|_| {
+                        active_repository_failure(ActiveRepositoryFailureClass::DatabaseUnavailable)
+                    })?
+                    .ok_or_else(|| {
+                        active_repository_failure(ActiveRepositoryFailureClass::DatabaseMissing)
+                    })?;
+                match std::fs::metadata(&paths.git_db_path) {
+                    Ok(metadata) if metadata.is_file() => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(active_repository_failure(
+                            ActiveRepositoryFailureClass::DatabaseMissing,
+                        ));
+                    }
+                    _ => {
+                        return Err(active_repository_failure(
+                            ActiveRepositoryFailureClass::DatabaseUnavailable,
+                        ));
+                    }
+                }
+                let terminal = ingress_command.event_kind() == LifecycleEventKind::SessionEnd;
+                let mut parts = (*ingress_command).into_parts();
+                let redaction = redact_lifecycle_event(&mut parts.event);
+                let dedup_key = parts
+                    .dedup_key
+                    .clone()
+                    .unwrap_or_else(|| parts.event_id.to_string());
+                let (lane, flags) = if terminal {
+                    (
+                        crate::storage::CaptureQueueLane::Priority,
+                        crate::storage::queue::FRAME_FLAG_PRIORITY,
+                    )
+                } else {
+                    (
+                        crate::storage::CaptureQueueLane::Normal,
+                        crate::storage::queue::FRAME_FLAG_NONE,
+                    )
+                };
+                let agent_kind_db = binding.agent_kind_db();
+                let agent_kind = crate::storage::CaptureAgentKind::parse(agent_kind_db)
+                    .map_err(|err| anyhow!("unsupported capture agent kind: {err}"))?;
+                let session_id =
+                    build_ai_session_id(agent_kind_db, &parts.context.provider_session_id);
+                let now = parts.event.timestamp.timestamp();
+                let worktree_id = util::try_get_worktree_gitdir(Some(worktree.clone()))
+                    .ok()
+                    .and_then(|gitdir| util::worktree_id_for_gitdir(&gitdir));
+                let metadata_json = serde_json::to_string(&json!({
+                    "event_id": parts.event_id.to_string(),
+                    "event_kind": parts.event.kind.to_string(),
+                    "hook_command": parts.hook_command.to_string(),
+                    "provider_source": parts.provider_source,
+                    "identity_scheme": parts.identity_scheme.as_wire(),
+                    "dedup_key": dedup_key,
+                    "lane": lane.as_str(),
+                }))
+                .context("encode capture queue session metadata")?;
+                let redaction_report =
+                    serde_json::to_string(&redaction).context("encode capture redaction report")?;
+                let payload = crate::storage::CaptureBatchPayload::UpsertSession(
+                    crate::storage::AgentSessionRecord {
+                        session_id,
+                        agent_kind,
+                        provider_session_id: parts.context.provider_session_id,
+                        thread_id: None,
+                        state: if terminal {
+                            crate::storage::CaptureSessionState::Stopped
+                        } else {
+                            crate::storage::CaptureSessionState::Active
+                        },
+                        working_dir: parts.context.working_dir,
+                        worktree_id,
+                        parent_commit: None,
+                        parent_session_id: None,
+                        metadata_json,
+                        redaction_report,
+                        started_at: now,
+                        last_event_at: now,
+                        stopped_at: terminal.then_some(now),
+                        schema_version: 1,
+                        sync_revision: 0,
+                        repo_id: None,
+                        workspace_id: None,
+                        workspace_fence: None,
+                        scope_state: crate::storage::CaptureScopeState::LegacyUnknown,
+                    },
+                );
+                let options = if let Some(deadline) = hook_deadline {
+                    let remaining = deadline
+                        .monotonic()
+                        .saturating_duration_since(Instant::now());
+                    crate::storage::queue::QueueAppendOptions::default()
+                        .with_lock_timeout(remaining)
+                } else {
+                    crate::storage::queue::QueueAppendOptions::default()
+                };
+                crate::storage::queue::init_capture_queue(&storage)
+                    .map_err(map_redb_enqueue_error)?;
+                crate::storage::queue::append_postcard_frame_with_options(
+                    &storage,
+                    lane,
+                    flags,
+                    &dedup_key,
+                    crate::storage::queue::CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload,
+                    options,
+                )
+                .map_err(map_redb_enqueue_error)?;
+                Ok(QueuedCapture {
+                    storage,
+                    worktree,
+                    backend,
+                })
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (worktree, hook_deadline, ingress_command, binding);
+                bail!("this Libra binary was compiled without `storage-redb`");
+            }
         }
     }
-    let terminal = ingress_command.event_kind() == LifecycleEventKind::SessionEnd;
-    let display_batch_limit = ingress_command
-        .display_batch_budget()
-        .map(|(_, limit)| limit);
-    let tool_link = ingress_command.tool_link().cloned();
-    let mut parts = (*ingress_command).into_parts();
-    let redaction = redact_lifecycle_event(&mut parts.event);
-    let dedup_key = parts
-        .dedup_key
-        .clone()
-        .unwrap_or_else(|| parts.event_id.to_string());
-    let body = encode_spool_envelope(
-        &parts,
-        binding,
-        display_batch_limit,
-        tool_link.as_ref(),
-        &redaction,
-    )?;
-    super::spool::publish(
-        &storage,
-        terminal,
-        &dedup_key,
-        &body,
-        hook_deadline.map(|deadline| deadline.monotonic()),
-    )
-    .context(super::spool::CaptureEnqueueFailed)?;
-    Ok(QueuedCapture { worktree })
+}
+
+#[cfg(feature = "storage-redb")]
+fn map_redb_enqueue_error(err: crate::storage::StorageBackendError) -> anyhow::Error {
+    match err {
+        crate::storage::StorageBackendError::QueueFull { .. } => {
+            anyhow::Error::new(super::spool::CaptureQueueFull)
+                .context(super::spool::CaptureEnqueueFailed)
+        }
+        crate::storage::StorageBackendError::QueueBusy { .. } => {
+            anyhow::Error::new(super::spool::CaptureQueueBusy)
+                .context(super::spool::CaptureEnqueueFailed)
+        }
+        other => anyhow::Error::new(other).context(super::spool::CaptureEnqueueFailed),
+    }
 }
 
 /// Store one queued envelope. The hook deadline is not reused: the file is
@@ -443,20 +639,23 @@ async fn persist_agent_traces_command(
             }
         }
         crate::storage::StorageBackendKind::Sqlite => {
-            let database_path = storage_path.join(util::DATABASE);
-            let setup_read_deadline = ingress_command
-                .deadline()
-                .map(|deadline| {
-                    if ingress_command.event_kind() == LifecycleEventKind::SessionEnd {
-                        hook_execution_deadline(deadline, true)
-                            .map(HookExecutionDeadline::commit_deadline)
-                    } else {
-                        Ok(capture_commit_deadline(deadline))
-                    }
-                })
-                .transpose()?;
-            let (repo_conn, capture_busy_timeout) =
-                if let Some(deadline) = ingress_command.deadline() {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let database_path = storage_path.join(util::DATABASE);
+                let setup_read_deadline = ingress_command
+                    .deadline()
+                    .map(|deadline| {
+                        if ingress_command.event_kind() == LifecycleEventKind::SessionEnd {
+                            hook_execution_deadline(deadline, true)
+                                .map(HookExecutionDeadline::commit_deadline)
+                        } else {
+                            Ok(capture_commit_deadline(deadline))
+                        }
+                    })
+                    .transpose()?;
+                let (repo_conn, capture_busy_timeout) = if let Some(deadline) =
+                    ingress_command.deadline()
+                {
                     let terminal = ingress_command.event_kind() == LifecycleEventKind::SessionEnd;
                     let remaining = deadline
                         .monotonic()
@@ -499,92 +698,98 @@ async fn persist_agent_traces_command(
                     })?;
                     (conn, db::DEFAULT_CONNECTION_TIMEOUT)
                 };
-            await_agent_traces_pure_read_until(
-                setup_read_deadline,
-                "failed to configure hash kind from repo config",
-                set_hash_kind_from_connection(&repo_conn),
-            )
-            .await?;
-            let repo_root = runtime_scope.worktree_root;
-            let scope = await_agent_traces_pure_read_until(
-                setup_read_deadline,
-                "resolve capture scope from hook database",
-                CaptureScope::resolve(&repo_conn, &repo_root),
-            )
-            .await?;
-            if !admit_display_batch(&repo_conn, &ingress_command).await? {
-                ingest_span.record("partial", true);
-                tracing::warn!(
-                    target: "agent.hook.ingest",
-                    provider = ingress_command.provider_kind(),
-                    reason = "display_batch_dropped",
-                    "coalesced display batch exceeded the per-session budget"
-                );
-                return Ok(());
-            }
-            if ingress_command.event_kind() == LifecycleEventKind::SessionStart {
-                match await_agent_traces_pure_read_until(
+                await_agent_traces_pure_read_until(
                     setup_read_deadline,
-                    "inspect bounded capture recovery hint",
-                    crate::internal::ai::capture::pending::has_pending_hint(&repo_conn, &scope),
+                    "failed to configure hash kind from repo config",
+                    set_hash_kind_from_connection(&repo_conn),
                 )
-                .await
-                {
-                    Ok(true) => {
-                        tracing::info!(
-                            target: "agent.capture.recovery",
-                            reason = "pending_artifact_hint",
-                            "a bounded local capture recovery may be available"
-                        );
-                        if crate::internal::ai::capture::worker::spawn_detached(
-                            &storage_path,
-                            &repo_root,
-                        )
-                        .is_err()
-                        {
-                            tracing::warn!(
+                .await?;
+                let repo_root = runtime_scope.worktree_root;
+                let scope = await_agent_traces_pure_read_until(
+                    setup_read_deadline,
+                    "resolve capture scope from hook database",
+                    CaptureScope::resolve(&repo_conn, &repo_root),
+                )
+                .await?;
+                if !admit_display_batch(&repo_conn, &ingress_command).await? {
+                    ingest_span.record("partial", true);
+                    tracing::warn!(
+                        target: "agent.hook.ingest",
+                        provider = ingress_command.provider_kind(),
+                        reason = "display_batch_dropped",
+                        "coalesced display batch exceeded the per-session budget"
+                    );
+                    return Ok(());
+                }
+                if ingress_command.event_kind() == LifecycleEventKind::SessionStart {
+                    match await_agent_traces_pure_read_until(
+                        setup_read_deadline,
+                        "inspect bounded capture recovery hint",
+                        crate::internal::ai::capture::pending::has_pending_hint(&repo_conn, &scope),
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            tracing::info!(
                                 target: "agent.capture.recovery",
-                                reason = "worker_spawn_failed",
-                                "automatic local recovery could not start; run `libra agent doctor --repair`"
+                                reason = "pending_artifact_hint",
+                                "a bounded local capture recovery may be available"
                             );
+                            if crate::internal::ai::capture::worker::spawn_detached(
+                                &storage_path,
+                                &repo_root,
+                            )
+                            .is_err()
+                            {
+                                tracing::warn!(
+                                    target: "agent.capture.recovery",
+                                    reason = "worker_spawn_failed",
+                                    "automatic local recovery could not start; run `libra agent doctor --repair`"
+                                );
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(_) => tracing::warn!(
+                            target: "agent.capture.recovery",
+                            reason = "pending_hint_unavailable",
+                            "could not inspect the bounded local capture recovery hint; run `libra agent doctor`"
+                        ),
+                    }
+                }
+                let capture_busy_timeout = match ingress_command.deadline() {
+                    Some(deadline) => {
+                        let remaining = deadline
+                            .monotonic()
+                            .saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            HOOK_TERMINAL_SETTLEMENT_GRACE
+                                .min(HOOK_DATABASE_BUSY_TIMEOUT_CAP)
+                                .min(capture_busy_timeout)
+                        } else {
+                            remaining.min(capture_busy_timeout)
                         }
                     }
-                    Ok(false) => {}
-                    Err(_) => tracing::warn!(
-                        target: "agent.capture.recovery",
-                        reason = "pending_hint_unavailable",
-                        "could not inspect the bounded local capture recovery hint; run `libra agent doctor`"
-                    ),
-                }
-            }
-            let capture_busy_timeout = match ingress_command.deadline() {
-                Some(deadline) => {
-                    let remaining = deadline
-                        .monotonic()
-                        .saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        HOOK_TERMINAL_SETTLEMENT_GRACE
-                            .min(HOOK_DATABASE_BUSY_TIMEOUT_CAP)
-                            .min(capture_busy_timeout)
-                    } else {
-                        remaining.min(capture_busy_timeout)
-                    }
-                }
-                None => capture_busy_timeout,
-            };
-            let capture_conn = capture_store::open(&storage_path, capture_busy_timeout)
+                    None => capture_busy_timeout,
+                };
+                let capture_conn = capture_store::open(&storage_path, capture_busy_timeout)
+                    .await
+                    .map_err(|err| super::drain::classify_capture_open(&err))?;
+                ingest_agent_traces_payload_with_scope(
+                    ingress_command,
+                    binding,
+                    &capture_conn,
+                    Some(&storage_path),
+                    &scope,
+                    ingest_span,
+                    &ExportJobLeaseStore::new(&capture_conn),
+                )
                 .await
-                .map_err(|err| super::drain::classify_capture_open(&err))?;
-            ingest_agent_traces_payload_with_scope(
-                ingress_command,
-                binding,
-                &capture_conn,
-                Some(&storage_path),
-                &scope,
-                ingest_span,
-                &ExportJobLeaseStore::new(&capture_conn),
-            )
-            .await
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (ingress_command, binding, ingest_span);
+                bail!("this Libra binary was compiled without `storage-sqlite`");
+            }
         }
     }
 }
@@ -2500,9 +2705,397 @@ pub(crate) async fn with_child_capture_budget_for_test<T>(
     future.await
 }
 
+/*
+Production/test split delimiter retained verbatim for `agent_architecture_guard`:
 #[cfg(test)]
 #[path = "live_pipeline_tests.rs"]
 mod tests;
+*/
+#[cfg(test)]
+#[path = "live_pipeline_tests.rs"]
+mod live_pipeline_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "storage-redb")]
+    struct Rb29CwdGuard(std::path::PathBuf);
+
+    #[cfg(feature = "storage-redb")]
+    impl Rb29CwdGuard {
+        fn enter(path: &std::path::Path) -> Self {
+            let prior = std::env::current_dir().expect("read prior cwd");
+            std::env::set_current_dir(path).expect("switch cwd into test repo");
+            Self(prior)
+        }
+    }
+
+    #[cfg(feature = "storage-redb")]
+    impl Drop for Rb29CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[cfg(feature = "storage-redb")]
+    fn rb29_lower_claude_hook_command(
+        repo_root: &std::path::Path,
+        storage: &std::path::Path,
+        event_name: &str,
+        session_id: &str,
+        verb: ProviderHookCommand,
+        kind: LifecycleEventKind,
+    ) -> Box<CaptureIngressCommand> {
+        let worktree = repo_root
+            .to_str()
+            .expect("worktree path is utf-8")
+            .to_string();
+        let payload = serde_json::to_vec(&json!({
+            "hook_event_name": event_name,
+            "session_id": session_id,
+            "cwd": worktree,
+        }))
+        .expect("serialize hook payload");
+        let outcome = CaptureIngressCommand::from_payload(
+            &payload,
+            verb,
+            kind,
+            crate::internal::ai::hooks::providers::claude_provider(),
+            None,
+            |_| {
+                Ok(
+                    crate::internal::ai::capture::ingress::CaptureIngressBinding::new(
+                        worktree.clone(),
+                        [0xB7; 32],
+                        CaptureRuntimeScope::new(storage.to_path_buf(), repo_root.to_path_buf()),
+                    ),
+                )
+            },
+        )
+        .expect("lower hook payload");
+        match outcome {
+            CaptureIngressOutcome::Command(command) => command,
+            _ => panic!("expected lowered capture command"),
+        }
+    }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn backend_aware_hook_dispatch_sqlite_vs_redb() {
+        use crate::{
+            internal::ai::hooks::providers::claude_provider,
+            storage::{
+                CaptureQueueLane, CaptureSessionState,
+                queue::{CaptureQueuePaths, read_converged_lane_tail_meta},
+                runtime::{init_redb_repository_storage, open_capture_store_read_only},
+            },
+        };
+
+        // AC1: Under dual-feature builds, a Sqlite repository writes ONLY to
+        // `capture-spool/ready/` and NEVER creates or writes `capture-queue/`.
+        let sqlite_repo = tempfile::tempdir().expect("sqlite repo tempdir");
+        crate::utils::test::setup_with_new_libra_in(sqlite_repo.path()).await;
+        let sqlite_storage = sqlite_repo.path().join(".libra");
+        let sqlite_cmd = rb29_lower_claude_hook_command(
+            sqlite_repo.path(),
+            &sqlite_storage,
+            "SessionStart",
+            "S-rb29-sqlite-only",
+            ProviderHookCommand::SessionStart,
+            LifecycleEventKind::SessionStart,
+        );
+        let binding = LiveCaptureBinding::resolve(claude_provider());
+        let sqlite_span = new_ingest_span(sqlite_cmd.hook_command(), claude_provider());
+        ingest_agent_traces(sqlite_cmd, binding, &sqlite_span)
+            .await
+            .expect("sqlite realtime hook enqueues into capture-spool");
+
+        assert_eq!(
+            crate::internal::ai::capture::spool::ready_names(&sqlite_storage)
+                .expect("read sqlite spool ready/")
+                .len(),
+            1,
+            "AC1: sqlite repo hook must write to capture-spool/ready/"
+        );
+        assert!(
+            !CaptureQueuePaths::from_storage_dir(&sqlite_storage)
+                .root
+                .exists(),
+            "AC1: sqlite repo hook must never create or write capture-queue/"
+        );
+
+        // AC4 & AC5: A Redb repository routes normal lifecycle events to `normal/`
+        // and `SessionEnd` to `priority/`, and `libra __capture-queue-drain`
+        // strictly drains `priority/` to `capture.redb` BEFORE consuming `normal/`.
+        let redb_repo = tempfile::tempdir().expect("redb repo tempdir");
+        let redb_storage = redb_repo.path().join(".libra");
+        let paths = init_redb_repository_storage(&redb_storage)
+            .await
+            .expect("init redb repo storage");
+        let queue_paths = CaptureQueuePaths::from_storage_dir(&redb_storage);
+
+        // Enqueue a normal event first (both a distinct session and an order-probe session).
+        let norm_cmd = rb29_lower_claude_hook_command(
+            redb_repo.path(),
+            &redb_storage,
+            "SessionStart",
+            "S-rb29-normal",
+            ProviderHookCommand::SessionStart,
+            LifecycleEventKind::SessionStart,
+        );
+        let norm_span = new_ingest_span(norm_cmd.hook_command(), claude_provider());
+        ingest_agent_traces(norm_cmd, binding, &norm_span)
+            .await
+            .expect("redb normal hook enqueues into normal/");
+
+        let order_norm_cmd = rb29_lower_claude_hook_command(
+            redb_repo.path(),
+            &redb_storage,
+            "SessionStart",
+            "S-rb29-order",
+            ProviderHookCommand::SessionStart,
+            LifecycleEventKind::SessionStart,
+        );
+        let order_norm_span = new_ingest_span(order_norm_cmd.hook_command(), claude_provider());
+        ingest_agent_traces(order_norm_cmd, binding, &order_norm_span)
+            .await
+            .expect("redb order-probe normal hook enqueues into normal/");
+
+        let prio_meta_before = read_converged_lane_tail_meta(&queue_paths.priority)
+            .expect("read priority tail meta before SessionEnd");
+        let norm_meta_before = read_converged_lane_tail_meta(&queue_paths.normal)
+            .expect("read normal tail meta after SessionStart");
+        assert_eq!(
+            prio_meta_before.committed_len, 0,
+            "AC4: normal events must not land in priority/"
+        );
+        assert!(
+            norm_meta_before.committed_len > 0,
+            "AC4: normal events must land in normal/"
+        );
+
+        // Enqueue `SessionEnd` hooks -> must route strictly to `priority/`.
+        let prio_cmd = rb29_lower_claude_hook_command(
+            redb_repo.path(),
+            &redb_storage,
+            "SessionEnd",
+            "S-rb29-priority",
+            ProviderHookCommand::SessionEnd,
+            LifecycleEventKind::SessionEnd,
+        );
+        let prio_span = new_ingest_span(prio_cmd.hook_command(), claude_provider());
+        ingest_agent_traces(prio_cmd, binding, &prio_span)
+            .await
+            .expect("redb SessionEnd hook enqueues into priority/");
+
+        let order_prio_cmd = rb29_lower_claude_hook_command(
+            redb_repo.path(),
+            &redb_storage,
+            "SessionEnd",
+            "S-rb29-order",
+            ProviderHookCommand::SessionEnd,
+            LifecycleEventKind::SessionEnd,
+        );
+        let order_prio_span = new_ingest_span(order_prio_cmd.hook_command(), claude_provider());
+        ingest_agent_traces(order_prio_cmd, binding, &order_prio_span)
+            .await
+            .expect("redb order-probe SessionEnd hook enqueues into priority/");
+
+        let prio_meta_after = read_converged_lane_tail_meta(&queue_paths.priority)
+            .expect("read priority tail meta after SessionEnd");
+        let norm_meta_after = read_converged_lane_tail_meta(&queue_paths.normal)
+            .expect("read normal tail meta after SessionEnd");
+        assert!(
+            prio_meta_after.committed_len > 0,
+            "AC4: SessionEnd must land in priority/"
+        );
+        assert_eq!(
+            norm_meta_after.committed_len, norm_meta_before.committed_len,
+            "AC4: SessionEnd must not append to normal/"
+        );
+        assert!(
+            !crate::internal::ai::capture::spool::ready_dir(&redb_storage).is_dir(),
+            "Redb hooks must never populate capture-spool/ready/"
+        );
+
+        // Drain via the exact `libra __capture-queue-drain` repository entrypoint.
+        let _cwd = Rb29CwdGuard::enter(redb_repo.path());
+        let report = crate::internal::ai::capture::drain::run_queue_from_repository()
+            .await
+            .expect("__capture-queue-drain must succeed on Redb repo");
+        assert!(report.acquired_writer_lock);
+        assert_eq!(report.priority_batches, 1);
+        assert_eq!(report.normal_batches, 1);
+        assert_eq!(report.applied_frames, 4);
+
+        let capture = open_capture_store_read_only(&redb_storage)
+            .await
+            .expect("open redb capture store read-only");
+        let prio_row = capture
+            .get_session("claude_code__S-rb29-priority")
+            .await
+            .expect("read priority session")
+            .expect("priority session persisted in capture.redb");
+        assert_eq!(prio_row.state, CaptureSessionState::Stopped);
+        let norm_row = capture
+            .get_session("claude_code__S-rb29-normal")
+            .await
+            .expect("read normal session")
+            .expect("normal session persisted in capture.redb");
+        assert_eq!(norm_row.state, CaptureSessionState::Active);
+
+        // AC5: For `S-rb29-order`, `normal/` was enqueued BEFORE `priority/`,
+        // yet `__capture-queue-drain` drained `priority/` FIRST and `normal/`
+        // SECOND, so the final upsert reflects the later-applied `normal/` batch.
+        let order_row = capture
+            .get_session("claude_code__S-rb29-order")
+            .await
+            .expect("read order-probe session")
+            .expect("order-probe session persisted in capture.redb");
+        assert_eq!(
+            order_row.state,
+            CaptureSessionState::Active,
+            "AC5: priority/ must drain strictly before normal/"
+        );
+        assert!(
+            order_row.metadata_json.contains("\"lane\":\"normal\""),
+            "AC5: normal/ batch must apply strictly after priority/: {}",
+            order_row.metadata_json
+        );
+        assert_eq!(
+            capture
+                .get_queue_highwater(CaptureQueueLane::Priority)
+                .await
+                .expect("read priority highwater")
+                .byte_offset,
+            prio_meta_after.committed_len
+        );
+        assert_eq!(
+            capture
+                .get_queue_highwater(CaptureQueueLane::Normal)
+                .await
+                .expect("read normal highwater")
+                .byte_offset,
+            norm_meta_after.committed_len
+        );
+        assert!(paths.capture_db_path.is_file());
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_only_feature_implies_queue_hook_to_capture_e2e() {
+        use crate::{
+            internal::ai::hooks::providers::claude_provider,
+            storage::{
+                CaptureQueueLane, CaptureSessionState,
+                queue::{CaptureQueuePaths, read_converged_lane_tail_meta},
+                runtime::{init_redb_repository_storage, open_capture_store_read_only},
+            },
+        };
+
+        let repo = tempfile::tempdir().expect("pure-redb repo tempdir");
+        let storage = repo.path().join(".libra");
+        let paths = init_redb_repository_storage(&storage)
+            .await
+            .expect("init redb repository storage");
+        let queue_paths = CaptureQueuePaths::from_storage_dir(&storage);
+        let capture_bytes_before_hooks =
+            std::fs::read(&paths.capture_db_path).expect("snapshot capture.redb before hooks");
+
+        // AC2: Realtime hooks write ONLY to `capture-queue/{priority,normal}/`
+        // and NEVER open or modify `capture.redb` directly.
+        let binding = LiveCaptureBinding::resolve(claude_provider());
+        let normal_cmd = rb29_lower_claude_hook_command(
+            repo.path(),
+            &storage,
+            "SessionStart",
+            "S-rb29-pure-norm",
+            ProviderHookCommand::SessionStart,
+            LifecycleEventKind::SessionStart,
+        );
+        let normal_span = new_ingest_span(normal_cmd.hook_command(), claude_provider());
+        ingest_agent_traces(normal_cmd, binding, &normal_span)
+            .await
+            .expect("pure-redb SessionStart hook queues into normal/");
+
+        let priority_cmd = rb29_lower_claude_hook_command(
+            repo.path(),
+            &storage,
+            "SessionEnd",
+            "S-rb29-pure-prio",
+            ProviderHookCommand::SessionEnd,
+            LifecycleEventKind::SessionEnd,
+        );
+        let priority_span = new_ingest_span(priority_cmd.hook_command(), claude_provider());
+        ingest_agent_traces(priority_cmd, binding, &priority_span)
+            .await
+            .expect("pure-redb SessionEnd hook queues into priority/");
+
+        assert_eq!(
+            std::fs::read(&paths.capture_db_path).expect("re-read capture.redb after hooks"),
+            capture_bytes_before_hooks,
+            "AC2: realtime hooks must never open or mutate capture.redb directly"
+        );
+        let prio_meta =
+            read_converged_lane_tail_meta(&queue_paths.priority).expect("read priority meta");
+        let norm_meta =
+            read_converged_lane_tail_meta(&queue_paths.normal).expect("read normal meta");
+        assert!(prio_meta.committed_len > 0);
+        assert!(norm_meta.committed_len > 0);
+        assert!(
+            !storage.join("libra.db").exists(),
+            "pure-redb hook must never create libra.db"
+        );
+        assert!(
+            !storage.join("private").join("capture.db").exists(),
+            "pure-redb hook must never create capture.db"
+        );
+
+        // AC3: `libra __capture-queue-drain` drains both channels losslessly into `capture.redb`.
+        let _cwd = Rb29CwdGuard::enter(repo.path());
+        crate::cli::parse_async(Some(&[
+            "libra",
+            crate::internal::ai::capture::spool::QUEUE_DRAIN_ARG,
+        ]))
+        .await
+        .expect("AC3: hidden `libra __capture-queue-drain` must succeed under pure storage-redb");
+
+        let capture = open_capture_store_read_only(&storage)
+            .await
+            .expect("open capture.redb read-only after drain");
+        let prio_session = capture
+            .get_session("claude_code__S-rb29-pure-prio")
+            .await
+            .expect("query priority session")
+            .expect("priority session must be persisted in capture.redb");
+        assert_eq!(prio_session.state, CaptureSessionState::Stopped);
+        let norm_session = capture
+            .get_session("claude_code__S-rb29-pure-norm")
+            .await
+            .expect("query normal session")
+            .expect("normal session must be persisted in capture.redb");
+        assert_eq!(norm_session.state, CaptureSessionState::Active);
+        assert_eq!(
+            capture
+                .get_queue_highwater(CaptureQueueLane::Priority)
+                .await
+                .expect("read priority highwater")
+                .byte_offset,
+            prio_meta.committed_len
+        );
+        assert_eq!(
+            capture
+                .get_queue_highwater(CaptureQueueLane::Normal)
+                .await
+                .expect("read normal highwater")
+                .byte_offset,
+            norm_meta.committed_len
+        );
+    }
+}
 
 #[cfg(test)]
 #[cfg(feature = "test-live-agent")]

@@ -711,6 +711,17 @@ async fn query_bridge_publication_in_conn<C: ConnectionTrait>(
     }))
 }
 
+fn is_unborn_reserved_branch_model(model: &reference::Model) -> bool {
+    model.kind == ConfigKind::Branch
+        && model.commit.is_none()
+        && model.remote.is_none()
+        && model.worktree_id.is_none()
+        && matches!(
+            model.name.as_deref(),
+            Some("intent" | "traces" | "agent-traces")
+        )
+}
+
 #[async_trait]
 impl GitStore for SqliteGitStore {
     fn backend(&self) -> StorageBackendKind {
@@ -722,6 +733,9 @@ impl GitStore for SqliteGitStore {
         let Some(model) = find_ref_model_in_conn(&self.conn, key).await? else {
             return Ok(None);
         };
+        if is_unborn_reserved_branch_model(&model) {
+            return Ok(None);
+        }
         decode_target_from_model(key, &model).map(Some)
     }
 
@@ -736,6 +750,9 @@ impl GitStore for SqliteGitStore {
             })?;
         let mut records = Vec::with_capacity(rows.len());
         for row in rows {
+            if is_unborn_reserved_branch_model(&row) {
+                continue;
+            }
             let rec = decode_record_from_model(row)?;
             if rec.key.visible_to_worktree(worktree_id) {
                 records.push(rec);

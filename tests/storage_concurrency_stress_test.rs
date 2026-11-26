@@ -1,5 +1,6 @@
 //! Multi-process concurrency stress tests, dual-feature migration roundtrip,
-//! and pre-unlock `libra-migrate` binary gate integration tests (`RB-12`).
+//! and post-unlock `libra-migrate` binary bidirectional roundtrip integration
+//! tests (`RB-12`, `RB-29c`).
 
 #[cfg(feature = "storage-redb")]
 mod redb_stress {
@@ -388,30 +389,30 @@ mod redb_stress {
 
 #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
 mod dual_feature_stress {
-    use std::{fs, path::PathBuf, process::Command};
+    use std::{fs, path::Path, process::Command};
 
     use libra::{
         internal::db::schema::{DatabaseRole, create_database_for_role},
         storage::{
             AgentSessionRecord, CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION, CaptureAgentKind,
             CaptureBatchPayload, CaptureQueueLane, CaptureScopeState, CaptureSessionState,
-            CaptureStore as _, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, GitStore as _,
-            INITIAL_STORAGE_GENERATION, LIBRA_CONFIG_GLOBAL_DB_ENV, LIBRA_CONFIG_SYSTEM_DB_ENV,
-            RedbCaptureStore, RedbGitStore, RedbRepairContext, RefCasOutcome, RefKey, RefTarget,
-            SqliteCaptureStore, SqliteGitStore, StorageBackendKind, append_postcard_frame,
-            config_format_manifest_path, config_redb_path_in_scope_dir, drain_capture_queue,
-            execute_forward_migration, execute_reverse_migration, init_capture_queue,
-            read_storage_manifest, resolve_redb_generation_paths, storage_manifest_path,
+            CaptureStore as _, ConfigStore as _, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY,
+            GitStore as _, INITIAL_STORAGE_GENERATION, LIBRA_CONFIG_GLOBAL_DB_ENV,
+            LIBRA_CONFIG_SYSTEM_DB_ENV, LIBRA_STORAGE_BACKEND_ENV, RedbCaptureStore, RedbGitStore,
+            RedbRepairContext, RefCasOutcome, RefKey, RefTarget, SqliteCaptureStore,
+            SqliteConfigStore, SqliteGitStore, StorageBackendKind, append_postcard_frame,
+            drain_capture_queue, execute_forward_migration, execute_reverse_migration,
+            init_capture_queue, read_storage_manifest, resolve_redb_generation_paths,
+            storage_manifest_path,
         },
     };
     use sea_orm::ConnectionTrait;
     use tempfile::tempdir;
 
     /// `RB-12` AC4 & AC6: SQLite -> redb forward migration, dual-lane capture queue
-    /// + concurrent MVCC read/CAS writes, then redb -> SQLite reverse migration with
+    /// with concurrent MVCC read/CAS writes, then redb -> SQLite reverse migration with
     /// 100% data integrity verification across both `libra.db` and `capture.db`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn dual_feature_migration_and_stress_roundtrip() {
+    pub(super) async fn dual_feature_migration_and_stress_roundtrip_impl() {
         let tmp = tempdir().expect("create dual-feature roundtrip tempdir");
         let dot_libra = tmp.path().join(".libra");
         fs::create_dir_all(&dot_libra).expect("mkdir .libra");
@@ -560,61 +561,417 @@ mod dual_feature_stress {
         );
     }
 
-    /// `RB-12` AC2: Real compiled `libra-migrate` binary invoked with `LIBRA_TEST=1`
-    /// must unconditionally fail closed with `LBR-CLI-003` and zero disk writes prior
-    /// to `RB-29a` unlock.
-    #[test]
-    fn pre_unlock_libra_migrate_binary_rejects_cutover_with_libra_test_env() {
-        let tmp = tempdir().expect("create pre-unlock gate tempdir");
-        let dot_libra = tmp.path().join(".libra");
-        let global_dir = tmp.path().join("g");
-        let system_dir = tmp.path().join("s");
-        fs::create_dir_all(&dot_libra).expect("mkdir .libra");
-        fs::create_dir_all(&global_dir).expect("mkdir g");
-        fs::create_dir_all(&system_dir).expect("mkdir s");
-        fs::write(dot_libra.join("libra.db"), b"").expect("touch libra.db");
-        let global_db: PathBuf = global_dir.join("config.db");
-        let system_db: PathBuf = system_dir.join("config.db");
-        fs::write(&global_db, b"").expect("touch g/config.db");
-        fs::write(&system_db, b"").expect("touch s/config.db");
+    fn make_roundtrip_session(session_id: &str, started_at: i64) -> AgentSessionRecord {
+        AgentSessionRecord {
+            session_id: session_id.to_string(),
+            agent_kind: CaptureAgentKind::Codex,
+            provider_session_id: format!("prov-{session_id}"),
+            thread_id: None,
+            state: CaptureSessionState::Stopped,
+            working_dir: "/workspace/rb29c-roundtrip".to_string(),
+            worktree_id: Some("main".to_string()),
+            parent_commit: None,
+            parent_session_id: None,
+            metadata_json: format!(r#"{{"session":"{session_id}"}}"#),
+            redaction_report: "{}".to_string(),
+            started_at,
+            last_event_at: started_at + 10,
+            stopped_at: Some(started_at + 20),
+            schema_version: 1,
+            sync_revision: 1,
+            repo_id: Some("rb29c-roundtrip-repo".to_string()),
+            workspace_id: Some("ws-rb29c-roundtrip".to_string()),
+            workspace_fence: Some(1),
+            scope_state: CaptureScopeState::Scoped,
+        }
+    }
 
-        let bin = env!("CARGO_BIN_EXE_libra-migrate");
-        let repo_arg = tmp.path().to_str().expect("utf8 repo path");
-        let arg_cases: &[&[&str]] = &[
-            &["--repo", repo_arg, "--to", "redb"],
-            &["--repo", repo_arg, "--to", "sqlite"],
-            &["--global", "--to", "redb"],
-            &["--system", "--to", "redb"],
-        ];
+    /// `RB-29c` AC1: End-to-end post-unlock bidirectional roundtrip exercising the
+    /// real compiled `libra-migrate` and `libra` binaries:
+    /// 1. Seed a real SQLite repository (commits, refs, HEAD, config, capture session).
+    /// 2. Run `libra-migrate --to redb --repo <repo>` -> exit 0, finalized redb manifest
+    ///    and `.libra/redb/git.gen-*.redb`.
+    /// 3. Perform new live writes on the Redb repository via unlocked `libra` CLI
+    ///    (`LIBRA_STORAGE_BACKEND=redb`: config, commit, branch) + new capture session,
+    ///    plus verify fresh `LIBRA_STORAGE_BACKEND=redb` `libra init`.
+    /// 4. Run `libra-migrate --to sqlite --repo <repo>` -> exit 0, converts back to SQLite
+    ///    preserving all pre-migration and post-Redb-cutover writes.
+    /// 5. Verify 100% readback consistency through both the `libra` CLI and SQLite stores.
+    pub(super) fn post_unlock_libra_migrate_binary_bidirectional_roundtrip_impl() {
+        let tmp = tempdir().expect("create post-unlock bidirectional roundtrip tempdir");
+        let repo_dir = tmp.path().join("repo");
+        let fresh_redb_dir = tmp.path().join("fresh-redb-repo");
+        let home_dir = tmp.path().join("home");
+        let xdg_dir = home_dir.join(".config");
+        let global_db = home_dir.join("global-config.db");
+        let system_db = home_dir.join("system-config.db");
+        fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        fs::create_dir_all(&fresh_redb_dir).expect("mkdir fresh-redb-repo");
+        fs::create_dir_all(&xdg_dir).expect("mkdir isolated xdg config");
 
-        for args in arg_cases {
-            let output = Command::new(bin)
-                .args(*args)
-                .env("LIBRA_TEST", "1")
+        let libra_bin = env!("CARGO_BIN_EXE_libra");
+        let migrate_bin = env!("CARGO_BIN_EXE_libra-migrate");
+
+        let run_libra = |cwd: &Path, backend_env: Option<&str>, args: &[&str]| -> String {
+            let mut cmd = Command::new(libra_bin);
+            cmd.current_dir(cwd)
+                .args(args)
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_dir)
+                .env(LIBRA_CONFIG_GLOBAL_DB_ENV, &global_db)
+                .env(LIBRA_CONFIG_SYSTEM_DB_ENV, &system_db);
+            match backend_env {
+                Some(v) => {
+                    cmd.env(LIBRA_STORAGE_BACKEND_ENV, v);
+                }
+                None => {
+                    cmd.env_remove(LIBRA_STORAGE_BACKEND_ENV);
+                }
+            }
+            let output = cmd
+                .output()
+                .unwrap_or_else(|err| panic!("spawn libra {args:?}: {err}"));
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "libra {args:?} (backend_env={backend_env:?}) failed (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            stdout
+        };
+
+        let run_migrate = |args: &[&str]| -> String {
+            let output = Command::new(migrate_bin)
+                .args(args)
+                .env("HOME", &home_dir)
+                .env("USERPROFILE", &home_dir)
+                .env("XDG_CONFIG_HOME", &xdg_dir)
                 .env(LIBRA_CONFIG_GLOBAL_DB_ENV, &global_db)
                 .env(LIBRA_CONFIG_SYSTEM_DB_ENV, &system_db)
+                .env_remove(LIBRA_STORAGE_BACKEND_ENV)
                 .output()
                 .unwrap_or_else(|err| panic!("spawn libra-migrate {args:?}: {err}"));
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             assert!(
-                !output.status.success(),
-                "pre-unlock libra-migrate {args:?} must exit non-zero even with LIBRA_TEST=1"
+                output.status.success(),
+                "libra-migrate {args:?} failed (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
             );
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                combined.contains("LBR-CLI-003"),
-                "pre-unlock libra-migrate {args:?} must emit LBR-CLI-003, got: {combined}"
-            );
-        }
+            stdout
+        };
 
-        // Verify zero disk writes across all scopes.
-        assert!(!storage_manifest_path(&dot_libra).exists());
-        assert!(!config_redb_path_in_scope_dir(&global_dir).exists());
-        assert!(!config_format_manifest_path(&global_dir).exists());
-        assert!(!config_redb_path_in_scope_dir(&system_dir).exists());
-        assert!(!config_format_manifest_path(&system_dir).exists());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread tokio runtime for store verification");
+
+        // -----------------------------------------------------------------
+        // 1. Seed a real SQLite repository (default backend before RB-33).
+        // -----------------------------------------------------------------
+        run_libra(&repo_dir, None, &["init", "--vault", "false"]);
+        let dot_libra = repo_dir.join(".libra");
+        let sqlite_git_path = dot_libra.join("libra.db");
+        assert!(
+            sqlite_git_path.is_file(),
+            "default libra init must create legacy SQLite libra.db"
+        );
+        assert!(
+            !storage_manifest_path(&dot_libra).exists(),
+            "fresh default SQLite init must not write storage-format.json"
+        );
+
+        run_libra(&repo_dir, None, &["config", "user.name", "RB29c Tester"]);
+        run_libra(
+            &repo_dir,
+            None,
+            &["config", "user.email", "rb29c@example.com"],
+        );
+        run_libra(
+            &repo_dir,
+            None,
+            &["config", "roundtrip.origin", "sqlite-initial"],
+        );
+
+        fs::write(repo_dir.join("hello.txt"), "seeded on sqlite\n").expect("write hello.txt");
+        run_libra(&repo_dir, None, &["add", "hello.txt"]);
+        run_libra(
+            &repo_dir,
+            None,
+            &["commit", "-m", "seed sqlite commit", "--no-verify"],
+        );
+        run_libra(&repo_dir, None, &["branch", "sqlite-branch"]);
+
+        let initial_head_oid = run_libra(&repo_dir, None, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        assert!(
+            !initial_head_oid.is_empty(),
+            "initial SQLite HEAD commit OID must be non-empty"
+        );
+
+        // Seed a pre-migration capture session in `.libra/private/capture.db`.
+        let private_dir = dot_libra.join("private");
+        fs::create_dir_all(&private_dir).expect("mkdir .libra/private");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&private_dir, fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 .libra/private");
+        }
+        let sqlite_cap_path = private_dir.join("capture.db");
+        let sqlite_session = make_roundtrip_session("rb29c-sqlite-seed-session", 1_760_200_000);
+        rt.block_on(async {
+            let cap_store = SqliteCaptureStore::create(&sqlite_cap_path)
+                .await
+                .expect("create SQLite capture store");
+            cap_store
+                .put_copy_receipt(&libra::storage::CaptureCatalogCopyReceiptRecord {
+                    id: 1,
+                    copied_at: "2026-11-26T00:00:00Z".to_string(),
+                })
+                .await
+                .expect("seed Layout B capture_catalog_copy_receipt");
+            cap_store
+                .upsert_session(&sqlite_session)
+                .await
+                .expect("seed SQLite capture session");
+        });
+
+        // -----------------------------------------------------------------
+        // 2. Real `libra-migrate --to redb --repo <repo>` forward cutover.
+        // -----------------------------------------------------------------
+        let repo_arg = repo_dir.to_str().expect("utf8 repo path");
+        let fwd_out = run_migrate(&["--to", "redb", "--repo", repo_arg]);
+        assert!(
+            fwd_out.contains("Migrated repository to redb"),
+            "unexpected forward migration stdout: {fwd_out}"
+        );
+
+        let fwd_manifest = read_storage_manifest(&dot_libra)
+            .expect("read manifest after forward migration")
+            .expect("storage-format.json must exist after forward migration");
+        assert_eq!(fwd_manifest.backend, StorageBackendKind::Redb);
+        assert!(
+            fwd_manifest.finalized,
+            "forward migration manifest must be finalized"
+        );
+        let redb_paths = resolve_redb_generation_paths(&dot_libra)
+            .expect("resolve redb generation paths")
+            .expect("redb generation paths must be present");
+        assert!(
+            redb_paths.git_db_path.is_file(),
+            "expected git.gen-*.redb to exist at {}",
+            redb_paths.git_db_path.display()
+        );
+        assert!(
+            redb_paths.capture_db_path.is_file(),
+            "expected capture.gen-*.redb to exist at {}",
+            redb_paths.capture_db_path.display()
+        );
+        assert!(
+            !sqlite_git_path.exists(),
+            "legacy libra.db must be unlinked after finalized forward migration"
+        );
+
+        // -----------------------------------------------------------------
+        // 3. Perform NEW writes on the Redb repository via unlocked `libra` CLI.
+        // -----------------------------------------------------------------
+        let origin_on_redb = run_libra(
+            &repo_dir,
+            Some("redb"),
+            &["config", "get", "roundtrip.origin"],
+        );
+        assert_eq!(origin_on_redb.trim(), "sqlite-initial");
+
+        let sqlite_branch_on_redb =
+            run_libra(&repo_dir, Some("redb"), &["rev-parse", "sqlite-branch"]);
+        assert_eq!(sqlite_branch_on_redb.trim(), initial_head_oid);
+
+        run_libra(
+            &repo_dir,
+            Some("redb"),
+            &["config", "roundtrip.redb_write", "written-on-redb"],
+        );
+        fs::write(repo_dir.join("redb.txt"), "written while on redb\n").expect("write redb.txt");
+        run_libra(&repo_dir, Some("redb"), &["add", "redb.txt"]);
+        run_libra(
+            &repo_dir,
+            Some("redb"),
+            &["commit", "-m", "post-cutover redb commit", "--no-verify"],
+        );
+        run_libra(&repo_dir, Some("redb"), &["branch", "redb-branch"]);
+
+        let redb_head_oid = run_libra(&repo_dir, Some("redb"), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        assert_ne!(
+            redb_head_oid, initial_head_oid,
+            "new commit on Redb must advance HEAD past initial SQLite commit"
+        );
+
+        // Record a new capture session while the repository is running on Redb.
+        let redb_session = make_roundtrip_session("rb29c-redb-live-session", 1_760_200_100);
+        rt.block_on(async {
+            let cap_store = RedbCaptureStore::open_read_write(
+                &redb_paths.capture_db_path,
+                RedbRepairContext::WriteCommand,
+            )
+            .await
+            .expect("open Redb capture store");
+            cap_store
+                .upsert_session(&redb_session)
+                .await
+                .expect("write post-cutover Redb capture session");
+        });
+
+        // Also verify fresh `libra init` honors explicit `LIBRA_STORAGE_BACKEND=redb`.
+        run_libra(&fresh_redb_dir, Some("redb"), &["init", "--vault", "false"]);
+        let fresh_dot_libra = fresh_redb_dir.join(".libra");
+        let fresh_manifest = read_storage_manifest(&fresh_dot_libra)
+            .expect("read fresh redb init manifest")
+            .expect("fresh LIBRA_STORAGE_BACKEND=redb init must publish storage-format.json");
+        assert_eq!(fresh_manifest.backend, StorageBackendKind::Redb);
+        assert!(fresh_manifest.finalized);
+        assert!(
+            !fresh_dot_libra.join("libra.db").exists(),
+            "fresh LIBRA_STORAGE_BACKEND=redb init must not create libra.db"
+        );
+
+        // -----------------------------------------------------------------
+        // 4. Real `libra-migrate --to sqlite --repo <repo>` reverse cutover.
+        // -----------------------------------------------------------------
+        let rev_out = run_migrate(&["--to", "sqlite", "--repo", repo_arg]);
+        assert!(
+            rev_out.contains("Migrated repository to sqlite"),
+            "unexpected reverse migration stdout: {rev_out}"
+        );
+
+        let rev_manifest = read_storage_manifest(&dot_libra)
+            .expect("read manifest after reverse migration")
+            .expect("storage-format.json must exist after reverse migration");
+        assert_eq!(rev_manifest.backend, StorageBackendKind::Sqlite);
+        assert!(
+            rev_manifest.finalized,
+            "reverse migration manifest must be finalized"
+        );
+        assert!(
+            sqlite_git_path.is_file(),
+            "libra.db must be restored after reverse migration"
+        );
+
+        // -----------------------------------------------------------------
+        // 5. Verify 100% readback consistency from restored SQLite repository.
+        // -----------------------------------------------------------------
+        assert_eq!(
+            run_libra(&repo_dir, None, &["rev-parse", "HEAD"]).trim(),
+            redb_head_oid
+        );
+        assert_eq!(
+            run_libra(&repo_dir, None, &["rev-parse", "sqlite-branch"]).trim(),
+            initial_head_oid
+        );
+        assert_eq!(
+            run_libra(&repo_dir, None, &["rev-parse", "redb-branch"]).trim(),
+            redb_head_oid
+        );
+        assert_eq!(
+            run_libra(&repo_dir, None, &["config", "get", "roundtrip.origin"]).trim(),
+            "sqlite-initial"
+        );
+        assert_eq!(
+            run_libra(&repo_dir, None, &["config", "get", "roundtrip.redb_write"]).trim(),
+            "written-on-redb"
+        );
+        let head_commit_body = run_libra(&repo_dir, None, &["cat-file", "-p", "HEAD"]);
+        assert!(
+            head_commit_body.contains("post-cutover redb commit")
+                && head_commit_body.contains(&initial_head_oid),
+            "restored HEAD commit must preserve post-cutover message and parent OID: {head_commit_body}"
+        );
+        let seed_commit_body = run_libra(&repo_dir, None, &["cat-file", "-p", "sqlite-branch"]);
+        assert!(
+            seed_commit_body.contains("seed sqlite commit"),
+            "restored sqlite-branch commit must preserve original message: {seed_commit_body}"
+        );
+
+        // Direct SQLite store readback verification across Git, Config, and Capture stores.
+        rt.block_on(async {
+            let restored_git = SqliteGitStore::open_read_only(&sqlite_git_path)
+                .await
+                .expect("open restored SqliteGitStore");
+            assert_eq!(
+                restored_git
+                    .get_ref(&RefKey::LocalBranch {
+                        name: "sqlite-branch".to_string(),
+                    })
+                    .await
+                    .expect("read sqlite-branch"),
+                Some(RefTarget::Direct(initial_head_oid.clone()))
+            );
+            assert_eq!(
+                restored_git
+                    .get_ref(&RefKey::LocalBranch {
+                        name: "redb-branch".to_string(),
+                    })
+                    .await
+                    .expect("read redb-branch"),
+                Some(RefTarget::Direct(redb_head_oid.clone()))
+            );
+
+            let restored_cfg =
+                SqliteConfigStore::open_read_only(&sqlite_git_path, DatabaseRole::Repository)
+                    .await
+                    .expect("open restored SqliteConfigStore");
+            assert_eq!(
+                restored_cfg
+                    .get("roundtrip.origin")
+                    .await
+                    .expect("read roundtrip.origin")
+                    .map(|e| e.value),
+                Some("sqlite-initial".to_string())
+            );
+            assert_eq!(
+                restored_cfg
+                    .get("roundtrip.redb_write")
+                    .await
+                    .expect("read roundtrip.redb_write")
+                    .map(|e| e.value),
+                Some("written-on-redb".to_string())
+            );
+
+            let restored_cap = SqliteCaptureStore::open_read_only(&sqlite_cap_path)
+                .await
+                .expect("open restored SqliteCaptureStore");
+            let restored_sqlite_session = restored_cap
+                .get_session("rb29c-sqlite-seed-session")
+                .await
+                .expect("read restored sqlite capture session")
+                .expect("pre-migration capture session must survive roundtrip");
+            assert_eq!(
+                restored_sqlite_session.session_id,
+                sqlite_session.session_id
+            );
+            let restored_redb_session = restored_cap
+                .get_session("rb29c-redb-live-session")
+                .await
+                .expect("read restored redb capture session")
+                .expect("post-cutover Redb capture session must survive reverse migration");
+            assert_eq!(restored_redb_session.session_id, redb_session.session_id);
+        });
     }
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dual_feature_migration_and_stress_roundtrip() {
+    dual_feature_stress::dual_feature_migration_and_stress_roundtrip_impl().await;
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[test]
+fn post_unlock_libra_migrate_binary_bidirectional_roundtrip() {
+    dual_feature_stress::post_unlock_libra_migrate_binary_bidirectional_roundtrip_impl();
 }

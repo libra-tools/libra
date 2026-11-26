@@ -181,6 +181,88 @@ fn is_retryable(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Drain `.libra/private/capture-queue/{priority,normal}/` for the Redb
+/// repository containing the current directory (`RB-29`).
+#[cfg(feature = "storage-redb")]
+pub(crate) async fn run_queue_from_repository() -> Result<crate::storage::queue::CaptureDrainReport>
+{
+    let storage = crate::utils::util::try_get_storage_path(None)?;
+    drain_queue_storage(&storage).await
+}
+
+/// Drain `.libra/private/capture-queue/{priority,normal}/` priority-first into
+/// `capture.redb` via [`crate::storage::queue::drain_capture_queue`] (`RB-29`).
+#[cfg(feature = "storage-redb")]
+pub(crate) async fn drain_queue_storage(
+    storage: &Path,
+) -> Result<crate::storage::queue::CaptureDrainReport> {
+    match crate::storage::runtime::detect_repo_backend(storage).map_err(map_redb_queue_error)? {
+        crate::storage::StorageBackendKind::Redb => {}
+        crate::storage::StorageBackendKind::Sqlite => {
+            return Err(anyhow!(
+                "capture queue drain applies only to redb repositories; run `libra __capture-spool-drain` for sqlite repositories"
+            ));
+        }
+    }
+    let capture = crate::storage::runtime::open_capture_store_read_write(
+        storage,
+        crate::storage::RedbRepairContext::WriteCommand,
+    )
+    .await
+    .map_err(map_redb_queue_error)?;
+
+    let mut report = crate::storage::queue::drain_capture_queue(storage, capture.as_ref())
+        .await
+        .map_err(map_redb_queue_error)?;
+    if report.acquired_writer_lock {
+        spool::clear_queue_drain_pending(storage);
+        // Perform one final pass after clearing `drain.pending` so any frame
+        // enqueued while `writer.lock` was being released is not stranded.
+        let followup = crate::storage::queue::drain_capture_queue(storage, capture.as_ref())
+            .await
+            .map_err(map_redb_queue_error)?;
+        if followup.acquired_writer_lock {
+            report.priority_batches = report
+                .priority_batches
+                .saturating_add(followup.priority_batches);
+            report.normal_batches = report
+                .normal_batches
+                .saturating_add(followup.normal_batches);
+            report.applied_frames = report
+                .applied_frames
+                .saturating_add(followup.applied_frames);
+            report.deduplicated_frames = report
+                .deduplicated_frames
+                .saturating_add(followup.deduplicated_frames);
+            report.reclaimed_segments = report
+                .reclaimed_segments
+                .saturating_add(followup.reclaimed_segments);
+            report.recovery_delegations = report
+                .recovery_delegations
+                .saturating_add(followup.recovery_delegations);
+            if followup.highwater.is_some() {
+                report.highwater = followup.highwater;
+            }
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(feature = "storage-redb")]
+fn map_redb_queue_error(err: crate::storage::StorageBackendError) -> anyhow::Error {
+    match err {
+        crate::storage::StorageBackendError::SchemaTooNew {
+            role: crate::internal::db::schema::DatabaseRole::Capture,
+            ..
+        } => anyhow!(CaptureSchemaTooNew),
+        crate::storage::StorageBackendError::WriteLockBusy {
+            role: crate::internal::db::schema::DatabaseRole::Capture,
+            ..
+        } => anyhow!(CaptureDatabaseBusy),
+        other => anyhow::Error::new(other),
+    }
+}
+
 /// Map an open failure of `capture.db` to the stable capture classes.
 pub(crate) fn classify_capture_open(error: &std::io::Error) -> anyhow::Error {
     let text = error.to_string();

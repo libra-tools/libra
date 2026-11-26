@@ -1,10 +1,13 @@
-//! Storage backend selection, compile-time feature dispatch, and pre-integration
-//! runtime gate (`ADR-RB-01` #3).
+//! Storage backend selection, compile-time feature dispatch, and runtime
+//! cutover gate (`ADR-RB-01` #3, `RB-29a`).
 //!
-//! While [`REDB_RUNTIME_UNLOCKED`] is `false` (Track A through `RB-29`), any
+//! While [`REDB_RUNTIME_UNLOCKED`] was `false` (Track A through `RB-28`), any
 //! runtime request selecting [`StorageBackendKind::Redb`] or calling
-//! [`assert_redb_runtime_unlocked`] fails closed with `LBR-CLI-003`, ignoring
-//! `LIBRA_TEST` and all other environment variables.
+//! [`assert_redb_runtime_unlocked`] failed closed with `LBR-CLI-003`. As of
+//! `RB-29a`, [`REDB_RUNTIME_UNLOCKED`] is `true` so explicit
+//! `LIBRA_STORAGE_BACKEND=redb` and live `libra-migrate` cutovers are active
+//! while `compiled_default()` remains `Sqlite` in dual-feature builds until
+//! `RB-33`.
 
 use std::{env, ffi::OsString, fmt, path::Path};
 
@@ -23,10 +26,10 @@ pub const LIBRA_STORAGE_BACKEND_ENV: &str = "LIBRA_STORAGE_BACKEND";
 /// Compile-time pre-integration lock for the `redb` runtime and `libra-migrate`
 /// live cutover commands (`ADR-RB-01` #3).
 ///
-/// Remains `false` throughout Track A and Track B until `RB-29a` unlocks it
-/// atomically alongside full 146-file wiring. There is intentionally no runtime
-/// environment bypass (including `LIBRA_TEST`).
-pub const REDB_RUNTIME_UNLOCKED: bool = false;
+/// Unlocked in `RB-29a` so explicit `LIBRA_STORAGE_BACKEND=redb` and live
+/// `libra-migrate` cutovers are active while `compiled_default()` continues to
+/// select `Sqlite` in dual-feature builds until `RB-33`.
+pub const REDB_RUNTIME_UNLOCKED: bool = true;
 
 /// Supported metadata storage engine backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -334,24 +337,27 @@ pub fn assert_redb_runtime_unlocked() -> StorageResult<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "storage-sqlite", feature = "storage-redb"))]
+#[cfg(all(test, feature = "storage-redb"))]
 mod tests {
+    #[cfg(feature = "storage-sqlite")]
     use std::{
         ffi::OsString,
-        fs,
-        path::PathBuf,
-        process::Command,
         sync::atomic::{AtomicUsize, Ordering},
     };
+    use std::{fs, path::PathBuf, process::Command};
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::storage::manifest::{
-        INITIAL_STORAGE_GENERATION, PRIVATE_SUBDIR, Phase2DbState, Phase2Progress, REDB_SUBDIR,
-        SourceDigests, StorageFormatManifest, publish_storage_manifest,
+        INITIAL_STORAGE_GENERATION, StorageFormatManifest, publish_storage_manifest,
+    };
+    #[cfg(feature = "storage-sqlite")]
+    use crate::storage::manifest::{
+        PRIVATE_SUBDIR, Phase2DbState, Phase2Progress, REDB_SUBDIR, SourceDigests,
     };
 
+    #[cfg(feature = "storage-sqlite")]
     #[test]
     fn dual_feature_resolution_and_pre_release_cli_gate() {
         // Isolated child-process mode exercises the real public `StorageBackendKind::resolve(dir)`
@@ -362,21 +368,17 @@ mod tests {
                     .expect("LIBRA_RB01C_STORAGE_DIR must be set for child mode"),
             );
             match mode.to_str() {
-                Some("locked_redb") => {
-                    let err = StorageBackendKind::resolve(&storage_dir).expect_err(
-                        "public resolve() must fail closed for redb even with LIBRA_TEST=1",
+                Some("unlocked_redb") => {
+                    let kind = StorageBackendKind::resolve(&storage_dir).expect(
+                        "public resolve() must allow explicit LIBRA_STORAGE_BACKEND=redb after RB-29a unlock",
                     );
-                    assert!(
-                        matches!(err, StorageBackendError::PreReleaseGateLocked { .. }),
-                        "expected PreReleaseGateLocked from resolve(), got {err:?}"
-                    );
-                    assert_eq!(err.stable_code_str(), "LBR-CLI-003");
-                    println!("RB01C_CHILD_OK:locked_redb");
+                    assert_eq!(kind, StorageBackendKind::Redb);
+                    println!("RB01C_CHILD_OK:unlocked_redb");
                     return;
                 }
                 Some("default_unset") => {
                     let kind = StorageBackendKind::resolve(&storage_dir).expect(
-                        "public resolve() with unset env must select sqlite before cutover",
+                        "public resolve() with unset env must select sqlite before RB-33 cutover",
                     );
                     assert_eq!(kind, StorageBackendKind::Sqlite);
                     println!("RB01C_CHILD_OK:default_unset");
@@ -388,42 +390,37 @@ mod tests {
 
         const {
             assert!(
-                !REDB_RUNTIME_UNLOCKED,
-                "REDB_RUNTIME_UNLOCKED must stay false prior to RB-29a"
+                REDB_RUNTIME_UNLOCKED,
+                "REDB_RUNTIME_UNLOCKED must be true as of RB-29a"
             );
         }
 
         let fresh = tempdir().expect("create fresh storage dir");
 
-        // AC4: assert_redb_runtime_unlocked() fails closed with LBR-CLI-003.
-        let gate_err = assert_redb_runtime_unlocked()
-            .expect_err("assert_redb_runtime_unlocked must fail while locked");
-        assert!(
-            matches!(gate_err, StorageBackendError::PreReleaseGateLocked { .. }),
-            "expected PreReleaseGateLocked, got {gate_err:?}"
-        );
-        assert_eq!(gate_err.stable_code_str(), "LBR-CLI-003");
+        // Post-RB-29a: assert_redb_runtime_unlocked() succeeds.
+        assert_redb_runtime_unlocked()
+            .expect("assert_redb_runtime_unlocked must succeed once unlocked in RB-29a");
 
-        // AC3 (process-level public resolve() verification with real env vars).
+        // Process-level public resolve() verification with real env vars.
         let exe = env::current_exe().expect("locate current test executable");
-        let locked_output = Command::new(&exe)
+        let unlocked_output = Command::new(&exe)
             .arg("--exact")
             .arg("storage::backend::tests::dual_feature_resolution_and_pre_release_cli_gate")
             .arg("--nocapture")
-            .env("LIBRA_RB01C_CHILD_MODE", "locked_redb")
+            .env("LIBRA_RB01C_CHILD_MODE", "unlocked_redb")
             .env("LIBRA_RB01C_STORAGE_DIR", fresh.path())
             .env(LIBRA_STORAGE_BACKEND_ENV, "redb")
             .env("LIBRA_TEST", "1")
             .output()
-            .expect("spawn isolated locked_redb child");
-        let locked_stdout = String::from_utf8_lossy(&locked_output.stdout);
-        let locked_stderr = String::from_utf8_lossy(&locked_output.stderr);
+            .expect("spawn isolated unlocked_redb child");
+        let unlocked_stdout = String::from_utf8_lossy(&unlocked_output.stdout);
+        let unlocked_stderr = String::from_utf8_lossy(&unlocked_output.stderr);
         assert!(
-            locked_output.status.success()
-                && locked_stdout.contains("RB01C_CHILD_OK:locked_redb")
-                && locked_stdout.contains("1 passed; 0 failed"),
-            "isolated locked_redb child did not execute expected test (status={:?}):\nstdout:\n{locked_stdout}\nstderr:\n{locked_stderr}",
-            locked_output.status
+            unlocked_output.status.success()
+                && unlocked_stdout.contains("RB01C_CHILD_OK:unlocked_redb")
+                && unlocked_stdout.contains("1 passed; 0 failed"),
+            "isolated unlocked_redb child did not execute expected test (status={:?}):\nstdout:\n{unlocked_stdout}\nstderr:\n{unlocked_stderr}",
+            unlocked_output.status
         );
 
         let default_output = Command::new(&exe)
@@ -496,6 +493,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "storage-sqlite")]
     fn forward_in_progress_manifest() -> StorageFormatManifest {
         StorageFormatManifest::new_redb_in_progress(
             INITIAL_STORAGE_GENERATION,
@@ -519,6 +517,7 @@ mod tests {
         .expect("construct valid forward in-progress manifest")
     }
 
+    #[cfg(feature = "storage-sqlite")]
     fn reverse_in_progress_manifest() -> StorageFormatManifest {
         StorageFormatManifest::new_sqlite_in_progress(
             INITIAL_STORAGE_GENERATION + 1,
@@ -543,6 +542,7 @@ mod tests {
         .expect("construct valid reverse in-progress manifest")
     }
 
+    #[cfg(feature = "storage-sqlite")]
     fn finalized_sqlite_manifest() -> StorageFormatManifest {
         let mut manifest = StorageFormatManifest::new_sqlite_in_progress(
             INITIAL_STORAGE_GENERATION + 1,
@@ -571,6 +571,7 @@ mod tests {
             .expect("finalize staged reverse sqlite manifest")
     }
 
+    #[cfg(feature = "storage-sqlite")]
     fn assert_error_does_not_leak_secret(err: &StorageBackendError, secret_marker: &str) {
         let display = err.to_string();
         assert!(
@@ -579,6 +580,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "storage-sqlite")]
     #[test]
     fn manifest_first_precedence_blocks_conflicting_env_overrides() {
         const SECRET_MARKER: &str = "private-tenant-secret-repo-7741";
@@ -646,15 +648,11 @@ mod tests {
                         .expect("fresh empty repo with LIBRA_STORAGE_BACKEND=sqlite must succeed");
                     assert_eq!(kind, StorageBackendKind::Sqlite);
                 }
-                "fresh_env_redb_hits_gate" => {
-                    let err = StorageBackendKind::resolve(&storage_dir).expect_err(
-                        "fresh empty repo with LIBRA_STORAGE_BACKEND=redb must pass authority and hit pre-release gate",
+                "fresh_env_redb" => {
+                    let kind = StorageBackendKind::resolve(&storage_dir).expect(
+                        "fresh empty repo with LIBRA_STORAGE_BACKEND=redb must resolve to Redb after RB-29a unlock",
                     );
-                    assert!(
-                        matches!(err, StorageBackendError::PreReleaseGateLocked { .. }),
-                        "expected PreReleaseGateLocked (proving override was accepted by authority layer), got {err:?}"
-                    );
-                    assert_eq!(err.stable_code_str(), "LBR-CLI-003");
+                    assert_eq!(kind, StorageBackendKind::Redb);
                 }
                 other => panic!("unexpected LIBRA_RB02E_CHILD_MODE: {other:?}"),
             }
@@ -841,16 +839,11 @@ mod tests {
         );
         assert_error_does_not_leak_secret(&redb_conflict, SECRET_MARKER);
 
-        // Matching redb override or unset on finalized redb passes authority check and hits
-        // `PreReleaseGateLocked` while locked, and succeeds (`Redb`) once unlocked.
+        // Matching redb override or unset on finalized redb succeeds (`Redb`) once unlocked.
         for matching in [None, Some("redb"), Some("REDB")] {
-            let locked = StorageBackendKind::resolve_from_override(&finalized_redb_dir, matching)
-                .expect_err("finalized redb must hit pre-release gate while locked");
-            assert!(
-                matches!(locked, StorageBackendError::PreReleaseGateLocked { .. }),
-                "expected PreReleaseGateLocked for matching {matching:?}, got {locked:?}"
-            );
-            assert_eq!(locked.stable_code_str(), "LBR-CLI-003");
+            let resolved = StorageBackendKind::resolve_from_override(&finalized_redb_dir, matching)
+                .expect("finalized redb must resolve to Redb once unlocked");
+            assert_eq!(resolved, StorageBackendKind::Redb);
 
             let unlocked = StorageBackendKind::resolve_post_unlock_for_test(
                 &finalized_redb_dir,
@@ -1007,8 +1000,8 @@ mod tests {
             run_child("fresh_env_sqlite", fresh_dir, Some("sqlite"));
 
             // Explicit `redb` override is permitted by authority layer (NOT `BackendMismatch`),
-            // and is governed by the compile-time `REDB_RUNTIME_UNLOCKED` gate while locked...
-            run_child("fresh_env_redb_hits_gate", fresh_dir, Some("redb"));
+            // and resolves to `Redb` once `REDB_RUNTIME_UNLOCKED` is `true` (`RB-29a`).
+            run_child("fresh_env_redb", fresh_dir, Some("redb"));
 
             // Invalid and non-UTF-8 env values on fresh repos fail closed with LBR-CLI-003.
             run_child(
@@ -1200,5 +1193,223 @@ mod tests {
             assert_eq!(dangling_db_err.stable_code_str(), "LBR-IO-001");
             assert_error_does_not_leak_secret(&dangling_db_err, SECRET_MARKER);
         }
+    }
+
+    /// `RB-29a` AC1, AC2, AC4: verifies `REDB_RUNTIME_UNLOCKED == true` (while
+    /// dual-feature `compiled_default()` remains `Sqlite` until `RB-33`), live
+    /// `LIBRA_STORAGE_BACKEND=redb` resolution succeeds via public `resolve()`
+    /// and `resolve_without_repo()`, and an unmigrated legacy SQLite repository
+    /// (`.libra/libra.db` without `storage-format.json`) on a pure `storage-redb`
+    /// build fails closed with `libra-migrate --to redb` upgrade guidance.
+    #[test]
+    fn unlocked_cli_and_migrate_cutover_with_unmigrated_sqlite_fail_closed() {
+        if let Some(mode) = env::var_os("LIBRA_RB29A_CHILD_MODE") {
+            let storage_dir = PathBuf::from(
+                env::var_os("LIBRA_RB29A_STORAGE_DIR")
+                    .expect("LIBRA_RB29A_STORAGE_DIR must be set for child mode"),
+            );
+            let mode_str = mode.to_str().expect("LIBRA_RB29A_CHILD_MODE must be UTF-8");
+            match mode_str {
+                "explicit_redb_fresh" => {
+                    let kind = StorageBackendKind::resolve(&storage_dir).expect(
+                        "fresh repo with LIBRA_STORAGE_BACKEND=redb must resolve to Redb after RB-29a",
+                    );
+                    assert_eq!(kind, StorageBackendKind::Redb);
+                    let without_repo = StorageBackendKind::resolve_without_repo().expect(
+                        "resolve_without_repo() with LIBRA_STORAGE_BACKEND=redb must resolve to Redb after RB-29a",
+                    );
+                    assert_eq!(without_repo, StorageBackendKind::Redb);
+                }
+                "finalized_redb_unset" => {
+                    let kind = StorageBackendKind::resolve(&storage_dir).expect(
+                        "finalized redb manifest with unset env must resolve to Redb after RB-29a",
+                    );
+                    assert_eq!(kind, StorageBackendKind::Redb);
+                }
+                "legacy_sqlite_unset" => {
+                    #[cfg(feature = "storage-sqlite")]
+                    {
+                        let kind = StorageBackendKind::resolve(&storage_dir)
+                            .expect("dual-feature build must still open legacy libra.db as Sqlite");
+                        assert_eq!(kind, StorageBackendKind::Sqlite);
+                    }
+                    #[cfg(not(feature = "storage-sqlite"))]
+                    {
+                        let err = StorageBackendKind::resolve(&storage_dir).expect_err(
+                            "pure storage-redb build must fail closed on unmigrated legacy libra.db",
+                        );
+                        assert!(
+                            matches!(err, StorageBackendError::UnsupportedBackend { .. }),
+                            "expected UnsupportedBackend on pure storage-redb build, got {err:?}"
+                        );
+                        assert_eq!(err.stable_code_str(), "LBR-CLI-003");
+                        assert!(
+                            err.to_string().contains("libra-migrate --to redb"),
+                            "expected libra-migrate upgrade guidance, got: {err}"
+                        );
+                        let rendered = err.into_cli_error().render();
+                        assert!(
+                            rendered.contains("libra-migrate --to redb"),
+                            "expected libra-migrate upgrade guidance in CLI error, got: {rendered}"
+                        );
+                    }
+                }
+                "legacy_sqlite_env_redb" => {
+                    let err = StorageBackendKind::resolve(&storage_dir).expect_err(
+                        "LIBRA_STORAGE_BACKEND=redb against unmigrated legacy libra.db must fail closed",
+                    );
+                    assert!(
+                        matches!(err, StorageBackendError::BackendMismatch { .. }),
+                        "expected BackendMismatch against legacy libra.db, got {err:?}"
+                    );
+                    assert_eq!(err.stable_code_str(), "LBR-CLI-003");
+                    assert!(
+                        err.to_string().contains("libra-migrate --to redb"),
+                        "expected libra-migrate upgrade guidance, got: {err}"
+                    );
+                }
+                other => panic!("unexpected LIBRA_RB29A_CHILD_MODE: {other:?}"),
+            }
+            println!("RB29A_CHILD_OK:{mode_str}");
+            return;
+        }
+
+        // AC1: compile-time unlock flag is true, runtime gate passes, and
+        // compiled_default() stays Sqlite whenever storage-sqlite is compiled.
+        const {
+            assert!(
+                REDB_RUNTIME_UNLOCKED,
+                "REDB_RUNTIME_UNLOCKED must be true as of RB-29a"
+            );
+        }
+        assert_redb_runtime_unlocked()
+            .expect("assert_redb_runtime_unlocked() must succeed in RB-29a");
+        if has_sqlite_backend() {
+            assert_eq!(
+                StorageBackendKind::compiled_default(),
+                StorageBackendKind::Sqlite,
+                "dual-feature compiled_default() must stay Sqlite until RB-33"
+            );
+        } else {
+            assert_eq!(
+                StorageBackendKind::compiled_default(),
+                StorageBackendKind::Redb,
+                "pure storage-redb compiled_default() must be Redb"
+            );
+        }
+
+        let root = tempdir().expect("create RB-29a tempdir");
+        let fresh_dir = root.path().join("fresh");
+        fs::create_dir_all(&fresh_dir).expect("mkdir fresh");
+
+        // Verify capability matrix defaults and explicit `redb` override (AC1 & AC2).
+        assert_eq!(
+            StorageBackendKind::resolve_with_capabilities(&fresh_dir, None, true, true)
+                .expect("dual-feature unset default must remain Sqlite"),
+            StorageBackendKind::Sqlite
+        );
+        assert_eq!(
+            StorageBackendKind::resolve_with_capabilities(&fresh_dir, Some("redb"), true, true)
+                .expect("dual-feature explicit redb must succeed after RB-29a"),
+            StorageBackendKind::Redb
+        );
+        assert_eq!(
+            StorageBackendKind::resolve_with_capabilities(&fresh_dir, None, false, true)
+                .expect("pure storage-redb default must be Redb"),
+            StorageBackendKind::Redb
+        );
+
+        let finalized_redb_dir = root.path().join("finalized-redb");
+        fs::create_dir_all(&finalized_redb_dir).expect("mkdir finalized-redb");
+        let finalized_manifest =
+            StorageFormatManifest::new_redb_finalized(INITIAL_STORAGE_GENERATION)
+                .expect("construct finalized redb manifest");
+        publish_storage_manifest(&finalized_redb_dir, &finalized_manifest)
+            .expect("publish finalized redb manifest");
+
+        // Unmigrated legacy SQLite repository: `.libra/libra.db` without `storage-format.json`.
+        let legacy_dir = root.path().join("legacy-sqlite");
+        fs::create_dir_all(&legacy_dir).expect("mkdir legacy-sqlite");
+        fs::write(legacy_dir.join("libra.db"), b"SQLite format 3\0")
+            .expect("write legacy libra.db");
+
+        // AC4: pure `storage-redb` capabilities fail closed on legacy SQLite repo with
+        // explicit `libra-migrate --to redb` upgrade guidance.
+        let pure_redb_err =
+            StorageBackendKind::resolve_with_capabilities(&legacy_dir, None, false, true)
+                .expect_err("pure storage-redb must fail closed on unmigrated legacy libra.db");
+        assert!(
+            matches!(
+                pure_redb_err,
+                StorageBackendError::UnsupportedBackend { .. }
+            ),
+            "expected UnsupportedBackend for legacy libra.db on pure redb, got {pure_redb_err:?}"
+        );
+        assert_eq!(pure_redb_err.stable_code_str(), "LBR-CLI-003");
+        assert!(
+            pure_redb_err
+                .to_string()
+                .contains("libra-migrate --to redb"),
+            "expected libra-migrate guidance in Display: {pure_redb_err}"
+        );
+        let rendered = pure_redb_err.into_cli_error().render();
+        assert!(
+            rendered.contains("libra-migrate --to redb"),
+            "expected libra-migrate guidance in CLI error: {rendered}"
+        );
+
+        let legacy_override_err =
+            StorageBackendKind::resolve_with_capabilities(&legacy_dir, Some("redb"), false, true)
+                .expect_err("explicit redb override on legacy libra.db must fail closed");
+        assert!(
+            matches!(
+                legacy_override_err,
+                StorageBackendError::BackendMismatch { .. }
+            ),
+            "expected BackendMismatch for redb override on legacy libra.db, got {legacy_override_err:?}"
+        );
+        assert_eq!(legacy_override_err.stable_code_str(), "LBR-CLI-003");
+        assert!(
+            legacy_override_err
+                .to_string()
+                .contains("libra-migrate --to redb"),
+            "expected libra-migrate guidance in mismatch error: {legacy_override_err}"
+        );
+
+        // Process-level verification of real public `StorageBackendKind::resolve()`
+        // and `resolve_without_repo()` under this build's actual compiled features.
+        let exe = env::current_exe().expect("locate current test executable");
+        let run_child = |mode: &str, dir: &Path, backend_env: Option<&str>| {
+            let mut cmd = Command::new(&exe);
+            cmd.arg("--exact")
+                .arg("storage::backend::tests::unlocked_cli_and_migrate_cutover_with_unmigrated_sqlite_fail_closed")
+                .arg("--nocapture")
+                .env("LIBRA_RB29A_CHILD_MODE", mode)
+                .env("LIBRA_RB29A_STORAGE_DIR", dir);
+            match backend_env {
+                Some(v) => {
+                    cmd.env(LIBRA_STORAGE_BACKEND_ENV, v);
+                }
+                None => {
+                    cmd.env_remove(LIBRA_STORAGE_BACKEND_ENV);
+                }
+            }
+            let output = cmd.output().expect("spawn RB-29a child process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let sentinel = format!("RB29A_CHILD_OK:{mode}");
+            assert!(
+                output.status.success()
+                    && stdout.contains(&sentinel)
+                    && stdout.contains("1 passed; 0 failed"),
+                "RB-29a child `{mode}` (env={backend_env:?}) failed (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+        };
+
+        run_child("explicit_redb_fresh", &fresh_dir, Some("redb"));
+        run_child("finalized_redb_unset", &finalized_redb_dir, None);
+        run_child("legacy_sqlite_unset", &legacy_dir, None);
+        run_child("legacy_sqlite_env_redb", &legacy_dir, Some("redb"));
     }
 }

@@ -371,8 +371,8 @@ jobs:
           cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(/^storage::/)'
           # 5. Dual-feature libra-migrate CLI unit suite
           cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --bin libra-migrate
-          # 6. Dual-feature migration stress roundtrip & pre-unlock binary gate
-          cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --test storage_concurrency_stress_test -E 'test(=dual_feature_migration_and_stress_roundtrip) | test(=pre_unlock_libra_migrate_binary_rejects_cutover_with_libra_test_env)'
+          # 6. Dual-feature migration stress roundtrip & post-unlock binary bidirectional roundtrip
+          cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --test storage_concurrency_stress_test -E 'test(=dual_feature_migration_and_stress_roundtrip) | test(=post_unlock_libra_migrate_binary_bidirectional_roundtrip)'
 
       - name: Clean up CI scratch
         if: always()

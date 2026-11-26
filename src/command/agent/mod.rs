@@ -138,6 +138,7 @@ EXAMPLES:
     libra agent clean                               Drop temporary checkpoints from the most recent stopped session
     libra agent clean --all                         Drop temporary checkpoints from every stopped session
     libra agent doctor                              Diagnose hook installation and capture state
+    libra agent daemon                              Run the preview single-writer Redb capture queue daemon
     libra agent workspace list                      List workspace records (keyset pagination)
     libra agent workspace show <workspace-id>       Show one workspace record (lease, owner, path, state)
     libra agent push                                Push refs/libra/traces to the default remote
@@ -218,6 +219,10 @@ pub enum AgentSubcommand {
     /// Diagnose hook installation, stuck sessions, and orphan checkpoints.
     #[command(about = "Diagnose hook installation and capture state")]
     Doctor(DoctorArgs),
+
+    /// Run the optional preview single-writer Redb capture queue daemon.
+    #[command(about = "Run the preview single-writer capture queue daemon (Redb)")]
+    Daemon(DaemonArgs),
 
     /// Push `refs/libra/traces` to a remote.
     #[command(about = "Push refs/libra/traces to a remote")]
@@ -389,6 +394,22 @@ fn parse_codex_legacy_cursor(value: &str) -> Result<String, String> {
 }
 
 #[derive(Args, Debug)]
+pub struct DaemonArgs {
+    /// Poll interval in milliseconds between queue checks (default: 50, range: 5..=5000).
+    #[arg(
+        long,
+        value_name = "MILLISECONDS",
+        default_value_t = 50,
+        value_parser = clap::value_parser!(u64).range(5..=5000)
+    )]
+    pub poll_interval_ms: u64,
+
+    /// Drain once and exit instead of running continuously.
+    #[arg(long)]
+    pub once: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct PushArgs {
     /// Remote name to push refs/libra/traces to (default: origin)
     #[arg(long, value_name = "NAME")]
@@ -532,6 +553,7 @@ pub async fn execute_safe(
         AgentSubcommand::Skill(cmd) => skill::execute_safe(cmd, output).await,
         AgentSubcommand::Clean(cmd) => clean::execute_safe(cmd, output).await,
         AgentSubcommand::Doctor(cmd) => doctor::execute_safe(cmd, output).await,
+        AgentSubcommand::Daemon(cmd) => run_capture_queue_daemon(cmd, output).await,
         AgentSubcommand::Push(cmd) => push::execute_safe(cmd, output).await,
         AgentSubcommand::Workspace(cmd) => workspace::execute_safe(cmd, output).await,
         AgentSubcommand::Hooks(args) => {
@@ -540,6 +562,103 @@ pub async fn execute_safe(
         AgentSubcommand::Rpc(cmd) => rpc::execute_safe(cmd, output).await,
         AgentSubcommand::Bridge(args) => bridge::execute_safe(args, output).await,
         AgentSubcommand::Mcp(args) => mcp::execute_safe(args, output).await,
+    }
+}
+
+/// Optional preview single-writer Redb capture queue daemon (`RB-29d`).
+///
+/// While this daemon holds `.libra/private/capture-queue/daemon.lock`, realtime
+/// hooks skip spawning background `__capture-queue-drain` processes and rely on
+/// this single writer to drain `priority/` before `normal/` into `capture.redb`.
+pub(crate) async fn run_capture_queue_daemon(
+    args: DaemonArgs,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let storage =
+        crate::utils::util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(CliError::from)? {
+        crate::storage::StorageBackendKind::Sqlite => {
+            let _ = (args, output);
+            Err(CliError::fatal(
+                "`libra agent daemon` requires a Redb repository; SQLite repositories drain via `libra __capture-spool-drain`"
+                    .to_string(),
+            )
+            .with_stable_code(crate::utils::error::StableErrorCode::Unsupported))
+        }
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let Some(_daemon_lock) =
+                    crate::internal::ai::capture::spool::try_acquire_queue_daemon_lock(&storage)
+                        .map_err(|err| CliError::fatal(err.to_string()))?
+                else {
+                    return Err(CliError::fatal(
+                        "another `libra agent daemon` is already active for this repository"
+                            .to_string(),
+                    )
+                    .with_stable_code(
+                        crate::utils::error::StableErrorCode::ConflictOperationBlocked,
+                    ));
+                };
+                crate::internal::ai::capture::spool::clear_queue_drain_pending(&storage);
+                let capture = crate::storage::runtime::open_capture_store_read_write(
+                    &storage,
+                    crate::storage::RedbRepairContext::WriteCommand,
+                )
+                .await
+                .map_err(CliError::from)?;
+                let writer = crate::storage::queue::CaptureQueueWriter::in_storage_dir(&storage);
+                if !output.quiet && !output.is_json() {
+                    println!(
+                        "libra agent daemon: active (preview single-writer Redb capture queue consumer)"
+                    );
+                }
+                let poll_interval = std::time::Duration::from_millis(args.poll_interval_ms);
+                loop {
+                    let report = writer
+                        .drain_once(capture.as_ref())
+                        .await
+                        .map_err(CliError::from)?;
+                    if args.once {
+                        if output.is_json() {
+                            let summary = serde_json::json!({
+                                "backend": "redb",
+                                "once": true,
+                                "acquired_writer_lock": report.acquired_writer_lock,
+                                "priority_batches": report.priority_batches,
+                                "normal_batches": report.normal_batches,
+                                "applied_frames": report.applied_frames,
+                                "deduplicated_frames": report.deduplicated_frames,
+                                "reclaimed_segments": report.reclaimed_segments,
+                            });
+                            return crate::utils::output::emit_json_data(
+                                "agent_daemon",
+                                &summary,
+                                output,
+                            );
+                        }
+                        return Ok(());
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(poll_interval) => {}
+                        ctrl_c = tokio::signal::ctrl_c() => {
+                            let _ = ctrl_c;
+                            let _ = writer.drain_once(capture.as_ref()).await;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (args, output);
+                Err(crate::storage::StorageBackendError::UnsupportedBackend {
+                    requested: "redb".to_string(),
+                    detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                }
+                .into_cli_error())
+            }
+        }
     }
 }
 

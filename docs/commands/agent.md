@@ -231,6 +231,7 @@ libra agent checkpoint <subcommand>
 libra agent skill <subcommand>
 libra agent clean [--all]
 libra agent doctor [--repair]
+libra agent daemon [--poll-interval-ms <ms>] [--once]
 libra agent workspace list [--limit <n>] [--cursor <token>] [--state <state>]...
 libra agent workspace show <workspace-id>
 libra agent push [--remote <name>] [--force-rewrite]
@@ -291,6 +292,23 @@ file path or envelope content. When doctor cannot open
 database: a schema written by a newer Libra fails with `LBR-AGENT-048`, a busy
 database with `LBR-AGENT-047`, and a damaged or unreadable file with
 `LBR-IO-001`, each with its own remedy.
+
+On Redb repositories, realtime hooks instead append CRC32C-authenticated binary
+frames to `.libra/private/capture-queue/{priority,normal}/` (`SessionEnd` routes
+to `priority/`; normal lifecycle events route to `normal/`) without opening
+`capture.redb` directly, and never write to `capture-spool/`. Manual draining
+runs `libra __capture-queue-drain`, which strictly drains `priority/` into
+`capture.redb` before consuming `normal/`. The optional preview single-writer
+daemon `libra agent daemon` holds `.libra/private/capture-queue/daemon.lock` and
+drains both lanes continuously (`--once` drains one pass and exits); while it is
+active, realtime hooks skip spawning detached `__capture-queue-drain` processes,
+and when no daemon is active only the first enqueued frame spawns a single
+detached `__capture-queue-drain` consumer. On Redb repositories,
+`libra agent doctor` additionally reports `capture_queue.redb_queue` telemetry
+(and its human `Capture queue` line) with per-lane `priority/` and `normal/`
+highwaters and pending bytes, daemon/writer liveness, `quarantine/` artifact
+count, and diagnostic code `LBR-AGENT-050` whenever quarantined tail fragments
+exist.
 
 `libra agent workspace list|show` is the read-only machine interface over
 the workspace registry (`workspace_record`): every linked worktree, task
@@ -486,7 +504,8 @@ native-origin gates remain required.
 | `skill list` | Alias of `skill search` (same filters) |
 | `skill registry` | Show the curated per-agent discoverable-skill registry (`--provider <slug>` to scope; the public SkillDiscoverer surface) |
 | `clean` | Clean up temporary checkpoints from stopped sessions (prune fails closed while a checkpoint write is in flight, the traces ref reaches uncataloged commits, or durable object-index repair remains pending; also drops `object_index` rows made unreachable) |
-| `doctor` | Diagnose hook installation and capture state; detect (and with `--repair` fix) checkpoint-store inconsistencies. Its object checks deliberately inspect only this repository's local object directory: unavailable alternate/remote objects are reported conservatively rather than resolving an externally controlled alternate path while producing diagnostics. The read-only `legacy_code_residue` field (human: a "Frozen Code residue" line) reports whether the frozen Code-era paths `.libra/sessions/code/` and `.libra/code/` and the `libra/intent` ref still exist; it never deletes or rewrites that state — cleanup is tracked separately (plan-20260920 ADR-RC-04 / DEFER-RC-02) |
+| `doctor` | Diagnose hook installation and capture state; detect (and with `--repair` fix) checkpoint-store inconsistencies. Its object checks deliberately inspect only this repository's local object directory: unavailable alternate/remote objects are reported conservatively rather than resolving an externally controlled alternate path while producing diagnostics. On Redb repositories, also reports dual-lane `priority/` and `normal/` capture-queue highwaters, pending bytes, `quarantine/` count, and `LBR-AGENT-050` when quarantined items exist. The read-only `legacy_code_residue` field (human: a "Frozen Code residue" line) reports whether the frozen Code-era paths `.libra/sessions/code/` and `.libra/code/` and the `libra/intent` ref still exist; it never deletes or rewrites that state — cleanup is tracked separately (plan-20260920 ADR-RC-04 / DEFER-RC-02) |
+| `daemon` | Run the optional preview single-writer Redb capture queue daemon holding `.libra/private/capture-queue/daemon.lock` so realtime hooks skip spawning background `__capture-queue-drain` processes (supports `--poll-interval-ms <5..=5000>` and `--once`) |
 | `push` | Push `refs/libra/traces` to a remote (`--force-rewrite` for the non-fast-forward push after a `clean` prune, using force-with-lease) |
 | `rpc list` | List discovered `libra-agent-*` binaries on `PATH` (with trusted/quarantined state); requires the external-agents opt-in |
 | `rpc trust <slug>` | Trust a discovered binary — records path + sha256 + device/inode/mtime provenance (refused when its directory is world-writable, or when the binary is not under a trusted directory — `LBR-AGENT-005`). The provider-exporter slug `opencode` instead pins the provider's own CLI binary — resolved only from registered trusted directories, never `$PATH` — for the sandboxed export bridge; this form needs no external-agents opt-in. A mise (aube) or pnpm `.bin` launcher shim is followed to the native executable it declares, which must itself be under a trusted directory (reported as `launcher` in `--json`); a JavaScript launcher is refused (`LBR-AGENT-005`). Provenance is hashed in one streaming pass with no fixed size cap, so large single-file provider CLIs (the OpenCode Bun build is ~171 MiB) stay trustable; a file that yields more bytes than its reported size while being hashed is refused (`LBR-AGENT-005`) |

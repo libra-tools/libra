@@ -340,13 +340,49 @@ struct DoctorReport {
     capture_queue: CaptureQueueReport,
 }
 
-/// Realtime capture queue backlog under `.libra/private/capture-spool/`.
-/// Doctor only stats directory entries: it never reads an envelope, never
-/// takes the consumer lock, and never stores or moves a queued event.
+/// Realtime capture queue backlog under `.libra/private/capture-spool/` (SQLite)
+/// or `.libra/private/capture-queue/` (Redb).
+/// Doctor only stats directory entries and reads immutable metadata: it never
+/// reads an envelope, never takes the consumer lock, and never stores or moves
+/// a queued event.
 #[derive(Debug, Default, Serialize)]
 struct CaptureQueueReport {
     ready: CaptureQueueDirCount,
     quarantine: CaptureQueueDirCount,
+    #[cfg(feature = "storage-redb")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redb_queue: Option<RedbCaptureQueueTelemetry>,
+}
+
+/// Per-lane (`priority/` or `normal/`) read-only telemetry for the Redb dual-lane
+/// capture queue (`RB-29d`).
+#[cfg(feature = "storage-redb")]
+#[derive(Debug, Clone, Default, Serialize)]
+struct RedbCaptureQueueLaneTelemetry {
+    highwater_segment_id: u32,
+    highwater_byte_offset: u64,
+    pending_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_segment_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    committed_len: Option<u64>,
+    unavailable: bool,
+}
+
+/// Dual-lane Redb capture queue telemetry surfaced by `libra agent doctor` (`RB-29d`).
+#[cfg(feature = "storage-redb")]
+#[derive(Debug, Clone, Default, Serialize)]
+struct RedbCaptureQueueTelemetry {
+    daemon_active: bool,
+    writer_active: bool,
+    priority: RedbCaptureQueueLaneTelemetry,
+    normal: RedbCaptureQueueLaneTelemetry,
+    quarantine_count: u64,
+    quarantine_bytes: u64,
+    quarantine_at_least: bool,
+    quarantine_unavailable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quarantine_diagnostic_code: Option<&'static str>,
 }
 
 /// Files and bytes in one queue directory. The scan stats at most
@@ -427,8 +463,159 @@ impl CaptureQueueReport {
             quarantine: CaptureQueueDirCount::scan(
                 &crate::internal::ai::capture::spool::quarantine_dir(storage),
             ),
+            #[cfg(feature = "storage-redb")]
+            redb_queue: None,
         }
     }
+
+    /// Read-only inspection of the Redb dual-lane capture queue (`priority/`,
+    /// `normal/`, `quarantine/`) paired with authoritative highwaters from
+    /// `capture.redb` (`RB-29d`). Never mutates disk or takes write locks.
+    #[cfg(feature = "storage-redb")]
+    async fn scan_redb(
+        storage: &std::path::Path,
+        capture: &dyn crate::storage::CaptureStore,
+    ) -> Self {
+        let paths = crate::storage::queue::CaptureQueuePaths::from_storage_dir(storage);
+        let hw = crate::storage::queue::load_authoritative_highwater(capture)
+            .await
+            .unwrap_or_default();
+        let priority = inspect_redb_lane_telemetry(&paths.priority, hw.priority);
+        let normal = inspect_redb_lane_telemetry(&paths.normal, hw.normal);
+        let quarantine = scan_redb_quarantine_dir(&paths.quarantine);
+        let quarantine_diagnostic_code =
+            (quarantine.files > 0).then_some(crate::storage::queue::QUARANTINE_DIAGNOSTIC_CODE);
+        let daemon_active = crate::internal::ai::capture::spool::is_queue_daemon_active(storage);
+        let writer_active = crate::storage::queue::is_writer_active(storage).unwrap_or(false);
+        let pending_total = priority.pending_bytes.saturating_add(normal.pending_bytes);
+        Self {
+            ready: CaptureQueueDirCount {
+                files: 0,
+                bytes: pending_total,
+                at_least: false,
+                unavailable: priority.unavailable || normal.unavailable,
+            },
+            quarantine: CaptureQueueDirCount {
+                files: quarantine.files,
+                bytes: quarantine.bytes,
+                at_least: quarantine.at_least,
+                unavailable: quarantine.unavailable,
+            },
+            redb_queue: Some(RedbCaptureQueueTelemetry {
+                daemon_active,
+                writer_active,
+                priority,
+                normal,
+                quarantine_count: quarantine.files,
+                quarantine_bytes: quarantine.bytes,
+                quarantine_at_least: quarantine.at_least,
+                quarantine_unavailable: quarantine.unavailable,
+                quarantine_diagnostic_code,
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+fn compute_lane_pending_bytes(
+    meta: &crate::storage::queue::LaneTailMeta,
+    hw: crate::storage::CaptureQueueHighwater,
+) -> u64 {
+    let mut pending = 0u64;
+    for sealed in &meta.sealed {
+        if sealed.seg_id > hw.segment_id {
+            pending = pending.saturating_add(sealed.sealed_len);
+        } else if sealed.seg_id == hw.segment_id {
+            pending = pending.saturating_add(sealed.sealed_len.saturating_sub(hw.byte_offset));
+        }
+    }
+    if meta.active_seg > hw.segment_id {
+        pending = pending.saturating_add(meta.committed_len);
+    } else if meta.active_seg == hw.segment_id {
+        pending = pending.saturating_add(meta.committed_len.saturating_sub(hw.byte_offset));
+    }
+    pending
+}
+
+#[cfg(feature = "storage-redb")]
+fn inspect_redb_lane_telemetry(
+    lane_dir: &std::path::Path,
+    hw: crate::storage::CaptureQueueHighwater,
+) -> RedbCaptureQueueLaneTelemetry {
+    if !lane_dir.exists() {
+        return RedbCaptureQueueLaneTelemetry {
+            highwater_segment_id: hw.segment_id,
+            highwater_byte_offset: hw.byte_offset,
+            pending_bytes: 0,
+            active_segment_id: None,
+            committed_len: None,
+            unavailable: false,
+        };
+    }
+    match crate::storage::queue::read_converged_lane_tail_meta(lane_dir) {
+        Ok(meta) => {
+            let pending_bytes = compute_lane_pending_bytes(&meta, hw);
+            RedbCaptureQueueLaneTelemetry {
+                highwater_segment_id: hw.segment_id,
+                highwater_byte_offset: hw.byte_offset,
+                pending_bytes,
+                active_segment_id: Some(meta.active_seg),
+                committed_len: Some(meta.committed_len),
+                unavailable: false,
+            }
+        }
+        Err(_) => RedbCaptureQueueLaneTelemetry {
+            highwater_segment_id: hw.segment_id,
+            highwater_byte_offset: hw.byte_offset,
+            pending_bytes: 0,
+            active_segment_id: None,
+            committed_len: None,
+            unavailable: true,
+        },
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+fn scan_redb_quarantine_dir(dir: &std::path::Path) -> CaptureQueueDirCount {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CaptureQueueDirCount::default();
+        }
+        Err(_) => {
+            return CaptureQueueDirCount {
+                unavailable: true,
+                ..CaptureQueueDirCount::default()
+            };
+        }
+    };
+    let mut count = CaptureQueueDirCount::default();
+    for (visited, entry) in entries.enumerate() {
+        if visited as u64 >= CAPTURE_QUEUE_COUNT_LIMIT {
+            count.at_least = true;
+            break;
+        }
+        let Ok(entry) = entry else {
+            count.unavailable = true;
+            continue;
+        };
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(".tmp"))
+        {
+            continue;
+        }
+        match entry.metadata() {
+            Ok(metadata) if metadata.is_file() => {
+                count.files += 1;
+                count.bytes = count.bytes.saturating_add(metadata.len());
+            }
+            Ok(_) => {}
+            Err(_) => count.unavailable = true,
+        }
+    }
+    count
 }
 
 #[derive(Debug, Serialize)]
@@ -1227,6 +1414,12 @@ async fn execute_redb_doctor(
     args: DoctorArgs,
     output: &OutputConfig,
 ) -> CliResult<()> {
+    let report = collect_redb_doctor_report(storage, &args).await?;
+    emit_report(&report, output)
+}
+
+#[cfg(feature = "storage-redb")]
+async fn collect_redb_doctor_report(storage: &Path, args: &DoctorArgs) -> CliResult<DoctorReport> {
     let mut repaired_intents = 0usize;
     if args.repair {
         let paths = crate::storage::manifest::resolve_redb_generation_paths(storage)
@@ -1414,31 +1607,29 @@ async fn execute_redb_doctor(
                 native_claimed: false,
             },
         );
-    emit_report(
-        &DoctorReport {
-            capture_diagnostics: diagnostics::summarize(storage),
-            commit_links: Some(
-                crate::internal::ai::commit_recovery::CommitRecoveryReport::unavailable(
-                    args.commit_link_page,
-                    args.repair,
-                ),
+    let capture_queue = CaptureQueueReport::scan_redb(storage, capture.as_ref()).await;
+    Ok(DoctorReport {
+        capture_diagnostics: diagnostics::summarize(storage),
+        commit_links: Some(
+            crate::internal::ai::commit_recovery::CommitRecoveryReport::unavailable(
+                args.commit_link_page,
+                args.repair,
             ),
-            codex_reconciliation: None,
-            schema_present: true,
-            active_sessions,
-            stopped_sessions,
-            orphan_checkpoints: 0,
-            provider_hooks,
-            gemini_hooks_remnant,
-            checkpoint_store,
-            findings_store,
-            task_workspaces,
-            legacy_code_residue,
-            hermes_export,
-            capture_queue: CaptureQueueReport::scan(storage),
-        },
-        output,
-    )
+        ),
+        codex_reconciliation: None,
+        schema_present: true,
+        active_sessions,
+        stopped_sessions,
+        orphan_checkpoints: 0,
+        provider_hooks,
+        gemini_hooks_remnant,
+        checkpoint_store,
+        findings_store,
+        task_workspaces,
+        legacy_code_residue,
+        hermes_export,
+        capture_queue,
+    })
 }
 
 pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<()> {
@@ -7560,6 +7751,37 @@ fn opencode_config_path_error() -> Option<String> {
     None
 }
 
+fn format_capture_queue_line(report: &CaptureQueueReport) -> String {
+    #[cfg(feature = "storage-redb")]
+    if let Some(redb) = &report.redb_queue {
+        let diag = redb
+            .quarantine_diagnostic_code
+            .map(|code| format!(" [{code}]"))
+            .unwrap_or_default();
+        let bound = if redb.quarantine_at_least {
+            "at least "
+        } else {
+            ""
+        };
+        return format!(
+            "Capture queue        : priority hw=seg{}:{} pending={} bytes; normal hw=seg{}:{} pending={} bytes; quarantine {bound}{} items ({bound}{} bytes){diag}",
+            redb.priority.highwater_segment_id,
+            redb.priority.highwater_byte_offset,
+            redb.priority.pending_bytes,
+            redb.normal.highwater_segment_id,
+            redb.normal.highwater_byte_offset,
+            redb.normal.pending_bytes,
+            redb.quarantine_count,
+            redb.quarantine_bytes,
+        );
+    }
+    format!(
+        "Capture queue        : ready {}; quarantine {}",
+        report.ready.describe(),
+        report.quarantine.describe()
+    )
+}
+
 fn emit_report(report: &DoctorReport, output: &OutputConfig) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("agent_doctor", report, output);
@@ -7575,11 +7797,19 @@ fn emit_report(report: &DoctorReport, output: &OutputConfig) -> CliResult<()> {
     println!("Active sessions      : {}", report.active_sessions);
     println!("Stopped sessions     : {}", report.stopped_sessions);
     println!("Orphan checkpoints   : {}", report.orphan_checkpoints);
-    println!(
-        "Capture queue        : ready {}; quarantine {}",
-        report.capture_queue.ready.describe(),
-        report.capture_queue.quarantine.describe()
-    );
+    println!("{}", format_capture_queue_line(&report.capture_queue));
+    #[cfg(feature = "storage-redb")]
+    if let Some(redb) = &report.capture_queue.redb_queue {
+        println!(
+            "  queue daemon: {}; writer: {}",
+            if redb.daemon_active {
+                "active"
+            } else {
+                "inactive"
+            },
+            if redb.writer_active { "active" } else { "idle" }
+        );
+    }
     println!(
         "Codex diagnostics    : {}",
         report.capture_diagnostics.describe()
@@ -9681,5 +9911,314 @@ mod tests {
             !dot_libra.join("private").join("capture.db").exists(),
             "pure-redb doctor must never create capture.db"
         );
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_daemon_drain_priority_and_doctor_queue_telemetry() {
+        use crate::{
+            internal::ai::{
+                capture::{
+                    ingress::{
+                        CaptureIngressBinding, CaptureIngressCommand, CaptureIngressOutcome,
+                        CaptureRuntimeScope,
+                    },
+                    live::new_ingest_span,
+                    live_pipeline::ingest_agent_traces,
+                    spool::{
+                        QueueDrainSpawnDecision, is_queue_daemon_active,
+                        take_queue_consumer_spawns_for_test, try_acquire_queue_daemon_lock,
+                        try_spawn_queue_consumer,
+                    },
+                },
+                hooks::{
+                    lifecycle::LifecycleEventKind, provider::ProviderHookCommand,
+                    providers::claude_provider,
+                },
+                observed_agents::live_capture::LiveCaptureBinding,
+            },
+            storage::{
+                CaptureSessionState,
+                queue::{
+                    CaptureQueuePaths, QUARANTINE_DIAGNOSTIC_CODE, publish_quarantine_durable,
+                },
+                runtime::{init_redb_repository_storage, open_capture_store_read_only},
+            },
+        };
+
+        struct RestoreCwdGuard(PathBuf);
+        impl Drop for RestoreCwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let repo = tempfile::tempdir().expect("create redb daemon/doctor tempdir");
+        let dot_libra = repo.path().join(".libra");
+        let _paths = init_redb_repository_storage(&dot_libra)
+            .await
+            .expect("init redb repository storage");
+        let queue_paths = CaptureQueuePaths::from_storage_dir(&dot_libra);
+
+        let prior_cwd = std::env::current_dir().expect("read current dir");
+        std::env::set_current_dir(repo.path()).expect("enter redb repo");
+        let _cwd_guard = RestoreCwdGuard(prior_cwd);
+
+        let worktree = repo.path().to_str().expect("utf-8 repo path").to_string();
+        let lower_cmd = |event_name: &str,
+                         session_id: &str,
+                         verb: ProviderHookCommand,
+                         kind: LifecycleEventKind| {
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "hook_event_name": event_name,
+                "session_id": session_id,
+                "cwd": worktree,
+            }))
+            .expect("serialize hook payload");
+            match CaptureIngressCommand::from_payload(
+                &payload,
+                verb,
+                kind,
+                claude_provider(),
+                None,
+                |_| {
+                    Ok(CaptureIngressBinding::new(
+                        worktree.clone(),
+                        [0xC3; 32],
+                        CaptureRuntimeScope::new(dot_libra.clone(), repo.path().to_path_buf()),
+                    ))
+                },
+            )
+            .expect("lower hook payload")
+            {
+                CaptureIngressOutcome::Command(cmd) => cmd,
+                _ => panic!("expected lowered capture command"),
+            }
+        };
+        let binding = LiveCaptureBinding::resolve(claude_provider());
+
+        // Clear any stray counter entries before starting.
+        let _ = take_queue_consumer_spawns_for_test(&dot_libra);
+
+        // AC1: While an active `libra agent daemon` holds `daemon.lock`, realtime
+        // hooks enqueue frames into `capture-queue/{priority,normal}/` and SKIP
+        // spawning background `__capture-queue-drain` processes.
+        let daemon_guard = try_acquire_queue_daemon_lock(&dot_libra)
+            .expect("acquire daemon lock")
+            .expect("daemon lock must be available");
+        assert!(
+            is_queue_daemon_active(&dot_libra),
+            "AC1: daemon active probe must report true while lock is held"
+        );
+        let cmd1 = lower_cmd(
+            "SessionStart",
+            "S-rb29d-daemon-norm",
+            ProviderHookCommand::SessionStart,
+            LifecycleEventKind::SessionStart,
+        );
+        let span1 = new_ingest_span(cmd1.hook_command(), claude_provider());
+        ingest_agent_traces(cmd1, binding, &span1)
+            .await
+            .expect("enqueue normal frame under active daemon");
+
+        let cmd2 = lower_cmd(
+            "SessionEnd",
+            "S-rb29d-daemon-prio",
+            ProviderHookCommand::SessionEnd,
+            LifecycleEventKind::SessionEnd,
+        );
+        let span2 = new_ingest_span(cmd2.hook_command(), claude_provider());
+        ingest_agent_traces(cmd2, binding, &span2)
+            .await
+            .expect("enqueue priority frame under active daemon");
+
+        assert_eq!(
+            take_queue_consumer_spawns_for_test(&dot_libra),
+            0,
+            "AC1: active daemon must cause realtime hooks to skip spawning __capture-queue-drain"
+        );
+        assert_eq!(
+            try_spawn_queue_consumer(&dot_libra, repo.path()).expect("probe spawn under daemon"),
+            QueueDrainSpawnDecision::SkippedDaemonActive,
+            "AC1: explicit spawn decision must report SkippedDaemonActive"
+        );
+        drop(daemon_guard);
+        assert!(
+            !is_queue_daemon_active(&dot_libra),
+            "daemon active probe must report false after daemon exits"
+        );
+
+        // AC2: When no active daemon is running, ONLY the first enqueued frame
+        // triggers a single detached `__capture-queue-drain` spawn; subsequent
+        // frames skip redundant spawn while drain is pending.
+        for idx in 0..3 {
+            let cmd = lower_cmd(
+                "SessionStart",
+                &format!("S-rb29d-nodae-{idx}"),
+                ProviderHookCommand::SessionStart,
+                LifecycleEventKind::SessionStart,
+            );
+            let span = new_ingest_span(cmd.hook_command(), claude_provider());
+            ingest_agent_traces(cmd, binding, &span)
+                .await
+                .expect("enqueue frame without daemon");
+        }
+        assert_eq!(
+            take_queue_consumer_spawns_for_test(&dot_libra),
+            1,
+            "AC2: without an active daemon, ONLY the first enqueued frame may trigger spawn"
+        );
+        assert_eq!(
+            try_spawn_queue_consumer(&dot_libra, repo.path()).expect("probe redundant spawn"),
+            QueueDrainSpawnDecision::SkippedDrainPending,
+            "AC2: subsequent spawn check while drain is pending must report SkippedDrainPending"
+        );
+
+        let quiet_output = OutputConfig {
+            pager: false,
+            quiet: true,
+            ..OutputConfig::default()
+        };
+        let ro_args = DoctorArgs {
+            repair: false,
+            commit_link_page: 1,
+            codex_legacy_after: None,
+            reset_commit_link_journal: false,
+            acknowledge_commit_link_loss: false,
+            codex_index_backup: None,
+            codex_index_page: None,
+        };
+
+        // AC3 (before drain): `agent doctor` reports both `priority/` and
+        // `normal/` highwater + non-zero pending bytes without mutating disk.
+        let before_drain = collect_redb_doctor_report(&dot_libra, &ro_args)
+            .await
+            .expect("collect redb doctor report before drain");
+        let before_q = before_drain
+            .capture_queue
+            .redb_queue
+            .as_ref()
+            .expect("redb doctor report must include redb_queue telemetry");
+        assert_eq!(before_q.priority.highwater_segment_id, 0);
+        assert_eq!(before_q.priority.highwater_byte_offset, 0);
+        assert!(
+            before_q.priority.pending_bytes > 0,
+            "AC3: priority/ must report pending bytes before drain"
+        );
+        assert_eq!(before_q.normal.highwater_segment_id, 0);
+        assert_eq!(before_q.normal.highwater_byte_offset, 0);
+        assert!(
+            before_q.normal.pending_bytes > 0,
+            "AC3: normal/ must report pending bytes before drain"
+        );
+        assert_eq!(before_q.quarantine_count, 0);
+        assert_eq!(before_q.quarantine_diagnostic_code, None);
+
+        // Run the preview single-writer `libra agent daemon --once` to drain
+        // both lanes priority-first into `capture.redb`.
+        crate::command::agent::run_capture_queue_daemon(
+            crate::command::agent::DaemonArgs {
+                poll_interval_ms: 10,
+                once: true,
+            },
+            &quiet_output,
+        )
+        .await
+        .expect("preview `libra agent daemon --once` must drain queue cleanly");
+
+        let cap = open_capture_store_read_only(&dot_libra)
+            .await
+            .expect("open capture.redb after daemon drain");
+        let prio_row = cap
+            .get_session("claude_code__S-rb29d-daemon-prio")
+            .await
+            .expect("query priority session")
+            .expect("priority session drained by daemon");
+        assert_eq!(prio_row.state, CaptureSessionState::Stopped);
+        let norm_row = cap
+            .get_session("claude_code__S-rb29d-nodae-2")
+            .await
+            .expect("query normal session")
+            .expect("normal session drained by daemon");
+        assert_eq!(norm_row.state, CaptureSessionState::Active);
+        drop(cap);
+
+        // AC3 (after drain): highwaters advanced and pending bytes dropped to 0.
+        let after_drain = collect_redb_doctor_report(&dot_libra, &ro_args)
+            .await
+            .expect("collect redb doctor report after drain");
+        let after_q = after_drain
+            .capture_queue
+            .redb_queue
+            .as_ref()
+            .expect("redb_queue present after drain");
+        assert_eq!(
+            after_q.priority.highwater_byte_offset, before_q.priority.pending_bytes,
+            "AC3: priority highwater must advance to drained byte offset"
+        );
+        assert_eq!(after_q.priority.pending_bytes, 0);
+        assert_eq!(
+            after_q.normal.highwater_byte_offset, before_q.normal.pending_bytes,
+            "AC3: normal highwater must advance to drained byte offset"
+        );
+        assert_eq!(after_q.normal.pending_bytes, 0);
+
+        // AC4: Publish a durable quarantine artifact and verify `agent doctor`
+        // reports `quarantine/` count and diagnostic code `LBR-AGENT-050` in
+        // both structured JSON and human-rendered output.
+        let q_bytes = b"damaged-uncommitted-tail-bytes";
+        publish_quarantine_durable(
+            &queue_paths.quarantine,
+            "normal-seg00000000-off0-12345678",
+            q_bytes,
+        )
+        .expect("publish durable quarantine artifact");
+
+        let with_quarantine = collect_redb_doctor_report(&dot_libra, &ro_args)
+            .await
+            .expect("collect redb doctor report with quarantine");
+        let q_tel = with_quarantine
+            .capture_queue
+            .redb_queue
+            .as_ref()
+            .expect("redb_queue telemetry present with quarantine");
+        assert_eq!(q_tel.quarantine_count, 1, "AC4: quarantine count must be 1");
+        assert_eq!(q_tel.quarantine_bytes, q_bytes.len() as u64);
+        assert_eq!(
+            q_tel.quarantine_diagnostic_code,
+            Some(QUARANTINE_DIAGNOSTIC_CODE),
+            "AC4: doctor must emit diagnostic code LBR-AGENT-050 when quarantine items exist"
+        );
+
+        let json_report =
+            serde_json::to_value(&with_quarantine).expect("serialize doctor report to json");
+        let redb_json = &json_report["capture_queue"]["redb_queue"];
+        assert_eq!(
+            redb_json["priority"]["highwater_byte_offset"].as_u64(),
+            Some(after_q.priority.highwater_byte_offset)
+        );
+        assert_eq!(redb_json["priority"]["pending_bytes"].as_u64(), Some(0));
+        assert_eq!(
+            redb_json["normal"]["highwater_byte_offset"].as_u64(),
+            Some(after_q.normal.highwater_byte_offset)
+        );
+        assert_eq!(redb_json["normal"]["pending_bytes"].as_u64(), Some(0));
+        assert_eq!(redb_json["quarantine_count"].as_u64(), Some(1));
+        assert_eq!(
+            redb_json["quarantine_diagnostic_code"].as_str(),
+            Some("LBR-AGENT-050")
+        );
+
+        let human_line = format_capture_queue_line(&with_quarantine.capture_queue);
+        assert!(human_line.contains("priority hw=seg0:"), "{human_line}");
+        assert!(human_line.contains("normal hw=seg0:"), "{human_line}");
+        assert!(human_line.contains("pending=0 bytes"), "{human_line}");
+        assert!(human_line.contains("quarantine 1 items"), "{human_line}");
+        assert!(human_line.contains("LBR-AGENT-050"), "{human_line}");
+
+        execute_safe(ro_args, &quiet_output)
+            .await
+            .expect("agent doctor execute_safe must succeed on Redb repo");
     }
 }

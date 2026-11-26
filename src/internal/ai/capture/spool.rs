@@ -17,6 +17,24 @@ use uuid::Uuid;
 /// Hidden child argv. The parent recognizes it before ordinary startup.
 pub(crate) const DRAIN_ARG: &str = "__capture-spool-drain";
 
+/// Hidden child argv for the Redb dual-lane capture queue consumer (`RB-29`).
+/// The parent recognizes it before ordinary startup.
+pub(crate) const QUEUE_DRAIN_ARG: &str = "__capture-queue-drain";
+
+/// Optional preview single-writer daemon lock filename under
+/// `.libra/private/capture-queue/` (`RB-29d`).
+#[cfg(feature = "storage-queue")]
+pub(crate) const QUEUE_DAEMON_LOCK_FILE: &str = "daemon.lock";
+
+/// Atomic single-spawn coalescing marker under `.libra/private/capture-queue/`
+/// so only the first enqueued frame triggers a detached `__capture-queue-drain`
+/// process while no daemon is active (`RB-29d`).
+#[cfg(feature = "storage-queue")]
+pub(crate) const QUEUE_DRAIN_PENDING_FILE: &str = "drain.pending";
+
+#[cfg(feature = "storage-queue")]
+const QUEUE_DRAIN_PENDING_STALE_AGE: Duration = Duration::from_secs(5);
+
 const SPOOL_DIR: &str = "capture-spool";
 const TMP_DIR: &str = "tmp";
 const READY_DIR: &str = "ready";
@@ -251,10 +269,14 @@ pub(crate) fn try_spawn_consumer(repo_root: &Path) -> io::Result<()> {
         let _ = repo_root;
         return Ok(());
     }
+    spawn_detached_consumer_arg(repo_root, DRAIN_ARG)
+}
+
+fn spawn_detached_consumer_arg(repo_root: &Path, arg: &str) -> io::Result<()> {
     let executable = std::env::current_exe()?;
     let mut command = std::process::Command::new(executable);
     command
-        .arg(DRAIN_ARG)
+        .arg(arg)
         .current_dir(repo_root)
         .env_clear()
         .stdin(std::process::Stdio::null())
@@ -289,6 +311,233 @@ pub(crate) fn try_spawn_consumer(repo_root: &Path) -> io::Result<()> {
     // Dropping the handle neither waits for nor signals the detached child.
     let _child = command.spawn()?;
     Ok(())
+}
+
+/// Exclusive OS lock guard held by an active preview `libra agent daemon`
+/// process on `.libra/private/capture-queue/daemon.lock` (`RB-29d`).
+#[cfg(feature = "storage-queue")]
+#[derive(Debug)]
+pub(crate) struct QueueDaemonLockGuard {
+    _file: File,
+}
+
+/// Outcome of deciding whether to spawn a detached `__capture-queue-drain`
+/// consumer after enqueueing a Redb capture queue frame (`RB-29d`).
+#[cfg(feature = "storage-queue")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueDrainSpawnDecision {
+    /// First enqueued frame with no active daemon/writer/pending drain triggered
+    /// one detached `__capture-queue-drain` spawn.
+    Spawned,
+    /// Skipped spawn because an active `libra agent daemon` holds `daemon.lock`.
+    SkippedDaemonActive,
+    /// Skipped spawn because a capture queue writer already holds `writer.lock`.
+    SkippedWriterActive,
+    /// Skipped redundant spawn because an earlier frame already armed a pending
+    /// detached `__capture-queue-drain` handoff.
+    SkippedDrainPending,
+}
+
+#[cfg(feature = "storage-queue")]
+pub(crate) fn queue_root(storage: &Path) -> PathBuf {
+    crate::storage::queue::CaptureQueuePaths::from_storage_dir(storage).root
+}
+
+/// Attempt a non-blocking exclusive lock on `.libra/private/capture-queue/daemon.lock`
+/// for the preview single-writer `libra agent daemon` (`RB-29d`).
+///
+/// Returns `Ok(None)` when another daemon already holds the lock.
+#[cfg(feature = "storage-queue")]
+pub(crate) fn try_acquire_queue_daemon_lock(
+    storage: &Path,
+) -> Result<Option<QueueDaemonLockGuard>> {
+    let paths = crate::storage::queue::init_capture_queue(storage)
+        .map_err(|err| anyhow!("capture queue daemon could not initialize queue directory: {err}"))?
+        .paths;
+    let lock_path = paths.root.join(QUEUE_DAEMON_LOCK_FILE);
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(anyhow!("capture queue daemon lock path is unsafe"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(&lock_path)
+        .map_err(|_| anyhow!("capture queue daemon lock could not be opened"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(QueueDaemonLockGuard { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(_)) => {
+            Err(anyhow!("capture queue daemon lock could not be taken"))
+        }
+    }
+}
+
+/// Read-only probe for whether an active `libra agent daemon` holds
+/// `.libra/private/capture-queue/daemon.lock` without creating the file when
+/// absent (`RB-29d`).
+#[cfg(feature = "storage-queue")]
+pub(crate) fn is_queue_daemon_active(storage: &Path) -> bool {
+    let lock_path = queue_root(storage).join(QUEUE_DAEMON_LOCK_FILE);
+    let Ok(metadata) = fs::symlink_metadata(&lock_path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let Ok(file) = options.open(&lock_path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            drop(file);
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
+}
+
+/// Clear the single-spawn coalescing marker once a consumer or daemon has
+/// started/completed draining `.libra/private/capture-queue/` (`RB-29d`).
+#[cfg(feature = "storage-queue")]
+pub(crate) fn clear_queue_drain_pending(storage: &Path) {
+    let pending_path = queue_root(storage).join(QUEUE_DRAIN_PENDING_FILE);
+    if let Ok(metadata) = fs::symlink_metadata(&pending_path)
+        && !metadata.file_type().is_symlink()
+        && metadata.is_file()
+    {
+        let _ = fs::remove_file(&pending_path);
+    }
+}
+
+#[cfg(feature = "storage-queue")]
+fn try_claim_queue_drain_pending(storage: &Path) -> io::Result<bool> {
+    let root = queue_root(storage);
+    let pending_path = root.join(QUEUE_DRAIN_PENDING_FILE);
+    let create_marker = |path: &Path| -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        options.open(path)
+    };
+    match create_marker(&pending_path) {
+        Ok(mut file) => {
+            let _ = writeln!(file, "{}", std::process::id());
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            if let Ok(metadata) = fs::symlink_metadata(&pending_path)
+                && !metadata.file_type().is_symlink()
+                && metadata.is_file()
+                && let Ok(modified) = metadata.modified()
+                && SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default()
+                    > QUEUE_DRAIN_PENDING_STALE_AGE
+            {
+                let _ = fs::remove_file(&pending_path);
+                if let Ok(mut file) = create_marker(&pending_path) {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Start at most one detached `libra __capture-queue-drain` consumer for a Redb
+/// repository (`RB-29` / `RB-29d`):
+/// - Skips spawn immediately when an active `libra agent daemon` holds `daemon.lock`.
+/// - Skips spawn immediately when a writer already holds `writer.lock`.
+/// - When no daemon or writer is active, atomically claims `drain.pending` so
+///   ONLY the first enqueued frame triggers a detached `__capture-queue-drain`
+///   spawn while subsequent concurrent/queued frames skip redundant spawns.
+#[cfg(feature = "storage-queue")]
+pub(crate) fn try_spawn_queue_consumer(
+    storage: &Path,
+    repo_root: &Path,
+) -> io::Result<QueueDrainSpawnDecision> {
+    if is_queue_daemon_active(storage) {
+        return Ok(QueueDrainSpawnDecision::SkippedDaemonActive);
+    }
+    if crate::storage::queue::is_writer_active(storage).unwrap_or(false) {
+        return Ok(QueueDrainSpawnDecision::SkippedWriterActive);
+    }
+    if !try_claim_queue_drain_pending(storage)? {
+        return Ok(QueueDrainSpawnDecision::SkippedDrainPending);
+    }
+    note_queue_consumer_spawn_for_test(storage);
+    if cfg!(test) || consumer_spawn_disabled_for_test() {
+        let _ = repo_root;
+        return Ok(QueueDrainSpawnDecision::Spawned);
+    }
+    if let Err(err) = spawn_detached_consumer_arg(repo_root, QUEUE_DRAIN_ARG) {
+        clear_queue_drain_pending(storage);
+        return Err(err);
+    }
+    Ok(QueueDrainSpawnDecision::Spawned)
+}
+
+#[cfg(all(test, feature = "storage-queue"))]
+static QUEUE_CONSUMER_SPAWNS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "storage-queue")]
+fn note_queue_consumer_spawn_for_test(storage: &Path) {
+    #[cfg(test)]
+    if let Ok(mut spawns) = QUEUE_CONSUMER_SPAWNS.lock() {
+        let canonical = storage
+            .canonicalize()
+            .unwrap_or_else(|_| storage.to_path_buf());
+        spawns.push(canonical);
+    }
+    #[cfg(not(test))]
+    let _ = storage;
+}
+
+/// Drain and return how many detached `__capture-queue-drain` spawns were
+/// triggered for `storage` in this test process (`RB-29d`).
+#[cfg(all(test, feature = "storage-queue"))]
+pub(crate) fn take_queue_consumer_spawns_for_test(storage: &Path) -> usize {
+    let target = storage
+        .canonicalize()
+        .unwrap_or_else(|_| storage.to_path_buf());
+    let Ok(mut spawns) = QUEUE_CONSUMER_SPAWNS.lock() else {
+        return 0;
+    };
+    let mut matched = 0usize;
+    spawns.retain(|recorded| {
+        if recorded == &target {
+            matched += 1;
+            false
+        } else {
+            true
+        }
+    });
+    matched
 }
 
 /// Debug builds under `LIBRA_TEST=1` also forward the `LIBRA_TEST_*` fault

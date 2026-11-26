@@ -7475,14 +7475,15 @@ async fn export_repository_tables_to_redb(
     // 5. reference
     {
         let cols = require_sqlite_table_columns_on_conn(conn, r, "reference").await?;
-        let n = {
+        let mut written_refs = 0u64;
+        {
             require_columns(&cols, "reference", &["name", "kind", "commit", "remote"])?;
             let select = if cols.contains("worktree_id") {
                 "name, kind, \"commit\", remote, worktree_id"
             } else {
                 "name, kind, \"commit\", remote, NULL"
             };
-            stream_sqlite_table_to_redb(
+            let _ = stream_sqlite_table_to_redb(
                 conn,
                 db,
                 StreamTableSpec {
@@ -7499,6 +7500,20 @@ async fn export_repository_tables_to_redb(
                     let remote: Option<String> = col_get(row, 4, r, "reference", "remote")?;
                     let worktree_id: Option<String> =
                         col_get(row, 5, r, "reference", "worktree_id")?;
+
+                    // `libra init` pre-creates unborn placeholder rows for reserved AI
+                    // orphan branches (`intent`, `traces`, legacy `agent-traces`) with
+                    // `commit IS NULL`. Redb stores only born refs; omit these unborn
+                    // placeholders cleanly while still failing closed on any other
+                    // branch/tag missing a commit OID.
+                    if kind == "Branch"
+                        && commit.is_none()
+                        && remote.is_none()
+                        && worktree_id.is_none()
+                        && matches!(name.as_deref(), Some("intent" | "traces" | "agent-traces"))
+                    {
+                        return Ok(None);
+                    }
 
                     let key = match kind.as_str() {
                         "Head" => match remote {
@@ -7596,13 +7611,16 @@ async fn export_repository_tables_to_redb(
                         }
                     };
 
-                    Ok((key, MigRefTargetStored { target }))
+                    Ok(Some((key, MigRefTargetStored { target })))
                 },
                 |wtx, batch| {
                     let mut tbl = wtx
                         .open_table(redb_git::REFERENCE_TABLE)
                         .map_err(|e| map_redb_table_err(e, "open reference"))?;
-                    for (key, stored) in batch {
+                    for entry in batch {
+                        let Some((key, stored)) = entry else {
+                            continue;
+                        };
                         let enc_key = encode_mig_ref_key(key);
                         let bytes = encode_versioned(redb_git::GIT_REF_CODEC_VERSION, stored)?;
                         if tbl
@@ -7615,14 +7633,15 @@ async fn export_repository_tables_to_redb(
                                     .to_string(),
                             });
                         }
+                        written_refs = written_refs.saturating_add(1);
                     }
                     Ok(())
                 },
                 max_batch_rows,
             )
-            .await?
-        };
-        counts.insert("reference", n);
+            .await?;
+        }
+        counts.insert("reference", written_refs);
     }
 
     // 6. reflog + reflog_by_ref + git_sequences
@@ -25684,7 +25703,71 @@ async fn verify_forward_redb_targets_core(
         let schema_ver_cnt =
             check_git_table!("schema_versions", redb_cfg::SCHEMA_VERSIONS_TABLE, false);
 
-        let reference_cnt = check_git_table!("reference", redb_git::REFERENCE_TABLE, false);
+        let reference_cnt = {
+            let ref_cols =
+                sqlite_table_columns_on_conn(git_conn, DatabaseRole::Repository, "reference")
+                    .await?;
+            let count_sql = if ref_cols.contains("worktree_id") {
+                "SELECT COUNT(*) FROM reference WHERE NOT (kind = 'Branch' AND \"commit\" IS NULL AND remote IS NULL AND worktree_id IS NULL AND name IN ('intent', 'traces', 'agent-traces'))"
+            } else {
+                "SELECT COUNT(*) FROM reference WHERE NOT (kind = 'Branch' AND \"commit\" IS NULL AND remote IS NULL AND name IN ('intent', 'traces', 'agent-traces'))"
+            };
+            let count_row = sea_orm::sqlx::query(AssertSqlSafe(count_sql))
+                .fetch_one(&mut *git_conn)
+                .await
+                .map_err(|e| {
+                    map_export_sqlite_err(
+                        DatabaseRole::Repository,
+                        "reference",
+                        "count materialized references",
+                        &e,
+                    )
+                })?;
+            let sqlite_cnt_i64: i64 = count_row.try_get(0).map_err(|e| {
+                map_export_sqlite_err(
+                    DatabaseRole::Repository,
+                    "reference",
+                    "decode materialized reference count",
+                    &e,
+                )
+            })?;
+            let sqlite_cnt = u64::try_from(sqlite_cnt_i64).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "negative reference count in sqlite source".to_string(),
+                }
+            })?;
+            let (redb_cnt, sampled) = hash_redb_table_endpoints(
+                &git_rtx,
+                redb_git::REFERENCE_TABLE,
+                "reference",
+                &mut git_hasher,
+            )?;
+            if let Some(exp) = export {
+                let Some(reported_cnt) = exp.git_table_counts.get("reference").copied() else {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail:
+                            "forward migration Phase 1 export report missing git table `reference`"
+                                .to_string(),
+                    });
+                };
+                if redb_cnt != sqlite_cnt || redb_cnt != reported_cnt {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 row-count mismatch on git table `reference`: sqlite={sqlite_cnt}, redb={redb_cnt}, reported={reported_cnt}"
+                        ),
+                    });
+                }
+            } else if redb_cnt != sqlite_cnt {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration recovery row-count mismatch on git table `reference`: sqlite={sqlite_cnt}, redb={redb_cnt}"
+                    ),
+                });
+            }
+            git_tables_verified += 1;
+            git_sampled_rows_verified += sampled;
+            redb_cnt
+        };
         let reflog_cnt = check_git_table!("reflog", redb_git::REFLOG_TABLE, false);
         let _ = check_git_table!(
             "agent_bridge_publication",
@@ -26188,9 +26271,9 @@ async fn verify_forward_redb_targets_core(
                     .await?;
             let has_wt = ref_cols.contains("worktree_id");
             let sql = if has_wt {
-                "SELECT name, kind, \"commit\", remote, worktree_id FROM reference ORDER BY _rowid_ ASC LIMIT 1 OFFSET ?"
+                "SELECT name, kind, \"commit\", remote, worktree_id FROM reference WHERE NOT (kind = 'Branch' AND \"commit\" IS NULL AND remote IS NULL AND worktree_id IS NULL AND name IN ('intent', 'traces', 'agent-traces')) ORDER BY _rowid_ ASC LIMIT 1 OFFSET ?"
             } else {
-                "SELECT name, kind, \"commit\", remote, NULL FROM reference ORDER BY _rowid_ ASC LIMIT 1 OFFSET ?"
+                "SELECT name, kind, \"commit\", remote, NULL FROM reference WHERE NOT (kind = 'Branch' AND \"commit\" IS NULL AND remote IS NULL AND name IN ('intent', 'traces', 'agent-traces')) ORDER BY _rowid_ ASC LIMIT 1 OFFSET ?"
             };
             let tbl = git_rtx
                 .open_table(redb_git::REFERENCE_TABLE)

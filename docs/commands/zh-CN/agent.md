@@ -199,6 +199,7 @@ libra agent checkpoint <subcommand>
 libra agent skill <subcommand>
 libra agent clean [--all]
 libra agent doctor [--repair]
+libra agent daemon [--poll-interval-ms <ms>] [--once]
 libra agent workspace list [--limit <n>] [--cursor <token>] [--state <state>]...
 libra agent workspace show <workspace-id>
 libra agent push [--remote <name>] [--force-rewrite]
@@ -242,6 +243,17 @@ hook 在本 hook 的整个捕获预算内（最多 30 秒）一直占着队列�
 不含文件路径或信封内容。doctor 打不开 `.libra/private/capture.db` 时，报告的是捕获
 库而不是仓库库：库 schema 由更新版本写入时报 `LBR-AGENT-048`，库忙时报
 `LBR-AGENT-047`，文件损坏或不可读时报 `LBR-IO-001`，各自给出不同的处理办法。
+
+在 Redb 仓库中，实时 hook 改为向 `.libra/private/capture-queue/{priority,normal}/`
+追加带 CRC32C 校验的二进制帧（`SessionEnd` 路由到 `priority/`，普通生命周期事件路由到
+`normal/`），绝不直接打开 `capture.redb`，也不写入 `capture-spool/`。手动排空执行
+`libra __capture-queue-drain`，严格先将 `priority/` 落库 `capture.redb` 再消费
+`normal/`。可选预览单写入者守护进程 `libra agent daemon` 持有
+`.libra/private/capture-queue/daemon.lock` 并持续排空双通道（`--once` 执行单次排空后退出）：
+守护活跃时实时 hook 跳过派生后台 `__capture-queue-drain` 进程；无活跃守护时仅首帧触发单次分离式
+`__capture-queue-drain`。在 Redb 仓库上，`libra agent doctor` 同时在人读 `Capture queue`
+行与 `--json` 的 `capture_queue.redb_queue` 中输出 `priority/` 与 `normal/` 各自高水位与积压字节数、
+daemon/writer 活跃状态、`quarantine/` 计数，以及存在隔离尾碎片时的诊断码 `LBR-AGENT-050`。
 
 `libra agent workspace list|show` 是 workspace 注册表（`workspace_record`）的
 只读机器接口：agent runtime 关联过的每个 linked worktree、task worktree 或
@@ -376,7 +388,8 @@ OpenCode 提取对空输入、非法 JSON 和非法 export 形状显式标记
 | `skill list` | `skill search` 的别名（同过滤项） |
 | `skill registry` | 展示各 agent 的 curated 可发现 skill 注册表（`--provider <slug>` 限定；公开 SkillDiscoverer 面） |
 | `clean` | 清理已停止会话的临时 checkpoint（prune 遇到进行中的 checkpoint 写入、traces 引用可达但无 catalog 行的提交、或仍有耐久 object-index repair 待处理时 fail-closed 拒绝；同时删除因此不可达的 `object_index` 行） |
-| `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致。对象检查刻意只读取本仓库的本地对象目录：不可用的 alternate/remote 对象会保守地报告为不可用，而不会在产生诊断时解析外部可控的 alternate 路径。只读的 `legacy_code_residue` 字段（人读为「Frozen Code residue」行）报告冷冻的 Code 时代路径 `.libra/sessions/code/`、`.libra/code/` 与 `libra/intent` ref 是否仍存在；它不会删除或改写该状态，清理另由 plan-20260920 ADR-RC-04 / DEFER-RC-02 承接 |
+| `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致。对象检查刻意只读取本仓库的本地对象目录：不可用的 alternate/remote 对象会保守地报告为不可用，而不会在产生诊断时解析外部可控的 alternate 路径。在 Redb 仓库上还会输出双通道 `priority/` 与 `normal/` 队列高水位、积压字节数、`quarantine/` 计数以及存在隔离项时的 `LBR-AGENT-050`。只读的 `legacy_code_residue` 字段（人读为「Frozen Code residue」行）报告冷冻的 Code 时代路径 `.libra/sessions/code/`、`.libra/code/` 与 `libra/intent` ref 是否仍存在；它不会删除或改写该状态，清理另由 plan-20260920 ADR-RC-04 / DEFER-RC-02 承接 |
+| `daemon` | 运行可选预览单写入者 Redb 捕获队列守护进程，持有 `.libra/private/capture-queue/daemon.lock`，使实时 hook 跳过派生后台 `__capture-queue-drain` 进程（支持 `--poll-interval-ms <5..=5000>` 与 `--once`） |
 | `push` | 将 `refs/libra/traces` 推送到远程（`clean` prune 重写后的非快进推送用 `--force-rewrite`，采用 force-with-lease 语义） |
 | `rpc list` | 列出 `PATH` 上发现的 `libra-agent-*` 二进制（含 trusted/quarantined 状态）；需先开启 external-agents 开关 |
 | `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable、或二进制不在受信目录下时拒绝——`LBR-AGENT-005`）。provider-exporter slug `opencode` 则改为固定 provider 自身的 CLI 二进制——只从已注册受信目录解析、绝不扫描 `$PATH`——供沙箱化 export bridge 使用；该形式无需 external-agents opt-in。来源 sha256 以单次流式读取计算、不设固定大小上限，因此大型单文件 provider CLI（OpenCode Bun 构建约 171 MiB）仍可受信；计算期间读出字节超过其报告大小的文件会被拒绝（`LBR-AGENT-005`）。mise（aube）或 pnpm 的 `.bin` 启动器 shim 会被跟随到其声明的原生可执行文件，该文件本身也必须位于受信目录下（`--json` 中以 `launcher` 字段报告）；JavaScript 启动器会被拒绝（`LBR-AGENT-005`） |
