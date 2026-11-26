@@ -2059,3 +2059,5 @@ path and default stay compatible.
 config list matches unscoped list.
 
 config --file reads a git-style file.
+
+regexp no-match exits 1 with empty stdout.

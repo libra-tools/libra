@@ -226,3 +226,13 @@ fn test_cf_104_predicates() {
     assert_cli_success(&default, "--default");
     assert_eq!(String::from_utf8_lossy(&default.stdout).trim(), "fallback");
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_26_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let out = run_libra_command(&["config", "--get-regexp", "^nomatch"], repo.path());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "no-match stdout must be empty");
+}
