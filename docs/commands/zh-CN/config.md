@@ -988,3 +988,5 @@ encrypted unset matches plaintext.
 removed_count equals deleted values.
 
 config unrecognized type exit-code exception.
+
+bool-or-int canonicalizes ints and booleans.

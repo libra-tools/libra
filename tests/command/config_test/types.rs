@@ -729,3 +729,31 @@ fn test_cf_72_predicates() {
     assert!(!stderr.contains("error: error:"), "{stderr}");
     assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_70_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    for (input, expected) in [("1", "1"), ("yes", "true"), ("1k", "1024")] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", "bo.k", input], repo.path()),
+            "set",
+        );
+        let typed = run_libra_command(
+            &["config", "--local", "--type=bool-or-int", "--get", "bo.k"],
+            repo.path(),
+        );
+        assert_cli_success(&typed, "type");
+        assert_eq!(String::from_utf8_lossy(&typed.stdout).trim(), expected);
+        let shortcut = run_libra_command(
+            &["config", "--local", "--bool-or-int", "--get", "bo.k"],
+            repo.path(),
+        );
+        assert_cli_success(&shortcut, "shortcut");
+        assert_eq!(shortcut.stdout, typed.stdout, "--bool-or-int parity");
+    }
+}
