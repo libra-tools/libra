@@ -1064,7 +1064,7 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `in-progress` / 空（已推送 main `1d3c8d2`；family child 无独立发布，所以不是 done。session `c1d476b0-876f-46a7-bb94-ce56405a85ee` 已准入 `remote.rs` 与 `tiered.rs`；实现审查 `bc600c5b-b019-4988-a347-7f25472ba8b7` VERDICT PASS）
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：三个 search_checked 门复跑 3/3；本卡不 bump、不打 tag，D 组按 family child 继承。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** `RemoteStorage::search_checked` 在对象列举失败时返回 `Err`。`NotFound` 和空列举仍是没有匹配。`TieredStorage::search_checked` 同时采用本地和远端的可失败结果。离线或 local 读策略不访问远端。两端的 `search -> Vec` 保持原样。
 
@@ -1074,12 +1074,12 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Acceptance criteria:**
 
-- [ ] AC-1: 远端列举失败是 `Err`，空列举和 `NotFound` 仍是空结果。
-- [ ] AC-2: tiered 在自动策略下传播任一端的读失败。离线策略不访问远端。本地目录不可读仍是 `Err`。
+- [x] AC-1: 远端列举失败是 `Err`，空列举和 `NotFound` 仍是空结果（`remote_search_checked_distinguishes_list_failure_from_absence`）。
+- [x] AC-2: tiered 在自动策略下传播任一端的读失败；离线策略不访问远端；本地目录不可读仍是 `Err`（两个 tiered 测试）。
 
 **Verification:**
 
-- [ ] VER-1: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(remote_search_checked_distinguishes_list_failure_from_absence) or test(tiered_search_checked_local_only_skips_unreachable_remote) or test(tiered_search_checked_unreadable_local_dir_is_not_empty)' --no-fail-fast --retries 0`
+- [x] VER-1: 同上命令（3/3 passed，2026-11-25 复跑）。
 
 **Full-suite trigger:** `N/A`（本卡不改 `sql/**`、`src/cli.rs`、稳定错误码或版本面）。
 
