@@ -5,7 +5,7 @@ use std::fs;
 use serial_test::serial;
 use tempfile::tempdir;
 
-use crate::command::{assert_cli_success, run_libra_command};
+use crate::command::{assert_cli_success, run_libra_command, run_libra_command_with_env};
 
 /// CF-04 (M-FMT F1..F7): Comprehensive test matrix for `--list` and `--get-regexp`
 /// ordering, formatting, scopes, and `--name-only`.
@@ -393,4 +393,50 @@ fn test_cf_48_predicates() {
             .windows(b"name.one\0".len())
             .any(|w| w == b"name.one\0")
     );
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_49_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("xdg");
+    let global = temp.path().join("global.db");
+    let system = temp.path().join("system.db");
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", global.to_str().unwrap()),
+        ("LIBRA_CONFIG_SYSTEM_DB", system.to_str().unwrap()),
+    ];
+    for (scope, key) in [
+        ("--local", "scope.local"),
+        ("--global", "scope.global"),
+        ("--system", "scope.system"),
+    ] {
+        assert_cli_success(
+            &run_libra_command_with_env(&["config", scope, key, "v"], &repo, &envs),
+            scope,
+        );
+        let listed = run_libra_command_with_env(&["config", scope, "--list"], &repo, &envs);
+        assert_cli_success(&listed, scope);
+        let text = String::from_utf8_lossy(&listed.stdout);
+        assert!(text.contains(&format!("{key}=v")), "{scope}: {text}");
+        for (other_scope, other_key) in [
+            ("--local", "scope.local"),
+            ("--global", "scope.global"),
+            ("--system", "scope.system"),
+        ] {
+            if other_scope != scope {
+                assert!(
+                    !text.contains(other_key),
+                    "{scope} leaks {other_key}: {text}"
+                );
+            }
+        }
+    }
 }
