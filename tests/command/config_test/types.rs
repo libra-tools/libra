@@ -662,3 +662,51 @@ fn test_cf_78_predicates() {
         );
     }
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_79_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    for (key, value) in [("exp.never", "never"), ("exp.bad", "abc")] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", key, value], repo.path()),
+            "seed",
+        );
+    }
+    let valid = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--type=expiry-date",
+            "--get",
+            "exp.never",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&valid, "valid expiry");
+    assert_eq!(String::from_utf8_lossy(&valid.stdout).trim(), "0");
+    let invalid = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--type=expiry-date",
+            "--get",
+            "exp.bad",
+        ],
+        repo.path(),
+    );
+    assert_eq!(invalid.status.code(), Some(129), "invalid expiry");
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("not a valid timestamp"));
+    let listed = run_libra_command(
+        &["config", "--local", "list", "--type=expiry-date"],
+        repo.path(),
+    );
+    assert_cli_success(&listed, "list expiry");
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains("exp.never=0"), "{text}");
+    assert!(!text.contains("exp.bad"), "{text}");
+}
