@@ -8150,4 +8150,49 @@ mod value_pattern {
             );
         }
     }
+
+    #[test]
+    fn test_get_with_value_pattern_matrix() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", "user.name", "Test"], repo.path()),
+            "user name",
+        );
+        let exact = run_libra_command(&["config", "--get", "multi.k", "two"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&exact.stdout).trim(), "two");
+        let last = run_libra_command(&["config", "--get", "multi.k", "o"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&last.stdout).trim(), "two");
+        let all = run_libra_command(&["config", "--get-all", "multi.k", "o$"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "two");
+        let regexp = run_libra_command(&["config", "--get-regexp", "^user", "Test"], repo.path());
+        assert_eq!(
+            String::from_utf8_lossy(&regexp.stdout).trim(),
+            "user.name Test"
+        );
+        let negated = run_libra_command(&["config", "--get", "multi.k", "!two"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&negated.stdout).trim(), "one");
+    }
+
+    #[test]
+    fn test_t1300_non_match_and_multivar_get() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        let miss = run_libra_command(&["config", "--get", "multi.k", "absent"], repo.path());
+        assert_eq!(miss.status.code(), Some(1));
+        let all = run_libra_command(&["config", "--get-all", "multi.k", "two"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "two");
+    }
 }

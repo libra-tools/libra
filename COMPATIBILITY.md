@@ -2195,3 +2195,5 @@ writing stdin or a blob fails.
 config blob read resolves a revision.
 
 file origin labels distinguish file blob and stdin.
+
+get prints the last value matching the pattern.

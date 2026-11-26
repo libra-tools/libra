@@ -717,3 +717,5 @@ config file read exit-code exception.
 invalid unset pattern exits 6.
 
 config unrecognized type exit-code exception.
+
+get prints the last value matching the pattern.

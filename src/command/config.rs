@@ -4476,6 +4476,7 @@ fn scope_origin_path(scope: ConfigScope) -> Option<PathBuf> {
 /// A value-pattern matcher: Git's regexp form, or `--fixed-value` byte equality.
 enum ValueMatcher {
     Regex(regex::Regex),
+    Negated(regex::Regex),
     Fixed(String),
 }
 
@@ -4483,6 +4484,7 @@ impl ValueMatcher {
     fn matches(&self, value: &str) -> bool {
         match self {
             Self::Regex(re) => re.is_match(value),
+            Self::Negated(re) => !re.is_match(value),
             Self::Fixed(expected) => expected == value,
         }
     }
@@ -4491,6 +4493,8 @@ impl ValueMatcher {
 fn compile_value_matcher(pattern: &str, fixed: bool) -> CliResult<ValueMatcher> {
     if fixed {
         Ok(ValueMatcher::Fixed(pattern.to_string()))
+    } else if let Some(rest) = pattern.strip_prefix('!') {
+        Ok(ValueMatcher::Negated(compile_config_regexp(rest)?))
     } else {
         Ok(ValueMatcher::Regex(compile_config_regexp(pattern)?))
     }
