@@ -921,3 +921,5 @@ color list and json emit ansi.
 expiry-date shortcut matches the type value.
 
 an existing config lock fails with no write.
+
+file writes reject vault options.

@@ -3365,6 +3365,39 @@ fn write_config_file(
         )
         .with_stable_code(StableErrorCode::CliInvalidArguments));
     }
+    if matches!(
+        _args.command,
+        Some(ConfigCommand::Set { encrypt: true, .. })
+            | Some(ConfigCommand::Set {
+                plaintext: true,
+                ..
+            })
+    ) {
+        return Err(CliError::command_usage(
+            "vault encryption options are not supported with --file",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+    let vault_key = match mutation {
+        crate::internal::config_file::write::Mutation::Set { key, .. }
+        | crate::internal::config_file::write::Mutation::Unset { key, .. } => Some(key.as_str()),
+        crate::internal::config_file::write::Mutation::RemoveSection { name } => {
+            Some(name.as_str())
+        }
+        crate::internal::config_file::write::Mutation::RenameSection { old, new } => {
+            if new.starts_with("vault.") {
+                Some(new.as_str())
+            } else {
+                Some(old.as_str())
+            }
+        }
+    };
+    if vault_key.is_some_and(|key| key.starts_with("vault.")) {
+        return Err(
+            CliError::command_usage("vault entries are not supported with --file")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
     let target = Path::new(path);
     let existing = match std::fs::read_to_string(target) {
         Ok(text) => text,

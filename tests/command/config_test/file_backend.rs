@@ -260,3 +260,24 @@ fn test_cf_89_predicates() {
         "no write"
     );
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_91_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let cfg = repo.path().join("cfg");
+    fs::write(&cfg, "[a]\nb = c\n").unwrap();
+    for args in [
+        vec!["config", "--file", "cfg", "set", "--encrypt", "a.b", "x"],
+        vec!["config", "--file", "cfg", "set", "vault.env.X", "y"],
+    ] {
+        let out = run_libra_command(&args, repo.path());
+        assert_eq!(out.status.code(), Some(129), "usage error: {args:?}");
+        assert_eq!(
+            fs::read_to_string(&cfg).unwrap(),
+            "[a]\nb = c\n",
+            "no write: {args:?}"
+        );
+    }
+}
