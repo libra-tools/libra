@@ -7734,3 +7734,38 @@ mod value_pattern {
         );
     }
 }
+
+#[test]
+fn test_cf_41_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for value in ["one", "o.e", "oXe"] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+            "add",
+        );
+    }
+    let fixed = run_libra_command(
+        &["config", "--fixed-value", "--unset", "multi.k", "o.e"],
+        repo.path(),
+    );
+    assert_cli_success(&fixed, "fixed unset");
+    let left = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+    assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "one\noXe");
+
+    let before = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+    let missing = run_libra_command(
+        &["config", "--fixed-value", "--unset", "multi.k"],
+        repo.path(),
+    );
+    assert_eq!(
+        missing.status.code(),
+        Some(129),
+        "missing pattern exits 129"
+    );
+    let after = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+    assert_eq!(
+        before.stdout, after.stdout,
+        "missing pattern writes nothing"
+    );
+}

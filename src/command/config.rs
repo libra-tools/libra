@@ -1892,12 +1892,20 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 all,
                 value_pattern,
                 fixed_value,
-            } => ResolvedCommand::Unset {
-                key: key.clone(),
-                all: *all,
-                value_pattern: value_pattern.clone(),
-                fixed_value: *fixed_value,
-            },
+            } => {
+                if *fixed_value && value_pattern.is_none() {
+                    return Err(CliError::command_usage(
+                        "--fixed-value requires a value pattern for unset",
+                    )
+                    .with_stable_code(StableErrorCode::CliInvalidArguments));
+                }
+                ResolvedCommand::Unset {
+                    key: key.clone(),
+                    all: *all,
+                    value_pattern: value_pattern.clone(),
+                    fixed_value: *fixed_value,
+                }
+            }
             ConfigCommand::RenameSection { old, new } => ResolvedCommand::RenameSection {
                 old: old.clone(),
                 new: new.clone(),
@@ -2148,6 +2156,12 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             value_type,
             name_only: args.name_only,
         });
+    }
+    if (args.unset || args.unset_all) && args.fixed_value && args.valuepattern.is_none() {
+        return Err(
+            CliError::command_usage("--fixed-value requires a value pattern for unset")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
     }
     if args.unset {
         return Ok(ResolvedCommand::Unset {
