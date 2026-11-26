@@ -399,7 +399,7 @@ libra config path --global
 
 #### `edit` / `-e` / `--edit`
 
-在编辑器中打开所选作用域。Libra 将作用域导出为 `0600` 的 Git 配置格式临时文件，校验编辑后的文本，并在解析成功后只写回发生变化的条目。加密条目显示为 `<REDACTED>` 且只读。语法错误不会写入任何内容，并在错误信息中保留临时文件路径。
+在编辑器中打开所选作用域。Libra 将作用域导出为 `0600` 的 Git 配置格式临时文件，校验编辑后的文本，并在解析成功后只写回发生变化的条目。加密条目以注释形式的只读占位符导出（`# key = <REDACTED> (read-only)`）；修改或删除占位符不会改动加密值。语法错误不会写入任何内容，并在错误信息中保留临时文件路径。
 
 #### `generate-ssh-key --remote <name>`
 
@@ -751,7 +751,7 @@ Git 将配置存储在明文 INI 文件中，用来保存 API keys、access toke
 
 ### `config edit` 如何在 SQLite 上保持安全？
 
-Libra 将作用域导出为私有 `0600` 的 Git 配置格式临时文件，并在触碰数据库前解析编辑后的文本。只有值列表确实变化的 key 会被重写，未变化的 key 保持不动，加密条目显示为只读的 `<REDACTED>` 占位符。解析失败不会写入任何内容，并报告保留的临时文件路径。脚本化修改仍应使用精确的 `set`、`--add`、`unset` 和 `list` 接口。
+Libra 将作用域导出为私有 `0600` 的 Git 配置格式临时文件，并在触碰数据库前解析编辑后的文本。只有值列表确实变化的 key 会被重写，未变化的 key 保持不动，加密条目显示为注释形式的只读 `<REDACTED>` 占位符，删除或修改不会生效。解析失败不会写入任何内容，并报告保留的临时文件路径。脚本化修改仍应使用精确的 `set`、`--add`、`unset` 和 `list` 接口。
 
 ### 为什么内置 SSH/GPG 密钥管理？
 
@@ -926,3 +926,5 @@ file writes reject vault options.
 edit temp files are mode 0600.
 
 a syntax error in an edit keeps the temp path.
+
+edit placeholders do not change encrypted entries.

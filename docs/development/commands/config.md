@@ -260,3 +260,5 @@ file writes reject vault options.
 edit temp files are mode 0600.
 
 a syntax error in an edit keeps the temp path.
+
+edit placeholders do not change encrypted entries.

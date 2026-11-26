@@ -178,3 +178,57 @@ fn test_t1300_edit() {
     assert_cli_success(&value, "edited addition");
     assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "works");
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_95_predicates() {
+    const SENTINEL: &str = "cf95-encrypted-sentinel";
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "--local",
+                "--encrypt",
+                "vault.env.CF95",
+                SENTINEL,
+            ],
+            &repo,
+        ),
+        "encrypted seed",
+    );
+    let capture = temp.path().join("capture.log");
+    let script = editor_script(
+        temp.path(),
+        "delete-placeholder.sh",
+        &format!(
+            "grep '<REDACTED>' \"$1\" > {}; grep -v '<REDACTED>' \"$1\" > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"",
+            capture.display()
+        ),
+    );
+    let out = run_libra_command_with_env(
+        &["config", "--edit"],
+        &repo,
+        &[("GIT_EDITOR", script.as_str())],
+    );
+    assert_cli_success(&out, "edit with placeholder deletion");
+    let captured = fs::read_to_string(&capture).unwrap();
+    assert!(
+        captured.contains("#"),
+        "placeholder is a comment: {captured}"
+    );
+    assert!(
+        captured.contains("<REDACTED>"),
+        "placeholder exported: {captured}"
+    );
+    let reveal = run_libra_command(
+        &["config", "get", "--local", "--reveal", "vault.env.CF95"],
+        &repo,
+    );
+    assert_cli_success(&reveal, "reveal encrypted");
+    assert_eq!(String::from_utf8_lossy(&reveal.stdout).trim(), SENTINEL);
+}

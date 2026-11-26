@@ -4713,12 +4713,11 @@ fn render_edit_text(entries: &[ConfigKvEntry]) -> String {
             }
             current_section = Some(section.to_string());
         }
-        let value = if entry.encrypted {
-            "<REDACTED>".to_string()
+        if entry.encrypted {
+            out.push_str(&format!("\t# {variable} = <REDACTED> (read-only)\n"));
         } else {
-            quote_value(&entry.value)
-        };
-        out.push_str(&format!("\t{variable} = {value}\n"));
+            out.push_str(&format!("\t{variable} = {}\n", quote_value(&entry.value)));
+        }
     }
     out
 }
@@ -4786,6 +4785,9 @@ async fn apply_edited_config(
             .push(value.clone());
     }
     for key in old_values.keys() {
+        if old_encrypted.get(key) == Some(&true) {
+            continue;
+        }
         if !new_values.contains_key(key) {
             ScopedConfig::unset_all(scope, key)
                 .await
@@ -4797,11 +4799,6 @@ async fn apply_edited_config(
             continue;
         }
         if old_encrypted.get(&key) == Some(&true) {
-            if values.len() == old_values.get(&key).map_or(0, Vec::len)
-                && values.iter().all(|value| value == "<REDACTED>")
-            {
-                continue;
-            }
             return Err(CliError::command_usage(format!(
                 "encrypted config entry '{key}' is read-only in config edit"
             ))

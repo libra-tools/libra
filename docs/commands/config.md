@@ -488,7 +488,7 @@ libra config path --global
 
 #### `edit` / `-e` / `--edit`
 
-Open the selected scope in your editor. Libra exports the scope to a `0600` temporary file in Git config format, validates the edited text, and writes back only changed entries after a successful parse. Encrypted entries appear as `<REDACTED>` and are read-only. A syntax error writes nothing and keeps the temporary file path in the error message.
+Open the selected scope in your editor. Libra exports the scope to a `0600` temporary file in Git config format, validates the edited text, and writes back only changed entries after a successful parse. Encrypted entries are exported as commented read-only placeholders (`# key = <REDACTED> (read-only)`); editing or deleting the placeholder does not change the encrypted value. A syntax error writes nothing and keeps the temporary file path in the error message.
 
 #### `generate-ssh-key --remote <name>`
 
@@ -883,7 +883,7 @@ What it deliberately does **not** support is the vault: storing encrypted secret
 
 ### How does `config edit` stay safe on SQLite?
 
-Libra exports the scope to a private `0600` Git-format temporary file and parses the edited text before touching the database. Only keys whose value list actually changed are rewritten; unchanged keys are left alone, and encrypted entries are shown as `<REDACTED>` read-only placeholders. A parse failure writes nothing and reports the kept temporary path. For scripted changes, `set`, `--add`, `unset`, and `list` remain the precise interface.
+Libra exports the scope to a private `0600` Git-format temporary file and parses the edited text before touching the database. Only keys whose value list actually changed are rewritten; unchanged keys are left alone, and encrypted entries are shown as commented read-only `<REDACTED>` placeholders whose removal or edit is ignored. A parse failure writes nothing and reports the kept temporary path. For scripted changes, `set`, `--add`, `unset`, and `list` remain the precise interface.
 
 ### Why built-in SSH/GPG key management?
 
@@ -1125,3 +1125,5 @@ file writes reject vault options.
 edit temp files are mode 0600.
 
 a syntax error in an edit keeps the temp path.
+
+edit placeholders do not change encrypted entries.
