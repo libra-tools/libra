@@ -7853,4 +7853,33 @@ mod value_pattern {
         let all = run_libra_command(&["config", "--get-all", "replace.multi"], repo.path());
         assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "green\nblue");
     }
+
+    #[test]
+    fn test_cf_45_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "o.e", "oXe"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "fixed.k", value], repo.path()),
+                "add",
+            );
+        }
+        let get = run_libra_command(
+            &["config", "--fixed-value", "--get", "fixed.k", "o.e"],
+            repo.path(),
+        );
+        assert_cli_success(&get, "fixed get");
+        assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "o.e");
+        let all = run_libra_command(
+            &["config", "--fixed-value", "--get-all", "fixed.k", "o.e"],
+            repo.path(),
+        );
+        assert_cli_success(&all, "fixed get-all");
+        assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "o.e");
+        let miss = run_libra_command(
+            &["config", "--fixed-value", "--get", "fixed.k", "o.e."],
+            repo.path(),
+        );
+        assert_eq!(miss.status.code(), Some(1), "fixed get miss");
+    }
 }
