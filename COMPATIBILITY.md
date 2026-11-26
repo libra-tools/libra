@@ -2123,3 +2123,5 @@ missing system list exits 128.
 unreadable system get exits 1.
 
 fixed-value set replaces the literal value.
+
+upstream replace cases pass.

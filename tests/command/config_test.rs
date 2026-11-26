@@ -7965,4 +7965,38 @@ mod value_pattern {
         let after = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
         assert_eq!(before.stdout, after.stdout, "usage error writes nothing");
     }
+
+    #[test]
+    fn test_cf_64_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", "replace.single", "old"], repo.path()),
+            "seed single",
+        );
+        let single = run_libra_command(
+            &["config", "--replace-all", "replace.single", "new"],
+            repo.path(),
+        );
+        assert_cli_success(&single, "t1300 replace single");
+        let value = run_libra_command(
+            &["config", "--local", "--get", "replace.single"],
+            repo.path(),
+        );
+        assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "new");
+
+        for value in ["one", "two"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "replace.multi", value], repo.path()),
+                "seed multi",
+            );
+        }
+        let multi = run_libra_command(
+            &["config", "--replace-all", "replace.multi", "three", "one"],
+            repo.path(),
+        );
+        assert_cli_success(&multi, "t1300 replace multivar");
+        let all = run_libra_command(&["config", "--get-all", "replace.multi"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "three\ntwo");
+    }
 }
