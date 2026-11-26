@@ -1141,3 +1141,5 @@ missing key get exits 1.
 fixed-value unset without a pattern exits 129.
 
 json envelope mirrors the no-section exit.
+
+name-only prints keys.

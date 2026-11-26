@@ -347,3 +347,50 @@ fn test_cf_51_predicates() {
     );
     assert!(!text.contains(SENTINEL), "plaintext must not leak");
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_48_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for (key, value) in [("name.one", "1"), ("name.two", "2")] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", key, value], repo.path()),
+            "set",
+        );
+    }
+    let list = run_libra_command(&["config", "--local", "--list", "--name-only"], repo.path());
+    assert_cli_success(&list, "--list --name-only");
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(stdout.lines().any(|line| line == "name.one"));
+    assert!(stdout.lines().all(|line| !line.contains('=')));
+
+    let regexp = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--get-regexp",
+            "^name\\.",
+            "--name-only",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&regexp, "--get-regexp --name-only");
+    assert_eq!(
+        String::from_utf8_lossy(&regexp.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["name.one", "name.two"]
+    );
+
+    let nul = run_libra_command(
+        &["config", "--local", "-z", "--list", "--name-only"],
+        repo.path(),
+    );
+    assert_cli_success(&nul, "-z --list --name-only");
+    assert!(
+        nul.stdout
+            .windows(b"name.one\0".len())
+            .any(|w| w == b"name.one\0")
+    );
+}
