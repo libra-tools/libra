@@ -1213,3 +1213,5 @@ fatal: unrecognized --type argument.
 bool-or-str and bool-or-int preserve and canonicalize.
 
 type=expiry-date prints a unix timestamp.
+
+config --file writes through a lock and rename.
