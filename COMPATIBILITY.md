@@ -2119,3 +2119,5 @@ encrypted get stays redacted.
 explicit scope list prints one scope.
 
 missing system list exits 128.
+
+unreadable system get exits 1.
