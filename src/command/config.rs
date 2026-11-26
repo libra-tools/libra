@@ -1476,6 +1476,10 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             return Err(CliError::command_usage("editing blobs is not supported")
                 .with_stable_code(StableErrorCode::CliInvalidArguments));
         }
+        if config_file_write_mutation(&cmd)?.is_some() {
+            return Err(CliError::fatal("writing config blobs is not supported")
+                .with_stable_code(StableErrorCode::IoWriteFailed));
+        }
         return Err(
             CliError::command_usage(format!("--blob '{blob}' is not supported yet"))
                 .with_stable_code(StableErrorCode::CliInvalidArguments),
@@ -3855,10 +3859,8 @@ fn config_file_write_mutation(
                 .with_stable_code(StableErrorCode::CliInvalidArguments));
             }
             if *stdin {
-                return Err(CliError::command_usage(
-                    "writing stdin is not supported with --file (a blob has no writable backing store)",
-                )
-                .with_stable_code(StableErrorCode::CliInvalidArguments));
+                return Err(CliError::command_usage("writing to stdin is not supported")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments));
             }
             let Some(value) = value else {
                 return Err(
@@ -3907,10 +3909,8 @@ fn write_config_file(
     use std::io::Write;
 
     if path == "-" {
-        return Err(CliError::command_usage(
-            "writing stdin is not supported with --file (a blob has no writable backing store)",
-        )
-        .with_stable_code(StableErrorCode::CliInvalidArguments));
+        return Err(CliError::command_usage("writing to stdin is not supported")
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
     }
     if matches!(
         _args.command,
@@ -4047,9 +4047,8 @@ async fn serve_config_file(
     }
     if let Some(mutation) = config_file_write_mutation(cmd)? {
         if path == "-" {
-            return Err(CliError::command_usage(
-                "writing to standard input ('--file -') is not supported",
-            ));
+            return Err(CliError::fatal("writing to stdin is not supported")
+                .with_stable_code(StableErrorCode::IoWriteFailed));
         }
         return write_config_file(path, &mutation, args, output);
     }

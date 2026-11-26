@@ -2189,3 +2189,5 @@ replace-all with the wrong arity exits 129.
 file reads keep file order.
 
 file and another source together exit 129.
+
+writing stdin or a blob fails.

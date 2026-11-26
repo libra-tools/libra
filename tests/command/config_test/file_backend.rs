@@ -429,3 +429,18 @@ fn test_cf_83_predicates() {
         );
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_90_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let stdin = run_libra_command(&["config", "--file", "-", "a.b", "c"], repo.path());
+    assert_eq!(stdin.status.code(), Some(128));
+    assert!(String::from_utf8_lossy(&stdin.stderr).contains("writing to stdin is not supported"));
+    let blob = run_libra_command(&["config", "--blob", "HEAD:cfg", "a.b", "c"], repo.path());
+    assert_eq!(blob.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&blob.stderr).contains("writing config blobs is not supported")
+    );
+}
