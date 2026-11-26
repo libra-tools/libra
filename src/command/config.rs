@@ -5187,6 +5187,10 @@ async fn handle_edit(scope: ConfigScope, _output: &OutputConfig) -> CliResult<()
         Err(error) if error.contains("NOT_FOUND") || error.contains("No such file") => Vec::new(),
         Err(error) => return Err(CliError::from_legacy_string(error)),
     };
+    let entries: Vec<ConfigKvEntry> = entries
+        .into_iter()
+        .filter(|entry| !is_upgrade_namespace_key(&entry.key))
+        .collect();
     let original_text = render_edit_text(&entries);
 
     let mut temp = tempfile::Builder::new()
@@ -5252,7 +5256,14 @@ async fn handle_edit(scope: ConfigScope, _output: &OutputConfig) -> CliResult<()
         CliError::fatal(format!("failed to read edited config: {error}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
-    let parsed = match parse_strict_git_config_text(&edited) {
+    let parsed = match parse_strict_git_config_text(&edited).and_then(|parsed| {
+        if let Some((key, _)) = parsed.iter().find(|(key, _)| is_upgrade_namespace_key(key)) {
+            return Err(format!(
+                "upgrade.* entries are reserved and cannot be edited: {key}"
+            ));
+        }
+        Ok(parsed)
+    }) {
         Ok(parsed) => parsed,
         Err(error) => {
             // Keep the temp file so the user's edits are not lost.

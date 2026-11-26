@@ -1169,3 +1169,5 @@ upstream expiry get and list pass.
 config file read exit-code exception.
 
 edit refuses stdin and blobs.
+
+edit does not export upgrade.mode.

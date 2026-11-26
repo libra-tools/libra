@@ -314,3 +314,51 @@ fn test_cf_96_predicates() {
     assert!(!blob.status.success());
     assert!(String::from_utf8_lossy(&blob.stderr).contains("editing blobs is not supported"));
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_98_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], &repo),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--global", "upgrade.mode", "auto"], &repo),
+        "seed upgrade mode",
+    );
+    let capture = temp.path().join("capture.log");
+    let cat = editor_script(
+        temp.path(),
+        "capture.sh",
+        &format!("cat \"$1\" > {}", capture.display()),
+    );
+    let out = run_libra_command_with_env(
+        &["config", "--global", "--edit"],
+        &repo,
+        &[("GIT_EDITOR", cat.as_str())],
+    );
+    assert_cli_success(&out, "global edit");
+    assert!(
+        !fs::read_to_string(&capture)
+            .unwrap()
+            .contains("upgrade.mode")
+    );
+
+    let add = editor_script(
+        temp.path(),
+        "add-upgrade.sh",
+        "printf '\\n[upgrade]\\n\\tmode = manual\\n' >> \"$1\"",
+    );
+    let rejected = run_libra_command_with_env(
+        &["config", "--global", "--edit"],
+        &repo,
+        &[("GIT_EDITOR", add.as_str())],
+    );
+    assert!(!rejected.status.success(), "reserved edit rejected");
+    let mode = run_libra_command(&["config", "get", "--global", "upgrade.mode"], &repo);
+    assert_cli_success(&mode, "mode unchanged");
+    assert_eq!(String::from_utf8_lossy(&mode.stdout).trim(), "auto");
+}
