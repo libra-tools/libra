@@ -1045,3 +1045,5 @@ invalid set pattern exits 6.
 replace-all refuses upgrade.mode.
 
 bool-or-str shortcut matches the type value.
+
+conflicting type switches exit 129.

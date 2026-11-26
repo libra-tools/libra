@@ -454,3 +454,20 @@ fn test_cf_71_predicates() {
         );
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_73_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let out = run_libra_command(
+        &["config", "--get", "--type=bool", "--int", "x.k"],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "conflicting type switches exit 129: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
