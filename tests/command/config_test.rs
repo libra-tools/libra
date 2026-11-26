@@ -8132,4 +8132,22 @@ mod value_pattern {
         let missing = run_libra_command(&["config", "--get-all", "up.k"], repo.path());
         assert_eq!(missing.status.code(), Some(1));
     }
+
+    #[test]
+    fn test_cf_65_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for args in [
+            vec!["config", "--replace-all"],
+            vec!["config", "--replace-all", "multi.k"],
+        ] {
+            let out = run_libra_command(&args, repo.path());
+            assert_eq!(out.status.code(), Some(129), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("wrong number of arguments"),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 }

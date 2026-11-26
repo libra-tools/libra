@@ -2550,6 +2550,12 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 .with_exit_code(2),
         );
     }
+    if args.replace_all && (args.key.is_none() || args.valuepattern.is_none()) {
+        return Err(
+            CliError::command_usage("wrong number of arguments for --replace-all")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
 
     // All remaining modes need a key
     let key = args.key.as_deref().ok_or_else(|| {

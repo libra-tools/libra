@@ -2183,3 +2183,5 @@ removed_count equals deleted values.
 config unrecognized type exit-code exception.
 
 bool-or-int canonicalizes ints and booleans.
+
+replace-all with the wrong arity exits 129.
