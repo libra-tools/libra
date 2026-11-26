@@ -45,3 +45,7 @@
 
 - 改进本命令前先阅读 [docs/development/commands/_general.md](_general.md)。
 - 合并核心必须继续走 `merge_bytes_with_driver`；其中 text/union 的行级合并继续由共享 `diffy` 路径承载，不得自建第二套行级合并/标记逻辑。
+
+## 2026-11-25（MX-13 / M-MF MF5）
+
+- 移除 `merge-file` 冲突时的 `warning: conflicts during merge...`（`--stdout` 与原地写入两条路径），stderr 保持与 Git 一致的静默；退出码 1 与冲突标记仍表达结果。补 `merge_file_conflict_is_silent_on_stderr` 覆盖两种路径。`-q/--quiet` 保留为 no-op。
