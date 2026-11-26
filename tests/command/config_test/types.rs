@@ -596,3 +596,34 @@ fn test_cf_74_predicates() {
     );
     assert_eq!(invalid.status.code(), Some(129));
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_75_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "color.bad", "bogus"], repo.path()),
+        "store invalid spelling",
+    );
+    let get = run_libra_command(
+        &["config", "--local", "--type=color", "--get", "color.bad"],
+        repo.path(),
+    );
+    assert_eq!(get.status.code(), Some(129), "invalid color get");
+    assert!(
+        String::from_utf8_lossy(&get.stderr).contains("invalid color value"),
+        "stderr: {}",
+        String::from_utf8_lossy(&get.stderr)
+    );
+    let set = run_libra_command(
+        &["config", "--local", "--type=color", "color.new", "bogus"],
+        repo.path(),
+    );
+    assert_eq!(set.status.code(), Some(129), "invalid color set");
+    let missing = run_libra_command(&["config", "--local", "--get", "color.new"], repo.path());
+    assert_eq!(missing.status.code(), Some(1), "invalid set writes nothing");
+}

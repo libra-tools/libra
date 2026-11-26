@@ -294,3 +294,5 @@ fixed-value set replaces the literal value.
 upstream replace cases pass.
 
 upstream color get and set pass.
+
+invalid colors fail and do not store.
