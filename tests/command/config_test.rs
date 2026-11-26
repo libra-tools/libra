@@ -7999,4 +7999,25 @@ mod value_pattern {
         let all = run_libra_command(&["config", "--get-all", "replace.multi"], repo.path());
         assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "three\ntwo");
     }
+
+    #[test]
+    fn test_cf_40_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        assert_cli_success(
+            &run_libra_command(&["config", "--add", "aa.key", "v"], repo.path()),
+            "seed",
+        );
+        for flag in ["--unset", "--unset-all"] {
+            let out = run_libra_command(&["config", flag, "aa.key", "("], repo.path());
+            assert_eq!(out.status.code(), Some(6), "{flag} invalid pattern");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("invalid pattern"),
+                "{flag}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let value = run_libra_command(&["config", "--get", "aa.key"], repo.path());
+            assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "v");
+        }
+    }
 }

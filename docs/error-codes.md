@@ -713,3 +713,5 @@ pattern unset with no match exits 5.
 invalid get pattern exits 6.
 
 config file read exit-code exception.
+
+invalid unset pattern exits 6.
