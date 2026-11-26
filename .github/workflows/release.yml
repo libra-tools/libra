@@ -94,27 +94,30 @@ jobs:
             fi
           fi
 
-          echo "Building $BINARY_NAME for target ${{ matrix.target.rust }}..."
+          echo "Building $BINARY_NAME and libra-migrate for target ${{ matrix.target.rust }}..."
 
-          RUSTFLAGS="-C strip=symbols" cargo build --locked --release --features keyring --target ${{ matrix.target.rust }}
+          RUSTFLAGS="-C strip=symbols" cargo build --locked --release --features storage-sqlite,storage-redb,storage-queue,keyring --bin libra --target ${{ matrix.target.rust }}
+          RUSTFLAGS="-C strip=symbols" cargo build --locked --release --features storage-sqlite,storage-redb,storage-queue --bin libra-migrate --target ${{ matrix.target.rust }}
 
-          # Create build directory and copy binary
+          # Create build directory and stage both release binaries with sidecars
           mkdir -p build
-          cp target/${{ matrix.target.rust }}/release/${{ matrix.component }} build/$BINARY_NAME
+          stage_unix_binary() {
+            local src="$1"
+            local name="$2"
+            cp "$src" "build/$name"
+            chmod +x "build/$name"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "build/$name" | awk '{print $1}' > "build/$name.sha256"
+            else
+              shasum -a 256 "build/$name" | awk '{print $1}' > "build/$name.sha256"
+            fi
+            wc -c < "build/$name" | tr -d '[:space:]' > "build/$name.size"
+            echo "Built binary: $name"
+          }
 
-          # Make binary executable
-          chmod +x build/$BINARY_NAME
-
-          # Generate sha256 for Homebrew tap updates and CDN verification,
-          # plus the byte size the publish job binds into the signed manifest.
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "build/$BINARY_NAME" | awk '{print $1}' > "build/$BINARY_NAME.sha256"
-          else
-            shasum -a 256 "build/$BINARY_NAME" | awk '{print $1}' > "build/$BINARY_NAME.sha256"
-          fi
-          wc -c < "build/$BINARY_NAME" | tr -d '[:space:]' > "build/$BINARY_NAME.size"
-
-          echo "Built binary: $BINARY_NAME"
+          MIGRATE_BINARY_NAME="libra-migrate-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+          stage_unix_binary "target/${{ matrix.target.rust }}/release/${{ matrix.component }}" "$BINARY_NAME"
+          stage_unix_binary "target/${{ matrix.target.rust }}/release/libra-migrate" "$MIGRATE_BINARY_NAME"
 
       - name: Build Binary (Windows)
         if: matrix.target.os == 'windows'
@@ -125,31 +128,36 @@ jobs:
           # suffixless object consumed by signed manifests.
           $binaryName = "libra-windows-amd64"
 
-          Write-Output "Building $binaryName for target ${{ matrix.target.rust }}..."
+          Write-Output "Building $binaryName and libra-migrate-windows-amd64 for target ${{ matrix.target.rust }}..."
 
           $env:RUSTFLAGS = "-C strip=symbols -C link-args=/STACK:0x1000000" 
-          cargo build --locked --release --features keyring --target ${{ matrix.target.rust }}
+          cargo build --locked --release --features storage-sqlite,storage-redb,storage-queue,keyring --bin libra --target ${{ matrix.target.rust }}
+          cargo build --locked --release --features storage-sqlite,storage-redb,storage-queue --bin libra-migrate --target ${{ matrix.target.rust }}
 
-          # Create build directory and copy binary
+          # Create build directory and copy both binaries with sidecars
           New-Item -ItemType Directory -Force -Path "build" | Out-Null
-          $sourceBinary = "target\${{ matrix.target.rust }}\release\${{ matrix.component }}.exe"
-          $sourceHash = (Get-FileHash -Algorithm SHA256 $sourceBinary).Hash.ToLowerInvariant()
-          Copy-Item $sourceBinary "build\$binaryName.exe"
-          # The signed-manifest URL grammar has no `.exe` suffix. Publish a
-          # byte-identical second name and verify both copied release objects.
-          Copy-Item "build\$binaryName.exe" "build\$binaryName"
-          $exeHash = (Get-FileHash -Algorithm SHA256 "build\$binaryName.exe").Hash.ToLowerInvariant()
-          $suffixlessHash = (Get-FileHash -Algorithm SHA256 "build\$binaryName").Hash.ToLowerInvariant()
-          if ($sourceHash -ne $exeHash -or $sourceHash -ne $suffixlessHash) {
-            throw "Windows release copies do not match the built executable"
+          function Stage-WindowsBinary {
+            param([string]$SourceBinary, [string]$OutName)
+            $sourceHash = (Get-FileHash -Algorithm SHA256 $SourceBinary).Hash.ToLowerInvariant()
+            Copy-Item $SourceBinary "build\$OutName.exe"
+            # The signed-manifest URL grammar has no `.exe` suffix. Publish a
+            # byte-identical second name and verify both copied release objects.
+            Copy-Item "build\$OutName.exe" "build\$OutName"
+            $exeHash = (Get-FileHash -Algorithm SHA256 "build\$OutName.exe").Hash.ToLowerInvariant()
+            $suffixlessHash = (Get-FileHash -Algorithm SHA256 "build\$OutName").Hash.ToLowerInvariant()
+            if ($sourceHash -ne $exeHash -or $sourceHash -ne $suffixlessHash) {
+              throw "Windows release copies for $OutName do not match the built executable"
+            }
+            Set-Content -NoNewline -Path "build\$OutName.sha256" -Value $exeHash
+            # The upload loop reads "<file>.sha256" per file; give the .exe its
+            # own (byte-identical) sidecar so both binaries resolve digests.
+            Set-Content -NoNewline -Path "build\$OutName.exe.sha256" -Value $exeHash
+            Set-Content -NoNewline -Path "build\$OutName.size" -Value ((Get-Item "build\$OutName").Length)
+            Write-Output "Built binary: $OutName"
           }
-          Set-Content -NoNewline -Path "build\$binaryName.sha256" -Value $exeHash
-          # The upload loop reads "<file>.sha256" per file; give the .exe its
-          # own (byte-identical) sidecar so both binaries resolve digests.
-          Set-Content -NoNewline -Path "build\$binaryName.exe.sha256" -Value $exeHash
-          Set-Content -NoNewline -Path "build\$binaryName.size" -Value ((Get-Item "build\$binaryName").Length)
 
-          Write-Output "Built binary: $binaryName"
+          Stage-WindowsBinary -SourceBinary "target\${{ matrix.target.rust }}\release\${{ matrix.component }}.exe" -OutName $binaryName
+          Stage-WindowsBinary -SourceBinary "target\${{ matrix.target.rust }}\release\libra-migrate.exe" -OutName "libra-migrate-windows-amd64"
 
       - name: Upload release objects via the credential broker (Unix)
         if: matrix.target.os != 'windows'

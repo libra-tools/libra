@@ -3016,3 +3016,408 @@ fn syn_guard_fails_closed_on_malformed_rust_input() {
 fn syn_ast_per_callsite_storage_wiring_completeness_guard() {
     rb29b_ast_audit::per_callsite_storage_wiring_completeness_guard_impl();
 }
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+mod packaged_release_audit {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    use libra::{
+        internal::db::schema::DatabaseRole,
+        storage::{
+            StorageBackendKind,
+            config_store::{CONFIG_REDB_FILE_NAME, ConfigStore},
+            manifest::{read_storage_manifest, resolve_redb_generation_paths},
+            sqlite::SqliteConfigStore,
+        },
+    };
+    use sha2::{Digest, Sha256};
+
+    pub(super) fn sha256_file_hex(path: &Path) -> String {
+        let bytes = fs::read(path)
+            .unwrap_or_else(|err| panic!("failed to read '{}' for sha256: {err}", path.display()));
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    pub(super) fn verify_staged_binary_with_sidecar(env_var: &str) -> PathBuf {
+        let raw = std::env::var(env_var)
+            .unwrap_or_else(|_| panic!("{env_var} must be set to the staged release binary path"));
+        let bin = PathBuf::from(&raw);
+        assert!(
+            bin.is_file(),
+            "{env_var} '{}' does not exist or is not a regular file",
+            bin.display()
+        );
+        let sidecar = PathBuf::from(format!("{}.sha256", bin.display()));
+        assert!(
+            sidecar.is_file(),
+            "expected SHA-256 sidecar '{}' beside {env_var}",
+            sidecar.display()
+        );
+        let expected = fs::read_to_string(&sidecar)
+            .unwrap_or_else(|err| panic!("failed to read '{}': {err}", sidecar.display()))
+            .trim()
+            .to_ascii_lowercase();
+        assert_eq!(
+            expected.len(),
+            64,
+            "sidecar '{}' must contain a 64-hex SHA-256 digest, got '{expected}'",
+            sidecar.display()
+        );
+        let actual = sha256_file_hex(&bin);
+        assert_eq!(
+            actual,
+            expected,
+            "SHA-256 mismatch for staged {env_var} '{}'",
+            bin.display()
+        );
+        bin
+    }
+
+    pub(super) fn run_cmd(
+        bin: &Path,
+        cwd: &Path,
+        home: &Path,
+        global_db: &Path,
+        system_db: &Path,
+        args: &[&str],
+    ) -> String {
+        let mut cmd = Command::new(bin);
+        cmd.current_dir(cwd)
+            .args(args)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("LIBRA_CONFIG_GLOBAL_DB", global_db)
+            .env("LIBRA_CONFIG_SYSTEM_DB", system_db)
+            .env("LIBRA_TEST", "1")
+            .env_remove("LIBRA_STORAGE_BACKEND")
+            .env_remove("LIBRA_CONFIG_BACKEND");
+        let out = cmd
+            .output()
+            .unwrap_or_else(|err| panic!("failed to execute {} {:?}: {err}", bin.display(), args));
+        assert!(
+            out.status.success(),
+            "{} {:?} failed (status {:?})\nstdout:\n{}\nstderr:\n{}",
+            bin.display(),
+            args,
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    pub(super) fn pre_cutover_dual_backend_coherence_impl() {
+        let libra_bin = verify_staged_binary_with_sidecar("LIBRA_PACKAGED_BIN");
+        let migrate_bin = verify_staged_binary_with_sidecar("LIBRA_MIGRATE_PACKAGED_BIN");
+
+        let tmp = tempfile::tempdir().expect("create RB-32b tempdir");
+        let home = tmp.path().join("home");
+        let global_dir = tmp.path().join("global-cfg");
+        let system_dir = tmp.path().join("system-cfg");
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(home.join(".config")).expect("mkdir home/.config");
+        fs::create_dir_all(&global_dir).expect("mkdir global-cfg");
+        fs::create_dir_all(&system_dir).expect("mkdir system-cfg");
+        fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+        let global_db = global_dir.join("config.db");
+        let system_db = system_dir.join("config.db");
+
+        // AC3 & AC4: Unset LIBRA_STORAGE_BACKEND -> `libra config set --global` creates
+        // SQLite config.db and NEVER creates config.redb.
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "set", "--global", "user.name", "PreCutoverUser"],
+        );
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &[
+                "config",
+                "set",
+                "--global",
+                "user.email",
+                "precutover@example.com",
+            ],
+        );
+        assert!(
+            global_db.is_file(),
+            "AC3: pre-cutover `libra config set --global` must create SQLite config.db at {}",
+            global_db.display()
+        );
+        assert!(
+            !global_dir.join(CONFIG_REDB_FILE_NAME).exists(),
+            "AC4: pre-cutover `libra config set --global` must NOT create config.redb"
+        );
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["config", "get", "--global", "user.name"],
+            )
+            .trim(),
+            "PreCutoverUser"
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async {
+            let sqlite_cfg =
+                SqliteConfigStore::open_read_only(&global_db, DatabaseRole::GlobalConfig)
+                    .await
+                    .expect("open SQLite global config.db");
+            assert_eq!(
+                sqlite_cfg
+                    .get("user.name")
+                    .await
+                    .expect("read user.name from SQLite config.db")
+                    .map(|e| e.value),
+                Some("PreCutoverUser".to_string())
+            );
+        });
+
+        // AC2: Unset LIBRA_STORAGE_BACKEND -> `libra init` creates SQLite `.libra/libra.db`.
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["init", "--vault", "false"],
+        );
+        let dot_libra = repo_dir.join(".libra");
+        let sqlite_git_path = dot_libra.join("libra.db");
+        assert!(
+            sqlite_git_path.is_file(),
+            "AC2: pre-cutover `libra init` must default to SQLite libra.db"
+        );
+        assert!(
+            !dot_libra.join("storage-format.json").exists(),
+            "AC2: pre-cutover SQLite `libra init` must not write Redb storage-format.json"
+        );
+        assert!(
+            !dot_libra.join("redb").exists(),
+            "AC2: pre-cutover SQLite `libra init` must not create .libra/redb"
+        );
+
+        // AC1: Full bidirectional interop between staged `libra` (with keyring)
+        // and staged `libra-migrate` (without keyring):
+        // SQLite repo -> migrate --to redb -> libra read/write/commit -> migrate --to sqlite -> libra readback.
+        fs::write(repo_dir.join("seed.txt"), "seeded-on-sqlite\n").expect("write seed.txt");
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["add", "seed.txt"],
+        );
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "rb32b.origin", "sqlite-before-cutover"],
+        );
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["commit", "-m", "rb32b seed sqlite commit", "--no-verify"],
+        );
+        let seed_oid = run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["rev-parse", "HEAD"],
+        )
+        .trim()
+        .to_string();
+
+        let repo_arg = repo_dir.to_str().expect("utf-8 repo path");
+        let fwd_out = run_cmd(
+            &migrate_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["--to", "redb", "--repo", repo_arg],
+        );
+        assert!(
+            fwd_out.contains("Migrated repository to redb"),
+            "unexpected forward migrate output: {fwd_out}"
+        );
+        let fwd_manifest = read_storage_manifest(&dot_libra)
+            .expect("read manifest after --to redb")
+            .expect("manifest must exist after --to redb");
+        assert_eq!(fwd_manifest.backend, StorageBackendKind::Redb);
+        assert!(fwd_manifest.finalized);
+        let redb_paths = resolve_redb_generation_paths(&dot_libra)
+            .expect("resolve redb paths")
+            .expect("redb paths must exist");
+        assert!(redb_paths.git_db_path.is_file());
+        assert!(redb_paths.capture_db_path.is_file());
+
+        // Read & write with packaged `libra` while repository is on Redb.
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["config", "get", "rb32b.origin"],
+            )
+            .trim(),
+            "sqlite-before-cutover"
+        );
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["rev-parse", "HEAD"],
+            )
+            .trim(),
+            seed_oid
+        );
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "rb32b.redb_write", "written-on-redb"],
+        );
+        fs::write(repo_dir.join("redb_step.txt"), "written-on-redb\n")
+            .expect("write redb_step.txt");
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["add", "redb_step.txt"],
+        );
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["commit", "-m", "rb32b redb commit", "--no-verify"],
+        );
+        let redb_oid = run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["rev-parse", "HEAD"],
+        )
+        .trim()
+        .to_string();
+        assert_ne!(redb_oid, seed_oid);
+
+        // Reverse migrate back to SQLite via staged `libra-migrate` (no keyring).
+        let rev_out = run_cmd(
+            &migrate_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["--to", "sqlite", "--repo", repo_arg],
+        );
+        assert!(
+            rev_out.contains("Migrated repository to sqlite"),
+            "unexpected reverse migrate output: {rev_out}"
+        );
+        let rev_manifest = read_storage_manifest(&dot_libra)
+            .expect("read manifest after --to sqlite")
+            .expect("manifest must exist after --to sqlite");
+        assert_eq!(rev_manifest.backend, StorageBackendKind::Sqlite);
+        assert!(rev_manifest.finalized);
+        assert!(sqlite_git_path.is_file());
+
+        // Read 100% back via packaged `libra` on restored SQLite repo.
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["rev-parse", "HEAD"],
+            )
+            .trim(),
+            redb_oid
+        );
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["config", "get", "rb32b.origin"],
+            )
+            .trim(),
+            "sqlite-before-cutover"
+        );
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["config", "get", "rb32b.redb_write"],
+            )
+            .trim(),
+            "written-on-redb"
+        );
+        let commit_obj = run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["cat-file", "-p", "HEAD"],
+        );
+        assert!(
+            commit_obj.contains("rb32b redb commit") && commit_obj.contains(&seed_oid),
+            "restored SQLite HEAD commit must retain message and parent OID: {commit_obj}"
+        );
+    }
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[test]
+fn packaged_release_dual_backend_libra_and_migrate_coherence_pre_cutover() {
+    packaged_release_audit::pre_cutover_dual_backend_coherence_impl();
+}

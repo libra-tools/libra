@@ -178,7 +178,7 @@ jobs:
           echo "LIBRA_TEST_SCRATCH_DIR=$scratch" >> "$GITHUB_ENV"
 
       - name: Check compatibility matrix drift
-        run: cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact
+        run: cargo test --no-default-features --features storage-sqlite --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact
 
       # plan-20260827 NP-04 / GC-NP-04: pinned nextest install, idempotent.
       - name: Install cargo-nextest (pinned 0.9.143)
@@ -238,8 +238,8 @@ jobs:
           # Do not exclude grok_* with `binary(~^grok_)`. In nextest, `~` is a
           # contains match, so that expression looks for a binary name containing
           # the literal "^grok_" and aborts the run before any test (exit 94).
-          cargo nextest run --all --no-fail-fast --retries 2
-          cargo test --doc
+          cargo nextest run --no-default-features --features storage-sqlite --all --no-fail-fast --retries 2
+          cargo test --no-default-features --features storage-sqlite --doc
 
       # REMOVED 2026-08-31 — the "Run Code UI automation scenarios" step is
       # dropped because `libra code` TUI support was removed upstream; the
@@ -249,35 +249,35 @@ jobs:
 
       # lore.md 1.7: the OTLP wire test needs the feature compiled in
       # (required-features excludes it from the default `cargo test --all`).
-      - name: Run OTLP telemetry wire test (--features otlp)
+      - name: Run OTLP telemetry wire test (--features storage-sqlite,otlp)
         env:
           HOME: ${{ runner.temp }}/libra-ci-home
           USERPROFILE: ${{ runner.temp }}/libra-ci-home
           XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
         run: |
-          cargo test --features otlp --test otlp_telemetry -- --test-threads=1
+          cargo test --no-default-features --features storage-sqlite,otlp --test otlp_telemetry -- --test-threads=1
 
       # lore.md 2.7: keyring-backend plumbing over the in-process mock store
       # (debug builds only honor the mock env; headless-safe).
-      - name: Run keyring auth backend test (--features keyring)
+      - name: Run keyring auth backend test (--features storage-sqlite,keyring)
         env:
           HOME: ${{ runner.temp }}/libra-ci-home
           USERPROFILE: ${{ runner.temp }}/libra-ci-home
           XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
         run: |
-          cargo test --features keyring --test auth_keyring_backend -- --test-threads=1
+          cargo test --no-default-features --features storage-sqlite,keyring --test auth_keyring_backend -- --test-threads=1
 
       # plan-20260714 §A.11: auto-upgrade integration targets. Trust-root and
       # endpoint injection is compile-time only (the `test-upgrade` feature),
       # so a release build cannot alter the trust root even with LIBRA_TEST=1.
-      - name: Run auto-upgrade tests (--features test-upgrade)
+      - name: Run auto-upgrade tests (--features storage-sqlite,test-upgrade)
         env:
           HOME: ${{ runner.temp }}/libra-ci-home
           USERPROFILE: ${{ runner.temp }}/libra-ci-home
           XDG_CONFIG_HOME: ${{ runner.temp }}/libra-ci-home/.config
           LIBRA_TEST: "1"
         run: |
-          cargo test --features test-upgrade \
+          cargo test --no-default-features --features storage-sqlite,test-upgrade \
             --test upgrade_auto_test \
             --test upgrade_publish_contract_test -- --test-threads=1
 
@@ -305,12 +305,12 @@ jobs:
   # inside a single run), so the merge is the correctness-preserving shape.
   # Rollback: revert the commit that removed the job (ADR-NP-02).
 
-  compat-redb-storage:
-    name: compat-redb-storage
+  compat-redb-queue:
+    name: compat-redb-queue
 
     runs-on: [self-hosted]
 
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     env:
       CARGO_TERM_COLOR: always
@@ -353,7 +353,7 @@ jobs:
           fi
           cargo nextest --version
 
-      - name: Run isolated redb storage stack checks (RB-12)
+      - name: Run full offline core suite on redb+queue (RB-31)
         env:
           HOME: ${{ runner.temp }}/libra-redb-ci-home
           USERPROFILE: ${{ runner.temp }}/libra-redb-ci-home
@@ -361,18 +361,35 @@ jobs:
         run: |
           set -euo pipefail
           umask 0022
-          # 1. SQLite-only storage unit suite
-          cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'
-          # 2. Redb-only storage unit suite (implicitly validates storage-redb -> storage-queue)
-          cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(/^storage::/)'
-          # 3. Redb-only 32-producer + concurrent MVCC readers/writers stress test
-          cargo nextest run --no-tests=fail --no-default-features --features storage-redb --test storage_concurrency_stress_test -E 'test(=multiprocess_32_producers_and_concurrent_mvcc_readers_writers)'
-          # 4. Dual-feature storage unit suite
+          # 1. Full offline core suite on pure storage-redb,storage-queue
+          cargo nextest run --no-default-features --features storage-redb,storage-queue --all --no-fail-fast --retries 2
+          cargo test --no-default-features --features storage-redb,storage-queue --doc
+          # 2. Explicit redb-only concurrency stress suite
+          cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --test storage_concurrency_stress_test
+          # 3. Dual-feature storage unit suite, libra-migrate CLI, AST guard, and unlocked bidirectional roundtrip
           cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(/^storage::/)'
-          # 5. Dual-feature libra-migrate CLI unit suite
           cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --bin libra-migrate
-          # 6. Dual-feature migration stress roundtrip & post-unlock binary bidirectional roundtrip
-          cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --test storage_concurrency_stress_test -E 'test(=dual_feature_migration_and_stress_roundtrip) | test(=post_unlock_libra_migrate_binary_bidirectional_roundtrip)'
+          cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --test storage_concurrency_stress_test -E 'test(=dual_feature_migration_and_stress_roundtrip) | test(=post_unlock_libra_migrate_binary_bidirectional_roundtrip) | test(=syn_ast_per_callsite_storage_wiring_completeness_guard)'
+
+      - name: Run keyring auth backend test on pure redb+queue (RB-31b)
+        env:
+          HOME: ${{ runner.temp }}/libra-redb-ci-home
+          USERPROFILE: ${{ runner.temp }}/libra-redb-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/libra-redb-ci-home/.config
+        run: |
+          set -euo pipefail
+          umask 0022
+          cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue,keyring --test auth_keyring_backend
+
+      - name: Run keyring auth backend test on dual-backend release configuration (RB-31b)
+        env:
+          HOME: ${{ runner.temp }}/libra-redb-ci-home
+          USERPROFILE: ${{ runner.temp }}/libra-redb-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/libra-redb-ci-home/.config
+        run: |
+          set -euo pipefail
+          umask 0022
+          cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue,keyring --test auth_keyring_backend
 
       - name: Clean up CI scratch
         if: always()

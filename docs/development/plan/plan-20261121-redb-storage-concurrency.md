@@ -9345,7 +9345,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 在 `.github/workflows/base.yml` 中显式将既有 `compat-offline-core` 锁定为 `--no-default-features --features storage-sqlite`（确保后续 `RB-34` 切换 Cargo 默认 Feature 后 SQLite 全量测试绝不静默失效），并将 `compat-redb-storage` 升级为全量离线 CLI 矩阵 `compat-redb-queue`（`--no-default-features --features storage-redb,storage-queue`），完整保留 `RB-29c` 切好的双特性等价与解锁态双向迁移步骤（`--lib`、`--bin libra-migrate` 与 `post_unlock_libra_migrate_binary_bidirectional_roundtrip`）。
 
@@ -9402,7 +9402,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 在 `.github/workflows/base.yml` 中紧接 `RB-31` 补齐两套含 `keyring` 组合的显式 CI 编译与 `auth_keyring_backend` 验证步骤：纯红库构型 `--no-default-features --features storage-redb,storage-queue,keyring` 与官方双后端发行构型 `--features storage-sqlite,storage-redb,storage-queue,keyring`。
 
@@ -9457,7 +9457,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 在切换默认新仓后端之前升级 `.github/workflows/release.yml`（实盘核查该工作流向 `build/` 暂存单文件平台二进制与 `.sha256`/`.size` 并上传 R2，非 tar 归档）：使全部目标平台按**各自真实发行命令**先后构建并暂存：① 官方双后端 `libra`（`cargo build --locked --release --features storage-sqlite,storage-redb,storage-queue,keyring --bin libra --target <triple>` → `build/libra-<os>-<arch>` + `.sha256`/`.size`，Windows 同步产出 `.exe` 与无后缀双份）；② 官方迁移器 `libra-migrate`（`cargo build --locked --release --features storage-sqlite,storage-redb,storage-queue --bin libra-migrate --target <triple>`，**明确不含 `keyring`** → `build/libra-migrate-<os>-<arch>` + `.sha256`/`.size`，Windows 同理）。
 
@@ -9516,7 +9516,7 @@
 
 **Task type:** `audit`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 在 `REL-RB-03` 切换官方发行运行时默认后端之前（不修改任何生产源码），于 `tests/storage_concurrency_stress_test.rs` 内按 `release.yml` 各自真实特性分别构建并经独立 `mktemp -d` 暂存双后端 `libra`（含 `keyring`）与 `libra-migrate`（**不含 `keyring`**），经 `LIBRA_PACKAGED_BIN` 与 `LIBRA_MIGRATE_PACKAGED_BIN` 核验双 `.sha256` 后实测切前双向互操作以及 `libra init`/`libra config set --global` 默认行为零变化。
 
@@ -10101,7 +10101,8 @@
 | `RB-11` | `done` / `remote-verified` | `ea56994`（`main`） | `0.30.491` | 2026-11-25T11:23:53Z：Stage 1 精确 2 文件写集（`src/storage/mod.rs`、`src/storage/migrate.rs`）实现对称反向迁移 Phase 1 红库写者静默门与严格 `ADR-RB-07` #2 全局 8 锁序（导出 `ReversePhase1QuiesceStage`、`ReversePhase1Locks`、`QuiescedRepositoryRedbSources`、`ReversePhase1QuiesceGuard`、`quiesce_reverse_repository_phase1`、`quiesce_reverse_repository_phase1_for_role`）：严格按 `migration.lock → maintenance.lock → capture-spool-consumer.lock → capture-queue/writer.lock → 原地 capture-queue/append.lock → 原地 capture-spool/capacity.lock → (git_wtx, cap_wtx)` 获取锁并逆序释放；持 6 锁后二次复核已终态 Redb `storage-format.json` 消除清单 TOCTOU；落地描述符绑定零路径重开 `open_verified_existing_redb_backend_for_reverse`（Unix `openat(O_RDWR\|O_NOFOLLOW\|O_NONBLOCK\|O_CLOEXEC)` + `fstat` 核验 / Windows `CreateFileW(FILE_FLAG_OPEN_REPARSE_POINT)` + `WinFileId` 核验）及 `ReverseNonBlockingFileBackend`（将 `redb 5.0` `MultiWriter` open 阻塞 `lock_range(WRITER_BYTE)` 转为非阻塞 `try_lock_range` + 零写 `WRITER_BYTE` 先验探针 + 4 KiB 内存 CoW 覆层保持 Phase 1 源 `.redb` 逐字节零写盘，且释放 `WRITER_BYTE` 前清空覆层确保 `sync_to_latest_commit` 完整收敛中段并发提交；`set_repair_callback(|s| s.abort())` 杜绝隐式修复改字节；`try_begin_reverse_source_write_tx` 统一将 `Repository`/`Capture` `WriteLockBusy` 映射为 `LBR-IO-001`；私有化 `ReversePhase1QuiesceGuard::redb` 仅提供绑生命周期借用 `redb(&self)`）；`VER1` 发现门 1/1、`VER2`（`reverse_phase1_quiescence_rejects_redb_writers_and_enforces_lock_order` 覆盖 AC1–AC5 跨 OS 子进程活跃 `git.redb`/`capture.redb` 写者拒收 `LBR-IO-001` 与源库逐字节零改动、全 8 锁跨进程互斥与预开 `RedbGitStore`/`RedbCaptureStore` `WriteLockBusy`、确定性中段并发提交 `MidOpenPeerCommitObserver` 回归、Phase 1 持锁及中止零写盘、`<= 50ms` 预算、`GC-13` 禁入角色与未终态/SQLite 清单拒收）、纯 SQLite `storage::` 11/11、三构型矩阵、`rustfmt +nightly` + `cargo +stable fmt --all -- --check` + `cargo +stable`/`+nightly clippy --all-targets --all-features -- -D warnings` + `compat_version_surface_sync` 2/2 全绿；Codex R1 两项 P1（CoW 覆层释放 `WRITER_BYTE` 清空防隐藏中段提交 + `ReversePhase1QuiesceGuard::redb` 私有化）全部闭环，Codex R2 获零残留 P0/P1 通过 |
 | `RB-11z` | `done` / `remote-pending` | 本提交（`main`） | `0.30.506` | 2026-11-25T14:53:00Z：Stage 1 精确白名单内单文件写集（`src/storage/migrate.rs`）扩展对称反向迁移 Phase 1 静默门，实现外部队列生产者原地 `capture-queue/append.lock` 与在途 `capture-spool/tmp/` 发布者（`spool.rs:119-145`）双重竞争拒收：新增 `ReversePhase1QuiesceStage::CaptureSpoolInFlightTmp` 并在 `quiesce_reverse_repository_phase1_inner` 的 Phase 0 零创建预检（先于 `any_lock_absent` 及任意缺席锁文件创建）与 Phase 1 持齐全部 6 把咨询锁（含 `capture-spool/capacity.lock`）之后二次调用 `verify_no_inflight_spool_tmp_files`（统一经 `normalize_reverse_quiesce_err` 映射为 `LBR-IO-001` 且零私密路径泄露）；`VER1` 发现门 1/1、`VER2`（`reverse_phase1_rejects_queue_producer_and_inflight_spool_tmp` 覆盖 AC1–AC8 全锁存在/缺锁两变体 × 外部 OS 子进程排他与共享 `append.lock` + 新鲜/未来 mtime `capture-spool/tmp/` 在途文件均返 `LBR-IO-001` 且源 `git.redb`/`capture.redb`、`capture-queue/`、`capture-spool/` 三域全树逐字节快照 100% 相等且零创建 `migration.lock`；含确定性 `PostLockInflightTmpInjector` 持锁后 TOCTOU 回归、过期 `>24h` 孤儿放行且保留与 `<= 50ms` 预算、Unix 硬链/符号链 `capture-spool/tmp` 墓碑 fail-closed 回归）、`RB-11` 回归 1/1、纯 SQLite `storage::` 11/11、三构型矩阵、`rustfmt +nightly` + `cargo +stable fmt --all -- --check` + `cargo +stable`/`+nightly clippy --all-targets --all-features -- -D warnings` + `compat_version_surface_sync` 2/2 全绿；Codex R1 只读审查所提 2 项晚竞态预检后已建锁文件留存属于与 `RB-10n` 同源的 POSIX 三元互斥（`ADR-RB-07` #2 严禁先于 `writer.lock` 获取 `append.lock`，且严禁 `unlink` 已发布锁 inode 杜绝 POSIX 锁裂脑；稳态竞争由 Phase 0 零创建预检 100% 覆盖 AC1–AC8），依用户授权如实留证并推进 |
 | `RB-11q`..`RB-30`（`Track A` 余卡 + `REL-RB-01` 全 30 卡） | `done` / `complete` | `98c4a3d`..本提交（`main`） | `0.30.588` | Track A 114/114 与 Track B `REL-RB-01` 全 30 卡（`RB-13`..`RB-30`）完成：146 生产接线文件与 `RB-29b` `syn 2.0` 全树 AST 审计发现的全部 36 个 `src/` 文件补齐配对 `StorageBackendKind::{Sqlite, Redb}` 运行时分发，4 组负向自测 + `syn_ast_per_callsite_storage_wiring_completeness_guard`（0 违规）+ `post_unlock_libra_migrate_binary_bidirectional_roundtrip` + 禁改 4 文件与 `init.rs:1-20` 逐字节校验 + `Cargo.toml` 默认 `storage-sqlite` + `base.yml` 解锁态选测 + 纯 Redb/纯 SQLite/双特性回归 + `fmt`/`nightly clippy -D warnings` 全绿；注：本 Linux 主机无外部网站仓库 `/Volumes/Sea/libra-backend`（`DEP-RB-03`），仓内 `docs/commands/{,zh-CN/}agent.md` 与 `docs/error-codes.md` 已 100% 同步并通过契约测试，外部网站同步按实记录待授权环境交付 |
-| `RB-31`..`RB-34c`（剩余 10 卡） | `pending` | — | — | `REL-RB-01`（144 / 154 卡）全部闭环，下一阶段进入里程碑 7（`RB-31`、`RB-31b`、`RB-32`、`RB-32b`、`RB-33`..`RB-33c`、`RB-34`..`RB-34c`） |
+| `RB-31`..`RB-32b`（Milestone 7 Wave 1，4 卡） | `done` / `complete` | 本提交（`main`） | `0.30.589` | `.github/workflows/base.yml` 显式锁定 `compat-offline-core` 为 `--no-default-features --features storage-sqlite`，升级 `compat-redb-queue`（全量离线核心 + 压测 + 双特性 `libra-migrate`/AST 守卫）并补齐纯 Redb+`keyring` 与双后端+`keyring` 两步 `auth_keyring_backend` 验证（并修复 `src/internal/auth.rs` `repair_global_modes()` 避免对 Redb `0400` `config.db` 墓碑误改 `0600`）；`.github/workflows/release.yml` 全平台协同构建并暂存双后端 `libra`（含 `keyring`）与 `libra-migrate`（不含 `keyring`）；独立 `mktemp -d` 暂存双 `--release` 成品实测 `packaged_release_dual_backend_libra_and_migrate_coherence_pre_cutover`（SHA-256 核验、SQLite→Redb→SQLite 双向互操作、切前默认 `init` 与 `config set --global` 保持 SQLite 零建 `config.redb`）、`compat_matrix_alignment`、`compat_release_{rclone_env_guard,homebrew_verify}`、`fmt`、`nightly clippy -D warnings` 全绿 |
+| `RB-33`..`RB-34c`（剩余 6 卡） | `pending` | — | — | 148 / 154 卡已完成，下一批次进入 `REL-RB-03`（`RB-33`/`RB-33b`/`RB-33c` 运行时默认切红库与双向回退）与 `REL-RB-02`（`RB-34`/`RB-34b`/`RB-34c` Cargo 默认 Feature 切红库） |
 
 ## Codex review log
 

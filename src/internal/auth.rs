@@ -196,8 +196,19 @@ fn repair_global_modes() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let global_store_path = ConfigScope::Global.get_config_path().map(|path| {
+            if let Some(parent) = path.parent() {
+                let redb_path = parent.join(crate::storage::config_store::CONFIG_REDB_FILE_NAME);
+                if redb_path.exists() {
+                    // On Redb global config scopes, `config.db` is an immutable `0400`
+                    // legacy-SQLite tombstone and must NEVER be chmodded writable (`0600`).
+                    return redb_path;
+                }
+            }
+            path
+        });
         for path in [
-            ConfigScope::Global.get_config_path(),
+            global_store_path,
             // Only the key Libra actually uses: a migrated legacy file is a
             // user-owned backup and is left untouched (ADR-GCX-04).
             crate::internal::vault::active_global_unseal_key_path(),
