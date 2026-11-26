@@ -7565,6 +7565,27 @@ mod value_pattern {
     use super::*;
 
     #[test]
+    fn test_cf_62_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two", "thr"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add value",
+            );
+        }
+        let out = run_libra_command(
+            &["config", "set", "--value", "thr", "multi.k", "four"],
+            repo.path(),
+        );
+        assert_cli_success(&out, "set --value thr");
+        let all = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        let all_text = String::from_utf8_lossy(&all.stdout).to_string();
+        let values: Vec<&str> = all_text.lines().collect();
+        assert_eq!(values, ["one", "two", "four"]);
+    }
+
+    #[test]
     fn test_cf_38_predicates() {
         let repo = tempdir().unwrap();
         assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");

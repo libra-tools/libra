@@ -875,3 +875,5 @@ HTTPS和Git传输没有这一特定上限。若服务器提供HTTPS端点，SSH�
 分别承担该成本。这与两秒直接子程序清理预算分开，不构成性能基准或任意后代清理保证。
 
 pattern unset with no match exits 5.
+
+value pattern replaces one matching value.

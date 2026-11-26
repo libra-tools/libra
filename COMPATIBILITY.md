@@ -2039,3 +2039,5 @@ The write contract is:
 - The typed write selectors are literal repository-relative paths and refuse a backslash, an absolute path, parent traversal and pathspec syntax. The existing `diff.get` selector keeps its previous behavior, including a backslash used as a separator.
 
 pattern unset with no match exits 5.
+
+value pattern replaces one matching value.

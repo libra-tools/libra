@@ -1037,3 +1037,5 @@ separate from the two-second direct-child cleanup budget; no benchmark or
 arbitrary-descendant cleanup guarantee is implied.
 
 pattern unset with no match exits 5.
+
+value pattern replaces one matching value.
