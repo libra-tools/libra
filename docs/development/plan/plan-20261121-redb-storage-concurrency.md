@@ -5992,7 +5992,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内于 `migrate.rs` 落实并实证反向迁移对 `capture-spool-consumer.lock`（`src/internal/ai/capture/drain.rs:87` `CONSUMER_LOCK`）的全程持有与并发 `drain_storage` 互斥，以及 `capture-spool/quarantine/` 非空时的无条件 fail-closed 零删损保护。
 
@@ -6006,17 +6006,17 @@
 | 既有 spool 消费者 `drain.rs:87-139` 仅通过 `capture-spool-consumer.lock`（`CONSUMER_LOCK`）互斥并将不可用事件自 `ready/` 移至 `quarantine/`；反向迁移必须持该消费者锁并对非空 `quarantine/` fail-closed | `src/internal/ai/capture/drain.rs:85-143`；`ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] **消费者锁占用返回 `LBR-IO-001`：** 既有 spool 消费者持有 `capture-spool-consumer.lock`（`drain.rs:87`）时，反向静默门 fail-closed 返回 `LBR-IO-001`。
-- [ ] **消费者锁拒收源红库零改动：** 上述 AC1 拒收前后，源红库（`git.redb`/`capture.redb`）逐字节快照完全相等。
-- [ ] **消费者锁拒收 `capture-spool/` 零改动：** 上述 AC1 拒收前后，`capture-spool/` 全文件逐字节快照完全相等。
-- [ ] **并发 `drain` 锁排除回归实测：** 反向迁移持有 `capture-spool-consumer.lock` 期间，并发调用 `drain_storage` 立即感知锁被占用并零移动退出（绝不把 `ready/` 文件移入 `quarantine/`）。
-- [ ] **`quarantine/` 非空 fail-closed 拒收：** `capture-spool/quarantine/` 存在任意隔离事件文件时，反向 Phase 1 立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] **`quarantine/` 文件 100% 完好留存：** 上述 fail-closed 返回后，`capture-spool/quarantine/` 内全部隔离文件逐字节完好留存（绝不静默清空）。
+- [x] **消费者锁占用返回 `LBR-IO-001`：** 既有 spool 消费者持有 `capture-spool-consumer.lock`（`drain.rs:87`）时，反向静默门 fail-closed 返回 `LBR-IO-001`。
+- [x] **消费者锁拒收源红库零改动：** 上述 AC1 拒收前后，源红库（`git.redb`/`capture.redb`）逐字节快照完全相等。
+- [x] **消费者锁拒收 `capture-spool/` 零改动：** 上述 AC1 拒收前后，`capture-spool/` 全文件逐字节快照完全相等。
+- [x] **并发 `drain` 锁排除回归实测：** 反向迁移持有 `capture-spool-consumer.lock` 期间，并发调用 `drain_storage` 立即感知锁被占用并零移动退出（绝不把 `ready/` 文件移入 `quarantine/`）。
+- [x] **`quarantine/` 非空 fail-closed 拒收：** `capture-spool/quarantine/` 存在任意隔离事件文件时，反向 Phase 1 立即 fail-closed 返回 `LBR-IO-001`。
+- [x] **`quarantine/` 文件 100% 完好留存：** 上述 fail-closed 返回后，`capture-spool/quarantine/` 内全部隔离文件逐字节完好留存（绝不静默清空）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine)'`（new，覆盖 AC1–AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine)'`（new，覆盖 AC1–AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6054,7 +6054,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现对称反向迁移 Phase 1 流式导出引擎（`src/storage/migrate.rs`）：在 `RB-11` 已持全部静默锁与 `(git_wtx, cap_wtx)`（严格 `Git → Capture` 序，全程不提交也不嵌套重开写事务，彻底杜绝死锁）内单趟流式导出 61+25 源表至 `libra.db.tmp`/`capture.db.tmp`，直读未对账 `META_CROSS_STORE_INTENT`（`gen > cap_gen`）按升序幂等直灌并只读并入 `capture-queue/{priority,normal}/` 待消费帧，分别向 `capture.db.tmp` 与 `libra.db.tmp` 写入唯一非零 `PRAGMA application_id = target_migration_tag` 并满足单批/堆内存预算。
 
@@ -6069,18 +6069,18 @@
 | 反向导出须在持双 `WriteTransaction` 时零死锁直灌半提交意图并分别向两枚 `.tmp` 库写入 `PRAGMA application_id = target_migration_tag` | `ADR-RB-06`、`ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] 在已持 `(git_wtx, cap_wtx)` 内零嵌套写事务单趟导出全部 61+25 源表与切后新提交至 `libra.db.tmp`/`capture.db.tmp`。
-- [ ] 真实半提交意图反向导出：从 `git_wtx` 直读全部未对账 `META_CROSS_STORE_INTENT`（`gen > cap_gen`）按严格升序幂等直灌入 `capture.db.tmp`（零死锁）。
-- [ ] 只读直灌 `capture-queue/{priority,normal}/` 待消费帧至 `capture.db.tmp`（源队列文件零改动）。
-- [ ] `fsync` 前向 `capture.db.tmp` 写入唯一非零 `PRAGMA application_id = target_migration_tag`。
-- [ ] `fsync` 前向 `libra.db.tmp` 写入同一唯一非零 `PRAGMA application_id = target_migration_tag`。
-- [ ] 反向流式导出维持单批 ≤ 500 行且额外堆内存峰值 ≤ `64 MiB`。
+- [x] 在已持 `(git_wtx, cap_wtx)` 内零嵌套写事务单趟导出全部 61+25 源表与切后新提交至 `libra.db.tmp`/`capture.db.tmp`。
+- [x] 真实半提交意图反向导出：从 `git_wtx` 直读全部未对账 `META_CROSS_STORE_INTENT`（`gen > cap_gen`）按严格升序幂等直灌入 `capture.db.tmp`（零死锁）。
+- [x] 只读直灌 `capture-queue/{priority,normal}/` 待消费帧至 `capture.db.tmp`（源队列文件零改动）。
+- [x] `fsync` 前向 `capture.db.tmp` 写入唯一非零 `PRAGMA application_id = target_migration_tag`。
+- [x] `fsync` 前向 `libra.db.tmp` 写入同一唯一非零 `PRAGMA application_id = target_migration_tag`。
+- [x] 反向流式导出维持单批 ≤ 500 行且额外堆内存峰值 ≤ `64 MiB`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_replays_real_half_committed_intent_deadlock_free) | test(=storage::migrate::tests::reverse_phase1_stamps_application_id_and_ingests_queue_readonly)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_replays_real_half_committed_intent_deadlock_free)'`（new，覆盖 AC1、AC2、AC6）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_stamps_application_id_and_ingests_queue_readonly)'`（new，覆盖 AC3、AC4、AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_replays_real_half_committed_intent_deadlock_free) | test(=storage::migrate::tests::reverse_phase1_stamps_application_id_and_ingests_queue_readonly)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_replays_real_half_committed_intent_deadlock_free)'`（new，覆盖 AC1、AC2、AC6）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_stamps_application_id_and_ingests_queue_readonly)'`（new，覆盖 AC3、AC4、AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6118,7 +6118,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内完成对称反向迁移 Phase 1 备份与中止不变性（`src/storage/migrate.rs`）：对产出的 `libra.db.tmp`/`capture.db.tmp` 执行 `PRAGMA integrity_check == "ok"` 与 `fsync`，将冻结中的 `git.redb`/`capture.redb` 与 `capture-queue/{priority,normal,quarantine}/`（保留原目录与 `append.lock` 原地不动）拷贝至 `.libra/redb-backup/<gen>/` 完成 SHA-256 校验与 `fsync`，并实测 Phase 1 中止后源红库与 `capture-queue/` 各自逐字节未变。
 
@@ -6132,16 +6132,16 @@
 | 反向 Phase 1 须在提交任何围栏前产出经 SHA-256 校验的不可变 `.libra/redb-backup/<gen>/` 并在中止时确保两类源均逐字节不变 | `ADR-RB-07` #2 Phase 1 |
 
 **Acceptance criteria:**
-- [ ] `libra.db.tmp` 与 `capture.db.tmp` 导出后均通过 `PRAGMA integrity_check == "ok"` 并完成 `fsync`。
-- [ ] 冻结中的 `git.redb`/`capture.redb` 与 `capture-queue/{priority,normal,quarantine}/`（保留原目录与 `append.lock` 原地不动）备份至 `.libra/redb-backup/<gen>/` 并完成 SHA-256 校验与 `fsync`。
-- [ ] Phase 1 校验中止并丢弃 `.tmp` 与未提交写事务后，源 `git.redb` 与 `capture.redb` 逐字节未变。
-- [ ] Phase 1 校验中止并丢弃 `.tmp` 与未提交写事务后，源 `capture-queue/` 逐字节未变。
+- [x] `libra.db.tmp` 与 `capture.db.tmp` 导出后均通过 `PRAGMA integrity_check == "ok"` 并完成 `fsync`。
+- [x] 冻结中的 `git.redb`/`capture.redb` 与 `capture-queue/{priority,normal,quarantine}/`（保留原目录与 `append.lock` 原地不动）备份至 `.libra/redb-backup/<gen>/` 并完成 SHA-256 校验与 `fsync`。
+- [x] Phase 1 校验中止并丢弃 `.tmp` 与未提交写事务后，源 `git.redb` 与 `capture.redb` 逐字节未变。
+- [x] Phase 1 校验中止并丢弃 `.tmp` 与未提交写事务后，源 `capture-queue/` 逐字节未变。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_tmp_integrity_and_verified_redb_queue_backup) | test(=storage::migrate::tests::reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_tmp_integrity_and_verified_redb_queue_backup)'`（new，覆盖 AC1、AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical)'`（new，覆盖 AC3、AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_tmp_integrity_and_verified_redb_queue_backup) | test(=storage::migrate::tests::reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_tmp_integrity_and_verified_redb_queue_backup)'`（new，覆盖 AC1、AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical)'`（new，覆盖 AC3、AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 

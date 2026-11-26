@@ -48,7 +48,7 @@ use redb::{
     backends::FileBackend,
 };
 use sea_orm::sqlx::{
-    AssertSqlSafe, Connection as _, Executor as _, Row as _, SqliteConnection,
+    AssertSqlSafe, ConnectOptions as _, Connection as _, Executor as _, Row as _, SqliteConnection,
     sqlite::SqliteConnectOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -68,19 +68,20 @@ use crate::{
             AgentSessionRecord, AgentSubagentContentClaimRecord,
             AgentSubagentContentRevisionRecord, AgentSubagentLinkRecord, AgentUsageStatsRecord,
             AgentWorkspaceScopeAuditRecord, BridgeLinkSourceType, BridgeOperationStatus,
-            BridgeSessionState, CAPTURE_SOURCE_TABLES, CAPTURE_SOURCE_TABLES_COUNT,
-            CaptureAgentKind, CaptureBatchItem, CaptureBatchPayload,
-            CaptureCatalogCopyReceiptRecord, CaptureCheckpointScope, CaptureCompleteness,
-            CaptureCoverageClaimState, CaptureExportJobState, CaptureHashKind,
-            CaptureImportIdentityState, CaptureQueueHighwater, CaptureQueueLane,
-            CaptureSchemaVersionRecord, CaptureScopeState, CaptureSessionState,
-            CaptureSourceChannel, CaptureSubagentClaimState, CaptureSubagentLinkState,
-            CaptureSubagentSourceChannel, RedbCaptureStore, invert_capture_timestamp,
-            redb_capture_store as redb_cap, validate_capture_batch_item,
+            BridgeSessionState, CAPTURE_APPEND_ONLY_ERROR_PREFIX, CAPTURE_SOURCE_TABLES,
+            CAPTURE_SOURCE_TABLES_COUNT, CAPTURE_TOMBSTONE_ERROR_PREFIX, CaptureAgentKind,
+            CaptureBatchItem, CaptureBatchPayload, CaptureCatalogCopyReceiptRecord,
+            CaptureCheckpointScope, CaptureCompleteness, CaptureCoverageClaimState,
+            CaptureExportJobState, CaptureHashKind, CaptureImportIdentityState,
+            CaptureQueueHighwater, CaptureQueueLane, CaptureSchemaVersionRecord, CaptureScopeState,
+            CaptureSessionState, CaptureSourceChannel, CaptureSubagentClaimState,
+            CaptureSubagentLinkState, CaptureSubagentSourceChannel, RedbCaptureStore,
+            invert_capture_timestamp, redb_capture_store as redb_cap, validate_capture_batch_item,
             validate_capture_dedup_key,
         },
         codec::{decode_versioned, encode_versioned},
         config_store::{LegacyConfigEntry, SQLITE_MIGRATED_FENCE_SQL, SQLITE_MIGRATED_FENCE_TABLE},
+        cross_store::{CROSS_STORE_INTENT_CODEC_VERSION, CrossStoreIntentRecord},
         error::{StorageBackendError, StorageResult},
         git_state_store::{
             AiDecisionProposalRecord, AiFinalDecisionRecord, AiIndexIntentContextFrameRecord,
@@ -104,8 +105,8 @@ use crate::{
             repository_active_source_tables,
         },
         git_store::{
-            BridgePublicationPhase, ObjectHashKind, ObliterationState, RefKey, RefTarget,
-            redb as redb_git,
+            BridgePublicationPhase, ObjectHashKind, ObliterationState, RedbGitStore, RefKey,
+            RefTarget, redb as redb_git,
         },
         manifest::{
             LEGACY_SQLITE_DB_FILE, ManifestOrigin, PRIVATE_SUBDIR, Phase2DbState, Phase2Progress,
@@ -121,9 +122,9 @@ use crate::{
             CAPTURE_SPOOL_TOMBSTONE_SENTINEL, CaptureSpoolTombstonePaths, FrameDecodeError,
             FrameStreamDecoder, FrameStreamItem, LTM2_MAX_LEN, LaneTailMeta,
             QUEUE_APPEND_LOCK_FILE, QUEUE_LANE_NORMAL_DIR, QUEUE_LANE_PRIORITY_DIR,
-            QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE, QUEUE_WRITER_LOCK_FILE, crc32c_append,
-            decode_postcard_payload, parse_segment_log_file_name, read_converged_lane_tail_meta,
-            segment_log_file_name,
+            QUEUE_QUARANTINE_DIR, QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE,
+            QUEUE_WRITER_LOCK_FILE, crc32c_append, decode_postcard_payload,
+            parse_segment_log_file_name, read_converged_lane_tail_meta, segment_log_file_name,
         },
         redb::{
             config_store as redb_cfg, map_redb_commit_err, map_redb_database_err,
@@ -304,6 +305,8 @@ pub enum ForwardPhase1QuiesceStage {
     CaptureQueueAppendLock,
     /// Active unexpired staging file check under `<common_storage>/private/capture-spool/tmp/`.
     CaptureSpoolInFlightTmp,
+    /// Non-empty quarantine directory check under `<common_storage>/private/capture-spool/quarantine/`.
+    CaptureSpoolQuarantine,
     /// Single-connection SQLite Phase 1 quiescence on `libra.db` and optional `capture.db`.
     SqliteSources,
 }
@@ -321,6 +324,7 @@ impl ForwardPhase1QuiesceStage {
             Self::CaptureSpoolCapacityLock => "capture-spool/capacity.lock",
             Self::CaptureQueueAppendLock => "capture-queue/append.lock",
             Self::CaptureSpoolInFlightTmp => "capture-spool/tmp in-flight publisher check",
+            Self::CaptureSpoolQuarantine => "capture-spool/quarantine non-empty check",
             Self::SqliteSources => "sqlite sources quiescence",
         }
     }
@@ -2887,6 +2891,355 @@ fn verify_no_inflight_spool_tmp_files_non_unix(
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+/// Fail closed if `.libra/private/capture-spool/quarantine/` contains any
+/// quarantined event entry (`ADR-RB-07` #2, `RB-11q`).
+///
+/// Mirrors [`verify_no_inflight_spool_tmp_files`]: on Unix, pins `common_storage`
+/// -> `private` -> `capture-spool` -> `quarantine` with `openat(O_NOFOLLOW)` and
+/// `fstatat(AT_SYMLINK_NOFOLLOW)`, accepts an absent `quarantine` path, an empty
+/// `quarantine/` directory, or a verified `0400` Redb tombstone sentinel regular
+/// file (`S_IFREG`, `nlink == 1`, `uid == geteuid()`, exact `(dev, ino)` match,
+/// bounded read), and unconditionally fails closed (`LBR-IO-001`) without
+/// deleting or modifying any file when `quarantine/` is non-empty or unsafe.
+fn verify_no_spool_quarantine_files(common_storage: &Path) -> StorageResult<()> {
+    let stage = ForwardPhase1QuiesceStage::CaptureSpoolQuarantine;
+    #[cfg(unix)]
+    {
+        verify_no_spool_quarantine_files_unix(common_storage, stage)
+            .map_err(normalize_reverse_quiesce_err)
+    }
+    #[cfg(not(unix))]
+    {
+        verify_no_spool_quarantine_files_non_unix(common_storage, stage)
+            .map_err(normalize_reverse_quiesce_err)
+    }
+}
+
+#[cfg(unix)]
+fn verify_no_spool_quarantine_files_unix(
+    common_storage: &Path,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<()> {
+    use std::{
+        ffi::CString,
+        io::Read as _,
+        os::unix::{
+            ffi::OsStrExt as _,
+            io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        },
+    };
+
+    let c_storage = CString::new(common_storage.as_os_str().as_bytes()).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: invalid storage path",
+                stage.as_str()
+            ),
+        }
+    })?;
+    // SAFETY: `c_storage` is NUL-terminated.
+    let raw_root = unsafe {
+        libc::open(
+            c_storage.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw_root < 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: storage root must be a non-symlink directory",
+                stage.as_str()
+            ),
+        });
+    }
+    // SAFETY: `raw_root >= 0` is exclusively owned here.
+    let root_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
+
+    let Some((private_fd, _)) = open_verified_dir_at_unix(&root_fd, c"private", true, stage)?
+    else {
+        return Ok(());
+    };
+    let Some((spool_fd, _)) =
+        open_verified_dir_at_unix(&private_fd, c"capture-spool", true, stage)?
+    else {
+        return Ok(());
+    };
+
+    let mut quar_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `spool_fd` is valid and `c"quarantine"` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            spool_fd.as_raw_fd(),
+            c"quarantine".as_ptr(),
+            quar_stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(StorageBackendError::io(
+            "inspect capture-spool/quarantine metadata",
+            err,
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let quar_stat = unsafe { quar_stat.assume_init() };
+    let quar_kind = quar_stat.st_mode & libc::S_IFMT;
+    if quar_kind == libc::S_IFLNK {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine must not be a symlink",
+                stage.as_str()
+            ),
+        });
+    }
+    if quar_kind == libc::S_IFREG {
+        // SAFETY: `spool_fd` is valid and `c"quarantine"` is NUL-terminated.
+        let raw_tomb = unsafe {
+            libc::openat(
+                spool_fd.as_raw_fd(),
+                c"quarantine".as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw_tomb < 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: unable to open capture-spool/quarantine tombstone safely",
+                    stage.as_str()
+                ),
+            });
+        }
+        // SAFETY: `raw_tomb >= 0` is exclusively owned here.
+        let tomb_file = File::from(unsafe { OwnedFd::from_raw_fd(raw_tomb) });
+        let mut fd_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `tomb_file` is valid.
+        if unsafe { libc::fstat(tomb_file.as_raw_fd(), fd_st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat capture-spool/quarantine tombstone descriptor",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let fd_st = unsafe { fd_st.assume_init() };
+        let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if (fd_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || fd_st.st_nlink != 1
+            || fd_st.st_uid != euid
+            || fd_st.st_dev != quar_stat.st_dev
+            || fd_st.st_ino != quar_stat.st_ino
+            || fd_st.st_size != expected_len as i64
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: capture-spool/quarantine is an unsafe or non-tombstone file",
+                    stage.as_str()
+                ),
+            });
+        }
+        let mut buf = Vec::with_capacity(expected_len + 1);
+        tomb_file
+            .take((expected_len + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: failed to read capture-spool/quarantine tombstone",
+                    stage.as_str()
+                ),
+            })?;
+        if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: capture-spool/quarantine regular file does not match Redb tombstone sentinel",
+                    stage.as_str()
+                ),
+            });
+        }
+        return Ok(());
+    }
+    if quar_kind != libc::S_IFDIR {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is neither a directory nor a valid tombstone",
+                stage.as_str()
+            ),
+        });
+    }
+
+    let Some((quar_fd, _)) = open_verified_dir_at_unix(&spool_fd, c"quarantine", true, stage)?
+    else {
+        return Ok(());
+    };
+    // SAFETY: `quar_fd` is valid.
+    let dup_raw = unsafe { libc::fcntl(quar_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_raw < 0 {
+        return Err(StorageBackendError::io(
+            "duplicate capture-spool/quarantine directory descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `dup_raw` is an open directory fd; on success `fdopendir` owns it.
+    let dir_ptr = unsafe { libc::fdopendir(dup_raw) };
+    if dir_ptr.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so close `dup_raw`.
+        unsafe {
+            libc::close(dup_raw);
+        }
+        return Err(StorageBackendError::io(
+            "open capture-spool/quarantine directory stream",
+            err,
+        ));
+    }
+
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was returned by `fdopendir`.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+    }
+    let _dir_guard = DirGuard(dir_ptr);
+
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        // SAFETY: `dir_ptr` is open and valid for the lifetime of `_dir_guard`.
+        let entry = unsafe { libc::readdir(dir_ptr) };
+        if entry.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error().unwrap_or(0) != 0 {
+                return Err(StorageBackendError::io(
+                    "iterate capture-spool/quarantine directory",
+                    err,
+                ));
+            }
+            break;
+        }
+        // SAFETY: `entry` is non-null and `d_name` is NUL-terminated.
+        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name_bytes = name_cstr.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is non-empty; inspect and resolve quarantined events before migrating",
+                stage.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_no_spool_quarantine_files_non_unix(
+    common_storage: &Path,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<()> {
+    use std::io::Read as _;
+
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    if !validate_existing_dir_no_mutate(&private_dir, true, stage)? {
+        return Ok(());
+    }
+    let spool_dir = capture_spool_dir_path(common_storage);
+    if !validate_existing_dir_no_mutate(&spool_dir, true, stage)? {
+        return Ok(());
+    }
+    let quar_path = spool_dir.join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+    let quar_meta = match fs::symlink_metadata(&quar_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "inspect capture-spool/quarantine metadata",
+                err,
+            ));
+        }
+    };
+    if quar_meta.file_type().is_symlink() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine must not be a symlink",
+                stage.as_str()
+            ),
+        });
+    }
+    if quar_meta.file_type().is_file() {
+        let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+        if quar_meta.len() != expected_len as u64 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: capture-spool/quarantine is an unexpected non-directory file",
+                    stage.as_str()
+                ),
+            });
+        }
+        let file = File::open(&quar_path).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: unable to open capture-spool/quarantine tombstone",
+                stage.as_str()
+            ),
+        })?;
+        let mut buf = Vec::with_capacity(expected_len + 1);
+        file.take((expected_len + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: failed to read capture-spool/quarantine tombstone",
+                    stage.as_str()
+                ),
+            })?;
+        if buf.as_slice() == CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+            return Ok(());
+        }
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is an unexpected non-directory file",
+                stage.as_str()
+            ),
+        });
+    }
+    if !quar_meta.file_type().is_dir() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is neither a directory nor a valid tombstone",
+                stage.as_str()
+            ),
+        });
+    }
+    let mut entries = fs::read_dir(&quar_path)
+        .map_err(|err| StorageBackendError::io("read capture-spool/quarantine directory", err))?;
+    if let Some(entry_res) = entries.next() {
+        let _ = entry_res.map_err(|err| {
+            StorageBackendError::io("iterate capture-spool/quarantine directory", err)
+        })?;
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is non-empty; inspect and resolve quarantined events before migrating",
+                stage.as_str()
+            ),
+        });
     }
     Ok(())
 }
@@ -42100,9 +42453,11 @@ fn quiesce_reverse_repository_phase1_inner(
     .map_err(normalize_reverse_quiesce_err)?;
 
     // Reject active in-flight `capture-spool/tmp/` publishers (`spool.rs:119-145`)
-    // BEFORE creating any absent lock file so AC5–AC8 leave source redb,
-    // `capture-spool/`, and `capture-queue/` 100% byte-for-byte untouched (`RB-11z`).
+    // and any non-empty `capture-spool/quarantine/` BEFORE creating any absent
+    // lock file so rejections leave source redb, `capture-spool/`, and
+    // `capture-queue/` 100% byte-for-byte untouched (`RB-11z`, `RB-11q`).
     verify_no_inflight_spool_tmp_files(common_storage).map_err(normalize_reverse_quiesce_err)?;
+    verify_no_spool_quarantine_files(common_storage)?;
 
     // If any of the 6 lock files is not yet materialized on disk, run a
     // non-creating redb writer contention probe BEFORE materializing any
@@ -42227,11 +42582,11 @@ fn quiesce_reverse_repository_phase1_inner(
         _migration_lock: migration_lock,
     };
 
-    // Re-check `capture-spool/tmp/` strictly AFTER acquiring all 6 advisory
-    // locks (including `capture-spool/capacity.lock`) to catch any publisher
-    // that passed `spool.rs:112` before our lock acquisition and staged an
-    // in-flight file between `spool.rs:119` and `spool.rs:145` (`RB-11z`).
+    // Re-check `capture-spool/tmp/` and `capture-spool/quarantine/` strictly
+    // AFTER acquiring all 6 advisory locks (including `capture-spool-consumer.lock`
+    // and `capture-spool/capacity.lock`) to close any TOCTOU race (`RB-11z`, `RB-11q`).
     verify_no_inflight_spool_tmp_files(common_storage).map_err(normalize_reverse_quiesce_err)?;
+    verify_no_spool_quarantine_files(common_storage)?;
 
     // Re-read and verify `storage-format.json` strictly AFTER holding
     // `migration.lock .. capacity.lock` to close any pre-lock manifest TOCTOU.
@@ -42309,6 +42664,5221 @@ fn quiesce_reverse_repository_phase1_inner(
         };
 
         Ok(ReversePhase1QuiesceGuard { redb, locks })
+    }
+}
+
+// ============================================================================
+// Symmetric Reverse Migration Phase 1: Deadlock-Free Streaming Export, Direct
+// Intent Replay, Read-Only Queue Ingest, `PRAGMA application_id` Tagging,
+// Verified `.tmp` Integrity & SHA-256 `redb-backup` (`ADR-RB-07` #2, `RB-11i`, `RB-11p`)
+// ============================================================================
+
+/// Canonical subdirectory under `<common_storage>` storing generation-scoped
+/// reverse migration backups (`.libra/redb-backup/<gen>/`).
+pub const REDB_BACKUP_SUBDIR: &str = "redb-backup";
+
+/// Return the canonical relative reverse backup directory under `<common_storage>`,
+/// e.g. `"redb-backup/00000001"`.
+#[must_use]
+pub fn canonical_redb_backup_rel_dir(generation: u64) -> String {
+    format!("{REDB_BACKUP_SUBDIR}/{}", format_generation_id(generation))
+}
+
+/// Return the canonical absolute reverse backup directory
+/// `<common_storage>/redb-backup/<gen>`.
+#[must_use]
+pub fn redb_backup_dir_path(common_storage: &Path, generation: u64) -> PathBuf {
+    common_storage.join(canonical_redb_backup_rel_dir(generation))
+}
+
+/// Return the canonical backed-up `git.gen-<id>.redb` path inside
+/// `<common_storage>/redb-backup/<gen>/`.
+#[must_use]
+pub fn redb_backup_git_redb_path(common_storage: &Path, generation: u64) -> PathBuf {
+    redb_backup_dir_path(common_storage, generation)
+        .join(format!("git.gen-{}.redb", format_generation_id(generation)))
+}
+
+/// Return the canonical backed-up `capture.gen-<id>.redb` path inside
+/// `<common_storage>/redb-backup/<gen>/`.
+#[must_use]
+pub fn redb_backup_capture_redb_path(common_storage: &Path, generation: u64) -> PathBuf {
+    redb_backup_dir_path(common_storage, generation).join(format!(
+        "capture.gen-{}.redb",
+        format_generation_id(generation)
+    ))
+}
+
+/// Return the canonical backed-up `capture-queue/` directory inside
+/// `<common_storage>/redb-backup/<gen>/`.
+#[must_use]
+pub fn redb_backup_capture_queue_dir_path(common_storage: &Path, generation: u64) -> PathBuf {
+    redb_backup_dir_path(common_storage, generation).join(CAPTURE_QUEUE_SUBDIR)
+}
+
+/// Return the canonical staged SQLite repository temporary path:
+/// `<common_storage>/libra.db.tmp`.
+#[must_use]
+pub fn git_sqlite_tmp_path(common_storage: &Path) -> PathBuf {
+    common_storage.join(format!("{LEGACY_SQLITE_DB_FILE}.tmp"))
+}
+
+/// Return the canonical staged SQLite capture temporary path:
+/// `<common_storage>/private/capture.db.tmp`.
+#[must_use]
+pub fn capture_sqlite_tmp_path(common_storage: &Path) -> PathBuf {
+    common_storage.join(PRIVATE_SUBDIR).join("capture.db.tmp")
+}
+
+/// Summary report of unreconciled `META_CROSS_STORE_INTENT` entries replayed
+/// directly from the held `git_wtx` into `capture.db.tmp` during reverse
+/// migration Phase 1 (`RB-11i` AC2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrossStoreIntentReplayReport {
+    /// `git.redb` `META_GENERATION` observed inside the held `git_wtx`.
+    pub git_generation: u64,
+    /// `capture.redb` `META_GENERATION` observed inside the held `capture_wtx`.
+    pub capture_generation: u64,
+    /// Strictly ascending generations replayed from `META_CROSS_STORE_INTENT`.
+    pub replayed_generations: Vec<u64>,
+    /// Capture batch items applied into `capture.db.tmp`.
+    pub applied_items: u64,
+    /// Capture batch items skipped via idempotent deduplication.
+    pub deduplicated_items: u64,
+    /// SQLite transaction batches committed during intent replay.
+    pub batches_committed: u64,
+}
+
+/// Complete report returned after reverse migration Phase 1 streaming export,
+/// direct intent replay, read-only queue ingest, and `PRAGMA application_id`
+/// tagging (`RB-11i`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReversePhase1ExportReport {
+    /// Active source redb generation being migrated back to SQLite.
+    pub generation: u64,
+    /// Unique non-zero `PRAGMA application_id` stamped onto both `.tmp` SQLite targets.
+    pub target_migration_tag: u32,
+    /// Staged repository SQLite path (`<common_storage>/libra.db.tmp`).
+    pub git_tmp_path: PathBuf,
+    /// Staged capture SQLite path (`<common_storage>/private/capture.db.tmp`).
+    pub capture_tmp_path: PathBuf,
+    /// Exact row count exported for every one of the 61 Git source tables.
+    pub git_table_counts: BTreeMap<&'static str, u64>,
+    /// Exact row count exported for every one of the 25 Capture source tables
+    /// (prior to unreconciled intent replay and pending queue ingest).
+    pub capture_table_counts: BTreeMap<&'static str, u64>,
+    /// Maximum single batch size observed across all streaming commits (`<= 500`).
+    pub max_batch_rows: usize,
+    /// Total streaming batches committed across Git, Capture, intents, and queue.
+    pub total_streaming_batches: u64,
+    /// Unreconciled `META_CROSS_STORE_INTENT` direct replay summary.
+    pub intent_replay: CrossStoreIntentReplayReport,
+    /// Strictly read-only `capture-queue/{priority,normal}/` direct ingest summary.
+    pub queue_ingest: QueueDirectIngestReport,
+}
+
+/// Verified byte-for-byte backup receipt for one frozen source `.redb` file (`RB-11p` AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedbFileBackupReceipt {
+    /// Final durably published path inside `.libra/redb-backup/<gen>/`.
+    pub backup_path: PathBuf,
+    /// Lowercase 64-hex SHA-256 verified against an independent read-back of the backup file.
+    pub sha256: String,
+    /// Verified byte length.
+    pub byte_len: u64,
+}
+
+/// Verified byte-for-byte backup receipt for one `capture-queue` file (`RB-11p` AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueBackupFileReceipt {
+    /// Lane/quarantine subdirectory name (`"priority"`, `"normal"`, or `"quarantine"`).
+    pub subdir: &'static str,
+    /// Entry filename inside the subdirectory.
+    pub file_name: String,
+    /// Verified byte length.
+    pub byte_len: u64,
+    /// Lowercase 64-hex SHA-256 verified by independent read-back.
+    pub sha256: String,
+}
+
+/// Summary report returned after copying `capture-queue/{priority,normal,quarantine}/`
+/// into `.libra/redb-backup/<gen>/capture-queue/` while leaving source dirs and
+/// `append.lock` untouched in place (`RB-11p` AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueBackupReport {
+    /// Target backup directory `<common_storage>/redb-backup/<gen>/capture-queue`.
+    pub backup_queue_dir: PathBuf,
+    /// Verified receipts for every copied file across `{priority, normal, quarantine}`.
+    pub files: Vec<QueueBackupFileReceipt>,
+    /// Deterministic read-only manifest SHA-256 of the source `capture-queue/`.
+    pub queue_manifest_sha256: String,
+}
+
+/// Complete reverse Phase 1 backup and digest bundle (`RB-11p` AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReversePhase1BackupReport {
+    /// Source redb generation (`>= 1`).
+    pub generation: u64,
+    /// Relative backup directory under `<common_storage>` (e.g. `"redb-backup/00000001"`).
+    pub backup_rel_dir: String,
+    /// Absolute backup directory path.
+    pub backup_dir: PathBuf,
+    /// Verified backup receipt for frozen `git.gen-<id>.redb`.
+    pub git_redb_backup: RedbFileBackupReceipt,
+    /// Verified backup receipt for frozen `capture.gen-<id>.redb`.
+    pub capture_redb_backup: RedbFileBackupReceipt,
+    /// Verified backup report for `capture-queue/{priority,normal,quarantine}/`.
+    pub queue_backup: QueueBackupReport,
+    /// Deterministic read-only manifest SHA-256 of `capture-spool/`.
+    pub spool_manifest_sha256: String,
+    /// Populated `SourceDigests` ready for Phase 2 `storage-format.json`.
+    pub source_digests: SourceDigests,
+    /// Ordered durability audit receipt (`FileFsync`, `AtomicPublish`, `DirFsync`).
+    pub durability: Phase1DurabilityReceipt,
+}
+
+/// Verification report confirming both staged SQLite `.tmp` targets passed
+/// `PRAGMA integrity_check == "ok"`, carry the expected `PRAGMA application_id`,
+/// and completed `fsync` (`RB-11p` AC1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReversePhase1VerificationReport {
+    /// `true` once `libra.db.tmp` returned a single `"ok"` row from `PRAGMA integrity_check`.
+    pub git_tmp_integrity_ok: bool,
+    /// `true` once `capture.db.tmp` returned a single `"ok"` row from `PRAGMA integrity_check`.
+    pub capture_tmp_integrity_ok: bool,
+    /// Verified non-zero `PRAGMA application_id` read back from `libra.db.tmp`.
+    pub git_tmp_application_id: u32,
+    /// Verified non-zero `PRAGMA application_id` read back from `capture.db.tmp`.
+    pub capture_tmp_application_id: u32,
+    /// Durability receipt covering `.tmp` `FileFsync` and parent `DirFsync`.
+    pub durability: Phase1DurabilityReceipt,
+}
+
+/// Deterministic unique non-zero 31-bit `PRAGMA application_id` generator for
+/// reverse migration targets (`RB-11i` AC4 & AC5).
+///
+/// Restricting to `1..=i32::MAX as u32` keeps SQLite's signed 32-bit header
+/// `PRAGMA application_id` value identical across `i64` and `u32` queries with
+/// zero sign-extension ambiguity.
+fn allocate_reverse_target_migration_tag(generation: u64) -> u32 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(b"LIBRA_REVERSE_TARGET_MIGRATION_TAG_V1\0");
+    hasher.update(generation.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(seq.to_le_bytes());
+    hasher.update(now_ns.to_le_bytes());
+    let digest = hasher.finalize();
+    let raw = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) & 0x7FFF_FFFF;
+    if raw == 0 { 1 } else { raw }
+}
+
+/// RAII cleanup guard for staged reverse Phase 1 artifacts (`libra.db.tmp`,
+/// `capture.db.tmp`, `.libra/redb-backup/<gen>/`, and newly-created
+/// `.libra/redb-backup/`). Armed by default so any error, panic, or explicit
+/// Phase 1 abort removes all staged artifacts while leaving source `git.redb`,
+/// `capture.redb`, and `capture-queue/` 100% byte-for-byte untouched (`RB-11p` AC3 & AC4).
+#[derive(Debug)]
+struct ReversePhase1ArtifactGuard {
+    common_storage: PathBuf,
+    git_tmp_path: Option<PathBuf>,
+    capture_tmp_path: Option<PathBuf>,
+    backup_gen_dir: Option<PathBuf>,
+    created_backup_root: bool,
+    armed: bool,
+}
+
+impl ReversePhase1ArtifactGuard {
+    fn new(common_storage: &Path) -> Self {
+        Self {
+            common_storage: common_storage.to_path_buf(),
+            git_tmp_path: None,
+            capture_tmp_path: None,
+            backup_gen_dir: None,
+            created_backup_root: false,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn cleanup_now(&mut self) -> StorageResult<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        let mut errs: Vec<String> = Vec::new();
+        for path in [self.capture_tmp_path.take(), self.git_tmp_path.take()]
+            .into_iter()
+            .flatten()
+        {
+            remove_sqlite_tmp_and_sidecars(&path, &mut errs);
+            if let Some(parent) = path.parent() {
+                let _ = fsync_dir_best_effort(parent);
+            }
+        }
+        if let Some(gen_dir) = self.backup_gen_dir.take() {
+            if gen_dir.exists()
+                && let Err(err) = fs::remove_dir_all(&gen_dir)
+            {
+                errs.push(format!("remove staged redb-backup generation dir: {err}"));
+            }
+            let backup_root = self.common_storage.join(REDB_BACKUP_SUBDIR);
+            if self.created_backup_root {
+                let _ = fs::remove_dir(&backup_root);
+            }
+            let _ = fsync_dir_best_effort(&self.common_storage);
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration Phase 1 abort cleanup failed: {}",
+                    errs.join("; ")
+                ),
+            })
+        }
+    }
+}
+
+impl Drop for ReversePhase1ArtifactGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup_now();
+    }
+}
+
+fn remove_sqlite_tmp_and_sidecars(path: &Path, errs: &mut Vec<String>) {
+    let base = path.as_os_str();
+    let mut candidates = vec![path.to_path_buf()];
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut os = base.to_os_string();
+        os.push(suffix);
+        candidates.push(PathBuf::from(os));
+    }
+    for cand in candidates {
+        match fs::symlink_metadata(&cand) {
+            Ok(meta) if meta.file_type().is_file() => {
+                if let Err(err) = fs::remove_file(&cand)
+                    && err.kind() != io::ErrorKind::NotFound
+                {
+                    errs.push(format!("unlink staged sqlite tmp artifact: {err}"));
+                }
+            }
+            Ok(_) => {
+                errs.push("refused to unlink non-regular staged sqlite tmp artifact".to_string());
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => errs.push(format!("stat staged sqlite tmp artifact: {err}")),
+        }
+    }
+}
+
+fn fsync_dir_best_effort(dir: &Path) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        let fd = open_readonly_root_dir_unix(dir)?;
+        fsync_dir_fd_unix(&fd, "sync directory")
+    }
+    #[cfg(windows)]
+    {
+        fsync_dir_durable_windows(dir, "sync directory")
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Prepared reverse migration Phase 1 state holding all 8 quiescence locks
+/// (`migration.lock .. capture.redb WriteTransaction`), verified staged SQLite
+/// `.tmp` targets, verified `.libra/redb-backup/<gen>/`, and an armed RAII
+/// cleanup guard (`RB-11q`, `RB-11i`, `RB-11p`).
+///
+/// Field declaration order guarantees `artifacts` cleans staged files BEFORE
+/// `guard` aborts uncommitted `(capture_wtx, git_wtx)` and releases all 6
+/// advisory locks.
+pub struct ReversePhase1Prepared {
+    artifacts: ReversePhase1ArtifactGuard,
+    export: ReversePhase1ExportReport,
+    verification: ReversePhase1VerificationReport,
+    backup: ReversePhase1BackupReport,
+    guard: ReversePhase1QuiesceGuard,
+}
+
+impl std::fmt::Debug for ReversePhase1Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReversePhase1Prepared")
+            .field("export", &self.export)
+            .field("verification", &self.verification)
+            .field("backup", &self.backup)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReversePhase1Prepared {
+    /// Borrow the Phase 1 streaming export, intent replay, and queue ingest report.
+    #[must_use]
+    pub fn export(&self) -> &ReversePhase1ExportReport {
+        &self.export
+    }
+
+    /// Borrow the Phase 1 `.tmp` `PRAGMA integrity_check` & `fsync` verification report.
+    #[must_use]
+    pub fn verification(&self) -> &ReversePhase1VerificationReport {
+        &self.verification
+    }
+
+    /// Borrow the Phase 1 SHA-256 verified `redb-backup/<gen>/` report.
+    #[must_use]
+    pub fn backup(&self) -> &ReversePhase1BackupReport {
+        &self.backup
+    }
+
+    /// Borrow the still-held quiescence guard (`migration.lock .. capture_wtx`).
+    #[must_use]
+    pub fn guard(&self) -> &ReversePhase1QuiesceGuard {
+        &self.guard
+    }
+
+    /// Explicitly abort Phase 1: remove staged `.tmp` targets and
+    /// `.libra/redb-backup/<gen>/`, abort uncommitted `(capture_wtx, git_wtx)`
+    /// without writing a single byte to source `.redb` or `capture-queue/`, and
+    /// release all 6 advisory locks (`RB-11p` AC3 & AC4).
+    pub fn abort_and_cleanup(mut self) -> StorageResult<()> {
+        let cleanup_res = self.artifacts.cleanup_now();
+        let release_res = self.guard.abort_and_release();
+        cleanup_res?;
+        release_res
+    }
+}
+
+fn list_existing_redb_tables(wtx: &redb::WriteTransaction) -> StorageResult<BTreeSet<String>> {
+    let mut set = BTreeSet::new();
+    let handles = wtx
+        .list_tables()
+        .map_err(|err| map_redb_storage_err(err, "list redb tables for reverse export"))?;
+    for h in handles {
+        set.insert(h.name().to_string());
+    }
+    Ok(set)
+}
+
+async fn open_reverse_sqlite_tmp_conn_async(
+    path: &Path,
+    role: DatabaseRole,
+    read_only: bool,
+) -> StorageResult<SqliteConnection> {
+    let mut opts = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(read_only)
+        .foreign_keys(false)
+        .busy_timeout(Duration::from_secs(5));
+    if !read_only {
+        opts = opts
+            .journal_mode(sea_orm::sqlx::sqlite::SqliteJournalMode::Delete)
+            .synchronous(sea_orm::sqlx::sqlite::SqliteSynchronous::Full)
+            .pragma("cache_size", "-4096");
+    }
+    opts.connect()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("reverse migration Phase 1 failed opening {role} sqlite tmp: {err}"),
+        })
+}
+
+/// Create a fresh staged SQLite `.tmp` file via `O_CREAT | O_EXCL | O_NOFOLLOW`
+/// with strict ownership and permission checks (`0600` for Capture inside `0700`
+/// `.libra/private`, non-group/world-writable `0644` for Repository).
+fn create_empty_sqlite_tmp_file_nofollow(
+    common_storage: &Path,
+    subdir: Option<&'static str>,
+    file_name: &str,
+    file_mode: u32,
+    require_private_dir: bool,
+) -> StorageResult<PathBuf> {
+    let target_path = match subdir {
+        Some(sub) => common_storage.join(sub).join(file_name),
+        None => common_storage.join(file_name),
+    };
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        };
+        let root_fd = open_readonly_root_dir_unix(common_storage)?;
+        let parent_fd = if let Some(sub) = subdir {
+            let c_sub = CString::new(sub).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "invalid reverse sqlite tmp parent subdir".to_string(),
+            })?;
+            let forbidden = if require_private_dir { 0o077 } else { 0o022 };
+            let Some((fd, _)) = open_readonly_subdir_unix(
+                &root_fd,
+                &c_sub,
+                forbidden,
+                "reverse sqlite tmp parent",
+            )?
+            else {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Phase 1 missing staging parent directory"
+                        .to_string(),
+                });
+            };
+            fd
+        } else {
+            root_fd
+        };
+        let c_file = CString::new(file_name).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "invalid reverse sqlite tmp filename".to_string(),
+        })?;
+        // SAFETY: `parent_fd` is valid and `c_file` is NUL-terminated.
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_file.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                file_mode as libc::mode_t as libc::c_uint,
+            )
+        };
+        if raw < 0 {
+            return Err(StorageBackendError::io(
+                "create staged sqlite tmp file",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `raw >= 0` is exclusively owned here.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Explicitly apply mode to bypass umask for `0600` private capture tmp.
+        // SAFETY: `fd` is valid and exclusively created by this process.
+        if unsafe { libc::fchmod(fd.as_raw_fd(), file_mode as libc::mode_t) } != 0 {
+            let err = io::Error::last_os_error();
+            drop(fd);
+            let _ = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), c_file.as_ptr(), 0) };
+            return Err(StorageBackendError::io(
+                "set staged sqlite tmp permissions",
+                err,
+            ));
+        }
+        drop(fd);
+        Ok(target_path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file_mode, require_private_dir);
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target_path)
+            .map_err(|err| StorageBackendError::io("create staged sqlite tmp file", err))?;
+        Ok(target_path)
+    }
+}
+
+/// Bootstrap `libra.db.tmp` with the canonical Repository schema (including
+/// lazy bridge publication tables) and return a single `SqliteConnection`.
+async fn bootstrap_reverse_git_sqlite_tmp(
+    common_storage: &Path,
+) -> StorageResult<(PathBuf, SqliteConnection)> {
+    let git_tmp = git_sqlite_tmp_path(common_storage);
+    // Validate storage root before letting `create_database_for_role` create `libra.db.tmp`
+    // via `OpenOptions::create_new(true)`.
+    if !validate_existing_dir_no_mutate(
+        common_storage,
+        false,
+        ForwardPhase1QuiesceStage::StorageRoot,
+    )
+    .map_err(normalize_reverse_quiesce_err)?
+    {
+        return Err(StorageBackendError::NotFound {
+            resource: "repository storage directory".to_string(),
+        });
+    }
+    let git_tmp_str = git_tmp
+        .to_str()
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "reverse migration Phase 1 staged libra.db.tmp path is not valid UTF-8"
+                .to_string(),
+        })?;
+    let db_conn = crate::internal::db::schema::create_database_for_role(
+        git_tmp_str,
+        DatabaseRole::Repository,
+    )
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!("reverse migration Phase 1 failed bootstrapping libra.db.tmp: {err}"),
+    })?;
+    db_conn
+        .close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed closing bootstrap libra.db.tmp handle: {err}"
+            ),
+        })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let meta = fs::symlink_metadata(&git_tmp)
+            .map_err(|err| StorageBackendError::io("stat bootstrapped libra.db.tmp", err))?;
+        if !meta.file_type().is_file() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "reverse migration Phase 1 rejected non-regular libra.db.tmp".to_string(),
+            });
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if (mode & 0o022) != 0 {
+            fs::set_permissions(&git_tmp, fs::Permissions::from_mode(mode & !0o022))
+                .map_err(|err| StorageBackendError::io("tighten libra.db.tmp permissions", err))?;
+        }
+    }
+
+    let mut conn =
+        open_reverse_sqlite_tmp_conn_async(&git_tmp, DatabaseRole::Repository, false).await?;
+    // Ensure lazy bridge publication tables exist before streaming tables 60 & 61.
+    for ddl in [
+        "CREATE TABLE IF NOT EXISTS agent_bridge_publication (\
+             operation_id TEXT PRIMARY KEY,\
+             commit_oid TEXT NOT NULL,\
+             phase TEXT NOT NULL DEFAULT 'published'\
+         )",
+        "CREATE TABLE IF NOT EXISTS agent_bridge_index_publication (\
+             operation_id TEXT PRIMARY KEY,\
+             index_digest TEXT NOT NULL,\
+             phase TEXT NOT NULL DEFAULT 'prepared'\
+         )",
+    ] {
+        sea_orm::sqlx::query(ddl)
+            .execute(&mut conn)
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration Phase 1 failed creating bridge publication table in libra.db.tmp: {err}"
+                ),
+            })?;
+    }
+    Ok((git_tmp, conn))
+}
+
+/// Bootstrap `.libra/private/capture.db.tmp` (`0600`) with canonical
+/// `CAPTURE_DATABASE_SQL` and default schema receipt.
+async fn bootstrap_reverse_capture_sqlite_tmp(
+    common_storage: &Path,
+) -> StorageResult<(PathBuf, SqliteConnection)> {
+    let cap_tmp = create_empty_sqlite_tmp_file_nofollow(
+        common_storage,
+        Some(PRIVATE_SUBDIR),
+        "capture.db.tmp",
+        0o600,
+        true,
+    )?;
+    let mut conn =
+        open_reverse_sqlite_tmp_conn_async(&cap_tmp, DatabaseRole::Capture, false).await?;
+    sea_orm::sqlx::raw_sql(crate::internal::db::schema::CAPTURE_DATABASE_SQL)
+        .execute(&mut conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed applying CAPTURE_DATABASE_SQL to capture.db.tmp: {err}"
+            ),
+        })?;
+    sea_orm::sqlx::query(
+        "INSERT OR IGNORE INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+    )
+    .bind(crate::internal::db::schema::CAPTURE_SCHEMA_VERSION)
+    .bind(crate::internal::db::schema::CAPTURE_SCHEMA_NAME)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&mut conn)
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!(
+            "reverse migration Phase 1 failed seeding capture schema_versions in capture.db.tmp: {err}"
+        ),
+    })?;
+    Ok((cap_tmp, conn))
+}
+
+/// Generate O(N) cursor-paged batch readers over an uncommitted
+/// `&redb::WriteTransaction` (`<= 500` rows AND `<= 2 MiB` payload per page),
+/// dropping the `redb::Table` / `redb::Range` BEFORE returning so async SQLite
+/// commits never hold any redb table guard across `.await`.
+macro_rules! define_redb_page_reader {
+    ($fn_name:ident, $key_ty:ty, $owned_ty:ty, |$k_pat:ident| $to_owned:expr, |$c_pat:ident| $as_ref:expr) => {
+        fn $fn_name(
+            wtx: &redb::WriteTransaction,
+            existing_tables: &BTreeSet<String>,
+            def: redb::TableDefinition<'static, $key_ty, &[u8]>,
+            cursor: &mut Option<$owned_ty>,
+            max_rows: usize,
+        ) -> StorageResult<Vec<($owned_ty, Vec<u8>)>> {
+            use redb::ReadableTable as _;
+            use std::ops::Bound;
+
+            if !existing_tables.contains(def.name()) {
+                return Ok(Vec::new());
+            }
+            let limit = max_rows.clamp(1, FORWARD_MIGRATION_STREAM_BATCH_ROWS);
+            let tbl = wtx
+                .open_table(def)
+                .map_err(|err| map_redb_table_err(err, "open source redb table for reverse export"))?;
+            let mut out: Vec<($owned_ty, Vec<u8>)> = Vec::new();
+            let mut bytes_acc = 0usize;
+            let mut last_key: Option<$owned_ty> = None;
+
+            macro_rules! drain_iter {
+                ($iter:expr) => {
+                    for entry in $iter {
+                        let (k_guard, v_guard) = entry.map_err(|err| {
+                            map_redb_storage_err(err, "iterate source redb table for reverse export")
+                        })?;
+                        let v_slice = v_guard.value();
+                        if v_slice.len() > FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "reverse migration Phase 1 row in `{}` exceeds {} byte single-row budget",
+                                    def.name(),
+                                    FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES
+                                ),
+                            });
+                        }
+                        if !out.is_empty()
+                            && (out.len() >= limit
+                                || bytes_acc.saturating_add(v_slice.len())
+                                    > FORWARD_MIGRATION_STREAM_BATCH_MAX_BYTES)
+                        {
+                            break;
+                        }
+                        let $k_pat = k_guard.value();
+                        let owned_k: $owned_ty = $to_owned;
+                        bytes_acc = bytes_acc.saturating_add(v_slice.len());
+                        last_key = Some(owned_k.clone());
+                        out.push((owned_k, v_slice.to_vec()));
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                };
+            }
+
+            if let Some($c_pat) = cursor.as_ref() {
+                let lower = $as_ref;
+                let range = tbl
+                    .range((Bound::Excluded(lower), Bound::Unbounded))
+                    .map_err(|err| {
+                        map_redb_storage_err(err, "range source redb table for reverse export")
+                    })?;
+                drain_iter!(range);
+            } else {
+                let iter = tbl.iter().map_err(|err| {
+                    map_redb_storage_err(err, "iter source redb table for reverse export")
+                })?;
+                drain_iter!(iter);
+            }
+
+            if let Some(lk) = last_key {
+                *cursor = Some(lk);
+            }
+            Ok(out)
+        }
+    };
+}
+
+define_redb_page_reader!(read_redb_page_i64, i64, i64, |k| k, |c| *c);
+define_redb_page_reader!(read_redb_page_u64, u64, u64, |k| k, |c| *c);
+define_redb_page_reader!(
+    read_redb_page_str,
+    &'static str,
+    String,
+    |k| k.to_string(),
+    |c| c.as_str()
+);
+define_redb_page_reader!(
+    read_redb_page_str2,
+    (&'static str, &'static str),
+    (String, String),
+    |k| (k.0.to_string(), k.1.to_string()),
+    |c| (c.0.as_str(), c.1.as_str())
+);
+define_redb_page_reader!(
+    read_redb_page_str_i64,
+    (&'static str, i64),
+    (String, i64),
+    |k| (k.0.to_string(), k.1),
+    |c| (c.0.as_str(), c.1)
+);
+define_redb_page_reader!(
+    read_redb_page_str_bytes,
+    (&'static str, &'static [u8]),
+    (String, Vec<u8>),
+    |k| (k.0.to_string(), k.1.to_vec()),
+    |c| (c.0.as_str(), c.1.as_slice())
+);
+define_redb_page_reader!(
+    read_redb_page_str3,
+    (&'static str, &'static str, &'static str),
+    (String, String, String),
+    |k| (k.0.to_string(), k.1.to_string(), k.2.to_string()),
+    |c| (c.0.as_str(), c.1.as_str(), c.2.as_str())
+);
+define_redb_page_reader!(
+    read_redb_page_u8_str2,
+    (u8, &'static str, &'static str),
+    (u8, String, String),
+    |k| (k.0, k.1.to_string(), k.2.to_string()),
+    |c| (c.0, c.1.as_str(), c.2.as_str())
+);
+define_redb_page_reader!(
+    read_redb_page_str2_i64,
+    (&'static str, &'static str, i64),
+    (String, String, i64),
+    |k| (k.0.to_string(), k.1.to_string(), k.2),
+    |c| (c.0.as_str(), c.1.as_str(), c.2)
+);
+define_redb_page_reader!(
+    read_redb_page_str2_i64_2,
+    (&'static str, &'static str, i64, i64),
+    (String, String, i64, i64),
+    |k| (k.0.to_string(), k.1.to_string(), k.2, k.3),
+    |c| (c.0.as_str(), c.1.as_str(), c.2, c.3)
+);
+define_redb_page_reader!(
+    read_redb_page_str3_i64,
+    (&'static str, &'static str, &'static str, i64),
+    (String, String, String, i64),
+    |k| (k.0.to_string(), k.1.to_string(), k.2.to_string(), k.3),
+    |c| (c.0.as_str(), c.1.as_str(), c.2.as_str(), c.3)
+);
+define_redb_page_reader!(
+    read_redb_page_str3_i64_2,
+    (&'static str, &'static str, &'static str, i64, i64),
+    (String, String, String, i64, i64),
+    |k| (k.0.to_string(), k.1.to_string(), k.2.to_string(), k.3, k.4),
+    |c| (c.0.as_str(), c.1.as_str(), c.2.as_str(), c.3, c.4)
+);
+
+fn map_reverse_sqlite_write_err(
+    role: DatabaseRole,
+    table: &'static str,
+    err: sea_orm::sqlx::Error,
+) -> StorageBackendError {
+    StorageBackendError::BackendInternal {
+        detail: format!(
+            "reverse migration Phase 1 failed inserting into {role} sqlite table `{table}`: {err}"
+        ),
+    }
+}
+
+async fn begin_reverse_sqlite_batch(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    table: &'static str,
+) -> StorageResult<()> {
+    sea_orm::sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| map_reverse_sqlite_write_err(role, table, err))?;
+    Ok(())
+}
+
+async fn commit_reverse_sqlite_batch(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    table: &'static str,
+) -> StorageResult<()> {
+    sea_orm::sqlx::query("COMMIT")
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| map_reverse_sqlite_write_err(role, table, err))?;
+    Ok(())
+}
+
+async fn rollback_reverse_sqlite_batch_best_effort(conn: &mut SqliteConnection) {
+    let _ = sea_orm::sqlx::query("ROLLBACK").execute(&mut *conn).await;
+}
+
+/// Synchronize `sqlite_sequence` highwater for an `AUTOINCREMENT` table when
+/// redb holds a higher sequence counter (e.g. empty-after-delete continuity).
+async fn sync_reverse_sqlite_sequence(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    table: &'static str,
+    seq_val: i64,
+) -> StorageResult<()> {
+    if seq_val <= 0 {
+        return Ok(());
+    }
+    let has_seq_table = sqlite_table_exists_on_conn(conn, role, "sqlite_sequence").await?;
+    if !has_seq_table {
+        return Ok(());
+    }
+    let existing: Option<i64> =
+        sea_orm::sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = ?")
+            .bind(table)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| map_reverse_sqlite_write_err(role, "sqlite_sequence", err))?;
+    match existing {
+        Some(cur) if cur >= seq_val => {}
+        Some(_) => {
+            sea_orm::sqlx::query("UPDATE sqlite_sequence SET seq = ? WHERE name = ?")
+                .bind(seq_val)
+                .bind(table)
+                .execute(&mut *conn)
+                .await
+                .map_err(|err| map_reverse_sqlite_write_err(role, "sqlite_sequence", err))?;
+        }
+        None => {
+            sea_orm::sqlx::query("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)")
+                .bind(table)
+                .bind(seq_val)
+                .execute(&mut *conn)
+                .await
+                .map_err(|err| map_reverse_sqlite_write_err(role, "sqlite_sequence", err))?;
+        }
+    }
+    Ok(())
+}
+
+fn read_redb_seq_u64(
+    wtx: &redb::WriteTransaction,
+    existing_tables: &BTreeSet<String>,
+    def: redb::TableDefinition<'static, &str, &[u8]>,
+    key: &str,
+    codec_version: u16,
+) -> StorageResult<Option<i64>> {
+    if !existing_tables.contains(def.name()) {
+        return Ok(None);
+    }
+    let tbl = wtx
+        .open_table(def)
+        .map_err(|err| map_redb_table_err(err, "open sequence table for reverse export"))?;
+    let Some(raw) = tbl
+        .get(key)
+        .map_err(|err| map_redb_storage_err(err, "read sequence value for reverse export"))?
+    else {
+        return Ok(None);
+    };
+    let val: MigConfigSequenceValue = decode_versioned(raw.value(), codec_version)?;
+    let seq = i64::try_from(val.last_id).map_err(|_| StorageBackendError::BackendInternal {
+        detail: format!("reverse export sequence counter for `{key}` exceeds i64::MAX"),
+    })?;
+    Ok(Some(seq))
+}
+
+fn read_redb_seq_i64(
+    wtx: &redb::WriteTransaction,
+    existing_tables: &BTreeSet<String>,
+    def: redb::TableDefinition<'static, &str, &[u8]>,
+    key: &str,
+    codec_version: u16,
+) -> StorageResult<Option<i64>> {
+    if !existing_tables.contains(def.name()) {
+        return Ok(None);
+    }
+    let tbl = wtx
+        .open_table(def)
+        .map_err(|err| map_redb_table_err(err, "open i64 sequence table for reverse export"))?;
+    let Some(raw) = tbl
+        .get(key)
+        .map_err(|err| map_redb_storage_err(err, "read i64 sequence value for reverse export"))?
+    else {
+        return Ok(None);
+    };
+    let val: MigSeqCounter = decode_versioned(raw.value(), codec_version)?;
+    Ok(Some(val.last_id))
+}
+
+/// Stream a single redb table from a held `&redb::WriteTransaction` into SQLite
+/// in `<= 500` row / `<= 2 MiB` cursor-paged batches (`RB-11i` AC1 & AC6).
+macro_rules! stream_redb_to_sqlite {
+    (
+        $wtx:expr,
+        $existing:expr,
+        $conn:expr,
+        $role:expr,
+        $telemetry:expr,
+        $counts:expr,
+        $table_name:expr,
+        $page_reader:ident,
+        $table_def:expr,
+        |$key_pat:ident, $val_pat:ident, $c_pat:ident| $insert_body:block
+    ) => {{
+        let mut cursor = None;
+        let mut total_rows = 0u64;
+        loop {
+            let page = $page_reader(
+                $wtx,
+                $existing,
+                $table_def,
+                &mut cursor,
+                FORWARD_MIGRATION_STREAM_BATCH_ROWS,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            let batch_len = page.len();
+            begin_reverse_sqlite_batch($conn, $role, $table_name).await?;
+            let batch_res: StorageResult<()> = async {
+                let $c_pat: &mut SqliteConnection = &mut *$conn;
+                for ($key_pat, $val_pat) in page {
+                    $insert_body
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(err) = batch_res {
+                rollback_reverse_sqlite_batch_best_effort($conn).await;
+                return Err(err);
+            }
+            commit_reverse_sqlite_batch($conn, $role, $table_name).await?;
+            $telemetry.record_batch($table_name, batch_len)?;
+            total_rows = total_rows.saturating_add(batch_len as u64);
+        }
+        $counts.insert($table_name, total_rows);
+        total_rows
+    }};
+}
+
+type DecodedSqliteRefRow = (
+    Option<String>,
+    &'static str,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn decode_mig_ref_row(
+    key: (u8, String, String),
+    stored: MigRefTargetStored,
+) -> StorageResult<DecodedSqliteRefRow> {
+    let (tag, part1, part2) = key;
+    match tag {
+        MIG_REF_TAG_LOCAL_HEAD_MAIN => match stored.target {
+            RefTarget::Symbolic(sym) => Ok((Some(sym), "Head", None, None, None)),
+            RefTarget::Direct(oid) => Ok((None, "Head", Some(oid), None, None)),
+        },
+        MIG_REF_TAG_LOCAL_HEAD_LINKED => match stored.target {
+            RefTarget::Symbolic(sym) => Ok((Some(sym), "Head", None, None, Some(part1))),
+            RefTarget::Direct(oid) => Ok((None, "Head", Some(oid), None, Some(part1))),
+        },
+        MIG_REF_TAG_REMOTE_HEAD => match stored.target {
+            RefTarget::Symbolic(sym) => Ok((Some(sym), "Head", None, Some(part1), None)),
+            RefTarget::Direct(oid) => Ok((None, "Head", Some(oid), Some(part1), None)),
+        },
+        MIG_REF_TAG_LOCAL_BRANCH => match stored.target {
+            RefTarget::Direct(oid) => Ok((Some(part2), "Branch", Some(oid), None, None)),
+            RefTarget::Symbolic(_) => Err(StorageBackendError::BackendInternal {
+                detail: "reverse export rejected symbolic local branch row in redb".to_string(),
+            }),
+        },
+        MIG_REF_TAG_REMOTE_BRANCH => match stored.target {
+            RefTarget::Direct(oid) => Ok((Some(part2), "Branch", Some(oid), Some(part1), None)),
+            RefTarget::Symbolic(_) => Err(StorageBackendError::BackendInternal {
+                detail: "reverse export rejected symbolic remote branch row in redb".to_string(),
+            }),
+        },
+        MIG_REF_TAG_TAG => match stored.target {
+            RefTarget::Direct(oid) => Ok((Some(part2), "Tag", Some(oid), None, None)),
+            RefTarget::Symbolic(_) => Err(StorageBackendError::BackendInternal {
+                detail: "reverse export rejected symbolic tag row in redb".to_string(),
+            }),
+        },
+        _ => Err(StorageBackendError::BackendInternal {
+            detail: format!("reverse export encountered unknown reference key tag {tag}"),
+        }),
+    }
+}
+
+/// Export all 61 Repository source tables directly from the held uncommitted
+/// `&git_wtx` into `libra.db.tmp` (`RB-11i` AC1 & AC6).
+#[allow(clippy::too_many_lines)]
+async fn export_reverse_git_tables_to_sqlite(
+    git_wtx: &redb::WriteTransaction,
+    conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<BTreeMap<&'static str, u64>> {
+    let existing = list_existing_redb_tables(git_wtx)?;
+    let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let r = DatabaseRole::Repository;
+    let cv_state = redb_state::GIT_STATE_CODEC_VERSION;
+
+    // 1. schema_versions (replace pre-seeded rows only when git.redb has explicit receipts)
+    {
+        let mut has_any_receipt = false;
+        if existing.contains(redb_cfg::SCHEMA_VERSIONS_TABLE.name()) {
+            let tbl = git_wtx
+                .open_table(redb_cfg::SCHEMA_VERSIONS_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open git schema_versions"))?;
+            has_any_receipt = tbl
+                .len()
+                .map_err(|e| map_redb_storage_err(e, "len git schema_versions"))?
+                > 0;
+        }
+        if has_any_receipt {
+            sea_orm::sqlx::query("DELETE FROM schema_versions")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+            stream_redb_to_sqlite!(
+                git_wtx,
+                &existing,
+                conn,
+                r,
+                telemetry,
+                counts,
+                "schema_versions",
+                read_redb_page_i64,
+                redb_cfg::SCHEMA_VERSIONS_TABLE,
+                |version, raw, c| {
+                    let row: MigSchemaReceiptStoredRow =
+                        decode_versioned(&raw, redb_cfg::SCHEMA_RECEIPT_CODEC_VERSION)?;
+                    sea_orm::sqlx::query(
+                        "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+                    )
+                    .bind(version)
+                    .bind(&row.name)
+                    .bind(&row.applied_at)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+                }
+            );
+        } else {
+            let seeded: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM schema_versions")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+            counts.insert("schema_versions", u64::try_from(seeded).unwrap_or(0));
+        }
+    }
+
+    // 2. config
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "config",
+        read_redb_page_u64,
+        redb_cfg::CONFIG_LEGACY_TABLE,
+        |id, raw, c| {
+            let id_i64 = i64::try_from(id).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "reverse export config.id exceeds i64::MAX".to_string(),
+            })?;
+            let rec: LegacyConfigEntry =
+                decode_versioned(&raw, redb_cfg::CONFIG_LEGACY_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO config (id, configuration, name, key, value) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id_i64)
+            .bind(&rec.configuration)
+            .bind(&rec.name)
+            .bind(&rec.key)
+            .bind(&rec.value)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "config", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_u64(
+        git_wtx,
+        &existing,
+        redb_cfg::CONFIG_SEQ_TABLE,
+        MIG_SEQ_KEY_CONFIG_LEGACY,
+        redb_cfg::CONFIG_SEQ_CODEC_VERSION,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "config", seq).await?;
+    }
+
+    // 3. config_kv
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "config_kv",
+        read_redb_page_u64,
+        redb_cfg::CONFIG_KV_TABLE,
+        |id, raw, c| {
+            let id_i64 = i64::try_from(id).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "reverse export config_kv.id exceeds i64::MAX".to_string(),
+            })?;
+            let rec: MigConfigKvStoredRow =
+                decode_versioned(&raw, redb_cfg::CONFIG_KV_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO config_kv (id, key, value, encrypted) VALUES (?, ?, ?, ?)",
+            )
+            .bind(id_i64)
+            .bind(&rec.key)
+            .bind(&rec.value)
+            .bind(i64::from(rec.encrypted))
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "config_kv", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_u64(
+        git_wtx,
+        &existing,
+        redb_cfg::CONFIG_SEQ_TABLE,
+        MIG_SEQ_KEY_CONFIG_KV,
+        redb_cfg::CONFIG_SEQ_CODEC_VERSION,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "config_kv", seq).await?;
+    }
+
+    // 4. metadata_kv
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "metadata_kv",
+        read_redb_page_str3,
+        redb_cfg::METADATA_KV_TABLE,
+        |key, raw, c| {
+            let (scope, target, k) = key;
+            let rec: MigMetadataStoredRow =
+                decode_versioned(&raw, redb_cfg::METADATA_KV_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO metadata_kv (scope, target, key, value, value_type, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&scope)
+            .bind(&target)
+            .bind(&k)
+            .bind(&rec.value)
+            .bind(&rec.value_type)
+            .bind(&rec.created_at)
+            .bind(&rec.updated_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "metadata_kv", e))?;
+        }
+    );
+
+    // 5. reference
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "reference",
+        read_redb_page_u8_str2,
+        redb_git::REFERENCE_TABLE,
+        |key, raw, c| {
+            let stored: MigRefTargetStored =
+                decode_versioned(&raw, redb_git::GIT_REF_CODEC_VERSION)?;
+            let (name, kind, commit, remote, worktree_id) = decode_mig_ref_row(key, stored)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO reference (name, kind, \"commit\", remote, worktree_id) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&name)
+            .bind(kind)
+            .bind(&commit)
+            .bind(&remote)
+            .bind(&worktree_id)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "reference", e))?;
+        }
+    );
+
+    // 6. reflog
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "reflog",
+        read_redb_page_u64,
+        redb_git::REFLOG_TABLE,
+        |id, raw, c| {
+            let id_i64 = i64::try_from(id).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "reverse export reflog.id exceeds i64::MAX".to_string(),
+            })?;
+            let rec: MigReflogStoredRow =
+                decode_versioned(&raw, redb_git::GIT_REFLOG_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO reflog (id, ref_name, old_oid, new_oid, committer_name, committer_email, timestamp, action, message, worktree_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id_i64)
+            .bind(&rec.ref_name)
+            .bind(&rec.old_oid)
+            .bind(&rec.new_oid)
+            .bind(&rec.committer_name)
+            .bind(&rec.committer_email)
+            .bind(rec.timestamp)
+            .bind(&rec.action)
+            .bind(&rec.message)
+            .bind(&rec.worktree_id)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "reflog", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_u64(
+        git_wtx,
+        &existing,
+        redb_git::GIT_SEQ_TABLE,
+        MIG_SEQ_KEY_REFLOG,
+        redb_git::GIT_SEQ_CODEC_VERSION,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "reflog", seq).await?;
+    }
+
+    // 7. notes
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "notes",
+        read_redb_page_str2,
+        redb_git::NOTES_TABLE,
+        |key, raw, c| {
+            let (notes_ref, object) = key;
+            let rec: MigNoteStoredRow = decode_versioned(&raw, redb_git::GIT_NOTES_CODEC_VERSION)?;
+            sea_orm::sqlx::query("INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)")
+                .bind(&notes_ref)
+                .bind(&object)
+                .bind(&rec.blob)
+                .execute(&mut *c)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "notes", e))?;
+        }
+    );
+
+    // 8. object_index
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "object_index",
+        read_redb_page_str2,
+        redb_git::OBJECT_INDEX_TABLE,
+        |key, raw, c| {
+            let (repo_id, o_id) = key;
+            let rec: MigObjectIndexStoredRow =
+                decode_versioned(&raw, redb_git::GIT_OBJECT_INDEX_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO object_index (repo_id, o_id, o_type, o_size, created_at, is_synced) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&repo_id)
+            .bind(&o_id)
+            .bind(&rec.o_type)
+            .bind(rec.o_size)
+            .bind(rec.created_at)
+            .bind(i64::from(rec.is_synced))
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "object_index", e))?;
+        }
+    );
+
+    // 9. object_obliteration
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "object_obliteration",
+        read_redb_page_str2,
+        redb_git::OBJECT_OBLITERATION_TABLE,
+        |key, raw, c| {
+            let (oid, hash_kind) = key;
+            let rec: MigObjectObliterationStoredRow =
+                decode_versioned(&raw, redb_git::GIT_OBJECT_OBLITERATION_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO object_obliteration \
+                 (oid, hash_kind, state, reason, actor, approval_source, requested_at, tombstone_written_at, payload_deleted_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&oid)
+            .bind(&hash_kind)
+            .bind(rec.state.as_str())
+            .bind(&rec.reason)
+            .bind(&rec.actor)
+            .bind(&rec.approval_source)
+            .bind(&rec.requested_at)
+            .bind(&rec.tombstone_written_at)
+            .bind(&rec.payload_deleted_at)
+            .bind(&rec.updated_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "object_obliteration", e))?;
+        }
+    );
+
+    // 10. revision_ordinal
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "revision_ordinal",
+        read_redb_page_str_i64,
+        redb_git::REVISION_ORDINAL_TABLE,
+        |key, raw, c| {
+            let (ref_name, ordinal) = key;
+            let rec: MigRevisionOrdinalStoredRow =
+                decode_versioned(&raw, redb_git::GIT_REVISION_ORDINAL_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO revision_ordinal (ref_name, ordinal, oid) VALUES (?, ?, ?)",
+            )
+            .bind(&ref_name)
+            .bind(ordinal)
+            .bind(&rec.oid)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "revision_ordinal", e))?;
+        }
+    );
+
+    // 11. revision_ordinal_meta
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "revision_ordinal_meta",
+        read_redb_page_str,
+        redb_git::REVISION_ORDINAL_META_TABLE,
+        |ref_name, raw, c| {
+            let rec: MigRevisionOrdinalMetaStoredRow =
+                decode_versioned(&raw, redb_git::GIT_REVISION_ORDINAL_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO revision_ordinal_meta (ref_name, tip_oid, replace_sig, max_ordinal, built_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&ref_name)
+            .bind(&rec.tip_oid)
+            .bind(&rec.replace_sig)
+            .bind(rec.max_ordinal)
+            .bind(&rec.built_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "revision_ordinal_meta", e))?;
+        }
+    );
+
+    // 12..32: RB-05 workflow state tables
+    export_reverse_rb05_state_tables(git_wtx, &existing, conn, telemetry, &mut counts, cv_state)
+        .await?;
+
+    // 33..61: RB-05b AI / memory / governance / bridge tables
+    export_reverse_rb05b_state_tables(git_wtx, &existing, conn, telemetry, &mut counts, cv_state)
+        .await?;
+
+    Ok(counts)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn export_reverse_rb05_state_tables(
+    git_wtx: &redb::WriteTransaction,
+    existing: &BTreeSet<String>,
+    conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    counts: &mut BTreeMap<&'static str, u64>,
+    cv: u16,
+) -> StorageResult<()> {
+    let r = DatabaseRole::Repository;
+
+    // 12. sequence_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "sequence_state",
+        read_redb_page_str,
+        redb_state::SEQUENCE_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: SequenceStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO sequence_state (worktree_id, kind, head_name, head_orig, current_oid, todo, payload, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.kind).bind(&rec.head_name).bind(&rec.head_orig)
+            .bind(&rec.current_oid).bind(&rec.todo).bind(&rec.payload).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "sequence_state", e))?;
+        }
+    );
+
+    // 13. rebase_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "rebase_state",
+        read_redb_page_str,
+        redb_state::REBASE_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: RebaseStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO rebase_state (worktree_id, head_name, onto, orig_head, current_head, todo, todo_actions, done, stopped_sha, autosquash, empty_mode) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.head_name).bind(&rec.onto).bind(&rec.orig_head)
+            .bind(&rec.current_head).bind(&rec.todo).bind(&rec.todo_actions).bind(&rec.done)
+            .bind(&rec.stopped_sha).bind(i64::from(rec.autosquash)).bind(&rec.empty_mode)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "rebase_state", e))?;
+        }
+    );
+
+    // 14. bisect_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "bisect_state",
+        read_redb_page_str,
+        redb_state::BISECT_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: BisectStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO bisect_state (worktree_id, orig_head, orig_head_name, bad, good, current, skipped, steps, completed, first_parent) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.orig_head).bind(&rec.orig_head_name).bind(&rec.bad)
+            .bind(&rec.good).bind(&rec.current).bind(&rec.skipped).bind(rec.steps)
+            .bind(i64::from(rec.completed)).bind(i64::from(rec.first_parent))
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "bisect_state", e))?;
+        }
+    );
+
+    // 15. worktree_registry_capability (clear pre-seeded capabilities if redb has explicit rows)
+    {
+        let has_cap_rows =
+            if existing.contains(redb_state::WORKTREE_REGISTRY_CAPABILITY_TABLE.name()) {
+                let tbl = git_wtx
+                    .open_table(redb_state::WORKTREE_REGISTRY_CAPABILITY_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open worktree_registry_capability"))?;
+                tbl.len()
+                    .map_err(|e| map_redb_storage_err(e, "len worktree_registry_capability"))?
+                    > 0
+            } else {
+                false
+            };
+        if has_cap_rows {
+            sea_orm::sqlx::query("DELETE FROM worktree_registry_capability")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "worktree_registry_capability", e))?;
+            stream_redb_to_sqlite!(
+                git_wtx,
+                existing,
+                conn,
+                r,
+                telemetry,
+                counts,
+                "worktree_registry_capability",
+                read_redb_page_i64,
+                redb_state::WORKTREE_REGISTRY_CAPABILITY_TABLE,
+                |ver, _raw, c| {
+                    sea_orm::sqlx::query(
+                        "INSERT INTO worktree_registry_capability (version) VALUES (?)",
+                    )
+                    .bind(ver)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| {
+                        map_reverse_sqlite_write_err(r, "worktree_registry_capability", e)
+                    })?;
+                }
+            );
+        } else {
+            let seeded: i64 =
+                sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM worktree_registry_capability")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        map_reverse_sqlite_write_err(r, "worktree_registry_capability", e)
+                    })?;
+            counts.insert(
+                "worktree_registry_capability",
+                u64::try_from(seeded).unwrap_or(0),
+            );
+        }
+    }
+
+    // 16. worktree_lifecycle
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "worktree_lifecycle",
+        read_redb_page_str,
+        redb_state::WORKTREE_LIFECYCLE_TABLE,
+        |_k, raw, c| {
+            let rec: WorktreeLifecycleRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO worktree_lifecycle (worktree_id, state, path, reason, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(rec.state.as_str()).bind(&rec.path)
+            .bind(&rec.reason).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "worktree_lifecycle", e))?;
+        }
+    );
+
+    // 17. worktree_intent_journal
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "worktree_intent_journal",
+        read_redb_page_i64,
+        redb_state::WORKTREE_INTENT_JOURNAL_TABLE,
+        |_k, raw, c| {
+            let rec: WorktreeIntentRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO worktree_intent_journal (id, op, worktree_id, payload, stage, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(rec.id).bind(rec.op.as_str()).bind(&rec.worktree_id)
+            .bind(&rec.payload).bind(&rec.stage).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "worktree_intent_journal", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_i64(
+        git_wtx,
+        existing,
+        redb_state::GIT_STATE_SEQ_TABLE,
+        MIG_SEQ_KEY_WORKTREE_INTENT,
+        cv,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "worktree_intent_journal", seq).await?;
+    }
+
+    // 18. workspace_record
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "workspace_record",
+        read_redb_page_str,
+        redb_state::WORKSPACE_RECORD_TABLE,
+        |_k, raw, c| {
+            let rec: WorkspaceRecordRow = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO workspace_record \
+                 (workspace_id, repo_id, kind, worktree_id, path, owner_kind, owner_id, task_id, session_id, \
+                  base_commit, branch, state, lease_owner, lease_fence, lease_expires_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.workspace_id).bind(&rec.repo_id).bind(rec.kind.as_str())
+            .bind(&rec.worktree_id).bind(&rec.path).bind(rec.owner_kind.as_str())
+            .bind(&rec.owner_id).bind(&rec.task_id).bind(&rec.session_id)
+            .bind(&rec.base_commit).bind(&rec.branch).bind(rec.state.as_str())
+            .bind(&rec.lease_owner).bind(rec.lease_fence).bind(rec.lease_expires_at)
+            .bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "workspace_record", e))?;
+        }
+    );
+
+    // 19. operation
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "operation",
+        read_redb_page_str,
+        redb_state::OPERATION_TABLE,
+        |_k, raw, c| {
+            let rec: OperationRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO operation \
+                 (op_id, repo_id, format_version, kind, status, command_name, description, args_digest, actor, \
+                  worktree_id, scope_kind, scope_provenance, pre_view_oid, post_view_oid, restores_op_id, \
+                  reverts_op_id, predecessor_map_oid, causal_context_id, restorable, control_slot, claim_owner, start_ts, end_ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.op_id).bind(&rec.repo_id).bind(rec.format_version).bind(&rec.kind)
+            .bind(&rec.status).bind(&rec.command_name).bind(&rec.description).bind(&rec.args_digest)
+            .bind(&rec.actor).bind(&rec.worktree_id).bind(rec.scope_kind.as_str())
+            .bind(rec.scope_provenance.as_str()).bind(&rec.pre_view_oid).bind(&rec.post_view_oid)
+            .bind(&rec.restores_op_id).bind(&rec.reverts_op_id).bind(&rec.predecessor_map_oid)
+            .bind(&rec.causal_context_id).bind(i64::from(rec.restorable)).bind(&rec.control_slot)
+            .bind(&rec.claim_owner).bind(rec.start_ts).bind(rec.end_ts)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "operation", e))?;
+        }
+    );
+
+    // 20. operation_parent
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "operation_parent",
+        read_redb_page_str_i64,
+        redb_state::OPERATION_PARENT_TABLE,
+        |key, raw, c| {
+            let (op_id, ordinal) = key;
+            let parent: MigStringValue = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO operation_parent (op_id, parent_op_id, ordinal) VALUES (?, ?, ?)",
+            )
+            .bind(&op_id)
+            .bind(&parent.value)
+            .bind(ordinal)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "operation_parent", e))?;
+        }
+    );
+
+    // 21. operation_head
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "operation_head",
+        read_redb_page_str3,
+        redb_state::OPERATION_HEAD_TABLE,
+        |key, raw, c| {
+            let (repo_id, scope_key, op_id) = key;
+            let gen_val: MigU64Value = decode_versioned(&raw, cv)?;
+            let gen_i64 =
+                i64::try_from(gen_val.value).map_err(|_| StorageBackendError::BackendInternal {
+                    detail: "reverse export operation_head.generation exceeds i64::MAX".to_string(),
+                })?;
+            sea_orm::sqlx::query(
+                "INSERT INTO operation_head (repo_id, scope_key, op_id, generation) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&repo_id).bind(&scope_key).bind(&op_id).bind(gen_i64)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "operation_head", e))?;
+        }
+    );
+
+    // 22. operation_journal
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "operation_journal",
+        read_redb_page_str,
+        redb_state::OPERATION_JOURNAL_TABLE,
+        |_k, raw, c| {
+            let rec: OperationJournalRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO operation_journal (journal_id, op_id, phase, pre_view_oid, target_view_oid, owner, updated_at, recovery_payload) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.journal_id).bind(&rec.op_id).bind(&rec.phase).bind(&rec.pre_view_oid)
+            .bind(&rec.target_view_oid).bind(&rec.owner).bind(rec.updated_at).bind(&rec.recovery_payload)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "operation_journal", e))?;
+        }
+    );
+
+    // 23. change_identity
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "change_identity",
+        read_redb_page_str,
+        redb_state::CHANGE_IDENTITY_TABLE,
+        |_k, raw, c| {
+            let rec: ChangeIdentityRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO change_identity (change_id, repo_id, origin, created_op_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.change_id).bind(&rec.repo_id).bind(&rec.origin)
+            .bind(&rec.created_op_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "change_identity", e))?;
+        }
+    );
+
+    // 24. change_revision
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "change_revision",
+        read_redb_page_str2,
+        redb_state::CHANGE_REVISION_TABLE,
+        |_k, raw, c| {
+            let rec: ChangeRevisionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO change_revision (change_id, commit_oid, created_op_id, visibility, revision_ordinal) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.change_id).bind(&rec.commit_oid).bind(&rec.created_op_id)
+            .bind(&rec.visibility).bind(rec.revision_ordinal)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "change_revision", e))?;
+        }
+    );
+
+    // 25. change_predecessor
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "change_predecessor",
+        read_redb_page_str3,
+        redb_state::CHANGE_PREDECESSOR_TABLE,
+        |_k, raw, c| {
+            let rec: ChangePredecessorRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO change_predecessor (successor_oid, predecessor_oid, op_id, relation_kind, ordinal) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.successor_oid).bind(&rec.predecessor_oid).bind(&rec.op_id)
+            .bind(&rec.relation_kind).bind(rec.ordinal)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "change_predecessor", e))?;
+        }
+    );
+
+    // 26. ai_operation_link
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_operation_link",
+        read_redb_page_str,
+        redb_state::AI_OPERATION_LINK_TABLE,
+        |_k, raw, c| {
+            let rec: AiOperationLinkRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_operation_link \
+                 (operation_id, session_id, run_id, tool_invocation_id, intent_id, repo_id, worktree_id, \
+                  workspace_id, lease_generation, config_provenance_digest, redaction_version, change_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.operation_id).bind(&rec.session_id).bind(&rec.run_id)
+            .bind(&rec.tool_invocation_id).bind(&rec.intent_id).bind(&rec.repo_id)
+            .bind(&rec.worktree_id).bind(&rec.workspace_id).bind(rec.lease_generation)
+            .bind(&rec.config_provenance_digest).bind(&rec.redaction_version).bind(&rec.change_id)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_operation_link", e))?;
+        }
+    );
+
+    // 27. working_dirty
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "working_dirty",
+        read_redb_page_str3,
+        redb_state::WORKING_DIRTY_TABLE,
+        |_k, raw, c| {
+            let rec: WorkingDirtyEntryRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO working_dirty (worktree_id, path, kind, source, marked_at, verified_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.path).bind(&rec.kind)
+            .bind(&rec.source).bind(rec.marked_at).bind(rec.verified_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "working_dirty", e))?;
+        }
+    );
+
+    // 28. working_dirty_meta
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "working_dirty_meta",
+        read_redb_page_str,
+        redb_state::WORKING_DIRTY_META_TABLE,
+        |_k, raw, c| {
+            let rec: WorkingDirtyMetaRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO working_dirty_meta (worktree_id, state, index_fingerprint, head_oid, scanned_at, scan_lock_pid, scan_lock_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.state).bind(&rec.index_fingerprint)
+            .bind(&rec.head_oid).bind(rec.scanned_at).bind(rec.scan_lock_pid).bind(rec.scan_lock_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "working_dirty_meta", e))?;
+        }
+    );
+
+    // 29. layer
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "layer",
+        read_redb_page_str2,
+        redb_state::LAYER_TABLE,
+        |_k, raw, c| {
+            let rec: LayerRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO layer (worktree_id, name, source, priority, enabled, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.name).bind(&rec.source).bind(rec.priority)
+            .bind(i64::from(rec.enabled)).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "layer", e))?;
+        }
+    );
+
+    // 30. layer_path
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "layer_path",
+        read_redb_page_str2,
+        redb_state::LAYER_PATH_TABLE,
+        |_k, raw, c| {
+            let rec: LayerPathRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash, materialized_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.layer_name).bind(&rec.path)
+            .bind(&rec.content_hash).bind(rec.materialized_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "layer_path", e))?;
+        }
+    );
+
+    // 31. sparse_view
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "sparse_view",
+        read_redb_page_str_i64,
+        redb_state::SPARSE_VIEW_TABLE,
+        |key, raw, c| {
+            let (worktree_id, ordinal) = key;
+            let pattern: MigStringValue = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
+            )
+            .bind(&worktree_id)
+            .bind(&pattern.value)
+            .bind(ordinal)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "sparse_view", e))?;
+        }
+    );
+
+    // 32. sparse_view_meta
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "sparse_view_meta",
+        read_redb_page_str,
+        redb_state::SPARSE_VIEW_META_TABLE,
+        |worktree_id, raw, c| {
+            let enabled: MigBoolValue = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?)",
+            )
+            .bind(&worktree_id)
+            .bind(i64::from(enabled.value))
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "sparse_view_meta", e))?;
+        }
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn export_reverse_rb05b_state_tables(
+    git_wtx: &redb::WriteTransaction,
+    existing: &BTreeSet<String>,
+    conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    counts: &mut BTreeMap<&'static str, u64>,
+    cv: u16,
+) -> StorageResult<()> {
+    let r = DatabaseRole::Repository;
+
+    // 33. ai_thread
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_thread",
+        read_redb_page_str,
+        redb_state::AI_THREAD_TABLE,
+        |_k, raw, c| {
+            let rec: AiThreadRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_thread (thread_id, title, owner_kind, owner_id, owner_display_name, current_intent_id, latest_intent_id, metadata_json, archived, version, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.title).bind(&rec.owner_kind).bind(&rec.owner_id)
+            .bind(&rec.owner_display_name).bind(&rec.current_intent_id).bind(&rec.latest_intent_id)
+            .bind(&rec.metadata_json).bind(i64::from(rec.archived)).bind(rec.version)
+            .bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_thread", e))?;
+        }
+    );
+
+    // 34. ai_thread_participant
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_thread_participant",
+        read_redb_page_str3,
+        redb_state::AI_THREAD_PARTICIPANT_TABLE,
+        |_k, raw, c| {
+            let rec: AiThreadParticipantRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_thread_participant (thread_id, actor_kind, actor_id, actor_display_name, role, joined_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.actor_kind).bind(&rec.actor_id)
+            .bind(&rec.actor_display_name).bind(&rec.role).bind(rec.joined_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_thread_participant", e))?;
+        }
+    );
+
+    // 35. ai_thread_intent
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_thread_intent",
+        read_redb_page_str2,
+        redb_state::AI_THREAD_INTENT_TABLE,
+        |_k, raw, c| {
+            let rec: AiThreadIntentRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_thread_intent (thread_id, intent_id, ordinal, is_head, linked_at, link_reason) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.intent_id).bind(rec.ordinal)
+            .bind(i64::from(rec.is_head)).bind(rec.linked_at).bind(&rec.link_reason)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_thread_intent", e))?;
+        }
+    );
+
+    // 36. ai_thread_provider_metadata
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_thread_provider_metadata",
+        read_redb_page_str,
+        redb_state::AI_THREAD_PROVIDER_METADATA_TABLE,
+        |_k, raw, c| {
+            let rec: AiThreadProviderMetadataRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_thread_provider_metadata (thread_id, legacy_session_id, provider_thread_id, provider_kind, metadata_json, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.legacy_session_id).bind(&rec.provider_thread_id)
+            .bind(&rec.provider_kind).bind(&rec.metadata_json).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_thread_provider_metadata", e))?;
+        }
+    );
+
+    // 37. ai_scheduler_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_scheduler_state",
+        read_redb_page_str,
+        redb_state::AI_SCHEDULER_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: AiSchedulerStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_scheduler_state (thread_id, selected_plan_id, active_task_id, active_run_id, metadata_json, version, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.selected_plan_id).bind(&rec.active_task_id)
+            .bind(&rec.active_run_id).bind(&rec.metadata_json).bind(rec.version).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_scheduler_state", e))?;
+        }
+    );
+
+    // 38. ai_scheduler_plan_head
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_scheduler_plan_head",
+        read_redb_page_str2,
+        redb_state::AI_SCHEDULER_PLAN_HEAD_TABLE,
+        |_k, raw, c| {
+            let rec: AiSchedulerPlanHeadRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_scheduler_plan_head (thread_id, plan_id, ordinal) VALUES (?, ?, ?)",
+            )
+            .bind(&rec.thread_id)
+            .bind(&rec.plan_id)
+            .bind(rec.ordinal)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "ai_scheduler_plan_head", e))?;
+        }
+    );
+
+    // 39. ai_scheduler_selected_plan
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_scheduler_selected_plan",
+        read_redb_page_str2,
+        redb_state::AI_SCHEDULER_SELECTED_PLAN_TABLE,
+        |_k, raw, c| {
+            let rec: AiSchedulerSelectedPlanRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_scheduler_selected_plan (thread_id, plan_id, ordinal) VALUES (?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.plan_id).bind(rec.ordinal)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_scheduler_selected_plan", e))?;
+        }
+    );
+
+    // 40. ai_live_context_window
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_live_context_window",
+        read_redb_page_str2,
+        redb_state::AI_LIVE_CONTEXT_WINDOW_TABLE,
+        |_k, raw, c| {
+            let rec: AiLiveContextWindowRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_live_context_window (thread_id, context_frame_id, position, source_kind, pin_kind, inserted_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.context_frame_id).bind(rec.position)
+            .bind(&rec.source_kind).bind(&rec.pin_kind).bind(rec.inserted_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_live_context_window", e))?;
+        }
+    );
+
+    // 41. ai_index_intent_plan
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_intent_plan",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_INTENT_PLAN_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexIntentPlanRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_intent_plan (intent_id, plan_id, created_at) VALUES (?, ?, ?)",
+            )
+            .bind(&rec.intent_id).bind(&rec.plan_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_intent_plan", e))?;
+        }
+    );
+
+    // 42. ai_index_intent_task
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_intent_task",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_INTENT_TASK_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexIntentTaskRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_intent_task (intent_id, task_id, parent_task_id, origin_step_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.intent_id).bind(&rec.task_id).bind(&rec.parent_task_id)
+            .bind(&rec.origin_step_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_intent_task", e))?;
+        }
+    );
+
+    // 43. ai_index_plan_step_task
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_plan_step_task",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_PLAN_STEP_TASK_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexPlanStepTaskRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_plan_step_task (plan_id, task_id, step_id, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&rec.plan_id).bind(&rec.task_id).bind(&rec.step_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_plan_step_task", e))?;
+        }
+    );
+
+    // 44. ai_index_task_run
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_task_run",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_TASK_RUN_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexTaskRunRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_task_run (task_id, run_id, is_latest, created_at, base_commit_ref) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.task_id).bind(&rec.run_id).bind(i64::from(rec.is_latest))
+            .bind(rec.created_at).bind(&rec.base_commit_ref)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_task_run", e))?;
+        }
+    );
+
+    // 45. ai_index_run_event
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_run_event",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_RUN_EVENT_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexRunEventRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_run_event (run_id, event_id, event_kind, is_latest, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.run_id).bind(&rec.event_id).bind(&rec.event_kind)
+            .bind(i64::from(rec.is_latest)).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_run_event", e))?;
+        }
+    );
+
+    // 46. ai_index_run_patchset
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_run_patchset",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_RUN_PATCHSET_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexRunPatchsetRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_run_patchset (run_id, patchset_id, sequence, is_latest, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.run_id).bind(&rec.patchset_id).bind(rec.sequence)
+            .bind(i64::from(rec.is_latest)).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_run_patchset", e))?;
+        }
+    );
+
+    // 47. ai_index_intent_context_frame
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_intent_context_frame",
+        read_redb_page_str3,
+        redb_state::AI_INDEX_INTENT_CONTEXT_FRAME_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexIntentContextFrameRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_intent_context_frame (intent_id, context_frame_id, relation_kind, created_at) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&rec.intent_id).bind(&rec.context_frame_id)
+            .bind(&rec.relation_kind).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_intent_context_frame", e))?;
+        }
+    );
+
+    // 48. ai_validation_report
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_validation_report",
+        read_redb_page_str,
+        redb_state::AI_VALIDATION_REPORT_TABLE,
+        |_k, raw, c| {
+            let rec: AiValidationReportRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_validation_report (report_id, thread_id, run_id, policy_version, stale, is_latest, summary_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.report_id).bind(&rec.thread_id).bind(&rec.run_id).bind(&rec.policy_version)
+            .bind(i64::from(rec.stale)).bind(i64::from(rec.is_latest)).bind(&rec.summary_json)
+            .bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_validation_report", e))?;
+        }
+    );
+
+    // 49. ai_risk_score_breakdown
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_risk_score_breakdown",
+        read_redb_page_str,
+        redb_state::AI_RISK_SCORE_BREAKDOWN_TABLE,
+        |_k, raw, c| {
+            let rec: AiRiskScoreBreakdownRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_risk_score_breakdown (breakdown_id, thread_id, validation_report_id, policy_version, stale, is_latest, summary_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.breakdown_id).bind(&rec.thread_id).bind(&rec.validation_report_id)
+            .bind(&rec.policy_version).bind(i64::from(rec.stale)).bind(i64::from(rec.is_latest))
+            .bind(&rec.summary_json).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_risk_score_breakdown", e))?;
+        }
+    );
+
+    // 50. ai_decision_proposal
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_decision_proposal",
+        read_redb_page_str,
+        redb_state::AI_DECISION_PROPOSAL_TABLE,
+        |_k, raw, c| {
+            let rec: AiDecisionProposalRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_decision_proposal (proposal_id, thread_id, validation_report_id, risk_score_breakdown_id, policy_version, stale, is_latest, summary_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.proposal_id).bind(&rec.thread_id).bind(&rec.validation_report_id)
+            .bind(&rec.risk_score_breakdown_id).bind(&rec.policy_version)
+            .bind(i64::from(rec.stale)).bind(i64::from(rec.is_latest))
+            .bind(&rec.summary_json).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_decision_proposal", e))?;
+        }
+    );
+
+    // 51. ai_final_decision
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_final_decision",
+        read_redb_page_str,
+        redb_state::AI_FINAL_DECISION_TABLE,
+        |_k, raw, c| {
+            let rec: AiFinalDecisionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_final_decision (decision_id, thread_id, decision_proposal_id, validation_report_id, policy_version, verdict, stale, is_latest, summary_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.decision_id).bind(&rec.thread_id).bind(&rec.decision_proposal_id)
+            .bind(&rec.validation_report_id).bind(&rec.policy_version).bind(&rec.verdict)
+            .bind(i64::from(rec.stale)).bind(i64::from(rec.is_latest))
+            .bind(&rec.summary_json).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_final_decision", e))?;
+        }
+    );
+
+    // 52. approved_permission
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "approved_permission",
+        read_redb_page_str3,
+        redb_state::APPROVED_PERMISSION_TABLE,
+        |_k, raw, c| {
+            let rec: ApprovedPermissionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO approved_permission (project_id, permission, pattern, created_at, source_worktree_id, source_session_id, source_workspace_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.project_id).bind(&rec.permission).bind(&rec.pattern).bind(rec.created_at)
+            .bind(&rec.source_worktree_id).bind(&rec.source_session_id).bind(&rec.source_workspace_id)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "approved_permission", e))?;
+        }
+    );
+
+    // 53. automation_log
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "automation_log",
+        read_redb_page_str,
+        redb_state::AUTOMATION_LOG_TABLE,
+        |_k, raw, c| {
+            let rec: AutomationLogRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO automation_log (id, rule_id, trigger_kind, action_kind, status, message, started_at, finished_at, details_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.id).bind(&rec.rule_id).bind(&rec.trigger_kind).bind(&rec.action_kind)
+            .bind(&rec.status).bind(&rec.message).bind(&rec.started_at)
+            .bind(&rec.finished_at).bind(&rec.details_json)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "automation_log", e))?;
+        }
+    );
+
+    // 54. source_call_log
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "source_call_log",
+        read_redb_page_str,
+        redb_state::SOURCE_CALL_LOG_TABLE,
+        |_k, raw, c| {
+            let rec: SourceCallLogRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO source_call_log (id, session_id, source_slug, tool_name, registered_tool_name, tool_call_id, credential_ref, latency_ms, input_bytes, output_bytes, cost_estimate_micros, approval_decision, state_namespace, success, created_at, agent_run_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.id).bind(&rec.session_id).bind(&rec.source_slug).bind(&rec.tool_name)
+            .bind(&rec.registered_tool_name).bind(&rec.tool_call_id).bind(&rec.credential_ref)
+            .bind(rec.latency_ms).bind(rec.input_bytes).bind(rec.output_bytes)
+            .bind(rec.cost_estimate_micros).bind(&rec.approval_decision).bind(&rec.state_namespace)
+            .bind(i64::from(rec.success)).bind(&rec.created_at).bind(&rec.agent_run_id)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "source_call_log", e))?;
+        }
+    );
+
+    // 55. memory_episode
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_episode",
+        read_redb_page_str,
+        redb_state::MEMORY_EPISODE_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryEpisodeRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_episode (episode_id, repo_id, source_kind, source_key, outcome, actor, started_at, ended_at, anchor_commit, change_id, title, body, content_digest, producer, rules_version) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.episode_id).bind(&rec.repo_id).bind(rec.source_kind.as_str())
+            .bind(&rec.source_key).bind(rec.outcome.as_str()).bind(&rec.actor)
+            .bind(rec.started_at).bind(rec.ended_at).bind(&rec.anchor_commit)
+            .bind(&rec.change_id).bind(&rec.title).bind(&rec.body)
+            .bind(&rec.content_digest).bind(&rec.producer).bind(rec.rules_version)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_episode", e))?;
+        }
+    );
+
+    // 56. memory_episode_evidence
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_episode_evidence",
+        read_redb_page_str_i64,
+        redb_state::MEMORY_EPISODE_EVIDENCE_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryEpisodeEvidenceRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_episode_evidence (episode_id, ordinal, kind, ref_id, link_confidence, resolution_status) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.episode_id).bind(rec.ordinal).bind(rec.kind.as_str())
+            .bind(&rec.ref_id).bind(rec.link_confidence.as_str())
+            .bind(rec.resolution_status.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_episode_evidence", e))?;
+        }
+    );
+
+    // 57. memory_projection_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_projection_state",
+        read_redb_page_str2,
+        redb_state::MEMORY_PROJECTION_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryProjectionStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_projection_state (repo_id, source_kind, cursor_json, fingerprint, rules_version, schema_version, horizon_truncated, revoked_count, aged_out_count, rebuilt_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.repo_id).bind(rec.source_kind.as_str()).bind(&rec.cursor_json)
+            .bind(&rec.fingerprint).bind(rec.rules_version).bind(rec.schema_version)
+            .bind(i64::from(rec.horizon_truncated)).bind(rec.revoked_count)
+            .bind(rec.aged_out_count).bind(rec.rebuilt_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_projection_state", e))?;
+        }
+    );
+
+    // 58. memory_episode_path
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_episode_path",
+        read_redb_page_str_bytes,
+        redb_state::MEMORY_EPISODE_PATH_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryEpisodePathRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_episode_path (episode_id, code_path, change_kind, blob_oid_at_end, ended_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.episode_id).bind(&rec.code_path).bind(rec.change_kind.as_str())
+            .bind(&rec.blob_oid_at_end).bind(rec.ended_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_episode_path", e))?;
+        }
+    );
+
+    // 59. memory_episode_search_doc (FTS5 virtual table)
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_episode_search_doc",
+        read_redb_page_i64,
+        redb_state::MEMORY_EPISODE_SEARCH_DOC_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryEpisodeSearchDocRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_episode_search_doc (rowid, episode_id, title, body, paths_text) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(rec.rowid).bind(&rec.episode_id).bind(&rec.title)
+            .bind(&rec.body).bind(&rec.paths_text)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_episode_search_doc", e))?;
+        }
+    );
+
+    // 60. agent_bridge_publication
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_publication",
+        read_redb_page_str,
+        redb_git::BRIDGE_PUBLICATION_TABLE,
+        |op_id, raw, c| {
+            let rec: MigBridgePublicationStoredRow =
+                decode_versioned(&raw, redb_git::GIT_BRIDGE_PUB_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_publication (operation_id, commit_oid, phase) VALUES (?, ?, ?)",
+            )
+            .bind(&op_id).bind(&rec.commit_oid).bind(rec.phase.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_publication", e))?;
+        }
+    );
+
+    // 61. agent_bridge_index_publication
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_index_publication",
+        read_redb_page_str,
+        redb_state::AGENT_BRIDGE_INDEX_PUBLICATION_TABLE,
+        |op_id, raw, c| {
+            let rec: MigBridgeIndexPublicationStoredRow = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_index_publication (operation_id, index_digest, phase) VALUES (?, ?, ?)",
+            )
+            .bind(&op_id).bind(&rec.index_digest).bind(rec.phase.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_index_publication", e))?;
+        }
+    );
+
+    Ok(())
+}
+
+/// Export all 25 Capture source tables directly from the held uncommitted
+/// `&capture_wtx` into `capture.db.tmp` (`RB-11i` AC1 & AC6).
+#[allow(clippy::too_many_lines)]
+async fn export_reverse_capture_tables_to_sqlite(
+    cap_wtx: &redb::WriteTransaction,
+    conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<BTreeMap<&'static str, u64>> {
+    let existing = list_existing_redb_tables(cap_wtx)?;
+    let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let r = DatabaseRole::Capture;
+    let cv = redb_cap::CAPTURE_CODEC_VERSION;
+
+    // 1. schema_versions
+    {
+        let has_cap_receipts = if existing.contains(redb_cap::SCHEMA_VERSIONS_TABLE.name()) {
+            let tbl = cap_wtx
+                .open_table(redb_cap::SCHEMA_VERSIONS_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open capture schema_versions"))?;
+            tbl.len()
+                .map_err(|e| map_redb_storage_err(e, "len capture schema_versions"))?
+                > 0
+        } else {
+            false
+        };
+        if has_cap_receipts {
+            sea_orm::sqlx::query("DELETE FROM schema_versions")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+            stream_redb_to_sqlite!(
+                cap_wtx,
+                &existing,
+                conn,
+                r,
+                telemetry,
+                counts,
+                "schema_versions",
+                read_redb_page_i64,
+                redb_cap::SCHEMA_VERSIONS_TABLE,
+                |_k, raw, c| {
+                    let rec: CaptureSchemaVersionRecord = decode_versioned(&raw, cv)?;
+                    sea_orm::sqlx::query(
+                        "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+                    )
+                    .bind(rec.version)
+                    .bind(&rec.name)
+                    .bind(&rec.applied_at)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+                }
+            );
+        } else {
+            let seeded: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM schema_versions")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+            counts.insert("schema_versions", u64::try_from(seeded).unwrap_or(0));
+        }
+    }
+
+    // 2. capture_catalog_copy_receipt
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "capture_catalog_copy_receipt",
+        read_redb_page_i64,
+        redb_cap::CAPTURE_CATALOG_COPY_RECEIPT_TABLE,
+        |_k, raw, c| {
+            let rec: CaptureCatalogCopyReceiptRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO capture_catalog_copy_receipt (id, copied_at) VALUES (?, ?)",
+            )
+            .bind(rec.id)
+            .bind(&rec.copied_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "capture_catalog_copy_receipt", e))?;
+        }
+    );
+
+    // 3. agent_audit_log
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_audit_log",
+        read_redb_page_str,
+        redb_cap::AGENT_AUDIT_LOG_TABLE,
+        |_k, raw, c| {
+            let rec: AgentAuditLogRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_audit_log (audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.audit_id).bind(&rec.timestamp).bind(&rec.user_id).bind(&rec.user_name)
+            .bind(&rec.action).bind(&rec.checkpoint_id).bind(&rec.scope).bind(&rec.export_path)
+            .bind(&rec.justification).bind(i64::from(rec.granted))
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_audit_log", e))?;
+        }
+    );
+
+    // 4. agent_bridge_session
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_session",
+        read_redb_page_str,
+        redb_cap::AGENT_BRIDGE_SESSION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeSessionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_session (bridge_session_id, source, repository_id, worktree_id, workspace_id, parent_session_id, agent_id, session_state, schema_version, last_event_seq, last_acked_seq, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.bridge_session_id).bind(&rec.source).bind(&rec.repository_id)
+            .bind(&rec.worktree_id).bind(&rec.workspace_id).bind(&rec.parent_session_id)
+            .bind(&rec.agent_id).bind(rec.session_state.as_str()).bind(rec.schema_version)
+            .bind(rec.last_event_seq).bind(rec.last_acked_seq).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_session", e))?;
+        }
+    );
+
+    // 5. agent_bridge_checkpoint
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_checkpoint",
+        read_redb_page_str,
+        redb_cap::AGENT_BRIDGE_CHECKPOINT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeCheckpointRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_checkpoint (checkpoint_id, bridge_session_id, agent_checkpoint_id, target_oid, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.checkpoint_id).bind(&rec.bridge_session_id).bind(&rec.agent_checkpoint_id)
+            .bind(&rec.target_oid).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_checkpoint", e))?;
+        }
+    );
+
+    // 6. agent_bridge_event
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_event",
+        read_redb_page_i64,
+        redb_cap::AGENT_BRIDGE_EVENT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeEventRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_event (event_id, bridge_session_id, event_seq, event_type, payload_sha256, payload, operation_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(rec.event_id).bind(&rec.bridge_session_id).bind(rec.event_seq)
+            .bind(&rec.event_type).bind(&rec.payload_sha256).bind(&rec.payload)
+            .bind(&rec.operation_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_event", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_i64(
+        cap_wtx,
+        &existing,
+        redb_cap::CAPTURE_SEQUENCES_TABLE,
+        MIG_SEQ_KEY_BRIDGE_EVENT,
+        cv,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "agent_bridge_event", seq).await?;
+    }
+
+    // 7. agent_bridge_link
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_link",
+        read_redb_page_i64,
+        redb_cap::AGENT_BRIDGE_LINK_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeLinkRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_link (link_id, bridge_session_id, source_type, source_id, target_type, target_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(rec.link_id).bind(&rec.bridge_session_id).bind(rec.source_type.as_str())
+            .bind(&rec.source_id).bind(&rec.target_type).bind(&rec.target_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_link", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_i64(
+        cap_wtx,
+        &existing,
+        redb_cap::CAPTURE_SEQUENCES_TABLE,
+        MIG_SEQ_KEY_BRIDGE_LINK,
+        cv,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "agent_bridge_link", seq).await?;
+    }
+
+    // 8. agent_bridge_operation
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_operation",
+        read_redb_page_str,
+        redb_cap::AGENT_BRIDGE_OPERATION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeOperationRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_operation (operation_id, bridge_session_id, method, params_digest, repository_id, workspace_id, status, result_digest, created_at, completed_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.operation_id).bind(&rec.bridge_session_id).bind(&rec.method)
+            .bind(&rec.params_digest).bind(&rec.repository_id).bind(&rec.workspace_id)
+            .bind(rec.status.as_str()).bind(&rec.result_digest).bind(rec.created_at).bind(rec.completed_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_operation", e))?;
+        }
+    );
+
+    // 9. agent_capture_cloud_base
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_capture_cloud_base",
+        read_redb_page_str,
+        redb_cap::AGENT_CAPTURE_CLOUD_BASE_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCaptureCloudBaseRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_capture_cloud_base (repo_id, remote_generation, updated_at) VALUES (?, ?, ?)",
+            )
+            .bind(&rec.repo_id).bind(rec.remote_generation).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_capture_cloud_base", e))?;
+        }
+    );
+
+    // 10. agent_capture_incarnation
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_capture_incarnation",
+        read_redb_page_str2,
+        redb_cap::AGENT_CAPTURE_INCARNATION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCaptureIncarnationRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_capture_incarnation (agent_kind, provider_session_id, next_session_sync_revision, source_namespace, updated_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.agent_kind).bind(&rec.provider_session_id)
+            .bind(rec.next_session_sync_revision).bind(&rec.source_namespace).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_capture_incarnation", e))?;
+        }
+    );
+
+    // 11. agent_import_tombstone (exported BEFORE agent_session/agent_checkpoint so
+    //     SQLite tombstone triggers protect all subsequent intent & queue writes!)
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_import_tombstone",
+        read_redb_page_str,
+        redb_cap::AGENT_IMPORT_TOMBSTONE_TABLE,
+        |_k, raw, c| {
+            let rec: AgentImportTombstoneRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_import_tombstone (tombstone_id, agent_kind, provider_session_id, erased_session_id, source_fingerprint, erased_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.tombstone_id).bind(&rec.agent_kind).bind(&rec.provider_session_id)
+            .bind(&rec.erased_session_id).bind(&rec.source_fingerprint).bind(rec.erased_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+        }
+    );
+
+    // 12. agent_session
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_session",
+        read_redb_page_str,
+        redb_cap::AGENT_SESSION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentSessionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_session \
+                 (session_id, agent_kind, provider_session_id, thread_id, state, working_dir, worktree_id, \
+                  parent_commit, parent_session_id, metadata_json, redaction_report, started_at, last_event_at, \
+                  stopped_at, schema_version, sync_revision, repo_id, workspace_id, workspace_fence, scope_state) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.session_id).bind(rec.agent_kind.as_str()).bind(&rec.provider_session_id)
+            .bind(&rec.thread_id).bind(rec.state.as_str()).bind(&rec.working_dir)
+            .bind(&rec.worktree_id).bind(&rec.parent_commit).bind(&rec.parent_session_id)
+            .bind(&rec.metadata_json).bind(&rec.redaction_report).bind(rec.started_at)
+            .bind(rec.last_event_at).bind(rec.stopped_at).bind(rec.schema_version)
+            .bind(rec.sync_revision).bind(&rec.repo_id).bind(&rec.workspace_id)
+            .bind(rec.workspace_fence).bind(rec.scope_state.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+        }
+    );
+
+    // 13. agent_checkpoint
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_checkpoint",
+        read_redb_page_str,
+        redb_cap::AGENT_CHECKPOINT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCheckpointRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_checkpoint \
+                 (checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit, tree_oid, \
+                  metadata_blob_oid, traces_commit, tool_use_id, subagent_session_id, description, created_at, sync_revision) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.checkpoint_id).bind(&rec.session_id).bind(&rec.parent_checkpoint_id)
+            .bind(rec.scope.as_str()).bind(&rec.parent_commit).bind(&rec.tree_oid)
+            .bind(&rec.metadata_blob_oid).bind(&rec.traces_commit).bind(&rec.tool_use_id)
+            .bind(&rec.subagent_session_id).bind(&rec.description).bind(rec.created_at)
+            .bind(rec.sync_revision)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_checkpoint", e))?;
+        }
+    );
+
+    // 14. agent_checkpoint_prune_tombstone
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_checkpoint_prune_tombstone",
+        read_redb_page_str,
+        redb_cap::AGENT_CHECKPOINT_PRUNE_TOMBSTONE_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCheckpointPruneTombstoneRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_checkpoint_prune_tombstone (checkpoint_id, session_id, pruned_at) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&rec.checkpoint_id).bind(&rec.session_id).bind(rec.pruned_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_checkpoint_prune_tombstone", e))?;
+        }
+    );
+
+    // 15. agent_coverage_claim
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_coverage_claim",
+        read_redb_page_str2_i64,
+        redb_cap::AGENT_COVERAGE_CLAIM_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCoverageClaimRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_coverage_claim \
+                 (session_id, logical_turn_key, coverage_schema_version, coverage_digest, completeness, revision, \
+                  state, attempt_checkpoint_id, owner, lease_expires_at, fence_token, checkpoint_id, traces_commit, \
+                  source_channel, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.session_id).bind(&rec.logical_turn_key).bind(rec.coverage_schema_version)
+            .bind(&rec.coverage_digest).bind(rec.completeness.as_str()).bind(rec.revision)
+            .bind(rec.state.as_str()).bind(&rec.attempt_checkpoint_id).bind(&rec.owner)
+            .bind(rec.lease_expires_at).bind(rec.fence_token).bind(&rec.checkpoint_id)
+            .bind(&rec.traces_commit).bind(rec.source_channel.as_str())
+            .bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_coverage_claim", e))?;
+        }
+    );
+
+    // 16. agent_coverage_conflict
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_coverage_conflict",
+        read_redb_page_str2_i64,
+        redb_cap::AGENT_COVERAGE_CONFLICT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCoverageConflictRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_coverage_conflict \
+                 (session_id, logical_turn_key, coverage_schema_version, incumbent_revision, incumbent_digest, \
+                  incumbent_checkpoint_id, incoming_digest, incoming_source_channel, incoming_observed_at, \
+                  incoming_canonical_json, incoming_redaction_report_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.session_id).bind(&rec.logical_turn_key).bind(rec.coverage_schema_version)
+            .bind(rec.incumbent_revision).bind(&rec.incumbent_digest).bind(&rec.incumbent_checkpoint_id)
+            .bind(&rec.incoming_digest).bind(rec.incoming_source_channel.as_str())
+            .bind(rec.incoming_observed_at).bind(&rec.incoming_canonical_json)
+            .bind(&rec.incoming_redaction_report_json)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_coverage_conflict", e))?;
+        }
+    );
+
+    // 17. agent_coverage_revision
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_coverage_revision",
+        read_redb_page_str2_i64_2,
+        redb_cap::AGENT_COVERAGE_REVISION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCoverageRevisionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_coverage_revision \
+                 (session_id, logical_turn_key, coverage_schema_version, revision, checkpoint_id, coverage_digest, completeness, source_channel, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.session_id).bind(&rec.logical_turn_key).bind(rec.coverage_schema_version)
+            .bind(rec.revision).bind(&rec.checkpoint_id).bind(&rec.coverage_digest)
+            .bind(rec.completeness.as_str()).bind(rec.source_channel.as_str()).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_coverage_revision", e))?;
+        }
+    );
+
+    // 18. agent_export_job
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_export_job",
+        read_redb_page_str,
+        redb_cap::AGENT_EXPORT_JOB_TABLE,
+        |_k, raw, c| {
+            let rec: AgentExportJobRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_export_job \
+                 (job_id, agent_kind, provider_session_id, owner, lease_expires_at, fence_token, \
+                  observed_generation, processed_generation, state, last_error_code, created_at, updated_at, \
+                  ttl_expires_at, repo_id, worktree_id, workspace_id, workspace_fence, scope_state) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.job_id).bind(&rec.agent_kind).bind(&rec.provider_session_id).bind(&rec.owner)
+            .bind(rec.lease_expires_at).bind(rec.fence_token).bind(rec.observed_generation)
+            .bind(rec.processed_generation).bind(rec.state.as_str()).bind(&rec.last_error_code)
+            .bind(rec.created_at).bind(rec.updated_at).bind(rec.ttl_expires_at).bind(&rec.repo_id)
+            .bind(&rec.worktree_id).bind(&rec.workspace_id).bind(rec.workspace_fence)
+            .bind(rec.scope_state.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_export_job", e))?;
+        }
+    );
+
+    // 19. agent_import_identity
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_import_identity",
+        read_redb_page_str,
+        redb_cap::AGENT_IMPORT_IDENTITY_TABLE,
+        |_k, raw, c| {
+            let rec: AgentImportIdentityRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_import_identity \
+                 (identity_id, agent_kind, provider_session_id, source_kind, source_id, schema_version, \
+                  observed_digest, committed_digest, attempt_id, attempt_checkpoint_id, next_ordinal, state, \
+                  owner, lease_expires_at, fence_token, last_error_code, created_at, updated_at, repo_id, \
+                  worktree_id, workspace_id, workspace_fence, scope_state) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.identity_id).bind(&rec.agent_kind).bind(&rec.provider_session_id)
+            .bind(&rec.source_kind).bind(&rec.source_id).bind(rec.schema_version)
+            .bind(&rec.observed_digest).bind(&rec.committed_digest).bind(&rec.attempt_id)
+            .bind(&rec.attempt_checkpoint_id).bind(rec.next_ordinal).bind(rec.state.as_str())
+            .bind(&rec.owner).bind(rec.lease_expires_at).bind(rec.fence_token)
+            .bind(&rec.last_error_code).bind(rec.created_at).bind(rec.updated_at)
+            .bind(&rec.repo_id).bind(&rec.worktree_id).bind(&rec.workspace_id)
+            .bind(rec.workspace_fence).bind(rec.scope_state.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_identity", e))?;
+        }
+    );
+
+    // 20. agent_session_commit (stored as MarkerValue keyed by (session_id, hash_kind, commit_oid))
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_session_commit",
+        read_redb_page_str3,
+        redb_cap::AGENT_SESSION_COMMIT_TABLE,
+        |key, _raw, c| {
+            let (session_id, hash_kind, commit_oid) = key;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_session_commit (session_id, hash_kind, commit_oid) VALUES (?, ?, ?)",
+            )
+            .bind(&session_id).bind(&hash_kind).bind(&commit_oid)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_session_commit", e))?;
+        }
+    );
+
+    // 21. agent_subagent_content_claim
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_subagent_content_claim",
+        read_redb_page_str3_i64,
+        redb_cap::AGENT_SUBAGENT_CONTENT_CLAIM_TABLE,
+        |_k, raw, c| {
+            let rec: AgentSubagentContentClaimRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_subagent_content_claim \
+                 (parent_session_id, provider_kind, source_key, content_schema_version, current_revision, \
+                  current_checkpoint_id, current_digest, state, attempt_digest, attempt_checkpoint_id, owner, \
+                  lease_expires_at, fence_token, created_at, updated_at, revision_cursor, sync_revision) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.parent_session_id).bind(&rec.provider_kind).bind(&rec.source_key)
+            .bind(rec.content_schema_version).bind(rec.current_revision)
+            .bind(&rec.current_checkpoint_id).bind(&rec.current_digest).bind(rec.state.as_str())
+            .bind(&rec.attempt_digest).bind(&rec.attempt_checkpoint_id).bind(&rec.owner)
+            .bind(rec.lease_expires_at).bind(rec.fence_token).bind(rec.created_at)
+            .bind(rec.updated_at).bind(rec.revision_cursor).bind(rec.sync_revision)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_subagent_content_claim", e))?;
+        }
+    );
+
+    // 22. agent_subagent_content_revision
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_subagent_content_revision",
+        read_redb_page_str3_i64_2,
+        redb_cap::AGENT_SUBAGENT_CONTENT_REVISION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentSubagentContentRevisionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_subagent_content_revision \
+                 (parent_session_id, provider_kind, source_key, content_schema_version, revision, \
+                  checkpoint_id, content_digest, source_channel, partial, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.parent_session_id)
+            .bind(&rec.provider_kind)
+            .bind(&rec.source_key)
+            .bind(rec.content_schema_version)
+            .bind(rec.revision)
+            .bind(&rec.checkpoint_id)
+            .bind(&rec.content_digest)
+            .bind(rec.source_channel.as_str())
+            .bind(i64::from(rec.partial))
+            .bind(rec.created_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_subagent_content_revision", e))?;
+        }
+    );
+
+    // 23. agent_subagent_link
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_subagent_link",
+        read_redb_page_str,
+        redb_cap::AGENT_SUBAGENT_LINK_TABLE,
+        |_k, raw, c| {
+            let rec: AgentSubagentLinkRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_subagent_link \
+                 (content_checkpoint_id, parent_session_id, link_state, boundary_checkpoint_id, stable_subagent_id, created_at, updated_at, sync_revision) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.content_checkpoint_id).bind(&rec.parent_session_id)
+            .bind(rec.link_state.as_str()).bind(&rec.boundary_checkpoint_id)
+            .bind(&rec.stable_subagent_id).bind(rec.created_at).bind(rec.updated_at)
+            .bind(rec.sync_revision)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_subagent_link", e))?;
+        }
+    );
+
+    // 24. agent_usage_stats
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_usage_stats",
+        read_redb_page_str,
+        redb_cap::AGENT_USAGE_STATS_TABLE,
+        |_k, raw, c| {
+            let rec: AgentUsageStatsRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_usage_stats \
+                 (id, session_id, thread_id, agent_run_id, run_id, provider, model, request_kind, intent, \
+                  prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, \
+                  tool_call_count, wall_clock_ms, provider_latency_ms, cost_estimate_micro_dollars, cost_usd, \
+                  usage_estimated, started_at, finished_at, success, error_kind, schema_version, created_at, \
+                  agent_name, repo_id, turn_id, event_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.id).bind(&rec.session_id).bind(&rec.thread_id).bind(&rec.agent_run_id)
+            .bind(&rec.run_id).bind(&rec.provider).bind(&rec.model).bind(&rec.request_kind)
+            .bind(&rec.intent).bind(rec.prompt_tokens).bind(rec.completion_tokens)
+            .bind(rec.cached_tokens).bind(rec.reasoning_tokens).bind(rec.total_tokens)
+            .bind(rec.tool_call_count).bind(rec.wall_clock_ms).bind(rec.provider_latency_ms)
+            .bind(rec.cost_estimate_micro_dollars).bind(rec.cost_usd)
+            .bind(i64::from(rec.usage_estimated)).bind(&rec.started_at).bind(&rec.finished_at)
+            .bind(i64::from(rec.success)).bind(&rec.error_kind).bind(rec.schema_version)
+            .bind(&rec.created_at).bind(&rec.agent_name).bind(&rec.repo_id)
+            .bind(&rec.turn_id).bind(&rec.event_id)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_usage_stats", e))?;
+        }
+    );
+
+    // 25. agent_workspace_scope_audit
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_workspace_scope_audit",
+        read_redb_page_str,
+        redb_cap::AGENT_WORKSPACE_SCOPE_AUDIT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentWorkspaceScopeAuditRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_workspace_scope_audit \
+                 (audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id, workspace_id, workspace_fence, actor, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.audit_id).bind(&rec.action).bind(&rec.agent_kind)
+            .bind(&rec.provider_session_id).bind(&rec.repo_id).bind(&rec.worktree_id)
+            .bind(&rec.workspace_id).bind(rec.workspace_fence).bind(&rec.actor).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_workspace_scope_audit", e))?;
+        }
+    );
+
+    Ok(counts)
+}
+
+fn cap_wtx_has_dedup_key(
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    dedup_key: &str,
+) -> StorageResult<bool> {
+    if !existing_cap_tables.contains(redb_cap::CAPTURE_DEDUP_KEYS_TABLE.name()) {
+        return Ok(false);
+    }
+    let tbl = cap_wtx
+        .open_table(redb_cap::CAPTURE_DEDUP_KEYS_TABLE)
+        .map_err(|e| map_redb_table_err(e, "open capture_dedup_keys in reverse export"))?;
+    Ok(tbl
+        .get(dedup_key)
+        .map_err(|e| map_redb_storage_err(e, "lookup capture_dedup_keys in reverse export"))?
+        .is_some())
+}
+
+async fn apply_capture_batch_items_to_sqlite_tmp(
+    conn: &mut SqliteConnection,
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    items: &[CaptureBatchItem],
+) -> StorageResult<(u64, u64)> {
+    let r = DatabaseRole::Capture;
+    for item in items {
+        validate_capture_batch_item(item)?;
+    }
+    if items.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Pre-check source `capture.redb`'s `capture_dedup_keys` synchronously before
+    // opening the SQLite write transaction so no redb table guard crosses `.await`.
+    let mut pre_deduped = Vec::with_capacity(items.len());
+    for item in items {
+        pre_deduped.push(cap_wtx_has_dedup_key(
+            cap_wtx,
+            existing_cap_tables,
+            &item.dedup_key,
+        )?);
+    }
+
+    begin_reverse_sqlite_batch(conn, r, "capture_batch_replay").await?;
+    let res: StorageResult<(u64, u64)> = async {
+        let mut applied = 0u64;
+        let mut deduped = 0u64;
+
+        for (item, already_in_redb) in items.iter().zip(pre_deduped.into_iter()) {
+            if already_in_redb {
+                deduped = deduped.saturating_add(1);
+                continue;
+            }
+            let inserted = sea_orm::sqlx::query(
+                "INSERT OR IGNORE INTO temp._rev_mig_dedup_keys (dedup_key) VALUES (?)",
+            )
+            .bind(&item.dedup_key)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "_rev_mig_dedup_keys", e))?;
+            if inserted.rows_affected() == 0 {
+                deduped = deduped.saturating_add(1);
+                continue;
+            }
+
+            match &item.payload {
+                CaptureBatchPayload::UpsertSession(rec) => {
+                    let tomb: Option<i64> = sea_orm::sqlx::query_scalar(
+                        "SELECT 1 FROM agent_import_tombstone \
+                         WHERE (agent_kind = ? AND provider_session_id = ?) OR erased_session_id = ? \
+                         LIMIT 1",
+                    )
+                    .bind(rec.agent_kind.as_str())
+                    .bind(&rec.provider_session_id)
+                    .bind(&rec.session_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                    if tomb.is_some() {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "{CAPTURE_TOMBSTONE_ERROR_PREFIX}: agent session is protected by an erasure tombstone"
+                            ),
+                        });
+                    }
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_session \
+                         (session_id, agent_kind, provider_session_id, thread_id, state, working_dir, \
+                          worktree_id, parent_commit, parent_session_id, metadata_json, redaction_report, \
+                          started_at, last_event_at, stopped_at, schema_version, sync_revision, \
+                          repo_id, workspace_id, workspace_fence, scope_state) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(session_id) DO UPDATE SET \
+                          agent_kind = excluded.agent_kind, \
+                          provider_session_id = excluded.provider_session_id, \
+                          thread_id = excluded.thread_id, \
+                          state = excluded.state, \
+                          working_dir = excluded.working_dir, \
+                          worktree_id = excluded.worktree_id, \
+                          parent_commit = excluded.parent_commit, \
+                          parent_session_id = excluded.parent_session_id, \
+                          metadata_json = excluded.metadata_json, \
+                          redaction_report = excluded.redaction_report, \
+                          started_at = excluded.started_at, \
+                          last_event_at = excluded.last_event_at, \
+                          stopped_at = excluded.stopped_at, \
+                          schema_version = excluded.schema_version, \
+                          sync_revision = excluded.sync_revision, \
+                          repo_id = excluded.repo_id, \
+                          workspace_id = excluded.workspace_id, \
+                          workspace_fence = excluded.workspace_fence, \
+                          scope_state = excluded.scope_state",
+                    )
+                    .bind(&rec.session_id).bind(rec.agent_kind.as_str()).bind(&rec.provider_session_id)
+                    .bind(&rec.thread_id).bind(rec.state.as_str()).bind(&rec.working_dir)
+                    .bind(&rec.worktree_id).bind(&rec.parent_commit).bind(&rec.parent_session_id)
+                    .bind(&rec.metadata_json).bind(&rec.redaction_report).bind(rec.started_at)
+                    .bind(rec.last_event_at).bind(rec.stopped_at).bind(rec.schema_version)
+                    .bind(rec.sync_revision).bind(&rec.repo_id).bind(&rec.workspace_id)
+                    .bind(rec.workspace_fence).bind(rec.scope_state.as_str())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+                }
+                CaptureBatchPayload::UpsertCheckpoint(rec) => {
+                    let tomb: Option<i64> = sea_orm::sqlx::query_scalar(
+                        "SELECT 1 FROM agent_import_tombstone WHERE erased_session_id = ? LIMIT 1",
+                    )
+                    .bind(&rec.session_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                    if tomb.is_some() {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "{CAPTURE_TOMBSTONE_ERROR_PREFIX}: agent checkpoint is protected by an erasure tombstone"
+                            ),
+                        });
+                    }
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_checkpoint \
+                         (checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit, \
+                          tree_oid, metadata_blob_oid, traces_commit, tool_use_id, subagent_session_id, \
+                          description, created_at, sync_revision) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(checkpoint_id) DO UPDATE SET \
+                          session_id = excluded.session_id, \
+                          parent_checkpoint_id = excluded.parent_checkpoint_id, \
+                          scope = excluded.scope, \
+                          parent_commit = excluded.parent_commit, \
+                          tree_oid = excluded.tree_oid, \
+                          metadata_blob_oid = excluded.metadata_blob_oid, \
+                          traces_commit = excluded.traces_commit, \
+                          tool_use_id = excluded.tool_use_id, \
+                          subagent_session_id = excluded.subagent_session_id, \
+                          description = excluded.description, \
+                          created_at = excluded.created_at, \
+                          sync_revision = excluded.sync_revision",
+                    )
+                    .bind(&rec.checkpoint_id).bind(&rec.session_id).bind(&rec.parent_checkpoint_id)
+                    .bind(rec.scope.as_str()).bind(&rec.parent_commit).bind(&rec.tree_oid)
+                    .bind(&rec.metadata_blob_oid).bind(&rec.traces_commit).bind(&rec.tool_use_id)
+                    .bind(&rec.subagent_session_id).bind(&rec.description).bind(rec.created_at)
+                    .bind(rec.sync_revision)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_checkpoint", e))?;
+                }
+                CaptureBatchPayload::UpsertSessionCommit(rec) => {
+                    sea_orm::sqlx::query(
+                        "INSERT OR IGNORE INTO agent_session_commit (session_id, hash_kind, commit_oid) \
+                         VALUES (?, ?, ?)",
+                    )
+                    .bind(&rec.session_id).bind(rec.hash_kind.as_str()).bind(&rec.commit_oid)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session_commit", e))?;
+                }
+                CaptureBatchPayload::InsertUsageStats(rec) => {
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_usage_stats \
+                         (id, session_id, thread_id, agent_run_id, run_id, provider, model, request_kind, \
+                          intent, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, \
+                          total_tokens, tool_call_count, wall_clock_ms, provider_latency_ms, \
+                          cost_estimate_micro_dollars, cost_usd, usage_estimated, started_at, finished_at, \
+                          success, error_kind, schema_version, created_at, agent_name, repo_id, turn_id, event_id) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(id) DO UPDATE SET \
+                          session_id = excluded.session_id, \
+                          thread_id = excluded.thread_id, \
+                          agent_run_id = excluded.agent_run_id, \
+                          run_id = excluded.run_id, \
+                          provider = excluded.provider, \
+                          model = excluded.model, \
+                          request_kind = excluded.request_kind, \
+                          intent = excluded.intent, \
+                          prompt_tokens = excluded.prompt_tokens, \
+                          completion_tokens = excluded.completion_tokens, \
+                          cached_tokens = excluded.cached_tokens, \
+                          reasoning_tokens = excluded.reasoning_tokens, \
+                          total_tokens = excluded.total_tokens, \
+                          tool_call_count = excluded.tool_call_count, \
+                          wall_clock_ms = excluded.wall_clock_ms, \
+                          provider_latency_ms = excluded.provider_latency_ms, \
+                          cost_estimate_micro_dollars = excluded.cost_estimate_micro_dollars, \
+                          cost_usd = excluded.cost_usd, \
+                          usage_estimated = excluded.usage_estimated, \
+                          started_at = excluded.started_at, \
+                          finished_at = excluded.finished_at, \
+                          success = excluded.success, \
+                          error_kind = excluded.error_kind, \
+                          schema_version = excluded.schema_version, \
+                          created_at = excluded.created_at, \
+                          agent_name = excluded.agent_name, \
+                          repo_id = excluded.repo_id, \
+                          turn_id = excluded.turn_id, \
+                          event_id = excluded.event_id",
+                    )
+                    .bind(&rec.id).bind(&rec.session_id).bind(&rec.thread_id).bind(&rec.agent_run_id)
+                    .bind(&rec.run_id).bind(&rec.provider).bind(&rec.model).bind(&rec.request_kind)
+                    .bind(&rec.intent).bind(rec.prompt_tokens).bind(rec.completion_tokens)
+                    .bind(rec.cached_tokens).bind(rec.reasoning_tokens).bind(rec.total_tokens)
+                    .bind(rec.tool_call_count).bind(rec.wall_clock_ms).bind(rec.provider_latency_ms)
+                    .bind(rec.cost_estimate_micro_dollars).bind(rec.cost_usd)
+                    .bind(i64::from(rec.usage_estimated)).bind(&rec.started_at).bind(&rec.finished_at)
+                    .bind(i64::from(rec.success)).bind(&rec.error_kind).bind(rec.schema_version)
+                    .bind(&rec.created_at).bind(&rec.agent_name).bind(&rec.repo_id)
+                    .bind(&rec.turn_id).bind(&rec.event_id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_usage_stats", e))?;
+                }
+                CaptureBatchPayload::AppendAuditLog(rec) => {
+                    let existing_row = sea_orm::sqlx::query(
+                        "SELECT timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted \
+                         FROM agent_audit_log WHERE audit_id = ?",
+                    )
+                    .bind(&rec.audit_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_audit_log", e))?;
+                    if let Some(row) = existing_row {
+                        let same = row.try_get::<String, _>(0).ok().as_deref()
+                            == Some(rec.timestamp.as_str())
+                            && row.try_get::<Option<String>, _>(1).ok() == Some(rec.user_id.clone())
+                            && row.try_get::<Option<String>, _>(2).ok()
+                                == Some(rec.user_name.clone())
+                            && row.try_get::<String, _>(3).ok().as_deref()
+                                == Some(rec.action.as_str())
+                            && row.try_get::<String, _>(4).ok().as_deref()
+                                == Some(rec.checkpoint_id.as_str())
+                            && row.try_get::<String, _>(5).ok().as_deref()
+                                == Some(rec.scope.as_str())
+                            && row.try_get::<Option<String>, _>(6).ok()
+                                == Some(rec.export_path.clone())
+                            && row.try_get::<Option<String>, _>(7).ok()
+                                == Some(rec.justification.clone())
+                            && row.try_get::<i64, _>(8).ok() == Some(i64::from(rec.granted));
+                        if same {
+                            deduped = deduped.saturating_add(1);
+                            continue;
+                        }
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "{CAPTURE_APPEND_ONLY_ERROR_PREFIX}: conflicting agent_audit_log overwrite rejected"
+                            ),
+                        });
+                    }
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_audit_log \
+                         (audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&rec.audit_id).bind(&rec.timestamp).bind(&rec.user_id).bind(&rec.user_name)
+                    .bind(&rec.action).bind(&rec.checkpoint_id).bind(&rec.scope)
+                    .bind(&rec.export_path).bind(&rec.justification).bind(i64::from(rec.granted))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_audit_log", e))?;
+                }
+                CaptureBatchPayload::AppendWorkspaceScopeAudit(rec) => {
+                    let existing_row = sea_orm::sqlx::query(
+                        "SELECT action, agent_kind, provider_session_id, repo_id, worktree_id, workspace_id, workspace_fence, actor, created_at \
+                         FROM agent_workspace_scope_audit WHERE audit_id = ?",
+                    )
+                    .bind(&rec.audit_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_workspace_scope_audit", e))?;
+                    if let Some(row) = existing_row {
+                        let same = row.try_get::<String, _>(0).ok().as_deref()
+                            == Some(rec.action.as_str())
+                            && row.try_get::<String, _>(1).ok().as_deref()
+                                == Some(rec.agent_kind.as_str())
+                            && row.try_get::<String, _>(2).ok().as_deref()
+                                == Some(rec.provider_session_id.as_str())
+                            && row.try_get::<String, _>(3).ok().as_deref()
+                                == Some(rec.repo_id.as_str())
+                            && row.try_get::<String, _>(4).ok().as_deref()
+                                == Some(rec.worktree_id.as_str())
+                            && row.try_get::<Option<String>, _>(5).ok()
+                                == Some(rec.workspace_id.clone())
+                            && row.try_get::<Option<i64>, _>(6).ok() == Some(rec.workspace_fence)
+                            && row.try_get::<Option<String>, _>(7).ok() == Some(rec.actor.clone())
+                            && row.try_get::<i64, _>(8).ok() == Some(rec.created_at);
+                        if same {
+                            deduped = deduped.saturating_add(1);
+                            continue;
+                        }
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "{CAPTURE_APPEND_ONLY_ERROR_PREFIX}: conflicting agent_workspace_scope_audit overwrite rejected"
+                            ),
+                        });
+                    }
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_workspace_scope_audit \
+                         (audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id, workspace_id, workspace_fence, actor, created_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&rec.audit_id).bind(&rec.action).bind(&rec.agent_kind)
+                    .bind(&rec.provider_session_id).bind(&rec.repo_id).bind(&rec.worktree_id)
+                    .bind(&rec.workspace_id).bind(rec.workspace_fence).bind(&rec.actor)
+                    .bind(rec.created_at)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_workspace_scope_audit", e))?;
+                }
+            }
+            applied = applied.saturating_add(1);
+        }
+
+        Ok((applied, deduped))
+    }
+    .await;
+
+    match res {
+        Ok(counts) => {
+            commit_reverse_sqlite_batch(conn, r, "capture_batch_replay").await?;
+            Ok(counts)
+        }
+        Err(err) => {
+            rollback_reverse_sqlite_batch_best_effort(conn).await;
+            Err(err)
+        }
+    }
+}
+
+/// Replay all unreconciled `META_CROSS_STORE_INTENT` entries (`gen > cap_gen`)
+/// directly from the held uncommitted `git_wtx` into `capture.db.tmp` in
+/// strictly ascending `gen` order without opening any nested `WriteTransaction`
+/// (`ADR-RB-06`, `ADR-RB-07` #2, `RB-11i` AC2).
+async fn replay_unreconciled_cross_store_intents_to_sqlite(
+    git_wtx: &redb::WriteTransaction,
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    cap_conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<CrossStoreIntentReplayReport> {
+    let git_gen = RedbGitStore::read_cross_store_generation_in_wtx(git_wtx)?;
+    let cap_gen = RedbCaptureStore::read_cross_store_generation_in_wtx(cap_wtx)?;
+    if cap_gen > git_gen {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 rejected capture generation ({cap_gen}) exceeding git generation ({git_gen})"
+            ),
+        });
+    }
+    RedbGitStore::ensure_no_orphan_cross_store_intents_in_wtx(git_wtx, git_gen)?;
+
+    let mut report = CrossStoreIntentReplayReport {
+        git_generation: git_gen,
+        capture_generation: cap_gen,
+        ..CrossStoreIntentReplayReport::default()
+    };
+    if cap_gen == git_gen {
+        return Ok(report);
+    }
+
+    let pending_raw = RedbGitStore::read_pending_cross_store_intents_in_wtx(git_wtx, cap_gen)?;
+    let expected_count =
+        usize::try_from(git_gen - cap_gen).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "reverse migration pending cross-store generation gap exceeds platform bounds"
+                .to_string(),
+        })?;
+    if pending_raw.len() < expected_count {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration cross-store outbox is missing pending intent(s) between generation {} and {git_gen}",
+                cap_gen + 1
+            ),
+        });
+    }
+
+    let mut expected_gen =
+        cap_gen
+            .checked_add(1)
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "reverse migration cross-store generation overflow".to_string(),
+            })?;
+
+    for (key_gen, raw_bytes) in pending_raw {
+        if key_gen > git_gen {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration cross-store outbox contains orphan intent generation {key_gen} beyond git generation {git_gen}"
+                ),
+            });
+        }
+        if key_gen != expected_gen {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration cross-store outbox generation gap: expected {expected_gen}, found {key_gen}"
+                ),
+            });
+        }
+        let intent: CrossStoreIntentRecord =
+            decode_versioned(&raw_bytes, CROSS_STORE_INTENT_CODEC_VERSION)?;
+        if intent.generation != key_gen {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration cross-store intent payload generation ({}) does not match key ({key_gen})",
+                    intent.generation
+                ),
+            });
+        }
+        // Apply items in bounded `<= 500` item chunks to honor the batch/heap budget.
+        for chunk in intent.items.chunks(FORWARD_MIGRATION_STREAM_BATCH_ROWS) {
+            let (applied, deduped) = apply_capture_batch_items_to_sqlite_tmp(
+                cap_conn,
+                cap_wtx,
+                existing_cap_tables,
+                chunk,
+            )
+            .await?;
+            report.applied_items = report.applied_items.saturating_add(applied);
+            report.deduplicated_items = report.deduplicated_items.saturating_add(deduped);
+            report.batches_committed = report.batches_committed.saturating_add(1);
+            telemetry.record_batch("meta_cross_store_intent", chunk.len())?;
+        }
+        report.replayed_generations.push(key_gen);
+        expected_gen = expected_gen.saturating_add(1);
+    }
+
+    if report.replayed_generations.len() != expected_count {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration cross-store intent replay incomplete: replayed {} of {expected_count}",
+                report.replayed_generations.len()
+            ),
+        });
+    }
+    Ok(report)
+}
+
+async fn stream_queue_segment_range_to_sqlite(
+    file: File,
+    slice: QueueSegmentSlice,
+    cap_conn: &mut SqliteConnection,
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    outcome: &mut LaneIngestOutcome,
+) -> StorageResult<File> {
+    use std::io::{BufReader, Seek as _, SeekFrom};
+    let QueueSegmentSlice {
+        lane,
+        start_offset,
+        end_offset,
+        committed_seg_hw,
+    } = slice;
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(start_offset)).map_err(|err| {
+        StorageBackendError::io("seek capture-queue segment for reverse decode", err)
+    })?;
+    let mut decoder = FrameStreamDecoder::with_known_len(reader, start_offset, end_offset);
+
+    let mut batch: Vec<CaptureBatchItem> = Vec::new();
+    let mut batch_bytes = 0usize;
+    let label = match lane {
+        CaptureQueueLane::Priority => "capture_queue_priority",
+        CaptureQueueLane::Normal => "capture_queue_normal",
+    };
+
+    loop {
+        match decoder.next_frame() {
+            Ok(FrameStreamItem::Frame { offset, frame, .. }) => {
+                let frame_bytes = frame.dedup_key.len().saturating_add(frame.payload.len());
+                let payload: CaptureBatchPayload =
+                    decode_postcard_payload(&frame, CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION)?;
+                let item = CaptureBatchItem {
+                    dedup_key: frame.dedup_key,
+                    payload,
+                };
+                validate_capture_batch_item(&item)?;
+                outcome.frames_read = outcome.frames_read.saturating_add(1);
+
+                if !batch.is_empty()
+                    && (batch.len() >= FORWARD_MIGRATION_QUEUE_INGEST_BATCH_ITEMS
+                        || batch_bytes.saturating_add(frame_bytes)
+                            > FORWARD_MIGRATION_INGEST_BATCH_MAX_BYTES)
+                {
+                    let (a, d) = apply_capture_batch_items_to_sqlite_tmp(
+                        cap_conn,
+                        cap_wtx,
+                        existing_cap_tables,
+                        &batch,
+                    )
+                    .await?;
+                    telemetry.record_batch(label, batch.len())?;
+                    outcome.applied_frames = outcome.applied_frames.saturating_add(a);
+                    outcome.deduplicated_frames = outcome.deduplicated_frames.saturating_add(d);
+                    outcome.batches_committed = outcome.batches_committed.saturating_add(1);
+                    if let Some((segment_id, _)) = committed_seg_hw {
+                        outcome.highwater = CaptureQueueHighwater {
+                            segment_id,
+                            byte_offset: offset,
+                        };
+                    }
+                    batch.clear();
+                    batch_bytes = 0;
+                }
+
+                batch_bytes = batch_bytes.saturating_add(frame_bytes);
+                batch.push(item);
+            }
+            Ok(FrameStreamItem::CleanEof { offset }) => {
+                if committed_seg_hw.is_some() && offset != end_offset {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail: "committed capture-queue segment ended before LTM2 boundary"
+                            .to_string(),
+                    });
+                }
+                break;
+            }
+            Err(decode_err) => {
+                if committed_seg_hw.is_some() {
+                    return Err(decode_err.into_storage_error());
+                }
+                match decode_err {
+                    FrameDecodeError::Io { .. } => return Err(decode_err.into_storage_error()),
+                    FrameDecodeError::CorruptHeader { .. }
+                    | FrameDecodeError::CorruptPayload { .. }
+                    | FrameDecodeError::TruncatedTail { .. } => break,
+                }
+            }
+        }
+    }
+
+    if !batch.is_empty() {
+        let (a, d) =
+            apply_capture_batch_items_to_sqlite_tmp(cap_conn, cap_wtx, existing_cap_tables, &batch)
+                .await?;
+        telemetry.record_batch(label, batch.len())?;
+        outcome.applied_frames = outcome.applied_frames.saturating_add(a);
+        outcome.deduplicated_frames = outcome.deduplicated_frames.saturating_add(d);
+        outcome.batches_committed = outcome.batches_committed.saturating_add(1);
+        if let Some((_, end_hw)) = committed_seg_hw {
+            outcome.highwater = end_hw;
+        }
+    } else if let Some((_, end_hw)) = committed_seg_hw
+        && outcome.highwater < end_hw
+    {
+        outcome.highwater = end_hw;
+    }
+
+    Ok(decoder.into_inner().into_inner())
+}
+
+/// Strictly read-only direct ingestion of pending `capture-queue/{priority,normal}/`
+/// frames (`priority/` first, then `normal/`) into `capture.db.tmp` (`RB-11i` AC3).
+/// Never mutates a single byte in `capture-queue/`.
+async fn ingest_capture_queue_readonly_to_sqlite(
+    common_storage: &Path,
+    cap_conn: &mut SqliteConnection,
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<QueueDirectIngestReport> {
+    let queue_root = capture_queue_dir_path(common_storage);
+    let mut priority = LaneIngestOutcome::default();
+    let mut normal = LaneIngestOutcome::default();
+
+    for (lane, lane_name, out) in [
+        (
+            CaptureQueueLane::Priority,
+            QUEUE_LANE_PRIORITY_DIR,
+            &mut priority,
+        ),
+        (CaptureQueueLane::Normal, QUEUE_LANE_NORMAL_DIR, &mut normal),
+    ] {
+        let lane_dir = queue_root.join(lane_name);
+        let meta_fs = match fs::symlink_metadata(&lane_dir) {
+            Ok(m) => m,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture-queue lane for reverse ingest",
+                    err,
+                ));
+            }
+        };
+        if meta_fs.file_type().is_symlink() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "reverse migration Phase 1 rejected symlinked capture-queue lane"
+                    .to_string(),
+            });
+        }
+        if meta_fs.file_type().is_file() {
+            // Already fenced `0400` tombstone: nothing pending to ingest.
+            continue;
+        }
+        if !meta_fs.file_type().is_dir() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "reverse migration Phase 1 rejected non-directory capture-queue lane"
+                    .to_string(),
+            });
+        }
+
+        // Open and verify segments strictly read-only.
+        #[cfg(unix)]
+        let lane_fd = {
+            let root_fd = open_readonly_root_dir_unix(common_storage)?;
+            let Some((priv_fd, _)) =
+                open_readonly_subdir_unix(&root_fd, c"private", 0o022, "private directory")?
+            else {
+                continue;
+            };
+            let Some((q_fd, _)) = open_readonly_subdir_unix(
+                &priv_fd,
+                c"capture-queue",
+                0o022,
+                "capture-queue directory",
+            )?
+            else {
+                continue;
+            };
+            let c_lane = match lane {
+                CaptureQueueLane::Priority => c"priority",
+                CaptureQueueLane::Normal => c"normal",
+            };
+            let Some((l_fd, _)) =
+                open_readonly_subdir_unix(&q_fd, c_lane, 0o022, "capture-queue lane")?
+            else {
+                continue;
+            };
+            l_fd
+        };
+
+        let mut segments = BTreeSet::new();
+        let mut has_meta_replica = false;
+        #[cfg(unix)]
+        {
+            let names = list_sorted_dir_names_bounded_unix(
+                &lane_fd,
+                MAX_SPOOL_BACKUP_FILES,
+                MAX_SPOOL_BACKUP_NAME_BYTES,
+                "capture-queue lane",
+            )?;
+            for name in &names {
+                if name == QUEUE_TAIL_META_FILE || name == QUEUE_TAIL_META_BAK_FILE {
+                    has_meta_replica = true;
+                } else if let Some(seg_id) = parse_segment_log_file_name(name.as_bytes()) {
+                    segments.insert(seg_id);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            for entry in fs::read_dir(&lane_dir)
+                .map_err(|err| StorageBackendError::io("list capture-queue lane", err))?
+            {
+                let entry = entry
+                    .map_err(|err| StorageBackendError::io("read capture-queue lane entry", err))?;
+                let name = entry.file_name().into_string().map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: "non-UTF-8 entry in capture-queue lane".to_string(),
+                    }
+                })?;
+                if name == QUEUE_TAIL_META_FILE || name == QUEUE_TAIL_META_BAK_FILE {
+                    has_meta_replica = true;
+                } else if let Some(seg_id) = parse_segment_log_file_name(name.as_bytes()) {
+                    segments.insert(seg_id);
+                }
+            }
+        }
+        if segments.is_empty() && !has_meta_replica {
+            continue;
+        }
+
+        #[cfg(unix)]
+        let meta = read_converged_lane_tail_meta_unix_protected(&lane_fd, &[], lane)?;
+        #[cfg(not(unix))]
+        let meta = read_converged_lane_tail_meta(&lane_dir)?;
+        validate_queue_lane_meta_against_segments(&meta, &segments, lane)?;
+
+        let open_seg = |seg_id: u32, subject: &'static str| -> StorageResult<(File, u64)> {
+            let seg_name = segment_log_file_name(seg_id);
+            #[cfg(unix)]
+            {
+                let c_name = std::ffi::CString::new(seg_name.as_bytes()).map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: "invalid capture-queue segment filename".to_string(),
+                    }
+                })?;
+                open_readonly_regular_file_at_unix(&lane_fd, &c_name, 0o022, None, subject)
+            }
+            #[cfg(not(unix))]
+            {
+                let path = lane_dir.join(&seg_name);
+                let f = File::open(&path).map_err(|e| StorageBackendError::io(subject, e))?;
+                let len = f
+                    .metadata()
+                    .map_err(|e| StorageBackendError::io(subject, e))?
+                    .len();
+                Ok((f, len))
+            }
+        };
+
+        if meta.is_initial_empty() {
+            if segments.contains(&0) {
+                let (file, actual_len) = open_seg(0, "capture-queue initial segment")?;
+                if actual_len > 0 {
+                    let _ = stream_queue_segment_range_to_sqlite(
+                        file,
+                        QueueSegmentSlice {
+                            lane,
+                            start_offset: 0,
+                            end_offset: actual_len,
+                            committed_seg_hw: None,
+                        },
+                        cap_conn,
+                        cap_wtx,
+                        existing_cap_tables,
+                        telemetry,
+                        out,
+                    )
+                    .await?;
+                }
+            }
+            continue;
+        }
+
+        for sealed in &meta.sealed {
+            let (mut file, actual_len) = open_seg(sealed.seg_id, "capture-queue sealed segment")?;
+            if actual_len != sealed.sealed_len {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: format!(
+                        "capture-queue {} sealed segment {:08x} length mismatch",
+                        lane.as_str(),
+                        sealed.seg_id
+                    ),
+                });
+            }
+            let crc = compute_file_prefix_crc32c(&mut file, sealed.sealed_len)?;
+            if crc != sealed.sealed_crc32c {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: format!(
+                        "capture-queue {} sealed segment {:08x} CRC32C mismatch",
+                        lane.as_str(),
+                        sealed.seg_id
+                    ),
+                });
+            }
+            let end_hw = CaptureQueueHighwater {
+                segment_id: sealed.seg_id.saturating_add(1),
+                byte_offset: 0,
+            };
+            let _ = stream_queue_segment_range_to_sqlite(
+                file,
+                QueueSegmentSlice {
+                    lane,
+                    start_offset: 0,
+                    end_offset: sealed.sealed_len,
+                    committed_seg_hw: Some((sealed.seg_id, end_hw)),
+                },
+                cap_conn,
+                cap_wtx,
+                existing_cap_tables,
+                telemetry,
+                out,
+            )
+            .await?;
+        }
+
+        {
+            let (mut file, actual_len) = open_seg(meta.active_seg, "capture-queue active segment")?;
+            if actual_len < meta.committed_len {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: format!(
+                        "capture-queue {} active segment {:08x} shorter than LTM2 committed_len",
+                        lane.as_str(),
+                        meta.active_seg
+                    ),
+                });
+            }
+            let crc = compute_file_prefix_crc32c(&mut file, meta.committed_len)?;
+            if crc != meta.prefix_crc32c {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: format!(
+                        "capture-queue {} active segment {:08x} prefix CRC32C mismatch",
+                        lane.as_str(),
+                        meta.active_seg
+                    ),
+                });
+            }
+            let committed_hw = CaptureQueueHighwater {
+                segment_id: meta.active_seg,
+                byte_offset: meta.committed_len,
+            };
+            let file = stream_queue_segment_range_to_sqlite(
+                file,
+                QueueSegmentSlice {
+                    lane,
+                    start_offset: 0,
+                    end_offset: meta.committed_len,
+                    committed_seg_hw: Some((meta.active_seg, committed_hw)),
+                },
+                cap_conn,
+                cap_wtx,
+                existing_cap_tables,
+                telemetry,
+                out,
+            )
+            .await?;
+            if actual_len > meta.committed_len {
+                let _ = stream_queue_segment_range_to_sqlite(
+                    file,
+                    QueueSegmentSlice {
+                        lane,
+                        start_offset: meta.committed_len,
+                        end_offset: actual_len,
+                        committed_seg_hw: None,
+                    },
+                    cap_conn,
+                    cap_wtx,
+                    existing_cap_tables,
+                    telemetry,
+                    out,
+                )
+                .await?;
+            }
+        }
+
+        let orphan_seg = meta.active_seg.saturating_add(1);
+        if segments.contains(&orphan_seg) {
+            let (file, actual_len) =
+                open_seg(orphan_seg, "capture-queue orphan successor segment")?;
+            if actual_len > 0 {
+                let _ = stream_queue_segment_range_to_sqlite(
+                    file,
+                    QueueSegmentSlice {
+                        lane,
+                        start_offset: 0,
+                        end_offset: actual_len,
+                        committed_seg_hw: None,
+                    },
+                    cap_conn,
+                    cap_wtx,
+                    existing_cap_tables,
+                    telemetry,
+                    out,
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(QueueDirectIngestReport {
+        priority_frames_read: priority.frames_read,
+        normal_frames_read: normal.frames_read,
+        applied_frames: priority
+            .applied_frames
+            .saturating_add(normal.applied_frames),
+        deduplicated_frames: priority
+            .deduplicated_frames
+            .saturating_add(normal.deduplicated_frames),
+        priority_highwater: priority.highwater,
+        normal_highwater: normal.highwater,
+        batches_committed: priority
+            .batches_committed
+            .saturating_add(normal.batches_committed),
+    })
+}
+
+/// Stamp `PRAGMA application_id = target_migration_tag` on an open staged SQLite
+/// `.tmp` connection (`RB-11i` AC4 & AC5).
+async fn stamp_sqlite_tmp_application_id(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    tag: u32,
+) -> StorageResult<()> {
+    if tag == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration Phase 1 target_migration_tag must be non-zero".to_string(),
+        });
+    }
+    let sql = format!("PRAGMA application_id = {tag};");
+    sea_orm::sqlx::query(AssertSqlSafe(sql))
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed setting PRAGMA application_id on {role} tmp: {err}"
+            ),
+        })?;
+    let read_back: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed verifying PRAGMA application_id on {role} tmp: {err}"
+            ),
+        })?;
+    if read_back != i64::from(tag) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA application_id mismatch on {role} tmp (expected {tag}, got {read_back})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Reverse migration Phase 1 single-pass streaming export, direct
+/// `META_CROSS_STORE_INTENT` replay, read-only `capture-queue/` ingest, and
+/// `PRAGMA application_id = target_migration_tag` tagging (`RB-11i`).
+pub async fn export_reverse_phase1_to_sqlite_tmp(
+    guard: &ReversePhase1QuiesceGuard,
+    common_storage: &Path,
+) -> StorageResult<ReversePhase1ExportReport> {
+    let mut telemetry = ExportStreamTelemetry::new();
+    let mut artifacts = ReversePhase1ArtifactGuard::new(common_storage);
+    let report = export_reverse_phase1_to_sqlite_tmp_inner(
+        guard,
+        common_storage,
+        &mut telemetry,
+        &mut artifacts,
+    )
+    .await?;
+    artifacts.disarm();
+    Ok(report)
+}
+
+async fn export_reverse_phase1_to_sqlite_tmp_inner(
+    guard: &ReversePhase1QuiesceGuard,
+    common_storage: &Path,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    artifacts: &mut ReversePhase1ArtifactGuard,
+) -> StorageResult<ReversePhase1ExportReport> {
+    let generation = guard.redb().generation();
+    let target_migration_tag = allocate_reverse_target_migration_tag(generation);
+
+    // Stage `libra.db.tmp` and `capture.db.tmp` under RAII cleanup ownership.
+    let (git_tmp_path, mut git_conn) = bootstrap_reverse_git_sqlite_tmp(common_storage).await?;
+    artifacts.git_tmp_path = Some(git_tmp_path.clone());
+
+    let (capture_tmp_path, mut cap_conn) =
+        bootstrap_reverse_capture_sqlite_tmp(common_storage).await?;
+    artifacts.capture_tmp_path = Some(capture_tmp_path.clone());
+
+    let git_wtx = guard.redb().git_wtx();
+    let cap_wtx = guard.redb().capture_wtx();
+    let existing_cap_tables = list_existing_redb_tables(cap_wtx)?;
+
+    // 1. Stream all 61 Git tables from held `git_wtx` -> `libra.db.tmp`.
+    let git_table_counts =
+        export_reverse_git_tables_to_sqlite(git_wtx, &mut git_conn, telemetry).await?;
+
+    // 2. Stream all 25 Capture tables from held `cap_wtx` -> `capture.db.tmp`.
+    let capture_table_counts =
+        export_reverse_capture_tables_to_sqlite(cap_wtx, &mut cap_conn, telemetry).await?;
+
+    // Create connection-local temporary dedup table (leaves `capture.db.tmp`
+    // 100% pure canonical 25-table schema on close while guaranteeing O(1) heap
+    // dedup across intent replay and queue direct ingest).
+    sea_orm::sqlx::query(
+        "CREATE TEMP TABLE _rev_mig_dedup_keys (dedup_key TEXT NOT NULL PRIMARY KEY)",
+    )
+    .execute(&mut cap_conn)
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!(
+            "reverse migration Phase 1 failed creating temp dedup table on capture.db.tmp: {err}"
+        ),
+    })?;
+
+    // 3. Direct deadlock-free replay of unreconciled `META_CROSS_STORE_INTENT`
+    //    (`gen > cap_gen`) in strictly ascending order directly into `capture.db.tmp`.
+    let intent_replay = replay_unreconciled_cross_store_intents_to_sqlite(
+        git_wtx,
+        cap_wtx,
+        &existing_cap_tables,
+        &mut cap_conn,
+        telemetry,
+    )
+    .await?;
+
+    // 4. Strictly read-only direct ingestion of pending `capture-queue/{priority,normal}/`
+    //    frames (`priority/` before `normal/`) into `capture.db.tmp`.
+    let queue_ingest = ingest_capture_queue_readonly_to_sqlite(
+        common_storage,
+        &mut cap_conn,
+        cap_wtx,
+        &existing_cap_tables,
+        telemetry,
+    )
+    .await?;
+
+    // 5. Stamp identical unique non-zero `PRAGMA application_id = target_migration_tag`
+    //    on BOTH `capture.db.tmp` and `libra.db.tmp` BEFORE closing & fsyncing.
+    stamp_sqlite_tmp_application_id(&mut cap_conn, DatabaseRole::Capture, target_migration_tag)
+        .await?;
+    stamp_sqlite_tmp_application_id(
+        &mut git_conn,
+        DatabaseRole::Repository,
+        target_migration_tag,
+    )
+    .await?;
+
+    cap_conn
+        .close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("reverse migration Phase 1 failed closing capture.db.tmp: {err}"),
+        })?;
+    git_conn
+        .close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("reverse migration Phase 1 failed closing libra.db.tmp: {err}"),
+        })?;
+
+    // Flush both `.tmp` files durably to disk before returning (`RB-11i` AC4 & AC5).
+    fsync_regular_file_nofollow(&capture_tmp_path, "sync capture.db.tmp")?;
+    fsync_regular_file_nofollow(&git_tmp_path, "sync libra.db.tmp")?;
+    fsync_dir_best_effort(&common_storage.join(PRIVATE_SUBDIR))?;
+    fsync_dir_best_effort(common_storage)?;
+
+    Ok(ReversePhase1ExportReport {
+        generation,
+        target_migration_tag,
+        git_tmp_path,
+        capture_tmp_path,
+        git_table_counts,
+        capture_table_counts,
+        max_batch_rows: telemetry.max_batch_rows,
+        total_streaming_batches: telemetry.total_batches,
+        intent_replay,
+        queue_ingest,
+    })
+}
+
+fn fsync_regular_file_nofollow(path: &Path, context: &'static str) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            os::unix::{
+                ffi::OsStrExt as _,
+                io::{FromRawFd as _, OwnedFd},
+            },
+        };
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: format!("invalid file path for {context}"),
+            }
+        })?;
+        // SAFETY: `c_path` is NUL-terminated.
+        let raw = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+        }
+        // SAFETY: `raw >= 0` is exclusively owned here.
+        let file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        file.sync_all()
+            .map_err(|err| StorageBackendError::io(context, err))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let file = File::open(path).map_err(|err| StorageBackendError::io(context, err))?;
+        file.sync_all()
+            .map_err(|err| StorageBackendError::io(context, err))?;
+        Ok(())
+    }
+}
+
+async fn verify_one_sqlite_tmp_integrity_and_tag(
+    path: &Path,
+    role: DatabaseRole,
+    expected_tag: u32,
+    target_label: &'static str,
+    durability: &mut Phase1DurabilityReceipt,
+) -> StorageResult<u32> {
+    let mut conn = open_reverse_sqlite_tmp_conn_async(path, role, true).await?;
+    let rows: Vec<String> = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_all(&mut conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA integrity_check failed for {role}: {err}"
+            ),
+        })?;
+    if rows.len() != 1 || rows[0] != "ok" {
+        let _ = conn.close().await;
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA integrity_check failed for {role} (rows={})",
+                rows.len()
+            ),
+        });
+    }
+    let app_id: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA application_id read failed for {role}: {err}"
+            ),
+        })?;
+    conn.close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed closing verified {role} sqlite tmp: {err}"
+            ),
+        })?;
+    if app_id <= 0 || app_id != i64::from(expected_tag) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA application_id mismatch on {role} tmp (expected {expected_tag}, got {app_id})"
+            ),
+        });
+    }
+    fsync_regular_file_nofollow(path, "fsync verified reverse sqlite tmp")?;
+    durability.record(Phase1DurabilityOpKind::FileFsync, target_label);
+    Ok(expected_tag)
+}
+
+/// Verify `PRAGMA integrity_check == "ok"`, exact non-zero
+/// `PRAGMA application_id == export.target_migration_tag`, and `fsync` on BOTH
+/// `libra.db.tmp` and `capture.db.tmp` (`RB-11p` AC1).
+pub async fn verify_reverse_phase1_sqlite_tmp(
+    common_storage: &Path,
+    export: &ReversePhase1ExportReport,
+) -> StorageResult<ReversePhase1VerificationReport> {
+    let mut durability = Phase1DurabilityReceipt::new();
+    let capture_tmp_application_id = verify_one_sqlite_tmp_integrity_and_tag(
+        &export.capture_tmp_path,
+        DatabaseRole::Capture,
+        export.target_migration_tag,
+        "private/capture.db.tmp",
+        &mut durability,
+    )
+    .await?;
+    let git_tmp_application_id = verify_one_sqlite_tmp_integrity_and_tag(
+        &export.git_tmp_path,
+        DatabaseRole::Repository,
+        export.target_migration_tag,
+        "libra.db.tmp",
+        &mut durability,
+    )
+    .await?;
+    fsync_dir_best_effort(&common_storage.join(PRIVATE_SUBDIR))?;
+    durability.record(Phase1DurabilityOpKind::DirFsync, PRIVATE_SUBDIR);
+    fsync_dir_best_effort(common_storage)?;
+    durability.record(Phase1DurabilityOpKind::DirFsync, ".");
+
+    Ok(ReversePhase1VerificationReport {
+        git_tmp_integrity_ok: true,
+        capture_tmp_integrity_ok: true,
+        git_tmp_application_id,
+        capture_tmp_application_id,
+        durability,
+    })
+}
+
+/// Stream-copy a single regular source file into `dest_dir/dest_name` via a
+/// sibling `.tmp` file in O(1) RAM (`64 KiB` buffer), `sync_all()`, verify
+/// independent read-back SHA-256 == source SHA-256, atomically rename, and
+/// record durability ops (`RB-11p` AC2).
+fn stream_copy_and_verify_backup_file(
+    src_path: &Path,
+    dest_dir: &Path,
+    dest_name: &str,
+    dest_mode: u32,
+    rel_label: String,
+    durability: &mut Phase1DurabilityReceipt,
+) -> StorageResult<(PathBuf, String, u64)> {
+    use std::io::{Read as _, Write as _};
+
+    let src_file = {
+        #[cfg(unix)]
+        {
+            use std::{
+                ffi::CString,
+                os::unix::{
+                    ffi::OsStrExt as _,
+                    io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+                },
+            };
+            let c_src = CString::new(src_path.as_os_str().as_bytes()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "invalid source backup path".to_string(),
+                }
+            })?;
+            // SAFETY: `c_src` is NUL-terminated.
+            let raw = unsafe {
+                libc::open(
+                    c_src.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                return Err(StorageBackendError::io(
+                    "open source file for reverse backup",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `raw >= 0` is exclusively owned.
+            let f = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+            let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `f` is valid.
+            if unsafe { libc::fstat(f.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+                return Err(StorageBackendError::io(
+                    "stat source file for reverse backup",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `fstat` succeeded.
+            let st = unsafe { st.assume_init() };
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Phase 1 backup rejected non-regular source file"
+                        .to_string(),
+                });
+            }
+            f
+        }
+        #[cfg(not(unix))]
+        {
+            File::open(src_path).map_err(|err| {
+                StorageBackendError::io("open source file for reverse backup", err)
+            })?
+        }
+    };
+
+    let tmp_name = format!(".{dest_name}.tmp");
+    let tmp_path = dest_dir.join(&tmp_name);
+    let final_path = dest_dir.join(dest_name);
+
+    let mut dst_file = {
+        #[cfg(unix)]
+        {
+            use std::{
+                ffi::CString,
+                os::unix::{
+                    ffi::OsStrExt as _,
+                    io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+                },
+            };
+            let c_tmp = CString::new(tmp_path.as_os_str().as_bytes()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "invalid backup tmp path".to_string(),
+                }
+            })?;
+            // SAFETY: `c_tmp` is NUL-terminated.
+            let raw = unsafe {
+                libc::open(
+                    c_tmp.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    dest_mode as libc::mode_t as libc::c_uint,
+                )
+            };
+            if raw < 0 {
+                return Err(StorageBackendError::io(
+                    "create reverse backup tmp file",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `raw >= 0` is exclusively owned.
+            let f = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+            // SAFETY: `f` is valid.
+            if unsafe { libc::fchmod(f.as_raw_fd(), dest_mode as libc::mode_t) } != 0 {
+                let err = io::Error::last_os_error();
+                drop(f);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(StorageBackendError::io(
+                    "set reverse backup tmp permissions",
+                    err,
+                ));
+            }
+            f
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dest_mode;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|err| StorageBackendError::io("create reverse backup tmp file", err))?
+        }
+    };
+
+    let mut buf = vec![0u8; BACKUP_STREAM_BUF_BYTES];
+    let mut src_hasher = Sha256::new();
+    let mut copied_len = 0u64;
+    let mut src_reader = src_file;
+    loop {
+        let n = match src_reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(err) => {
+                drop(dst_file);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(StorageBackendError::io(
+                    "read source file during reverse backup",
+                    err,
+                ));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        src_hasher.update(&buf[..n]);
+        if let Err(err) = dst_file.write_all(&buf[..n]) {
+            drop(dst_file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(StorageBackendError::io(
+                "write backup file during reverse backup",
+                err,
+            ));
+        }
+        copied_len = copied_len.saturating_add(n as u64);
+    }
+    if let Err(err) = dst_file.sync_all() {
+        drop(dst_file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(StorageBackendError::io(
+            "fsync reverse backup tmp file",
+            err,
+        ));
+    }
+    drop(dst_file);
+    durability.record(Phase1DurabilityOpKind::FileFsync, rel_label.clone());
+
+    // Independent read-back SHA-256 verification of the synced backup file.
+    let src_sha = sha256_hex_from_hasher(src_hasher);
+    let mut verify_file = File::open(&tmp_path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        StorageBackendError::io("reopen reverse backup file for SHA-256 verify", err)
+    })?;
+    let mut dst_hasher = Sha256::new();
+    let mut verified_len = 0u64;
+    loop {
+        let n = verify_file.read(&mut buf).map_err(|err| {
+            let _ = fs::remove_file(&tmp_path);
+            StorageBackendError::io("read reverse backup file for SHA-256 verify", err)
+        })?;
+        if n == 0 {
+            break;
+        }
+        dst_hasher.update(&buf[..n]);
+        verified_len = verified_len.saturating_add(n as u64);
+    }
+    drop(verify_file);
+    let dst_sha = sha256_hex_from_hasher(dst_hasher);
+    if verified_len != copied_len || dst_sha != src_sha {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 backup SHA-256 verification mismatch for `{rel_label}`"
+            ),
+        });
+    }
+
+    // Non-overwriting publish into final backup path.
+    if fs::symlink_metadata(&final_path).is_ok() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 backup target already exists (`{rel_label}`)"
+            ),
+        });
+    }
+    fs::rename(&tmp_path, &final_path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        StorageBackendError::io("publish reverse backup file", err)
+    })?;
+    durability.record(Phase1DurabilityOpKind::AtomicPublish, rel_label);
+    Ok((final_path, dst_sha, verified_len))
+}
+
+fn compute_capture_spool_manifest_sha256_readonly(common_storage: &Path) -> StorageResult<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0");
+    let spool_root = capture_spool_dir_path(common_storage);
+    for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+        hash_len_prefixed_bytes(&mut hasher, sub.as_bytes());
+        let p = spool_root.join(sub);
+        match fs::symlink_metadata(&p) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => hasher.update([0u8]),
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture-spool entry for reverse manifest digest",
+                    err,
+                ));
+            }
+            Ok(meta) if meta.file_type().is_file() => hasher.update([2u8]),
+            Ok(meta) if meta.file_type().is_dir() => {
+                hasher.update([1u8]);
+                let mut names = Vec::new();
+                for entry in fs::read_dir(&p).map_err(|err| {
+                    StorageBackendError::io("list capture-spool dir for reverse manifest", err)
+                })? {
+                    let entry = entry.map_err(|err| {
+                        StorageBackendError::io(
+                            "read capture-spool entry for reverse manifest",
+                            err,
+                        )
+                    })?;
+                    if let Ok(name) = entry.file_name().into_string() {
+                        names.push(name);
+                    }
+                }
+                names.sort();
+                for name in names {
+                    hash_len_prefixed_bytes(&mut hasher, name.as_bytes());
+                }
+            }
+            Ok(_) => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Phase 1 rejected unsafe capture-spool entry"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(sha256_hex_from_hasher(hasher))
+}
+
+/// Create SHA-256 verified, `fsync`-durable backups of frozen `git.redb`,
+/// `capture.redb`, and `capture-queue/{priority,normal,quarantine}/` (leaving
+/// source directories and `append.lock` untouched in place) under
+/// `.libra/redb-backup/<gen>/` (`RB-11p` AC2).
+pub fn create_reverse_phase1_backups(
+    guard: &ReversePhase1QuiesceGuard,
+    common_storage: &Path,
+) -> StorageResult<ReversePhase1BackupReport> {
+    let mut artifacts = ReversePhase1ArtifactGuard::new(common_storage);
+    let report = create_reverse_phase1_backups_inner(guard, common_storage, &mut artifacts)?;
+    artifacts.disarm();
+    Ok(report)
+}
+
+fn create_reverse_phase1_backups_inner(
+    guard: &ReversePhase1QuiesceGuard,
+    common_storage: &Path,
+    artifacts: &mut ReversePhase1ArtifactGuard,
+) -> StorageResult<ReversePhase1BackupReport> {
+    let generation = guard.redb().generation();
+    let backup_rel_dir = canonical_redb_backup_rel_dir(generation);
+    let backup_root = common_storage.join(REDB_BACKUP_SUBDIR);
+    let backup_dir = redb_backup_dir_path(common_storage, generation);
+    let mut durability = Phase1DurabilityReceipt::new();
+
+    let created_root = match fs::create_dir(&backup_root) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o700))
+                    .map_err(|err| StorageBackendError::io("chmod redb-backup root", err))?;
+            }
+            true
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let meta = fs::symlink_metadata(&backup_root)
+                .map_err(|e| StorageBackendError::io("stat existing redb-backup root", e))?;
+            if !meta.file_type().is_dir() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Phase 1 rejected non-directory redb-backup root"
+                        .to_string(),
+                });
+            }
+            false
+        }
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "create redb-backup root directory",
+                err,
+            ));
+        }
+    };
+    artifacts.created_backup_root = created_root;
+
+    fs::create_dir(&backup_dir)
+        .map_err(|err| StorageBackendError::io("create generation redb-backup directory", err))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|err| StorageBackendError::io("chmod generation redb-backup dir", err))?;
+    }
+    artifacts.backup_gen_dir = Some(backup_dir.clone());
+
+    let git_file_name = format!("git.gen-{}.redb", format_generation_id(generation));
+    let cap_file_name = format!("capture.gen-{}.redb", format_generation_id(generation));
+
+    let (git_backup_path, git_sha256, git_byte_len) = stream_copy_and_verify_backup_file(
+        guard.redb().git_redb_path(),
+        &backup_dir,
+        &git_file_name,
+        0o600,
+        format!("{backup_rel_dir}/{git_file_name}"),
+        &mut durability,
+    )?;
+    let (cap_backup_path, cap_sha256, cap_byte_len) = stream_copy_and_verify_backup_file(
+        guard.redb().capture_redb_path(),
+        &backup_dir,
+        &cap_file_name,
+        0o600,
+        format!("{backup_rel_dir}/{cap_file_name}"),
+        &mut durability,
+    )?;
+
+    // Backup `capture-queue/{priority,normal,quarantine}/` while leaving the live
+    // source directory and `append.lock` / `writer.lock` 100% untouched in place.
+    let backup_queue_dir = redb_backup_capture_queue_dir_path(common_storage, generation);
+    fs::create_dir(&backup_queue_dir)
+        .map_err(|err| StorageBackendError::io("create redb-backup capture-queue dir", err))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&backup_queue_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|err| StorageBackendError::io("chmod redb-backup capture-queue dir", err))?;
+    }
+
+    let live_queue_root = capture_queue_dir_path(common_storage);
+    let mut queue_files = Vec::new();
+    for subdir in [
+        QUEUE_LANE_PRIORITY_DIR,
+        QUEUE_LANE_NORMAL_DIR,
+        QUEUE_QUARANTINE_DIR,
+    ] {
+        let src_sub = live_queue_root.join(subdir);
+        let dst_sub = backup_queue_dir.join(subdir);
+        fs::create_dir(&dst_sub).map_err(|err| {
+            StorageBackendError::io("create redb-backup capture-queue subdir", err)
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&dst_sub, fs::Permissions::from_mode(0o700)).map_err(|err| {
+                StorageBackendError::io("chmod redb-backup capture-queue subdir", err)
+            })?;
+        }
+
+        let meta_opt = match fs::symlink_metadata(&src_sub) {
+            Ok(m) => Some(m),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "stat live capture-queue subdir for reverse backup",
+                    err,
+                ));
+            }
+        };
+        if let Some(meta) = meta_opt {
+            if meta.file_type().is_symlink() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "reverse migration Phase 1 backup rejected symlinked capture-queue subdir"
+                            .to_string(),
+                });
+            }
+            if meta.file_type().is_dir() {
+                let mut names = Vec::new();
+                for entry in fs::read_dir(&src_sub).map_err(|err| {
+                    StorageBackendError::io(
+                        "list live capture-queue subdir for reverse backup",
+                        err,
+                    )
+                })? {
+                    let entry = entry.map_err(|err| {
+                        StorageBackendError::io(
+                            "read live capture-queue subdir entry for reverse backup",
+                            err,
+                        )
+                    })?;
+                    let name = entry.file_name().into_string().map_err(|_| {
+                        StorageBackendError::BackendInternal {
+                            detail: "non-UTF-8 entry in capture-queue subdir".to_string(),
+                        }
+                    })?;
+                    names.push(name);
+                }
+                names.sort();
+                for name in names {
+                    let src_entry = src_sub.join(&name);
+                    let entry_meta = fs::symlink_metadata(&src_entry).map_err(|err| {
+                        StorageBackendError::io(
+                            "stat live capture-queue entry for reverse backup",
+                            err,
+                        )
+                    })?;
+                    if !entry_meta.file_type().is_file() {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "reverse migration Phase 1 backup rejected non-regular entry in capture-queue subdir"
+                                .to_string(),
+                        });
+                    }
+                    let rel_label =
+                        format!("{backup_rel_dir}/{CAPTURE_QUEUE_SUBDIR}/{subdir}/{name}");
+                    let (_dst_path, sha256, byte_len) = stream_copy_and_verify_backup_file(
+                        &src_entry,
+                        &dst_sub,
+                        &name,
+                        0o600,
+                        rel_label,
+                        &mut durability,
+                    )?;
+                    queue_files.push(QueueBackupFileReceipt {
+                        subdir,
+                        file_name: name,
+                        byte_len,
+                        sha256,
+                    });
+                }
+            }
+        }
+        fsync_dir_best_effort(&dst_sub)?;
+        durability.record(
+            Phase1DurabilityOpKind::DirFsync,
+            format!("{backup_rel_dir}/{CAPTURE_QUEUE_SUBDIR}/{subdir}"),
+        );
+    }
+
+    fsync_dir_best_effort(&backup_queue_dir)?;
+    durability.record(
+        Phase1DurabilityOpKind::DirFsync,
+        format!("{backup_rel_dir}/{CAPTURE_QUEUE_SUBDIR}"),
+    );
+    fsync_dir_best_effort(&backup_dir)?;
+    durability.record(Phase1DurabilityOpKind::DirFsync, backup_rel_dir.clone());
+    fsync_dir_best_effort(&backup_root)?;
+    durability.record(Phase1DurabilityOpKind::DirFsync, REDB_BACKUP_SUBDIR);
+
+    let queue_manifest_sha256 = compute_capture_queue_manifest_sha256_readonly(common_storage)?;
+    let spool_manifest_sha256 = compute_capture_spool_manifest_sha256_readonly(common_storage)?;
+    let source_digests = SourceDigests {
+        git_redb_sha256: Some(git_sha256.clone()),
+        cap_redb_sha256: Some(cap_sha256.clone()),
+        queue_manifest_sha256: Some(queue_manifest_sha256.clone()),
+        spool_manifest_sha256: Some(spool_manifest_sha256.clone()),
+        ..SourceDigests::default()
+    };
+
+    Ok(ReversePhase1BackupReport {
+        generation,
+        backup_rel_dir,
+        backup_dir,
+        git_redb_backup: RedbFileBackupReceipt {
+            backup_path: git_backup_path,
+            sha256: git_sha256,
+            byte_len: git_byte_len,
+        },
+        capture_redb_backup: RedbFileBackupReceipt {
+            backup_path: cap_backup_path,
+            sha256: cap_sha256,
+            byte_len: cap_byte_len,
+        },
+        queue_backup: QueueBackupReport {
+            backup_queue_dir,
+            files: queue_files,
+            queue_manifest_sha256,
+        },
+        spool_manifest_sha256,
+        source_digests,
+        durability,
+    })
+}
+
+/// Full orchestrated reverse migration Phase 1 (`RB-11q` + `RB-11i` + `RB-11p`):
+/// 1. Quiesce all 8 locks in strict `ADR-RB-07` #2 order (`migration.lock .. capture_wtx`).
+/// 2. Stream-export all 61 Git + 25 Capture tables, replay unreconciled
+///    `META_CROSS_STORE_INTENT`, ingest pending `capture-queue/{priority,normal}/`
+///    read-only, and stamp `PRAGMA application_id = target_migration_tag`.
+/// 3. Verify `PRAGMA integrity_check == "ok"` + `fsync` on both `.tmp` targets.
+/// 4. Stream-backup frozen `git.redb`, `capture.redb`, and
+///    `capture-queue/{priority,normal,quarantine}/` to `.libra/redb-backup/<gen>/`
+///    with SHA-256 verification and `fsync`.
+///
+/// Any failure or subsequent abort cleans up `.tmp` targets and staged backups
+/// while leaving source `git.redb`, `capture.redb`, and `capture-queue/` 100%
+/// byte-for-byte identical.
+pub async fn prepare_reverse_phase1(common_storage: &Path) -> StorageResult<ReversePhase1Prepared> {
+    prepare_reverse_phase1_for_role(DatabaseRole::Repository, common_storage).await
+}
+
+/// Role-validated variant of [`prepare_reverse_phase1`] enforcing `GC-13`
+/// isolation (rejects `GlobalConfig`, `SystemConfig`, and `Derived`).
+pub async fn prepare_reverse_phase1_for_role(
+    role: DatabaseRole,
+    common_storage: &Path,
+) -> StorageResult<ReversePhase1Prepared> {
+    prepare_reverse_phase1_inner(
+        role,
+        common_storage,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+enum ReversePhase1FaultPoint {
+    AfterExportBeforeVerify,
+    AfterVerifyBeforeBackup,
+    AfterBackupBeforeReturn,
+}
+
+async fn prepare_reverse_phase1_inner(
+    role: DatabaseRole,
+    common_storage: &Path,
+    #[cfg(test)] fault: Option<ReversePhase1FaultPoint>,
+) -> StorageResult<ReversePhase1Prepared> {
+    validate_forward_migration_role(role).map_err(normalize_reverse_quiesce_err)?;
+    let guard = quiesce_reverse_repository_phase1(common_storage)?;
+    let mut artifacts = ReversePhase1ArtifactGuard::new(common_storage);
+    let mut telemetry = ExportStreamTelemetry::new();
+
+    let result: StorageResult<(
+        ReversePhase1ExportReport,
+        ReversePhase1VerificationReport,
+        ReversePhase1BackupReport,
+    )> = async {
+        let export = export_reverse_phase1_to_sqlite_tmp_inner(
+            &guard,
+            common_storage,
+            &mut telemetry,
+            &mut artifacts,
+        )
+        .await?;
+        #[cfg(test)]
+        if fault == Some(ReversePhase1FaultPoint::AfterExportBeforeVerify) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "injected reverse Phase 1 fault after export before integrity verify"
+                    .to_string(),
+            });
+        }
+        let verification = verify_reverse_phase1_sqlite_tmp(common_storage, &export).await?;
+        #[cfg(test)]
+        if fault == Some(ReversePhase1FaultPoint::AfterVerifyBeforeBackup) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "injected reverse Phase 1 fault after verify before redb-backup"
+                    .to_string(),
+            });
+        }
+        let backup = create_reverse_phase1_backups_inner(&guard, common_storage, &mut artifacts)?;
+        #[cfg(test)]
+        if fault == Some(ReversePhase1FaultPoint::AfterBackupBeforeReturn) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "injected reverse Phase 1 fault after redb-backup before return"
+                    .to_string(),
+            });
+        }
+        Ok((export, verification, backup))
+    }
+    .await;
+
+    match result {
+        Ok((export, verification, backup)) => Ok(ReversePhase1Prepared {
+            artifacts,
+            export,
+            verification,
+            backup,
+            guard,
+        }),
+        Err(primary) => {
+            let _ = artifacts.cleanup_now();
+            let _ = guard.abort_and_release();
+            Err(primary)
+        }
     }
 }
 
@@ -66380,5 +71950,919 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
                 .expect_err("symlinked capture-spool/tmp must fail closed");
             assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
         }
+    }
+
+    /// `RB-11q`: Verifies reverse migration Phase 1:
+    /// - AC1–AC3: External OS process holding `capture-spool-consumer.lock`
+    ///   (`drain.rs:87`) fails closed with `LBR-IO-001` while keeping source
+    ///   `git.redb`/`capture.redb` and `capture-spool/` 100% byte-identical;
+    /// - AC4: While reverse migration holds `capture-spool-consumer.lock`,
+    ///   concurrent `drain_storage` sees the busy lock immediately and exits
+    ///   with zero file moves (never moving `ready/` into `quarantine/`);
+    /// - AC5–AC6: Non-empty `capture-spool/quarantine/` fails closed with
+    ///   `LBR-IO-001` within the `<= 20ms` lock-probe + dir-check budget while
+    ///   preserving every quarantined file 100% byte-for-byte intact.
+    #[cfg(all(
+        feature = "storage-sqlite",
+        feature = "storage-redb",
+        feature = "storage-queue"
+    ))]
+    #[tokio::test]
+    async fn reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine() {
+        use crate::internal::ai::capture::drain;
+
+        async fn setup_rb11q_fixture(
+            storage: &Path,
+            create_optional_locks: bool,
+            use_active_spool_dirs: bool,
+        ) -> (PathBuf, PathBuf) {
+            let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(storage).await;
+
+            let spool_dir = capture_spool_dir_path(storage);
+            if use_active_spool_dirs {
+                for name in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                    let p = spool_dir.join(name);
+                    if p.exists() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt as _;
+                            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+                        }
+                        #[cfg(windows)]
+                        {
+                            if let Ok(mut perms) = fs::metadata(&p).map(|m| m.permissions()) {
+                                perms.set_readonly(false);
+                                let _ = fs::set_permissions(&p, perms);
+                            }
+                        }
+                        fs::remove_file(&p).expect("remove spool tombstone for active dir fixture");
+                    }
+                    fs::create_dir_all(&p).expect("create active spool subdir");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))
+                            .expect("chmod 0700 active spool subdir");
+                    }
+                }
+            }
+
+            let consumer_lock = capture_spool_consumer_lock_path(storage);
+            if !consumer_lock.exists() {
+                fs::write(&consumer_lock, b"").expect("create capture-spool-consumer.lock");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&consumer_lock, fs::Permissions::from_mode(0o600))
+                        .expect("chmod 0600 consumer lock");
+                }
+            }
+
+            let writer_lock = capture_queue_writer_lock_path(storage);
+            let capacity_lock = capture_spool_capacity_lock_path(storage);
+            let append_lock = capture_queue_append_lock_path(storage);
+            if create_optional_locks {
+                for p in [&writer_lock, &capacity_lock, &append_lock] {
+                    if !p.exists() {
+                        fs::write(p, b"").expect("create optional lock file");
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt as _;
+                            fs::set_permissions(p, fs::Permissions::from_mode(0o600))
+                                .expect("chmod 0600 optional lock");
+                        }
+                    }
+                }
+            } else {
+                for p in [&writer_lock, &capacity_lock, &append_lock] {
+                    if p.exists() {
+                        fs::remove_file(p).expect("remove optional lock");
+                    }
+                }
+            }
+
+            (git_path, cap_path)
+        }
+
+        // ====================================================================
+        // AC1–AC3: External OS spool consumer holding `capture-spool-consumer.lock`
+        // ====================================================================
+        for (create_optional_locks, variant) in [
+            (true, "all-locks-present"),
+            (false, "optional-locks-absent"),
+        ] {
+            for (lock_mode, mode_label) in [
+                ("hold_flock_exclusive", "exclusive-consumer-lock"),
+                ("hold_flock_shared", "shared-consumer-lock"),
+            ] {
+                let dir = tempdir().expect("rb11q consumer lock tempdir");
+                let storage = dir.path().join(".libra");
+                let (git_path, cap_path) =
+                    setup_rb11q_fixture(&storage, create_optional_locks, true).await;
+
+                let spool_dir = capture_spool_dir_path(&storage);
+                let queue_dir = capture_queue_dir_path(&storage);
+                let consumer_lock = capture_spool_consumer_lock_path(&storage);
+                fs::write(
+                    spool_dir.join("ready").join("0001-ready.json"),
+                    b"{\"event\":\"ready-during-consumer-lock\"}",
+                )
+                .expect("seed ready spool file");
+
+                let before_git = fs::read(&git_path).expect("snapshot git.redb before AC1");
+                let before_cap = fs::read(&cap_path).expect("snapshot capture.redb before AC1");
+                let before_spool = snapshot_directory_tree(&spool_dir);
+                let before_queue = snapshot_directory_tree(&queue_dir);
+
+                let holder = ChildLockHolder::spawn(lock_mode, &consumer_lock);
+
+                let started = Instant::now();
+                let err = quiesce_reverse_repository_phase1(&storage).expect_err(&format!(
+                    "AC1 ({variant}/{mode_label}): held consumer lock must fail closed"
+                ));
+                let elapsed = started.elapsed();
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert!(
+                    !err.to_string().contains(&storage.display().to_string()),
+                    "AC1 ({variant}/{mode_label}): must not leak private path: {err}"
+                );
+                assert!(
+                    elapsed <= Duration::from_millis(20),
+                    "AC1 ({variant}/{mode_label}): lock probe exceeded 20ms budget: {elapsed:?}"
+                );
+
+                // AC2: source redb byte-identical
+                assert_eq!(fs::read(&git_path).expect("git after AC1"), before_git);
+                assert_eq!(fs::read(&cap_path).expect("cap after AC1"), before_cap);
+                // AC3: capture-spool/ (and capture-queue/) byte-identical, no stray migration.lock
+                assert_eq!(snapshot_directory_tree(&spool_dir), before_spool);
+                assert_eq!(snapshot_directory_tree(&queue_dir), before_queue);
+                assert!(!migration_lock_path(&storage).exists());
+
+                holder.release_and_wait();
+            }
+        }
+
+        // ====================================================================
+        // AC4: While reverse quiescence holds `capture-spool-consumer.lock`,
+        // concurrent `drain_storage` exits immediately with zero moves (never
+        // quarantining an unparseable `ready/` file).
+        // ====================================================================
+        {
+            let dir = tempdir().expect("rb11q concurrent drain tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = setup_rb11q_fixture(&storage, true, true).await;
+
+            let spool_dir = capture_spool_dir_path(&storage);
+            let ready_file = spool_dir.join("ready").join("0001-unparseable-ready.json");
+            let ready_bytes = b"{not-valid-envelope-json".to_vec();
+            fs::write(&ready_file, &ready_bytes).expect("seed unparseable ready envelope");
+            let quar_dir = spool_dir.join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+
+            let guard = quiesce_reverse_repository_phase1(&storage)
+                .expect("uncontended reverse quiescence with empty quarantine must succeed");
+
+            let before_spool = snapshot_directory_tree(&spool_dir);
+            let drain_started = Instant::now();
+            drain::drain_storage(&storage, |_| None)
+                .await
+                .expect("concurrent drain_storage must see busy consumer lock and exit Ok");
+            let drain_elapsed = drain_started.elapsed();
+            assert!(
+                drain_elapsed <= Duration::from_millis(20),
+                "AC4: busy drain_storage probe exceeded 20ms budget: {drain_elapsed:?}"
+            );
+            assert_eq!(
+                fs::read(&ready_file).expect("ready file must stay untouched in ready/"),
+                ready_bytes
+            );
+            assert_eq!(
+                fs::read_dir(&quar_dir)
+                    .expect("read quarantine dir")
+                    .count(),
+                0,
+                "AC4: concurrent drain_storage must NEVER move ready/ files into quarantine/"
+            );
+            assert_eq!(snapshot_directory_tree(&spool_dir), before_spool);
+
+            guard
+                .abort_and_release()
+                .expect("abort and release reverse quiescence guard");
+        }
+
+        // ====================================================================
+        // AC5–AC6: Non-empty `capture-spool/quarantine/` fails closed with
+        // `LBR-IO-001` and preserves every quarantined file 100% byte-intact.
+        // ====================================================================
+        for (create_optional_locks, variant) in [
+            (true, "all-locks-present"),
+            (false, "optional-locks-absent"),
+        ] {
+            let dir = tempdir().expect("rb11q non-empty quarantine tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_path, cap_path) =
+                setup_rb11q_fixture(&storage, create_optional_locks, true).await;
+
+            let spool_dir = capture_spool_dir_path(&storage);
+            let queue_dir = capture_queue_dir_path(&storage);
+            let quar_dir = spool_dir.join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+            let quar_file_a = quar_dir.join("0001-corrupt-a.json");
+            let quar_file_b = quar_dir.join("0002-corrupt-b.json");
+            let bytes_a = b"{\"quarantined\":\"event-a\",\"raw\":123}".to_vec();
+            let bytes_b = b"not-json-binary-\x00\xff-payload".to_vec();
+            fs::write(&quar_file_a, &bytes_a).expect("write quarantined file A");
+            fs::write(&quar_file_b, &bytes_b).expect("write quarantined file B");
+
+            let before_git = fs::read(&git_path).expect("snapshot git.redb before AC5");
+            let before_cap = fs::read(&cap_path).expect("snapshot capture.redb before AC5");
+            let before_spool = snapshot_directory_tree(&spool_dir);
+            let before_queue = snapshot_directory_tree(&queue_dir);
+
+            let started = Instant::now();
+            let err = quiesce_reverse_repository_phase1(&storage).expect_err(&format!(
+                "AC5 ({variant}): non-empty capture-spool/quarantine/ must fail closed"
+            ));
+            let elapsed = started.elapsed();
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !err.to_string().contains(&storage.display().to_string()),
+                "AC5 ({variant}): must not leak private path: {err}"
+            );
+            assert!(
+                elapsed <= Duration::from_millis(20),
+                "AC5 ({variant}): quarantine dir check exceeded 20ms budget: {elapsed:?}"
+            );
+
+            // AC6: Every quarantined file 100% byte-for-byte intact; zero mutations anywhere.
+            assert_eq!(fs::read(&quar_file_a).expect("read quar A"), bytes_a);
+            assert_eq!(fs::read(&quar_file_b).expect("read quar B"), bytes_b);
+            assert_eq!(snapshot_directory_tree(&spool_dir), before_spool);
+            assert_eq!(snapshot_directory_tree(&queue_dir), before_queue);
+            assert_eq!(fs::read(&git_path).expect("git after AC5"), before_git);
+            assert_eq!(fs::read(&cap_path).expect("cap after AC5"), before_cap);
+            assert!(!migration_lock_path(&storage).exists());
+        }
+
+        // ====================================================================
+        // Post-lock TOCTOU regression + Unix hardlink/symlink quarantine guard
+        // ====================================================================
+        {
+            struct PostLockQuarantineInjector {
+                quar_file: PathBuf,
+                injected: bool,
+            }
+            impl ReversePhase1LockObserver for PostLockQuarantineInjector {
+                fn on_stage_acquired(&mut self, stage: ReversePhase1QuiesceStage) {
+                    if stage == ReversePhase1QuiesceStage::CaptureSpoolConsumerLock {
+                        fs::write(&self.quar_file, b"{\"late_quarantine\":true}")
+                            .expect("inject late quarantine file");
+                        self.injected = true;
+                    }
+                }
+            }
+
+            let dir = tempdir().expect("rb11q post-lock quarantine TOCTOU tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_path, cap_path) = setup_rb11q_fixture(&storage, true, true).await;
+            let late_quar = capture_spool_dir_path(&storage)
+                .join(CAPTURE_SPOOL_QUARANTINE_SUBDIR)
+                .join("9999-late-quarantine.json");
+
+            let before_git = fs::read(&git_path).expect("git before post-lock TOCTOU");
+            let before_cap = fs::read(&cap_path).expect("cap before post-lock TOCTOU");
+            let mut injector = PostLockQuarantineInjector {
+                quar_file: late_quar.clone(),
+                injected: false,
+            };
+            let err = quiesce_reverse_repository_phase1_inner(&storage, Some(&mut injector))
+                .expect_err("post-lock non-empty quarantine must fail closed");
+            assert!(injector.injected);
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                fs::read(&late_quar).expect("late quarantine file must remain intact"),
+                b"{\"late_quarantine\":true}"
+            );
+            assert_eq!(fs::read(&git_path).expect("git after TOCTOU"), before_git);
+            assert_eq!(fs::read(&cap_path).expect("cap after TOCTOU"), before_cap);
+        }
+
+        #[cfg(unix)]
+        {
+            let dir = tempdir().expect("rb11q symlink/hardlink quarantine tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = setup_rb11q_fixture(&storage, true, true).await;
+            let quar_path = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+            fs::remove_dir(&quar_path).expect("remove empty quarantine dir");
+
+            let decoy = dir.path().join("quar-tombstone-decoy");
+            fs::write(&decoy, CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                .expect("write decoy quarantine tombstone");
+
+            fs::hard_link(&decoy, &quar_path).expect("plant hard-linked quarantine tombstone");
+            let hl_err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("hard-linked capture-spool/quarantine tombstone must fail closed");
+            assert_eq!(hl_err.stable_code_str(), "LBR-IO-001");
+            fs::remove_file(&quar_path).expect("remove hard-linked quarantine");
+
+            std::os::unix::fs::symlink(&decoy, &quar_path)
+                .expect("plant symlinked quarantine tombstone");
+            let sym_err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("symlinked capture-spool/quarantine must fail closed");
+            assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
+        }
+    }
+
+    fn snapshot_dir_tree_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            let Ok(rd) = fs::read_dir(dir) else {
+                return;
+            };
+            let mut entries: Vec<_> = rd.flatten().collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(base)
+                    .expect("strip prefix")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if let Ok(meta) = fs::symlink_metadata(&path) {
+                    if meta.file_type().is_dir() {
+                        walk(base, &path, out);
+                    } else if meta.file_type().is_file() {
+                        out.insert(rel, fs::read(&path).expect("read snapshot file"));
+                    }
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    fn make_rb11_test_session(session_id: &str, provider_session_id: &str) -> AgentSessionRecord {
+        AgentSessionRecord {
+            session_id: session_id.to_string(),
+            agent_kind: CaptureAgentKind::Codex,
+            provider_session_id: provider_session_id.to_string(),
+            thread_id: None,
+            state: CaptureSessionState::Active,
+            working_dir: "/workspace/rb11i".to_string(),
+            worktree_id: Some("wt-main".to_string()),
+            parent_commit: Some("a".repeat(40)),
+            parent_session_id: None,
+            metadata_json: "{\"rb11\":\"ok\"}".to_string(),
+            redaction_report: "{}".to_string(),
+            started_at: 1_795_500_000,
+            last_event_at: 1_795_500_100,
+            stopped_at: None,
+            schema_version: 1,
+            sync_revision: 1,
+            repo_id: None,
+            workspace_id: None,
+            workspace_fence: None,
+            scope_state: CaptureScopeState::LegacyUnknown,
+        }
+    }
+
+    /// `RB-11i` AC1, AC2, AC6: single-pass deadlock-free streaming export of
+    /// all 61+25 source tables + post-cutover commits, direct ascending replay
+    /// of real half-committed `META_CROSS_STORE_INTENT` (`gen > cap_gen`) inside
+    /// held `(git_wtx, cap_wtx)`, and `<= 500` rows/batch streaming cap.
+    #[tokio::test]
+    async fn reverse_phase1_replays_real_half_committed_intent_deadlock_free() {
+        use crate::storage::{
+            CrossStoreIntentRecord, GitStore, NoteCasOp, RedbGitStore, RefKey, RefTarget,
+        };
+
+        let dir = tempdir().expect("rb11i intent tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        // Seed post-cutover commits/refs + >500 notes rows so streaming MUST
+        // split into multiple batches each <= 500 rows (AC1 & AC6).
+        let git_store = RedbGitStore::open_read_write(&git_path).expect("open git.redb");
+        let tip_oid = "b".repeat(40);
+        git_store
+            .update_ref_cas(
+                &RefKey::LocalBranch {
+                    name: "rb11i-post-cutover".to_string(),
+                },
+                None,
+                Some(&RefTarget::Direct(tip_oid.clone())),
+                &[],
+            )
+            .await
+            .expect("write post-cutover branch");
+
+        let mut note_ops = Vec::with_capacity(620);
+        for i in 0..620u32 {
+            note_ops.push(NoteCasOp::InsertIfAbsent {
+                object: format!("{i:040x}"),
+                blob: format!("{:040x}", i + 10_000),
+            });
+        }
+        git_store
+            .apply_notes_cas_batch("refs/notes/commits", &note_ops)
+            .await
+            .expect("seed 620 notes rows");
+
+        // Inject REAL half-committed cross-store intents: `git.META_GENERATION = 2`
+        // with `META_CROSS_STORE_INTENT[1]` and `META_CROSS_STORE_INTENT[2]`, while
+        // `capture.META_GENERATION` remains at `0`!
+        let intent_sess_1 = make_rb11_test_session("sess-intent-gen1", "prov-intent-gen1");
+        let intent_sess_2 = make_rb11_test_session("sess-intent-gen2", "prov-intent-gen2");
+        let intent_audit_2 = AgentAuditLogRecord {
+            audit_id: "audit-intent-gen2".to_string(),
+            timestamp: "2026-11-26T00:00:02Z".to_string(),
+            user_id: Some("u1".to_string()),
+            user_name: Some("Tester".to_string()),
+            action: "raw_export".to_string(),
+            checkpoint_id: "cp-intent-2".to_string(),
+            scope: "full".to_string(),
+            export_path: None,
+            justification: Some("rb11i".to_string()),
+            granted: true,
+        };
+        let intent_1 = CrossStoreIntentRecord {
+            generation: 1,
+            items: vec![CaptureBatchItem {
+                dedup_key: "intent-key-1".to_string(),
+                payload: CaptureBatchPayload::UpsertSession(intent_sess_1.clone()),
+            }],
+        };
+        let intent_2 = CrossStoreIntentRecord {
+            generation: 2,
+            items: vec![
+                // Duplicate dedup_key from gen 1 verifies idempotent replay!
+                CaptureBatchItem {
+                    dedup_key: "intent-key-1".to_string(),
+                    payload: CaptureBatchPayload::UpsertSession(intent_sess_1.clone()),
+                },
+                CaptureBatchItem {
+                    dedup_key: "intent-key-2-sess".to_string(),
+                    payload: CaptureBatchPayload::UpsertSession(intent_sess_2.clone()),
+                },
+                CaptureBatchItem {
+                    dedup_key: "intent-key-2-audit".to_string(),
+                    payload: CaptureBatchPayload::AppendAuditLog(intent_audit_2.clone()),
+                },
+            ],
+        };
+        {
+            let wtx = git_store
+                .begin_checked_write_tx()
+                .expect("begin git wtx to plant half-committed intents");
+            let b1 = encode_versioned(CROSS_STORE_INTENT_CODEC_VERSION, &intent_1)
+                .expect("encode intent 1");
+            let b2 = encode_versioned(CROSS_STORE_INTENT_CODEC_VERSION, &intent_2)
+                .expect("encode intent 2");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 1, &b1).expect("put intent 1");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 2, &b2).expect("put intent 2");
+            RedbGitStore::write_cross_store_generation_in_wtx(&wtx, 2).expect("set git gen 2");
+            wtx.commit().expect("commit planted intents");
+        }
+        drop(git_store);
+
+        let before_git = fs::read(&git_path).expect("read git.redb before");
+        let before_cap = fs::read(&cap_path).expect("read cap.redb before");
+
+        let guard = quiesce_reverse_repository_phase1(&storage)
+            .expect("quiesce reverse Phase 1 must succeed");
+        let export = export_reverse_phase1_to_sqlite_tmp(&guard, &storage)
+            .await
+            .expect("reverse Phase 1 export + intent replay must complete deadlock-free");
+
+        // AC1: all 61 Git tables + 25 Capture tables accounted for.
+        assert_eq!(export.git_table_counts.len(), 61);
+        assert_eq!(export.capture_table_counts.len(), 25);
+        assert_eq!(export.git_table_counts.get("notes"), Some(&620));
+
+        // AC2: both unreconciled intents replayed in strict ascending order, idempotently.
+        assert_eq!(export.intent_replay.git_generation, 2);
+        assert_eq!(export.intent_replay.capture_generation, 0);
+        assert_eq!(export.intent_replay.replayed_generations, vec![1, 2]);
+        assert_eq!(export.intent_replay.applied_items, 3);
+        assert_eq!(export.intent_replay.deduplicated_items, 1);
+
+        // AC6: strict <= 500 rows/batch streaming cap.
+        assert!(export.max_batch_rows <= FORWARD_MIGRATION_STREAM_BATCH_ROWS);
+        assert_eq!(export.max_batch_rows, 500);
+        assert!(export.total_streaming_batches >= 2);
+
+        // Verify post-cutover ref + 620 notes in `libra.db.tmp`.
+        let mut git_conn = open_reverse_sqlite_tmp_conn_async(
+            &export.git_tmp_path,
+            DatabaseRole::Repository,
+            true,
+        )
+        .await
+        .expect("open libra.db.tmp");
+        let ref_oid: String = sea_orm::sqlx::query_scalar(
+            "SELECT \"commit\" FROM reference WHERE kind = 'Branch' AND name = 'rb11i-post-cutover'",
+        )
+        .fetch_one(&mut git_conn)
+        .await
+        .expect("query post-cutover branch in libra.db.tmp");
+        assert_eq!(ref_oid, tip_oid);
+        let notes_cnt: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM notes")
+            .fetch_one(&mut git_conn)
+            .await
+            .expect("count notes in libra.db.tmp");
+        assert_eq!(notes_cnt, 620);
+        git_conn.close().await.expect("close libra.db.tmp");
+
+        // Verify replayed intents landed in `capture.db.tmp`.
+        let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+            &export.capture_tmp_path,
+            DatabaseRole::Capture,
+            true,
+        )
+        .await
+        .expect("open capture.db.tmp");
+        let mut sess_ids: Vec<String> = sea_orm::sqlx::query_scalar(
+            "SELECT session_id FROM agent_session ORDER BY session_id ASC",
+        )
+        .fetch_all(&mut cap_conn)
+        .await
+        .expect("query replayed sessions in capture.db.tmp");
+        sess_ids.sort();
+        assert_eq!(sess_ids, vec!["sess-intent-gen1", "sess-intent-gen2"]);
+        let audit_cnt: i64 = sea_orm::sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_audit_log WHERE audit_id = 'audit-intent-gen2'",
+        )
+        .fetch_one(&mut cap_conn)
+        .await
+        .expect("query replayed audit in capture.db.tmp");
+        assert_eq!(audit_cnt, 1);
+        cap_conn.close().await.expect("close capture.db.tmp");
+
+        // Aborting Phase 1 guard leaves source redb files 100% byte-identical.
+        guard.abort_and_release().expect("abort reverse guard");
+        assert_eq!(fs::read(&git_path).expect("git.redb after"), before_git);
+        assert_eq!(fs::read(&cap_path).expect("cap.redb after"), before_cap);
+    }
+
+    /// `RB-11i` AC3, AC4, AC5: read-only direct ingestion of pending
+    /// `capture-queue/{priority,normal}/` frames (zero source queue mutation)
+    /// and identical unique non-zero `PRAGMA application_id = target_migration_tag`
+    /// stamped on both `capture.db.tmp` and `libra.db.tmp`.
+    #[tokio::test]
+    async fn reverse_phase1_stamps_application_id_and_ingests_queue_readonly() {
+        use crate::storage::{
+            CaptureQueueLane, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, append_postcard_frame,
+        };
+
+        let dir = tempdir().expect("rb11i queue & tag tempdir");
+        let storage = dir.path().join(".libra");
+        let (_git_path, _cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let prio_sess = make_rb11_test_session("sess-queue-prio", "prov-queue-prio");
+        let norm_sess = make_rb11_test_session("sess-queue-norm", "prov-queue-norm");
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Priority,
+            FRAME_FLAG_PRIORITY,
+            "q-prio-1",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(prio_sess),
+        )
+        .expect("append priority queue frame");
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "q-norm-1",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(norm_sess),
+        )
+        .expect("append normal queue frame");
+
+        let queue_dir = capture_queue_dir_path(&storage);
+        let queue_lanes_before = (
+            snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_LANE_PRIORITY_DIR)),
+            snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_LANE_NORMAL_DIR)),
+            snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_QUARANTINE_DIR)),
+        );
+
+        let guard = quiesce_reverse_repository_phase1(&storage).expect("quiesce reverse Phase 1");
+        let queue_before_export = snapshot_dir_tree_bytes(&queue_dir);
+        let export = export_reverse_phase1_to_sqlite_tmp(&guard, &storage)
+            .await
+            .expect("export reverse Phase 1");
+
+        // AC3: both priority and normal frames ingested, source queue 100% untouched.
+        assert_eq!(export.queue_ingest.priority_frames_read, 1);
+        assert_eq!(export.queue_ingest.normal_frames_read, 1);
+        assert_eq!(export.queue_ingest.applied_frames, 2);
+        let queue_after = snapshot_dir_tree_bytes(&queue_dir);
+        assert_eq!(
+            queue_after, queue_before_export,
+            "capture-queue/ must remain 100% byte-identical during read-only reverse Phase 1 ingest"
+        );
+        assert_eq!(
+            (
+                snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_LANE_PRIORITY_DIR)),
+                snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_LANE_NORMAL_DIR)),
+                snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_QUARANTINE_DIR)),
+            ),
+            queue_lanes_before,
+            "capture-queue/{{priority,normal,quarantine}}/ must remain 100% byte-identical"
+        );
+
+        // AC4 & AC5: unique non-zero `PRAGMA application_id` stamped identically on both `.tmp` DBs.
+        assert_ne!(export.target_migration_tag, 0);
+        let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+            &export.capture_tmp_path,
+            DatabaseRole::Capture,
+            true,
+        )
+        .await
+        .expect("open capture.db.tmp");
+        let cap_tag: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+            .fetch_one(&mut cap_conn)
+            .await
+            .expect("read capture.db.tmp application_id");
+        assert_eq!(cap_tag, i64::from(export.target_migration_tag));
+
+        let sess_ids: Vec<String> = sea_orm::sqlx::query_scalar(
+            "SELECT session_id FROM agent_session ORDER BY session_id ASC",
+        )
+        .fetch_all(&mut cap_conn)
+        .await
+        .expect("read queued sessions from capture.db.tmp");
+        assert_eq!(sess_ids, vec!["sess-queue-norm", "sess-queue-prio"]);
+        cap_conn.close().await.expect("close capture.db.tmp");
+
+        let mut git_conn = open_reverse_sqlite_tmp_conn_async(
+            &export.git_tmp_path,
+            DatabaseRole::Repository,
+            true,
+        )
+        .await
+        .expect("open libra.db.tmp");
+        let git_tag: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+            .fetch_one(&mut git_conn)
+            .await
+            .expect("read libra.db.tmp application_id");
+        assert_eq!(git_tag, i64::from(export.target_migration_tag));
+        git_conn.close().await.expect("close libra.db.tmp");
+
+        // Second export allocates a distinct non-zero tag.
+        fs::remove_file(&export.capture_tmp_path).expect("clean capture.db.tmp");
+        fs::remove_file(&export.git_tmp_path).expect("clean libra.db.tmp");
+        let export2 = export_reverse_phase1_to_sqlite_tmp(&guard, &storage)
+            .await
+            .expect("second reverse Phase 1 export");
+        assert_ne!(export2.target_migration_tag, 0);
+        assert_ne!(export2.target_migration_tag, export.target_migration_tag);
+
+        guard.abort_and_release().expect("abort reverse guard");
+    }
+
+    /// `RB-11p` AC1 & AC2: `libra.db.tmp` and `capture.db.tmp` pass
+    /// `PRAGMA integrity_check == "ok"` + `fsync`, and frozen `git.redb`,
+    /// `capture.redb`, and `capture-queue/{priority,normal,quarantine}/`
+    /// (preserving source dir & `append.lock` in place) are backed up to
+    /// `.libra/redb-backup/<gen>/` with independent SHA-256 verification & `fsync`.
+    #[tokio::test]
+    async fn reverse_phase1_tmp_integrity_and_verified_redb_queue_backup() {
+        use crate::storage::{CaptureQueueLane, FRAME_FLAG_PRIORITY, append_postcard_frame};
+
+        let dir = tempdir().expect("rb11p verify & backup tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Priority,
+            FRAME_FLAG_PRIORITY,
+            "rb11p-prio-1",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(make_rb11_test_session(
+                "sess-rb11p-prio",
+                "prov-rb11p-prio",
+            )),
+        )
+        .expect("append priority frame");
+        let queue_quar_file = capture_queue_dir_path(&storage)
+            .join(QUEUE_QUARANTINE_DIR)
+            .join("q-artifact-01.bin");
+        fs::write(&queue_quar_file, b"quarantined-queue-frame-bytes")
+            .expect("seed queue quarantine artifact");
+
+        let src_git_sha = sha256_file_bytes_for_test(&git_path);
+        let src_cap_sha = sha256_file_bytes_for_test(&cap_path);
+        let append_lock = capture_queue_append_lock_path(&storage);
+        assert!(
+            append_lock.is_file(),
+            "append.lock must exist before Phase 1"
+        );
+
+        let prepared = prepare_reverse_phase1(&storage)
+            .await
+            .expect("prepare_reverse_phase1 must succeed");
+
+        // AC1: both `.tmp` targets passed `PRAGMA integrity_check == "ok"` + `fsync`.
+        assert!(prepared.verification().git_tmp_integrity_ok);
+        assert!(prepared.verification().capture_tmp_integrity_ok);
+        assert_eq!(
+            prepared.verification().git_tmp_application_id,
+            prepared.export().target_migration_tag
+        );
+        assert_eq!(
+            prepared.verification().capture_tmp_application_id,
+            prepared.export().target_migration_tag
+        );
+        assert!(
+            prepared
+                .verification()
+                .durability
+                .has_file_fsync("libra.db.tmp")
+        );
+        assert!(
+            prepared
+                .verification()
+                .durability
+                .has_file_fsync("private/capture.db.tmp")
+        );
+
+        // AC2: verified `.libra/redb-backup/00000001/` contents, SHA-256 & durability ordering.
+        let backup = prepared.backup();
+        assert_eq!(backup.backup_rel_dir, "redb-backup/00000001");
+        assert_eq!(backup.git_redb_backup.sha256, src_git_sha);
+        assert_eq!(backup.capture_redb_backup.sha256, src_cap_sha);
+        assert_eq!(
+            sha256_file_bytes_for_test(&backup.git_redb_backup.backup_path),
+            src_git_sha
+        );
+        assert_eq!(
+            sha256_file_bytes_for_test(&backup.capture_redb_backup.backup_path),
+            src_cap_sha
+        );
+        assert_eq!(
+            backup.source_digests.git_redb_sha256.as_deref(),
+            Some(src_git_sha.as_str())
+        );
+        assert_eq!(
+            backup.source_digests.cap_redb_sha256.as_deref(),
+            Some(src_cap_sha.as_str())
+        );
+        assert!(backup.source_digests.queue_manifest_sha256.is_some());
+        assert!(
+            backup
+                .durability
+                .verify_file_fsync_before_publish_and_dir_fsync(
+                    "redb-backup/00000001/git.gen-00000001.redb",
+                    "redb-backup/00000001",
+                )
+        );
+        assert!(
+            backup
+                .durability
+                .verify_file_fsync_before_publish_and_dir_fsync(
+                    "redb-backup/00000001/capture.gen-00000001.redb",
+                    "redb-backup/00000001",
+                )
+        );
+
+        // Verify queue backup copied `{priority,normal,quarantine}` without moving `append.lock`.
+        let backed_quar = backup
+            .queue_backup
+            .backup_queue_dir
+            .join(QUEUE_QUARANTINE_DIR)
+            .join("q-artifact-01.bin");
+        assert_eq!(
+            fs::read(&backed_quar).expect("read backed-up queue quarantine file"),
+            b"quarantined-queue-frame-bytes"
+        );
+        assert!(
+            !backup
+                .queue_backup
+                .backup_queue_dir
+                .join(QUEUE_APPEND_LOCK_FILE)
+                .exists(),
+            "append.lock must stay in place and not be moved into backup"
+        );
+        assert!(
+            append_lock.is_file(),
+            "source append.lock must remain in place"
+        );
+        assert!(
+            backup
+                .queue_backup
+                .files
+                .iter()
+                .any(|f| f.subdir == QUEUE_LANE_PRIORITY_DIR && f.file_name.ends_with(".log"))
+        );
+
+        prepared
+            .abort_and_cleanup()
+            .expect("abort_and_cleanup must succeed");
+    }
+
+    /// `RB-11p` AC3 & AC4: Phase 1 abort (both injected mid-Phase-1 faults and
+    /// explicit post-prepare abort) discards `.tmp` files, staged backup, and
+    /// uncommitted write transactions while keeping source `git.redb`,
+    /// `capture.redb`, and `capture-queue/` 100% byte-for-byte identical.
+    #[tokio::test]
+    async fn reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical() {
+        use crate::storage::{
+            CaptureQueueLane, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, append_postcard_frame,
+        };
+
+        let dir = tempdir().expect("rb11p abort invariance tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Priority,
+            FRAME_FLAG_PRIORITY,
+            "rb11p-abort-prio",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(make_rb11_test_session(
+                "sess-rb11p-abort-p",
+                "prov-rb11p-abort-p",
+            )),
+        )
+        .expect("append priority frame");
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb11p-abort-norm",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(make_rb11_test_session(
+                "sess-rb11p-abort-n",
+                "prov-rb11p-abort-n",
+            )),
+        )
+        .expect("append normal frame");
+
+        // Materialize `writer.lock` as on a normal active Redb repo so the full
+        // `capture-queue/` tree (locks + segments + LTM2) can be compared byte-for-byte.
+        let _ = crate::storage::try_acquire_writer_lock(&storage).expect("init writer.lock");
+
+        // Snapshot exact source bytes BEFORE any Phase 1 attempt.
+        let before_git = fs::read(&git_path).expect("snapshot git.redb");
+        let before_cap = fs::read(&cap_path).expect("snapshot capture.redb");
+        let queue_dir = capture_queue_dir_path(&storage);
+        let before_queue = snapshot_dir_tree_bytes(&queue_dir);
+
+        // 1. Injected abort faults at every Phase 1 stage.
+        for fault in [
+            ReversePhase1FaultPoint::AfterExportBeforeVerify,
+            ReversePhase1FaultPoint::AfterVerifyBeforeBackup,
+            ReversePhase1FaultPoint::AfterBackupBeforeReturn,
+        ] {
+            let err = prepare_reverse_phase1_inner(DatabaseRole::Repository, &storage, Some(fault))
+                .await
+                .expect_err("injected Phase 1 fault must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(!git_sqlite_tmp_path(&storage).exists());
+            assert!(!capture_sqlite_tmp_path(&storage).exists());
+            assert!(!redb_backup_dir_path(&storage, 1).exists());
+            assert_eq!(
+                fs::read(&git_path).expect("git.redb after fault"),
+                before_git,
+                "AC3: git.redb must remain byte-identical after {fault:?}"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("capture.redb after fault"),
+                before_cap,
+                "AC3: capture.redb must remain byte-identical after {fault:?}"
+            );
+            assert_eq!(
+                snapshot_dir_tree_bytes(&queue_dir),
+                before_queue,
+                "AC4: capture-queue/ must remain byte-identical after {fault:?}"
+            );
+        }
+
+        // 2. Full Phase 1 prepare followed by explicit abort & cleanup.
+        let prepared = prepare_reverse_phase1(&storage)
+            .await
+            .expect("prepare_reverse_phase1 must succeed after cleaned abort");
+        assert!(git_sqlite_tmp_path(&storage).exists());
+        assert!(capture_sqlite_tmp_path(&storage).exists());
+        assert!(redb_backup_dir_path(&storage, 1).exists());
+
+        prepared
+            .abort_and_cleanup()
+            .expect("explicit Phase 1 abort_and_cleanup must succeed");
+
+        assert!(!git_sqlite_tmp_path(&storage).exists());
+        assert!(!capture_sqlite_tmp_path(&storage).exists());
+        assert!(!redb_backup_dir_path(&storage, 1).exists());
+        assert_eq!(
+            fs::read(&git_path).expect("git.redb after abort"),
+            before_git
+        );
+        assert_eq!(
+            fs::read(&cap_path).expect("capture.redb after abort"),
+            before_cap
+        );
+        assert_eq!(snapshot_dir_tree_bytes(&queue_dir), before_queue);
     }
 }
