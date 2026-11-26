@@ -261,3 +261,25 @@ fn test_cf_59_predicates() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "local-user");
     let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_60_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("xdg");
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+    ];
+    let list = run_libra_command_with_env(&["config", "--global", "--list"], &repo, &envs);
+    assert_eq!(list.status.code(), Some(128), "missing global store list");
+    assert!(String::from_utf8_lossy(&list.stderr).contains("unable to read config file"));
+    let get = run_libra_command_with_env(&["config", "--global", "--get", "x.y"], &repo, &envs);
+    assert_eq!(get.status.code(), Some(1), "missing global store get");
+    assert!(get.stdout.is_empty());
+}

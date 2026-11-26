@@ -1071,3 +1071,5 @@ nul list records use key newline value nul.
 multiline values stay literal and secrets stay redacted.
 
 cascade get skips an unreadable system store.
+
+missing global store follows the recorded git result.
