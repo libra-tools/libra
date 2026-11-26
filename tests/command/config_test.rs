@@ -8020,4 +8020,69 @@ mod value_pattern {
             assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "v");
         }
     }
+
+    #[test]
+    #[serial(env)]
+    fn test_cf_42_predicates() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let xdg = home.join("xdg");
+        let envs = [
+            ("HOME", home.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ];
+        assert_cli_success(&run_libra_command_with_env(&["init"], &repo, &envs), "init");
+        for value in ["abc123", "keep"] {
+            assert_cli_success(
+                &run_libra_command_with_env(
+                    &[
+                        "config",
+                        "set",
+                        "--local",
+                        "--add",
+                        "--encrypt",
+                        "secret.k",
+                        value,
+                    ],
+                    &repo,
+                    &envs,
+                ),
+                "seed",
+            );
+        }
+        let miss = run_libra_command_with_env(
+            &["config", "--unset", "secret.k", "^absent$"],
+            &repo,
+            &envs,
+        );
+        assert_eq!(miss.status.code(), Some(5), "plaintext miss exits 5");
+
+        let removed = run_libra_command_with_env(
+            &["config", "--unset", "secret.k", "^abc123$"],
+            &repo,
+            &envs,
+        );
+        assert_cli_success(&removed, "plaintext match removes");
+        let reveal = run_libra_command_with_env(
+            &["config", "get", "--local", "--all", "--reveal", "secret.k"],
+            &repo,
+            &envs,
+        );
+        assert_cli_success(&reveal, "reveal remaining");
+        assert_eq!(String::from_utf8_lossy(&reveal.stdout).trim(), "keep");
+
+        let vault_dir = home.join(".libra").join("vault-keys");
+        for entry in fs::read_dir(&vault_dir).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let before = run_libra_command_with_env(&["config", "--local", "--list"], &repo, &envs);
+        let failed =
+            run_libra_command_with_env(&["config", "--unset", "secret.k", "^keep$"], &repo, &envs);
+        assert!(!failed.status.success(), "vault unavailable fails");
+        let after = run_libra_command_with_env(&["config", "--local", "--list"], &repo, &envs);
+        assert_eq!(before.stdout, after.stdout, "vault failure writes nothing");
+    }
 }

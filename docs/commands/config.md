@@ -1181,3 +1181,5 @@ upstream list and regexp cases pass.
 invalid unset pattern exits 6.
 
 invalid key without a section writes nothing.
+
+encrypted unset matches plaintext.

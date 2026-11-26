@@ -728,6 +728,21 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
+        // Decrypt before opening a write transaction: loading the unseal key
+        // reads the same store and would otherwise contend with the write lock.
+        let entries = Self::get_all(scope, key).await?;
+        let mut matched_values = Vec::new();
+        for entry in entries {
+            let matches = if entry.encrypted {
+                let plaintext = decrypt_config_value(&entry.value, scope_name(scope)).await?;
+                matcher(&plaintext)
+            } else {
+                matcher(&entry.value)
+            };
+            if matches {
+                matched_values.push(entry.value);
+            }
+        }
         match Self::resolve_write_backend(scope).await? {
             ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => {
                 let entries = store
@@ -737,7 +752,7 @@ impl ScopedConfig {
                 let mut kept = Vec::with_capacity(entries.len());
                 let mut removed = 0usize;
                 for entry in entries {
-                    if matcher(&entry.value) {
+                    if matched_values.iter().any(|value| value == &entry.value) {
                         removed += 1;
                     } else {
                         kept.push(entry);
@@ -759,9 +774,11 @@ impl ScopedConfig {
             }
             ScopedConfigBackend::Sqlite(None) => {
                 let txn = Self::begin_mutation(scope).await?;
-                let removed = ConfigKv::unset_matching_with_conn(&txn, key, matcher)
-                    .await
-                    .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+                let removed = ConfigKv::unset_matching_with_conn(&txn, key, |value| {
+                    matched_values.iter().any(|matched| matched == value)
+                })
+                .await
+                .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
                 txn.commit()
                     .await
                     .map_err(|e| format!("failed to commit config update: {e}"))?;
