@@ -291,3 +291,17 @@ fn credential_outside_repository_roundtrip() {
         "erased credential should no longer fill"
     );
 }
+
+#[test]
+fn credential_helper_frame_matches_git_helper_test() {
+    let repo = init_repo();
+    let store = run_libra_command_with_stdin(&["credential", "store"], repo.path(), STORE_INPUT);
+    assert!(store.status.success(), "store: {}", stderr(&store));
+    let get = run_libra_command_with_stdin(&["credential", "get"], repo.path(), FILL_INPUT);
+    assert!(get.status.success(), "get: {}", stderr(&get));
+    assert_eq!(
+        stdout(&get),
+        "username=alice\npassword=s3cr3t-token\n",
+        "helper frame must match Git's credential helper_test"
+    );
+}

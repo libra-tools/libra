@@ -106,21 +106,11 @@ pub async fn execute_safe(args: CredentialArgs, _output: &OutputConfig) -> CliRe
 /// indistinguishable from "no vault" or "expired" from the caller's side.
 async fn fill(attrs: &CredentialAttrs) -> CliResult<()> {
     match repo_scoped_credential(attrs).await {
-        Some(stored) => emit_fill(
-            attrs,
-            &stored.username,
-            &stored.password,
-            Some(stored.expires_at),
-        ),
+        Some(stored) => emit_fill(&stored.username, &stored.password),
         // User-level store: available outside a repository (HP-14), so the
         // helper is usable as a global `credential.helper`.
         None => match user_scoped_credential(attrs).await {
-            Some(stored) => emit_fill(
-                attrs,
-                &stored.username,
-                &stored.password,
-                Some(stored.expires_at),
-            ),
+            Some(stored) => emit_fill(&stored.username, &stored.password),
             // Global-token fallback (lore.md 1.6, gh-style): https only, silent
             // on every miss — store/erase never manage auth tokens.
             None => {
@@ -136,7 +126,7 @@ async fn fill(attrs: &CredentialAttrs) -> CliResult<()> {
                     {
                         return Ok(());
                     }
-                    return emit_fill(attrs, &username, &token, None);
+                    return emit_fill(&username, &token);
                 }
                 Ok(())
             }
@@ -244,28 +234,10 @@ async fn user_erase(attrs: &CredentialAttrs) -> CliResult<()> {
     Ok(())
 }
 
-fn emit_fill(
-    attrs: &CredentialAttrs,
-    username: &str,
-    password: &str,
-    expires_at: Option<u64>,
-) -> CliResult<()> {
-    let mut response = String::new();
-    if !attrs.protocol.is_empty() {
-        response.push_str(&format!("protocol={}\n", attrs.protocol));
-    }
-    if !attrs.host.is_empty() {
-        response.push_str(&format!("host={}\n", attrs.host));
-    }
-    if !attrs.path.is_empty() {
-        response.push_str(&format!("path={}\n", attrs.path));
-    }
-    response.push_str(&format!("username={username}\n"));
-    response.push_str(&format!("password={password}\n"));
-    if let Some(expires_at) = expires_at {
-        response.push_str(&format!("password_expiry_utc={expires_at}\n"));
-    }
-    print!("{response}");
+fn emit_fill(username: &str, password: &str) -> CliResult<()> {
+    // Git's credential helper protocol returns only the credentials it can
+    // supply; the request's protocol/host/path are not echoed back.
+    print!("username={username}\npassword={password}\n");
     Ok(())
 }
 

@@ -13,7 +13,7 @@ libra credential erase
 ```
 
 `get` is the Git helper protocol operation for a fill; `fill` is accepted as a
-legacy alias. Each subcommand reads Git credential attributes (`key=value`
+legacy alias. `get`/`fill` prints only `username=` and `password=` lines (Git's helper frame; the request's protocol/host/path are not echoed). Each subcommand reads Git credential attributes (`key=value`
 lines, terminated by a blank line) from stdin. An unknown operation is silently
 ignored (Git helper convention).
 
