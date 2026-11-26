@@ -936,3 +936,5 @@ config unset subcommand matches legacy unset.
 config list subcommand matches the legacy flags.
 
 config get without a section exits 1.
+
+missing key get exits 1.
