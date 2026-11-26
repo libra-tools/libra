@@ -4,7 +4,7 @@ use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, div};
 
 use super::super::{
     desktop::Desktop,
-    widgets::{badge, column, label, mono, muted, title},
+    widgets::{badge, column, label, mono, title},
 };
 
 pub fn render(s: &Desktop, _cx: &Context<Desktop>, p: &Palette) -> AnyElement {
@@ -14,7 +14,6 @@ pub fn render(s: &Desktop, _cx: &Context<Desktop>, p: &Palette) -> AnyElement {
         .items_center()
         .justify_center()
         .child(title("Libra"))
-        .child(muted("Read-only preview", p))
         .child(
             div()
                 .mt_4()

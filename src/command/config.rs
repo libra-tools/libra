@@ -105,7 +105,7 @@ pub struct ConfigArgs {
     pub show_scope: bool,
     /// Read configuration from a Git-style INI file instead of the stores
     /// (`git config --file`). Read-only.
-    #[clap(long = "file", value_name = "PATH", hide = true)]
+    #[clap(short = 'f', long = "file", value_name = "PATH", hide = true)]
     pub file: Option<String>,
     /// Show only key names (`git config --name-only`)
     #[clap(long("name-only"), hide = true)]
@@ -178,6 +178,9 @@ pub struct ConfigArgs {
     /// Value or value pattern
     #[clap(value_name = "value")]
     pub valuepattern: Option<String>,
+    /// Value pattern for `--replace-all` (Git's third positional)
+    #[clap(value_name = "value-pattern")]
+    pub value_pattern: Option<String>,
     /// Default value when key not found
     #[clap(long, short = 'd')]
     pub default: Option<String>,
@@ -259,6 +262,9 @@ pub enum ConfigCommand {
         /// Show only key names
         #[clap(long("name-only"))]
         name_only: bool,
+        /// Canonicalize each listed value to this type (`--type=color`)
+        #[clap(long = "type", value_name = "TYPE")]
+        value_type: Option<String>,
         /// Show scope origin for each entry
         #[clap(long("show-origin"))]
         show_origin: bool,
@@ -1366,6 +1372,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 vault,
                 ssh_keys,
                 gpg_keys,
+                value_type: list_type,
             } => ResolvedCommand::List {
                 name_only: *name_only,
                 show_origin: *show_origin,
@@ -1374,7 +1381,10 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 ssh_keys: *ssh_keys,
                 gpg_keys: *gpg_keys,
                 null: args.null,
-                value_type,
+                value_type: match list_type.as_deref() {
+                    Some(name) => Some(parse_value_type_name(name)?),
+                    None => value_type,
+                },
             },
             ConfigCommand::Unset {
                 key,
@@ -1553,6 +1563,14 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
         return Ok(ResolvedCommand::Path);
     }
 
+    if args.value_pattern.is_some() && !args.replace_all {
+        return Err(
+            CliError::failure("value pattern is only accepted with --replace-all")
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_exit_code(2),
+        );
+    }
+
     // All remaining modes need a key
     let key = args.key.as_deref().ok_or_else(|| {
         CliError::from_legacy_string("error: missing required argument: <key>").with_exit_code(2)
@@ -1675,7 +1693,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
         value: args.valuepattern.clone(),
         add: false,
         replace_all: args.replace_all,
-        value_pattern: None,
+        value_pattern: args.value_pattern.clone(),
         fixed_value: args.fixed_value,
         encrypt: false,
         plaintext: false,
@@ -2009,7 +2027,7 @@ async fn handle_set(
                 }
             })?;
         emit_set_ack("add", scope, key, should_encrypt, output)?;
-    } else if replace_all {
+    } else if replace_all && value_pattern.is_none() {
         // Git `--replace-all`: every existing value is replaced by this one.
         ScopedConfig::replace_all(scope, key, &store_value)
             .await
@@ -2025,18 +2043,21 @@ async fn handle_set(
         // Git `config <key> <value> <value-pattern>`: replace only the entries
         // whose value matches, leaving the others alone.
         let matcher = compile_value_matcher(pattern, fixed_value)?;
-        ScopedConfig::unset_matching(scope, key, |value| matcher.matches(value))
-            .await
-            .map_err(CliError::from_legacy_string)?;
-        ScopedConfig::add(scope, key, &store_value, should_encrypt)
-            .await
-            .map_err(|e| {
-                if e.contains("core.objectformat cannot be changed") {
-                    core_objectformat_mutation_error("config set")
-                } else {
-                    CliError::from_legacy_string(e)
-                }
-            })?;
+        ScopedConfig::replace_matching(
+            scope,
+            key,
+            |value| matcher.matches(value),
+            &store_value,
+            should_encrypt,
+        )
+        .await
+        .map_err(|e| {
+            if e.contains("core.objectformat cannot be changed") {
+                core_objectformat_mutation_error("config set")
+            } else {
+                CliError::from_legacy_string(e)
+            }
+        })?;
         emit_set_ack("set", scope, key, should_encrypt, output)?;
     } else {
         ScopedConfig::set(scope, key, &store_value, should_encrypt)
@@ -2222,14 +2243,20 @@ fn resolve_value_type(args: &ConfigArgs) -> CliResult<Option<ConfigValueType>> {
     }
     match args.value_type.as_deref() {
         None => Ok(None),
-        Some("bool") => Ok(Some(ConfigValueType::Bool)),
-        Some("int") => Ok(Some(ConfigValueType::Int)),
-        Some("path") => Ok(Some(ConfigValueType::Path)),
-        Some("bool-or-str") => Ok(Some(ConfigValueType::BoolOrStr)),
-        Some("bool-or-int") => Ok(Some(ConfigValueType::BoolOrInt)),
-        Some("color") => Ok(Some(ConfigValueType::Color)),
-        Some("expiry-date") => Ok(Some(ConfigValueType::ExpiryDate)),
-        Some(other) => Err(CliError::command_usage(format!(
+        Some(name) => parse_value_type_name(name).map(Some),
+    }
+}
+
+fn parse_value_type_name(name: &str) -> CliResult<ConfigValueType> {
+    match name {
+        "bool" => Ok(ConfigValueType::Bool),
+        "int" => Ok(ConfigValueType::Int),
+        "path" => Ok(ConfigValueType::Path),
+        "bool-or-str" => Ok(ConfigValueType::BoolOrStr),
+        "bool-or-int" => Ok(ConfigValueType::BoolOrInt),
+        "color" => Ok(ConfigValueType::Color),
+        "expiry-date" => Ok(ConfigValueType::ExpiryDate),
+        other => Err(CliError::command_usage(format!(
             "error: unsupported --type '{other}' (expected bool, int, path, bool-or-str, bool-or-int, color, or expiry-date)"
         ))
         .with_stable_code(StableErrorCode::CliInvalidArguments)),
@@ -2847,6 +2874,39 @@ fn write_config_file(
         )
         .with_stable_code(StableErrorCode::CliInvalidArguments));
     }
+    if matches!(
+        _args.command,
+        Some(ConfigCommand::Set { encrypt: true, .. })
+            | Some(ConfigCommand::Set {
+                plaintext: true,
+                ..
+            })
+    ) {
+        return Err(CliError::command_usage(
+            "vault encryption options are not supported with --file",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+    let vault_key = match mutation {
+        crate::internal::config_file::write::Mutation::Set { key, .. }
+        | crate::internal::config_file::write::Mutation::Unset { key, .. } => Some(key.as_str()),
+        crate::internal::config_file::write::Mutation::RemoveSection { name } => {
+            Some(name.as_str())
+        }
+        crate::internal::config_file::write::Mutation::RenameSection { old, new } => {
+            if new.starts_with("vault.") {
+                Some(new.as_str())
+            } else {
+                Some(old.as_str())
+            }
+        }
+    };
+    if vault_key.is_some_and(|key| key.starts_with("vault.")) {
+        return Err(
+            CliError::command_usage("vault entries are not supported with --file")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
     let target = Path::new(path);
     let existing = match std::fs::read_to_string(target) {
         Ok(text) => text,
@@ -2921,11 +2981,30 @@ fn serve_config_file(
     output: &OutputConfig,
 ) -> CliResult<()> {
     if let Some(mutation) = config_file_write_mutation(cmd)? {
+        if path == "-" {
+            return Err(CliError::command_usage(
+                "writing to standard input ('--file -') is not supported",
+            ));
+        }
         return write_config_file(path, &mutation, args, output);
     }
     let show_origin = args.show_origin;
     let show_scope = args.show_scope;
-    let entries = read_git_config_file(Path::new(path))?;
+    let entries = if path == "-" {
+        let mut text = String::new();
+        use std::io::Read as _;
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to read config from standard input: {error}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+        parse_git_config_text(&text)
+    } else {
+        read_git_config_file(Path::new(path))?
+    };
     let origin = format!("file:{path}");
     let prefix = if show_scope {
         "command line".to_string()
@@ -3107,6 +3186,10 @@ fn read_git_config_file(path: &Path) -> CliResult<Vec<(String, String)>> {
         ))
         .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
+    Ok(parse_git_config_text(&text))
+}
+
+fn parse_git_config_text(text: &str) -> Vec<(String, String)> {
     let mut entries = Vec::new();
     let mut section = String::new();
     for raw in text.lines() {
@@ -3132,7 +3215,7 @@ fn read_git_config_file(path: &Path) -> CliResult<Vec<(String, String)>> {
             unquote_ini_value(value.trim()),
         ));
     }
-    Ok(entries)
+    entries
 }
 
 fn parse_ini_section(inner: &str) -> String {
@@ -3676,6 +3759,22 @@ async fn handle_unset(
     let count = if let Some(pattern) = value_pattern {
         // Git `--unset <key> <value-pattern>`: remove only the matching values.
         let matcher = compile_value_matcher(pattern, fixed_value)?;
+        if !all {
+            // A single unset must be unambiguous: more than one matching value
+            // is refused before any mutation (Git exits 5).
+            let existing = ScopedConfig::get_all(scope, key)
+                .await
+                .map_err(CliError::from_legacy_string)?;
+            let matches = existing
+                .iter()
+                .filter(|entry| matcher.matches(&entry.value))
+                .count();
+            if matches > 1 {
+                return Err(CliError::failure(format!("{key} has multiple values"))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_exit_code(5));
+            }
+        }
         ScopedConfig::unset_matching(scope, key, |value| matcher.matches(value))
             .await
             .map_err(CliError::from_legacy_string)?

@@ -3864,58 +3864,12 @@ fn uid07_welcome_in_and_out() {
 }
 
 #[test]
-fn uid07_label_copy() {
-    assert_eq!(crate::gui::desktop::WINDOW_LABEL, "Read-only preview");
-    assert!(!crate::gui::desktop::WINDOW_LABEL.contains("Design preview"));
-}
-
-#[test]
 fn uid07_import_copy() {
-    assert_eq!(crate::gui::desktop::WINDOW_LABEL, "Read-only preview");
     assert_eq!(
         crate::gui::screens::cloud::IMPORT_EXAMPLE,
         "your-repository"
     );
     assert!(!crate::gui::screens::cloud::IMPORT_EXAMPLE.contains("acme"));
-}
-
-#[test]
-fn uid07_deferred_pages_badge() {
-    use crate::gui::desktop::{Page, is_demo_page};
-    for page in [
-        Page::SplashError,
-        Page::Settings,
-        Page::Mega,
-        Page::Deps,
-        Page::Views,
-        Page::Cloud,
-        Page::Rebase,
-        Page::Refs,
-        Page::Bisect,
-        Page::Blame,
-        Page::Conflict,
-        Page::Automation,
-        Page::Review,
-        Page::Agents,
-        Page::Lanes,
-        Page::Search,
-    ] {
-        assert!(is_demo_page(page), "{page:?} is a demo page");
-    }
-    for page in [
-        Page::History,
-        Page::Sessions,
-        Page::Operations,
-        Page::Memory,
-        Page::Reviews,
-        Page::Investigate,
-        Page::Capabilities,
-        Page::Welcome,
-        Page::About,
-        Page::Splash,
-    ] {
-        assert!(!is_demo_page(page), "{page:?} carries real data");
-    }
 }
 
 #[tokio::test]

@@ -24,6 +24,14 @@
   routes: `search` requires `--stream` (unsupported filters are refused
   locally; the route owns the body budget), and `transcript` accepts an
   optional `--session` and resolves it from the checkpoint when omitted.
+- When an SSH connection to `github.com` is closed, refused or times out before
+  Git negotiation, an interactive `fetch` / `pull` / `push` / `clone` /
+  `ls-remote` now offers to route GitHub through `ssh.github.com` port 443. On
+  `yes` it appends the documented `Host github.com` block to `~/.ssh/config`,
+  checks with `ssh -G` that the route took effect (removing the block again when
+  another entry overrides it) and retries once. Nothing is asked for JSON,
+  machine or non-TTY callers, for other hosts, or when `github.com` is already
+  mapped in the SSH configuration.
 
 ### Changed
 

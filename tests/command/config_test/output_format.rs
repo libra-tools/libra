@@ -262,3 +262,88 @@ fn test_t1300_get_regexp_name_only() {
     assert_cli_success(&out_null_name, "--null --name-only --get-regexp");
     assert_eq!(out_null_name.stdout, b"section.val\0section.empty\0");
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_105_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for (key, value) in [("a.one", "1"), ("b.two", "2")] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", key, value], repo.path()),
+            "set",
+        );
+    }
+    let legacy = run_libra_command(&["config", "--local", "--list"], repo.path());
+    let sub = run_libra_command(&["config", "list", "--local"], repo.path());
+    assert_cli_success(&legacy, "--list");
+    assert_cli_success(&sub, "config list");
+    assert_eq!(legacy.stdout, sub.stdout, "same order and formatting");
+}
+
+#[test]
+#[serial(cwd)]
+fn test_cf_47_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "alpha.one", "v1"], repo.path()),
+        "set",
+    );
+    let list = run_libra_command(&["config", "--local", "-z", "--list"], repo.path());
+    assert_cli_success(&list, "-z --list");
+    assert!(
+        list.stdout
+            .windows(b"alpha.one\nv1\0".len())
+            .any(|w| w == b"alpha.one\nv1\0"),
+        "NUL list record is key\\nvalue\\0: {:?}",
+        list.stdout
+    );
+    let regexp = run_libra_command(
+        &["config", "--local", "-z", "--get-regexp", "^alpha\\."],
+        repo.path(),
+    );
+    assert_cli_success(&regexp, "-z --get-regexp");
+    assert_eq!(regexp.stdout, b"alpha.one\nv1\0");
+}
+
+#[test]
+#[serial(env)]
+fn test_cf_51_predicates() {
+    const SENTINEL: &str = "cf51-plaintext-sentinel";
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "multi.value", "line1\nline2"],
+            repo.path(),
+        ),
+        "multiline",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "--local",
+                "--encrypt",
+                "ordinary.blob",
+                SENTINEL,
+            ],
+            repo.path(),
+        ),
+        "encrypted",
+    );
+    let listed = run_libra_command(&["config", "--local", "--list"], repo.path());
+    assert_cli_success(&listed, "--list");
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        text.contains("multi.value=line1\nline2"),
+        "multiline verbatim: {text}"
+    );
+    assert!(
+        text.contains("ordinary.blob=<REDACTED>"),
+        "encrypted redacted: {text}"
+    );
+    assert!(!text.contains(SENTINEL), "plaintext must not leak");
+}

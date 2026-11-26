@@ -7622,6 +7622,101 @@ mod value_pattern {
     }
 
     #[test]
+    fn test_cf_39_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "other"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        let out = run_libra_command(&["config", "--unset", "multi.k", "o"], repo.path());
+        assert_eq!(out.status.code(), Some(5), "ambiguous single unset exits 5");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("has multiple values"),
+            "warning text: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let all = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(
+            String::from_utf8_lossy(&all.stdout).trim(),
+            "one\nother",
+            "no value removed on ambiguity"
+        );
+    }
+
+    #[test]
+    fn test_cf_44_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        assert_cli_success(
+            &run_libra_command(&["config", "--add", "multi.k", "v"], repo.path()),
+            "add",
+        );
+        let out = run_libra_command(&["config", "--get", "multi.k", "("], repo.path());
+        assert_eq!(out.status.code(), Some(6), "invalid get pattern exits 6");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("invalid pattern"));
+    }
+
+    #[test]
+    fn test_cf_43_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        for verb in ["--get", "--get-all"] {
+            let out = run_libra_command(&["config", verb, "multi.k", "nomatch"], repo.path());
+            assert_eq!(out.status.code(), Some(1), "{verb} miss exits 1");
+        }
+    }
+
+    #[test]
+    fn test_cf_63_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["five", "six"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        let all = run_libra_command(&["config", "--replace-all", "multi.k", "five"], repo.path());
+        assert_cli_success(&all, "replace-all without pattern");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &run_libra_command(&["config", "--get-all", "multi.k"], repo.path()).stdout
+            )
+            .trim(),
+            "five"
+        );
+
+        for value in ["five", "six"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "re-add",
+            );
+        }
+        let matched = run_libra_command(
+            &["config", "--replace-all", "multi.k", "seven", "fiv"],
+            repo.path(),
+        );
+        assert_cli_success(&matched, "replace-all with pattern");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &run_libra_command(&["config", "--get-all", "multi.k"], repo.path()).stdout
+            )
+            .trim(),
+            "seven\nsix",
+            "pattern replaces only matching values"
+        );
+    }
+
+    #[test]
     fn test_cf_38_predicates() {
         let repo = tempdir().unwrap();
         assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");

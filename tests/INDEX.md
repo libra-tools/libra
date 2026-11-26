@@ -239,6 +239,7 @@ dedicated feature-on steps.
 | `compat_fastcdc_feature_gate_guard` | 1F | pins the feature gating of the `media` command (`fastcdc`) | `src/cli.rs` |
 | `compat_keyring_feature_gate_guard` | 1F | pins the keyring backend's feature gating (`keyring`) | `src/cli.rs` |
 | `compat_otlp_feature_gate_guard` | 1F | pins OTLP telemetry's feature gating (`otlp`) | `src/cli.rs` |
+| `storage_concurrency_stress_test` | 1F | plan-20261121 RB-12 multi-process 32-producer dual-lane queue + concurrent RedbGitStore/RedbCaptureStore MVCC stress, dual-feature migration roundtrip, and pre-unlock `libra-migrate` binary gate (`storage-redb`, `storage-sqlite`) | `src/storage/`, `src/bin/libra_migrate.rs` |
 ## Wave 4 — Live AI (test-live-ai / DEEPSEEK_API_KEY)
 
 | target | wave | one-line purpose | relevant src |

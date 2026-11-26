@@ -471,3 +471,90 @@ fn test_cf_73_predicates() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_76_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "color.good", "red"], repo.path()),
+        "valid color",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "color.bad", "bogus"], repo.path()),
+        "invalid color",
+    );
+    let listed = run_libra_command(&["config", "list", "--local", "--type=color"], repo.path());
+    assert_cli_success(&listed, "list --type=color");
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains("color.good=\x1b[31m"), "{text:?}");
+    assert!(
+        !text.contains("color.bad"),
+        "only parseable values: {text:?}"
+    );
+    let json = run_libra_command(
+        &[
+            "--machine",
+            "config",
+            "--local",
+            "--type=color",
+            "--get",
+            "color.good",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&json, "machine get");
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(parsed["data"]["value"], "\u{1b}[31m");
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_80_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "date.value", "2024-01-01"],
+            repo.path(),
+        ),
+        "set date",
+    );
+    let shortcut = run_libra_command(
+        &["config", "--local", "--expiry-date", "--get", "date.value"],
+        repo.path(),
+    );
+    let typed = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--type=expiry-date",
+            "--get",
+            "date.value",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&shortcut, "--expiry-date");
+    assert_cli_success(&typed, "--type=expiry-date");
+    assert_eq!(shortcut.stdout, typed.stdout);
+    let invalid = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--expiry-date",
+            "date.bad",
+            "not-a-date",
+        ],
+        repo.path(),
+    );
+    assert_eq!(invalid.status.code(), Some(129), "invalid expiry set");
+    let stored = run_libra_command(&["config", "--local", "--get", "date.bad"], repo.path());
+    assert_eq!(stored.status.code(), Some(1), "invalid set writes nothing");
+}

@@ -331,6 +331,18 @@ impl SshConnectionFailed {
         }
     }
 
+    /// Whether the TCP path to the SSH port itself was cut, refused or timed
+    /// out — the failures an alternate SSH port can work around. A DNS or
+    /// routing failure would hit the alternate endpoint just the same.
+    const fn may_be_port_blocked(self) -> bool {
+        matches!(
+            self.kind,
+            SshConnectionFailureKind::ConnectionClosed
+                | SshConnectionFailureKind::TimedOut
+                | SshConnectionFailureKind::ConnectionRefused
+        )
+    }
+
     const fn io_error_kind(self) -> ErrorKind {
         match self.kind {
             SshConnectionFailureKind::TimedOut => ErrorKind::TimedOut,
@@ -951,6 +963,9 @@ pub struct SshClient {
     strict_host_key_checking: String,
     idle_timeout: Duration,
     host_key_confirmation: Option<HostKeyConfirmation>,
+    /// Set once the SSH-over-443 repair has been offered, so one command asks
+    /// at most once whatever the answer was.
+    github_port_443_offered: std::sync::atomic::AtomicBool,
 }
 
 impl SshClient {
@@ -1052,6 +1067,7 @@ impl SshClient {
             strict_host_key_checking: "ask".to_string(),
             idle_timeout: default_ssh_idle_timeout(),
             host_key_confirmation: None,
+            github_port_443_offered: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1076,6 +1092,7 @@ impl SshClient {
             strict_host_key_checking: "ask".to_string(),
             idle_timeout: default_ssh_idle_timeout(),
             host_key_confirmation: None,
+            github_port_443_offered: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1214,7 +1231,19 @@ impl SshClient {
         &self,
         service: ServiceType,
     ) -> Result<DiscoveryResult, GitError> {
-        match self.discovery_reference_inner(service).await {
+        let mut result = self.discovery_reference_inner(service).await;
+        // Discovery is the first connection of every fetch, push and
+        // ls-remote, and nothing has been negotiated yet, so one retry over the
+        // repaired route is safe. The retry result then flows through the
+        // host-key confirmation below: the alternate endpoint is verified under
+        // its own `known_hosts` token.
+        if let Err(error) = &result
+            && let Some(failure) = git_error_ssh_connection_failed(error)
+            && self.offer_github_ssh_over_443(failure).await
+        {
+            result = self.discovery_reference_inner(service).await;
+        }
+        match result {
             Err(error)
                 if self.host_key_confirmation_enabled()
                     && git_error_is_host_key_untrusted(&error) =>
@@ -1226,6 +1255,108 @@ impl SshClient {
             }
             other => other,
         }
+    }
+
+    /// Offer to route `github.com` through `ssh.github.com:443` after the
+    /// connection failed before Git negotiation.
+    ///
+    /// Asks only when the command is interactive, the URL targets `github.com`
+    /// on the default port, and `ssh -G` shows the user has not already mapped
+    /// that host elsewhere. Returns `true` only when the user accepted, the
+    /// block was written to the user's `ssh_config` and `ssh -G` confirms the
+    /// new target; the caller may then retry once. An edit that another
+    /// `ssh_config` entry overrides is rolled back.
+    async fn offer_github_ssh_over_443(&self, failure: SshConnectionFailed) -> bool {
+        use std::sync::atomic::Ordering;
+
+        use super::ssh_github_port443 as repair;
+
+        let Some(interaction) = &self.host_key_confirmation else {
+            return false;
+        };
+        if !failure.may_be_port_blocked()
+            || !self.host.eq_ignore_ascii_case(repair::GITHUB_SSH_HOST)
+            || self.port != DEFAULT_SSH_PORT
+        {
+            return false;
+        }
+        // Without `ssh -G` the effective target is unknown; do not guess.
+        let Some(resolved) = self.run_ssh_g().await else {
+            return false;
+        };
+        if !resolved.host.eq_ignore_ascii_case(repair::GITHUB_SSH_HOST)
+            || resolved.port != DEFAULT_SSH_PORT
+        {
+            return false;
+        }
+        let Some(config_path) = repair::user_ssh_config_path() else {
+            return false;
+        };
+        if self.github_port_443_offered.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+
+        let prompt = repair::prompt(&config_path, failure.message());
+        let mut accepted = false;
+        for _ in 0..repair::MAX_PROMPT_ATTEMPTS {
+            if (interaction.write_prompt)(&prompt).is_err() {
+                return false;
+            }
+            let Ok(answer) = (interaction.read_answer)() else {
+                return false;
+            };
+            match repair::resolve_answer(&answer) {
+                Some(true) => {
+                    accepted = true;
+                    break;
+                }
+                Some(false) => return false,
+                None => {}
+            }
+        }
+        if !accepted {
+            return false;
+        }
+
+        let receipt = match repair::append_block(&config_path) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let _ = (interaction.write_prompt)(&format!(
+                    "Could not update {}: {error}\n",
+                    config_path.display()
+                ));
+                return false;
+            }
+        };
+        let applied = self.run_ssh_g().await.is_some_and(|resolved| {
+            resolved
+                .host
+                .eq_ignore_ascii_case(repair::GITHUB_SSH_ALT_HOST)
+                && resolved.port == repair::GITHUB_SSH_ALT_PORT
+        });
+        if !applied {
+            let note = match receipt.roll_back() {
+                Ok(()) => format!(
+                    "Another ssh_config entry overrides the new block, so {} was left unchanged; set Hostname {} and Port {} for github.com manually.\n",
+                    config_path.display(),
+                    repair::GITHUB_SSH_ALT_HOST,
+                    repair::GITHUB_SSH_ALT_PORT
+                ),
+                Err(error) => format!(
+                    "Another ssh_config entry overrides the new block, and removing it from {} failed: {error}\n",
+                    config_path.display()
+                ),
+            };
+            let _ = (interaction.write_prompt)(&note);
+            return false;
+        }
+        let _ = (interaction.write_prompt)(&format!(
+            "Updated {}; retrying through {}:{} ...\n",
+            config_path.display(),
+            repair::GITHUB_SSH_ALT_HOST,
+            repair::GITHUB_SSH_ALT_PORT
+        ));
+        true
     }
 
     async fn discovery_reference_inner(
@@ -1814,6 +1945,13 @@ impl SshClient {
                 }
             }
         }
+    }
+}
+
+fn git_error_ssh_connection_failed(error: &GitError) -> Option<SshConnectionFailed> {
+    match error {
+        GitError::IOError(error) => ssh_connection_failed(error),
+        _ => None,
     }
 }
 
@@ -4869,5 +5007,281 @@ identityfile ~/.ssh/id_ed25519
             .expect("hostname must parse without an explicit port");
         assert_eq!(target.port, 2222);
         assert_eq!(target.known_hosts_token(), "[github.com]:2222");
+    }
+
+    /// How the fake `ssh` answers `ssh -G` in the SSH-over-443 repair tests.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum FakeSshConfigResolution {
+        /// Reports `ssh.github.com:443` once the block is in the config.
+        HonorsBlock,
+        /// Always reports `github.com:22`, as if an earlier entry won.
+        IgnoresBlock,
+        /// Already reports `ssh.github.com:443` before any edit.
+        AlreadyMapped,
+    }
+
+    /// Fake `ssh` whose transport is cut before Git negotiation until the
+    /// user's config maps GitHub to `ssh.github.com`. Every transport attempt
+    /// appends one byte to `attempts`.
+    #[cfg(unix)]
+    fn write_port_443_repair_ssh_script(
+        root: &std::path::Path,
+        ad: &std::path::Path,
+        config: &std::path::Path,
+        attempts: &std::path::Path,
+        resolution: FakeSshConfigResolution,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = root.join("port_443_repair_ssh.sh");
+        let resolved = match resolution {
+            FakeSshConfigResolution::HonorsBlock => {
+                "if [ \"$mapped\" = 1 ]; then printf 'hostname ssh.github.com\\nport 443\\n'; else printf 'hostname github.com\\nport 22\\n'; fi"
+            }
+            FakeSshConfigResolution::IgnoresBlock => "printf 'hostname github.com\\nport 22\\n'",
+            FakeSshConfigResolution::AlreadyMapped => {
+                "printf 'hostname ssh.github.com\\nport 443\\n'"
+            }
+        };
+        let text = format!(
+            "#!/bin/sh\nset -eu\nmapped=0\nif [ -f {cfg} ] && grep -Fq 'Hostname ssh.github.com' {cfg}; then mapped=1; fi\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-G\" ]; then\n    {resolved}\n    exit 0\n  fi\ndone\nprintf x >> {attempts}\nif [ \"$mapped\" = 1 ]; then\n  cat {ad}\n  exit 0\nfi\nprintf '%s\\n' 'kex_exchange_identification: Connection closed by remote host' >&2\nexit 255\n",
+            cfg = shell_single_quote(config.to_str().unwrap()),
+            attempts = shell_single_quote(attempts.to_str().unwrap()),
+            ad = shell_single_quote(ad.to_str().unwrap()),
+        );
+        std::fs::write(&script, text).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Everything one SSH-over-443 repair test needs: a private `HOME`, the
+    /// fake `ssh`, and the recorded prompt.
+    #[cfg(unix)]
+    struct Port443RepairFixture {
+        _root: tempfile::TempDir,
+        config: std::path::PathBuf,
+        attempts: std::path::PathBuf,
+        prompt: Arc<Mutex<Vec<String>>>,
+        client: SshClient,
+        _env: [crate::utils::test::ScopedEnvVar; 2],
+    }
+
+    #[cfg(unix)]
+    impl Port443RepairFixture {
+        fn new(
+            spec: &str,
+            resolution: FakeSshConfigResolution,
+            answer: Option<&'static str>,
+        ) -> Self {
+            use crate::utils::test::ScopedEnvVar;
+            let root = tempfile::tempdir().unwrap();
+            let ad = root.path().join("ad");
+            std::fs::write(&ad, b"0000").unwrap();
+            let config = root.path().join(".ssh").join("config");
+            let attempts = root.path().join("attempts");
+            let script =
+                write_port_443_repair_ssh_script(root.path(), &ad, &config, &attempts, resolution);
+            let env = [
+                ScopedEnvVar::set("LIBRA_SSH_COMMAND", &script),
+                ScopedEnvVar::set("HOME", root.path()),
+            ];
+            let prompt = Arc::new(Mutex::new(Vec::<String>::new()));
+            let mut client = SshClient::from_ssh_spec(spec)
+                .unwrap()
+                .with_idle_timeout(PKT11_FIXTURE_IDLE_TIMEOUT);
+            if let Some(answer) = answer {
+                let recorded = prompt.clone();
+                client = client.with_host_key_confirmation(HostKeyConfirmation {
+                    known_hosts_path: root.path().join("known_hosts"),
+                    keyscan_command: None,
+                    read_answer: Box::new(move || Ok(answer.to_string())),
+                    write_prompt: Box::new(move |text| {
+                        recorded.lock().unwrap().push(text.to_string());
+                        Ok(())
+                    }),
+                });
+            }
+            Self {
+                _root: root,
+                config,
+                attempts,
+                prompt,
+                client,
+                _env: env,
+            }
+        }
+
+        fn transport_attempts(&self) -> usize {
+            std::fs::read(&self.attempts).map_or(0, |bytes| bytes.len())
+        }
+
+        fn prompt_text(&self) -> String {
+            self.prompt.lock().unwrap().join("")
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_connection_closed(result: Result<DiscoveryResult, GitError>) {
+        let error = result.expect_err("the cut connection must surface");
+        let failure = git_error_ssh_connection_failed(&error)
+            .unwrap_or_else(|| panic!("expected a typed connection failure, got: {error:?}"));
+        assert_eq!(
+            failure,
+            SshConnectionFailed::new(SshConnectionFailureKind::ConnectionClosed)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn github_port_443_repair_accept_writes_config_and_retries() {
+        let fixture = Port443RepairFixture::new(
+            "git@github.com:owner/repo.git",
+            FakeSshConfigResolution::HonorsBlock,
+            Some("yes\n"),
+        );
+
+        let result = fixture
+            .client
+            .discovery_reference(ServiceType::UploadPack)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "accept must retry and succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(fixture.transport_attempts(), 2, "exactly one retry");
+        let config = std::fs::read_to_string(&fixture.config).expect("ssh_config written");
+        assert!(
+            config.contains("Host github.com\n    Hostname ssh.github.com\n    Port 443\n"),
+            "config must carry the GitHub block, got: {config}"
+        );
+        let prompt = fixture.prompt_text();
+        assert!(
+            prompt.contains("connection closed or reset before Git negotiation"),
+            "prompt must name the failure: {prompt}"
+        );
+        assert!(
+            prompt.contains(&fixture.config.display().to_string()),
+            "prompt must name the file it will edit: {prompt}"
+        );
+        assert!(
+            prompt.contains("retrying through ssh.github.com:443"),
+            "the applied edit must be reported: {prompt}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn github_port_443_repair_decline_leaves_config_untouched() {
+        let fixture = Port443RepairFixture::new(
+            "git@github.com:owner/repo.git",
+            FakeSshConfigResolution::HonorsBlock,
+            Some("no\n"),
+        );
+
+        let result = fixture
+            .client
+            .discovery_reference(ServiceType::UploadPack)
+            .await;
+
+        assert_connection_closed(result);
+        assert_eq!(fixture.transport_attempts(), 1, "a decline must not retry");
+        assert!(
+            !fixture.config.exists(),
+            "a decline must not create the config"
+        );
+        assert!(fixture.prompt_text().contains("(yes/no)? "));
+
+        // One command asks at most once, whatever the answer was.
+        let again = fixture
+            .client
+            .discovery_reference(ServiceType::UploadPack)
+            .await;
+        assert_connection_closed(again);
+        assert_eq!(
+            fixture.prompt_text().matches("(yes/no)? ").count(),
+            1,
+            "the offer must not repeat"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn github_port_443_repair_rolls_back_an_overridden_block() {
+        let fixture = Port443RepairFixture::new(
+            "git@github.com:owner/repo.git",
+            FakeSshConfigResolution::IgnoresBlock,
+            Some("yes\n"),
+        );
+        let original = "Host *\n    Port 22\n";
+        std::fs::create_dir_all(fixture.config.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.config, original).unwrap();
+
+        let result = fixture
+            .client
+            .discovery_reference(ServiceType::UploadPack)
+            .await;
+
+        assert_connection_closed(result);
+        assert_eq!(fixture.transport_attempts(), 1, "no retry on a dead edit");
+        assert_eq!(
+            std::fs::read_to_string(&fixture.config).unwrap(),
+            original,
+            "an overridden block must be removed again"
+        );
+        assert!(
+            fixture.prompt_text().contains("was left unchanged"),
+            "the rollback must be reported: {}",
+            fixture.prompt_text()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn github_port_443_repair_is_not_offered_when_it_cannot_help() {
+        // Already routed through ssh.github.com:443, a host that is not
+        // GitHub, an explicit non-default port, and a non-interactive command.
+        for (spec, resolution, answer) in [
+            (
+                "git@github.com:owner/repo.git",
+                FakeSshConfigResolution::AlreadyMapped,
+                Some("yes\n"),
+            ),
+            (
+                "git@example.com:owner/repo.git",
+                FakeSshConfigResolution::HonorsBlock,
+                Some("yes\n"),
+            ),
+            (
+                "ssh://git@github.com:2222/owner/repo.git",
+                FakeSshConfigResolution::HonorsBlock,
+                Some("yes\n"),
+            ),
+            (
+                "git@github.com:owner/repo.git",
+                FakeSshConfigResolution::HonorsBlock,
+                None,
+            ),
+        ] {
+            let fixture = Port443RepairFixture::new(spec, resolution, answer);
+
+            let result = fixture
+                .client
+                .discovery_reference(ServiceType::UploadPack)
+                .await;
+
+            assert_connection_closed(result);
+            assert_eq!(fixture.transport_attempts(), 1, "{spec}: no retry");
+            assert!(
+                !fixture.config.exists(),
+                "{spec}: config must not be written"
+            );
+            assert_eq!(fixture.prompt_text(), "", "{spec}: nothing may be asked");
+        }
     }
 }

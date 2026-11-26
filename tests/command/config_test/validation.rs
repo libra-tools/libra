@@ -205,3 +205,139 @@ fn test_explicit_scope_missing_or_unreadable_store() {
         "expected LBR-IO-001: {stderr_global_list}"
     );
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_104_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "x.path", "/tmp/example"], repo.path()),
+        "set path",
+    );
+    let path = run_libra_command(&["config", "--get", "--path", "x.path"], repo.path());
+    assert_cli_success(&path, "--path");
+    assert_eq!(String::from_utf8_lossy(&path.stdout).trim(), "/tmp/example");
+
+    let default = run_libra_command(
+        &["config", "--get", "--default", "fallback", "x.missing"],
+        repo.path(),
+    );
+    assert_cli_success(&default, "--default");
+    assert_eq!(String::from_utf8_lossy(&default.stdout).trim(), "fallback");
+}
+
+#[test]
+#[serial(cwd)]
+fn test_cf_26_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let out = run_libra_command(&["config", "--get-regexp", "^nomatch"], repo.path());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "no-match stdout must be empty");
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_59_predicates() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "local-user"], &repo),
+        "set local user.name",
+    );
+    let unreadable = temp.path().join("unreadable.db");
+    fs::write(&unreadable, b"placeholder").unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = run_libra_command_with_env(
+        &["config", "get", "user.name"],
+        &repo,
+        &[("LIBRA_CONFIG_SYSTEM_DB", unreadable.to_str().unwrap())],
+    );
+    assert_cli_success(&out, "cascade skips unreadable system store");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "local-user");
+    let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_60_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("xdg");
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+    ];
+    let list = run_libra_command_with_env(&["config", "--global", "--list"], &repo, &envs);
+    assert_eq!(list.status.code(), Some(128), "missing global store list");
+    assert!(String::from_utf8_lossy(&list.stderr).contains("unable to read config file"));
+    let get = run_libra_command_with_env(&["config", "--global", "--get", "x.y"], &repo, &envs);
+    assert_eq!(get.status.code(), Some(1), "missing global store get");
+    assert!(get.stdout.is_empty());
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_61_predicates() {
+    use std::process::Command;
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("xdg");
+    let global = temp.path().join("global.db");
+    let system = temp.path().join("system.db");
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", global.to_str().unwrap()),
+        ("LIBRA_CONFIG_SYSTEM_DB", system.to_str().unwrap()),
+    ];
+    for scope in ["--global", "--system"] {
+        assert_cli_success(
+            &run_libra_command_with_env(&["config", scope, "user.name", "X"], &repo, &envs),
+            "initialize store",
+        );
+    }
+    let query = |db: &std::path::Path, sql: &str| {
+        Command::new("sqlite3")
+            .arg(db)
+            .arg(sql)
+            .output()
+            .expect("sqlite3 available")
+    };
+    let make_future = |db: &std::path::Path| {
+        let out = query(db, "SELECT MAX(version) FROM configuration_schema_versions");
+        let latest: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let future = latest + 1;
+        let sql = format!(
+            "INSERT INTO configuration_schema_versions(version,name,applied_at) VALUES({future},'future','x')"
+        );
+        assert!(query(db, &sql).status.success());
+    };
+    for (scope, db) in [("--global", &global), ("--system", &system)] {
+        make_future(db.as_path());
+        let out = run_libra_command_with_env(&["config", scope, "--list"], &repo, &envs);
+        assert_eq!(out.status.code(), Some(128), "{scope} future schema");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("schema is newer"), "{scope}: {stderr}");
+        assert!(stderr.contains("LBR-INTERNAL-001"), "{scope}: {stderr}");
+        fs::remove_file(db).unwrap();
+        fs::write(db, b"not a sqlite database").unwrap();
+        let out = run_libra_command_with_env(&["config", scope, "--list"], &repo, &envs);
+        assert_eq!(out.status.code(), Some(128), "{scope} corrupt");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("LBR-IO-001"), "{scope}: {stderr}");
+        assert!(!stderr.contains("schema is newer"), "{scope}: {stderr}");
+    }
+}

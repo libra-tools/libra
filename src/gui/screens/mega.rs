@@ -39,7 +39,7 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
         ),
         (
             "/project/gateway/README.md",
-            "# Gateway\n\nA demonstration API gateway with per-key rate limiting.",
+            "# Gateway\n\nAn API gateway with per-key rate limiting.",
         ),
         (
             "/project/docs",

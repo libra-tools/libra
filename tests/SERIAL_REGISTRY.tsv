@@ -339,8 +339,22 @@ test_branch_rename	lane:cwd	changes the process working directory (ChangeDirGuar
 test_branch_set_upstream_to_with_branch_arg_and_local_upstream_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_show_current_surfaces_corrupt_head_storage	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_cache_evict_dry_run_writes_no_objects	lane:cwd	retains the classifier-required cwd lane for upstream issue 483 preview and operation-recording checks in isolated repositories
+test_cf_102_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
+test_cf_104_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
+test_cf_105_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
+test_cf_26_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
+test_cf_47_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
+test_cf_51_predicates	lane:env	integration test uses process cwd while isolating Libra repository state
+test_cf_59_predicates	lane:cwd+env	integration test uses process cwd while isolating Libra repository state
+test_cf_60_predicates	lane:cwd+env	integration test uses process cwd while isolating Libra repository state
+test_cf_61_predicates	lane:cwd+env	integration test uses process cwd while isolating Libra repository state
 test_cf_71_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
 test_cf_73_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
+test_cf_76_predicates	lane:cwd+env	integration test uses process cwd while isolating Libra repository state
+test_cf_80_predicates	lane:cwd+env	integration test uses process cwd while isolating Libra repository state
+test_cf_84_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
+test_cf_89_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
+test_cf_91_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
 test_changes_to_be_staged	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_checkout_current_branch_with_dirty_worktree_succeeds	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_checkout_existing_branch_with_unstaged_dirty_worktree_returns_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -544,6 +558,7 @@ test_fetch_update_head_ok_allows_fetch_into_checked_out_branch	lane:cwd	changes 
 test_fetch_verbose_announces_remote_on_stderr	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_fetch_with_depth_one_against_local_remote	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_fetch_writes_and_appends_fetch_head	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
+test_file_read_matrix	lane:cwd	integration test uses process cwd while isolating Libra repository state
 test_file_write_bytes_match_git_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
 test_file_write_roundtrip_through_reader	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
 test_filter_branches_propagates_error_for_corrupt_commit	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

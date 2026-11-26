@@ -1,6 +1,6 @@
 # `libra ui`
 
-打开 Libra 桌面设计预览：顶部显示当前仓库的只读上下文，其余页面仍为内置演示数据。这是 Libra 扩展，Git 没有对应命令。
+打开 Libra 桌面设计预览：底部状态栏显示当前仓库的只读上下文。这是 Libra 扩展，Git 没有对应命令。
 
 窗口编进所有标准 Libra 构建。不需要 Cargo feature；直接 `cargo build` 得到的
 二进制就能用 `libra ui` 打开窗口。
@@ -14,7 +14,7 @@ libra ui
 ## 说明
 
 不带位置参数的 `libra ui` 在进程主线程打开 Libra 桌面界面，默认显示 History；
-顶部显示当前工作树目录名、存储标签、分支、HEAD 与对象格式等只读上下文；History 的提交列表与归属筛选为真实数据；
+窗口底部状态栏左侧显示工作树目录名和分支，右侧显示 HEAD 短哈希；History 的提交列表与归属筛选为真实数据；
 子命令前后的全局标志都不影响窗口。
 使用 [Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components)
 仓库版本 `dd727f4` 和 `gpui-pre` 0.3.10。History 显示真实提交（按提交时间倒序；遍历上限 400 个提交、最多展示 200 行；父链决定合并标记），
@@ -31,13 +31,12 @@ Human／Agent-authored／Has checkpoint 三个归属筛选来自捕获目录，�
 Sessions 支持浅色／深色、可读内容搜索和本地筛选。表单输入与复选框只影响预览，
 不会保存配置。
 
-这是桌面设计的界面预览。窗口以**只读**方式读取当前工作目录的仓库：顶部显示
-仓库名、存储标签、分支、HEAD 与对象格式；读取不会写操作记录、不会升级 schema、
+这是桌面设计的界面预览。窗口以**只读**方式读取当前工作目录的仓库。读取中或仓库不可用时，底部状态栏显示相应提示。读取不会写操作记录、不会升级 schema、
 也不获取 writer boundary。未接入的数据面仍显示内置演示数据。导航、选择、标签和
 主题切换仅改变界面状态；仓库、Agent、信任、恢复、网络和账户操作不会执行。
 Logo 来自官网，字体和图片内置，离线可用。当前以 macOS 为验证平台。
-未接入的操作会显示预览提示；所有页面在共享上下文栏（或全局导航栏）显示 **Read-only preview** 标记。
-顶部上下文、History 提交列表与归属筛选、Sessions 列表与 Operations 列表均为真实数据：Operations 来自一份有界的 Operation v2 id 快照（按时间倒序、50k id 上限并标记 truncated），翻页只切片该快照（页间不重复、不丢行），新快照会重置到第 1 页；摘要为脱敏节选。Memory 页面显示有界真实 episode（≤200）；投影过期时显示零行并提示 `libra memory rebuild`，与 CLI 一致。Splash、Welcome、About 与能力地图显示真实仓库上下文和各数据面的观测状态（未检查的面显示 `未检查`）；窗口标签为 **Read-only preview**，仍使用内置演示内容的页面带 `demo` 徽标；搜索覆盖页面与数据面状态，内置演示会话目录已删除。Reviews/Investigate 显示真实 run 目录（每 kind 最新 100），损坏/超大/缺件/未知 kind 只影响该行，扫描上限命中时标记 truncated 子集。Sessions 来自只读 capture 目录（按当前 worktree/workspace scope 过滤、按时间倒序、最多 200 行），模型与用量字段可能缺失，摘要先脱敏再渲染，没有 capture 的仓库显示空列表。History 检查器里的 prompt、session、tool 与 checkpoint 细节仍是示例内容，只有提交元数据与归属计数是真实数据。
+未接入的操作会显示预览提示。
+底部状态栏、History 提交列表与归属筛选、Sessions 列表与 Operations 列表均为真实数据：Operations 来自一份有界的 Operation v2 id 快照（按时间倒序、50k id 上限并标记 truncated），翻页只切片该快照（页间不重复、不丢行），新快照会重置到第 1 页；摘要为脱敏节选。Memory 页面显示有界真实 episode（≤200）；投影过期时显示零行并提示 `libra memory rebuild`，与 CLI 一致。Splash、Welcome、About 与能力地图显示真实仓库上下文和各数据面的观测状态（未检查的面显示 `未检查`）；搜索覆盖页面与数据面状态，内置演示会话目录已删除。Reviews/Investigate 显示真实 run 目录（每 kind 最新 100），损坏/超大/缺件/未知 kind 只影响该行，扫描上限命中时标记 truncated 子集。Sessions 来自只读 capture 目录（按当前 worktree/workspace scope 过滤、按时间倒序、最多 200 行），模型与用量字段可能缺失，摘要先脱敏再渲染，没有 capture 的仓库显示空列表。History 检查器里的 prompt、session、tool 与 checkpoint 细节仍是示例内容，只有提交元数据与归属计数是真实数据。
 关闭窗口或按 `⌘Q` 退出；`Esc` 关闭命令面板。
 
 此命令只读当前仓库，不写入仓库。仓库外启动时窗口显示明确的“未创建/未打开仓库”

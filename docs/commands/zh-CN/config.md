@@ -885,3 +885,41 @@ replace-all refuses upgrade.mode.
 bool-or-str shortcut matches the type value.
 
 conflicting type switches exit 129.
+
+config --file - reads stdin.
+
+section subcommands match the legacy flags.
+
+path and default stay compatible.
+
+config list matches unscoped list.
+
+config --file reads a git-style file.
+
+regexp no-match exits 1 with empty stdout.
+
+single unset of multiple matches exits 5.
+
+invalid get pattern exits 6.
+
+get value pattern miss exits 1.
+
+nul list records use key newline value nul.
+
+multiline values stay literal and secrets stay redacted.
+
+cascade get skips an unreadable system store.
+
+missing global store follows the recorded git result.
+
+corrupt config stores keep the migration classification.
+
+replace-all rewrites every matching value.
+
+color list and json emit ansi.
+
+expiry-date shortcut matches the type value.
+
+an existing config lock fails with no write.
+
+file writes reject vault options.

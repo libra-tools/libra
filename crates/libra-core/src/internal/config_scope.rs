@@ -421,6 +421,54 @@ impl ScopedConfig {
             .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
+    /// Git `--replace-all <key> <value> <pattern>`: replace the first matching
+    /// value in place and drop any later matches, leaving other values in order.
+    pub async fn replace_matching(
+        scope: ConfigScope,
+        key: &str,
+        matcher: impl Fn(&str) -> bool,
+        value: &str,
+        encrypted: bool,
+    ) -> Result<usize, String> {
+        if scope == ConfigScope::Local && is_core_objectformat_key(key) {
+            return Err(
+                "core.objectformat cannot be changed after init; the object format is fixed at fresh init"
+                    .to_string(),
+            );
+        }
+        let txn = Self::begin_mutation(scope).await?;
+        let entries = ConfigKv::get_all_with_conn(&txn, key)
+            .await
+            .map_err(|e| format!("failed to read config '{key}': {e}"))?;
+        ConfigKv::unset_all_with_conn(&txn, key)
+            .await
+            .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+        let mut replaced = 0;
+        for entry in entries {
+            if matcher(&entry.value) {
+                if replaced == 0 {
+                    ConfigKv::add_with_conn(&txn, key, value, encrypted)
+                        .await
+                        .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                }
+                replaced += 1;
+            } else {
+                ConfigKv::add_with_conn(&txn, key, &entry.value, entry.encrypted)
+                    .await
+                    .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+            }
+        }
+        if replaced == 0 {
+            ConfigKv::add_with_conn(&txn, key, value, encrypted)
+                .await
+                .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+        }
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))?;
+        Ok(replaced)
+    }
+
     pub async fn unset_all(scope: ConfigScope, key: &str) -> Result<usize, String> {
         if scope == ConfigScope::Local && is_core_objectformat_key(key) {
             return Err(
