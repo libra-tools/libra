@@ -328,3 +328,23 @@ fn test_cf_100_predicates() {
         "missing key exit"
     );
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_101_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for (key, value) in [("list.one", "1"), ("list.two", "2")] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", key, value], repo.path()),
+            "set",
+        );
+    }
+    for flag in ["--show-scope", "--show-origin", "--name-only"] {
+        let legacy = run_libra_command(&["config", "--local", "--list", flag], repo.path());
+        let sub = run_libra_command(&["config", "list", "--local", flag], repo.path());
+        assert_cli_success(&legacy, flag);
+        assert_cli_success(&sub, flag);
+        assert_eq!(legacy.stdout, sub.stdout, "{flag} parity");
+    }
+}

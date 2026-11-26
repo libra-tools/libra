@@ -1131,3 +1131,5 @@ edit placeholders do not change encrypted entries.
 edit uses core.editor and fails closed without one.
 
 config unset subcommand matches legacy unset.
+
+config list subcommand matches the legacy flags.
