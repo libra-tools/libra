@@ -8583,7 +8583,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/internal/ai/agent_bridge/{ingress,methods,publication,storage}.rs`（1 目录、4 文件）接入 `CaptureStore`/`GitStore`，保留 `publication.rs` 既有 `ConnectionTrait` 签名并新增 `*_with_store` 路径将 `agent_bridge_publication` 与 `HEAD` 移动绑入同一 `git.redb` 写事务，同时支持 `agent_bridge_index_publication` 两阶段状态与长驻并发无锁读。
 
@@ -8598,17 +8598,17 @@
 | `agent_bridge/publication.rs:5-40` 在 `HEAD` 同事务写 `agent_bridge_publication` 并维护两阶段 `agent_bridge_index_publication` | `src/internal/ai/agent_bridge/publication.rs:5-40`；`src/internal/ai/agent_bridge/storage.rs` |
 
 **Acceptance criteria:**
-- [ ] `agent_bridge/{ingress,methods,storage}.rs` 在 `Redb` 仓库上通过 `CaptureStore`/`GitStore` 完成会话、事件序列确认与操作重放，不打开 SQLite。
-- [ ] `agent_bridge/publication.rs` 在 `Redb` 下经 `GitStore::update_ref_cas_with_bridge_publication` 同事务原子绑定 `HEAD` 与 `agent_bridge_publication`，回滚无孤行。
-- [ ] `agent_bridge/publication.rs` 在 `Redb` 下正确执行 `agent_bridge_index_publication` 的 `prepared` → `published` 两阶段提交。
-- [ ] `agent_bridge/publication.rs` 原样保留既有 `ConnectionTrait` 保签函数供 SQLite 与其它 Agent 调用。
-- [ ] 并发压测：长驻 `agent_bridge` 写入期间 8 个并发只读查询零锁错。
-- [ ] 既有 SQLite `agent_bridge_vcs_test`（与 `agent_bridge_crash_test`）路径零回归。
+- [x] `agent_bridge/{ingress,methods,storage}.rs` 在 `Redb` 仓库上通过 `CaptureStore`/`GitStore` 完成会话、事件序列确认与操作重放，不打开 SQLite。
+- [x] `agent_bridge/publication.rs` 在 `Redb` 下经 `GitStore::update_ref_cas_with_bridge_publication` 同事务原子绑定 `HEAD` 与 `agent_bridge_publication`，回滚无孤行。
+- [x] `agent_bridge/publication.rs` 在 `Redb` 下正确执行 `agent_bridge_index_publication` 的 `prepared` → `published` 两阶段提交。
+- [x] `agent_bridge/publication.rs` 原样保留既有 `ConnectionTrait` 保签函数供 SQLite 与其它 Agent 调用。
+- [x] 并发压测：长驻 `agent_bridge` 写入期间 8 个并发只读查询零锁错。
+- [x] 既有 SQLite `agent_bridge_vcs_test`（与 `agent_bridge_crash_test`）路径零回归。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::agent_bridge::publication::tests::redb_bridge_atomic_head_publication_and_index_two_phase)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::agent_bridge::publication::tests::redb_bridge_atomic_head_publication_and_index_two_phase)'`（new，覆盖 AC1–AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test agent_bridge_vcs_test`（覆盖 AC6）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::agent_bridge::publication::tests::redb_bridge_atomic_head_publication_and_index_two_phase)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::agent_bridge::publication::tests::redb_bridge_atomic_head_publication_and_index_two_phase)'`（new，覆盖 AC1–AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test agent_bridge_vcs_test`（覆盖 AC6）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8642,7 +8642,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区更新 `src/internal/ai/sandbox/policy.rs:669-681`（1 目录、1 文件），将 **`"redb"`、`"private"`、`"storage-format.json"`、`"sqlite-backup"`、`"redb-backup"` 与 `"git.redb"`** 整目录/固定路径无条件钉入 `task_workspace_sensitive_read_paths`，确保沙箱建立之后或迁移并发期间在 `.libra/redb/`、`.libra/private/` 内新建的所有未来代际文件（`git.gen-<id>.redb`、`capture.gen-<id>.redb`）自动落入拒读边界（`ADR-RB-02` #1）。
 
@@ -8656,15 +8656,15 @@
 | `sandbox/policy.rs:669-702` 当前仅钉死 `libra.db*`/`vault.db*`/`sessions`，未钉入 `.libra/redb/`、`.libra/private/`、`storage-format.json` 与备份目录 | `src/internal/ai/sandbox/policy.rs:661-702`；`ADR-RB-02` #1 |
 
 **Acceptance criteria:**
-- [ ] `sandbox/policy.rs` `task_workspace_sensitive_read_paths` 显式钉入整目录 `"redb"`、`"private"`、`"sqlite-backup"`、`"redb-backup"` 及 `"storage-format.json"`、`"git.redb"`（即使沙箱创建时目录尚未存在）。
-- [ ] 沙箱并发迁移测试：在沙箱策略生成之后于 `.libra/redb/` 新建未来代际 `git.gen-00000002.redb`，验证自动落入已钉死目录拒读范围。
-- [ ] 沙箱并发迁移测试：在沙箱策略生成之后于 `.libra/private/` 新建未来代际 `capture.gen-00000002.redb`，验证自动落入已钉死目录拒读范围。
-- [ ] 既有 SQLite 沙箱敏感路径拒读单元测试零回归。
+- [x] `sandbox/policy.rs` `task_workspace_sensitive_read_paths` 显式钉入整目录 `"redb"`、`"private"`、`"sqlite-backup"`、`"redb-backup"` 及 `"storage-format.json"`、`"git.redb"`（即使沙箱创建时目录尚未存在）。
+- [x] 沙箱并发迁移测试：在沙箱策略生成之后于 `.libra/redb/` 新建未来代际 `git.gen-00000002.redb`，验证自动落入已钉死目录拒读范围。
+- [x] 沙箱并发迁移测试：在沙箱策略生成之后于 `.libra/private/` 新建未来代际 `capture.gen-00000002.redb`，验证自动落入已钉死目录拒读范围。
+- [x] 既有 SQLite 沙箱敏感路径拒读单元测试零回归。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::sandbox::policy::tests::redb_generation_dir_pinned_against_future_and_concurrent_migration)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::sandbox::policy::tests::redb_generation_dir_pinned_against_future_and_concurrent_migration)'`（new，覆盖 AC1、AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^internal::ai::sandbox::policy::tests::/)'`（覆盖 AC4）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::sandbox::policy::tests::redb_generation_dir_pinned_against_future_and_concurrent_migration)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::sandbox::policy::tests::redb_generation_dir_pinned_against_future_and_concurrent_migration)'`（new，覆盖 AC1、AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^internal::ai::sandbox::policy::tests::/)'`（覆盖 AC4）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8698,7 +8698,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/agent/{bridge,checkpoint,clean,graph,import,mega2_stream,session,skill,status,workspace}.rs`（10 文件）与 `src/command/mega2_traces/mod.rs`（1 文件）共 2 目录、11 文件接入 `crate::storage`，落实只读 Agent 子命令走 `open_read_only`、`capture.redb` `LBR-AGENT-048` 隔离 Git 读路径，以及读写 Agent 子命令经 `CaptureStore`/`GitStore` 执行。
 
@@ -8713,15 +8713,15 @@
 | `agent/bridge.rs:119`、`agent/clean.rs:1097`、`agent/session.rs:800`、`agent/workspace.rs:113,151`、`agent/mega2_stream.rs:18` 直接调 `open_cached_repository(&path::database())` | `src/command/agent/bridge.rs:119`；`src/command/agent/workspace.rs:113`；`src/command/agent/mega2_stream.rs:18` |
 
 **Acceptance criteria:**
-- [ ] `agent session/status/checkpoint/graph/skill/workspace` 在 `Redb` 仓库严格经 `open_read_only` 执行，遇 `RepairAborted` fail-closed 不升写。
-- [ ] `agent bridge/clean/import/mega2_stream` 与 `mega2_traces` 在 `Redb` 仓库经 `CaptureStore`/`GitStore` 读写，不打开 `libra.db` 或 `capture.db`。
-- [ ] `capture.redb` 存在过新 `META_SCHEMA` 时，仅相关 Agent 命令报 `LBR-AGENT-048` 而仓库 Git 读路径保持正常。
-- [ ] 既有 SQLite `agent_bridge_workspace_test` 零回归。
+- [x] `agent session/status/checkpoint/graph/skill/workspace` 在 `Redb` 仓库严格经 `open_read_only` 执行，遇 `RepairAborted` fail-closed 不升写。
+- [x] `agent bridge/clean/import/mega2_stream` 与 `mega2_traces` 在 `Redb` 仓库经 `CaptureStore`/`GitStore` 读写，不打开 `libra.db` 或 `capture.db`。
+- [x] `capture.redb` 存在过新 `META_SCHEMA` 时，仅相关 Agent 命令报 `LBR-AGENT-048` 而仓库 Git 读路径保持正常。
+- [x] 既有 SQLite `agent_bridge_workspace_test` 零回归。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::agent::workspace::tests::redb_agent_cli_readonly_rw_and_mega2_traces)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::agent::workspace::tests::redb_agent_cli_readonly_rw_and_mega2_traces)'`（new，覆盖 AC1–AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test agent_bridge_workspace_test`（覆盖 AC4）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::agent::workspace::tests::redb_agent_cli_readonly_rw_and_mega2_traces)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::agent::workspace::tests::redb_agent_cli_readonly_rw_and_mega2_traces)'`（new，覆盖 AC1–AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test agent_bridge_workspace_test`（覆盖 AC4）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8755,7 +8755,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/agent/doctor.rs`（1 目录、1 文件）接入 `crate::storage`，落实不带 `--repair` 的 `agent doctor` 严格经 `open_read_only` 执行且遇 `RepairAborted` fail-closed 不升写，而 `agent doctor --repair` 显式允许触发 `redb` 崩溃恢复与 `cross_store::reconcile_pending_intents()`（只读挂载文件系统 fail-closed 报 `LBR-IO-001`）。
 
@@ -8769,15 +8769,15 @@
 | `agent/doctor.rs:5026,5093` 直接打开 SQLite 库 | `src/command/agent/doctor.rs:5026,5093`；`ADR-RB-03`、`ADR-RB-06` |
 
 **Acceptance criteria:**
-- [ ] 不带 `--repair` 的 `agent doctor` 在 `Redb` 仓库严格经 `open_read_only` 执行，遇 `RepairAborted` fail-closed 不升写。
-- [ ] `agent doctor --repair` 在可写红库上显式完成 `redb` 崩溃恢复。
-- [ ] `agent doctor --repair` 在可写红库上显式执行 `cross_store::reconcile_pending_intents()` 跨库意图对账。
-- [ ] `agent doctor --repair` 在只读挂载文件系统上 fail-closed 报 `LBR-IO-001`。
-- [ ] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
+- [x] 不带 `--repair` 的 `agent doctor` 在 `Redb` 仓库严格经 `open_read_only` 执行，遇 `RepairAborted` fail-closed 不升写。
+- [x] `agent doctor --repair` 在可写红库上显式完成 `redb` 崩溃恢复。
+- [x] `agent doctor --repair` 在可写红库上显式执行 `cross_store::reconcile_pending_intents()` 跨库意图对账。
+- [x] `agent doctor --repair` 在只读挂载文件系统上 fail-closed 报 `LBR-IO-001`。
+- [x] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::agent::doctor::tests::redb_agent_doctor_readonly_vs_explicit_repair)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::agent::doctor::tests::redb_agent_doctor_readonly_vs_explicit_repair)'`（new，覆盖 AC1–AC4；AC5 由 `RB-30` 禁改 diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::agent::doctor::tests::redb_agent_doctor_readonly_vs_explicit_repair)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::agent::doctor::tests::redb_agent_doctor_readonly_vs_explicit_repair)'`（new，覆盖 AC1–AC4；AC5 由 `RB-30` 禁改 diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8811,7 +8811,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `d242b90` 新增的 `src/gui/data/repo.rs` 与 `src/gui/data/state.rs`（1 目录、2 文件）接入 `crate::storage`，使桌面窗口根据仓库后端只读探测 `storage-format.json`/`.libra/redb/` 或 `libra.db`、经 `open_read_only`（`16 MiB` 缓存上限）读取 `RepoContext` 且永不触发 schema 迁移或自动升写修复。
 
@@ -8825,17 +8825,17 @@
 | `src/gui/data/repo.rs:47-88` 硬编码探测 `scope.storage.join(util::DATABASE)` 并经 `open_connection_without_schema_management` 检验 SQLite schema | `src/gui/data/repo.rs:45-88`；`src/gui/data/state.rs:14-100` |
 
 **Acceptance criteria:**
-- [ ] `gui::data::repo::read_context` 在 `Redb` 仓库（无 `libra.db`）上经 `open_read_only` 成功返回 `RepoContext`（HEAD、分支、hash kind），不修改磁盘文件。
-- [ ] `gui::data::state` 将 `redb` `META_SCHEMA` 过新精确映射至 `SourceState::SchemaNew`。
-- [ ] `gui::data::state` 将 `redb` `META_SCHEMA` 过旧精确映射至 `SourceState::SchemaOld`。
-- [ ] `gui::data::repo` 遇 `DatabaseError::RepairAborted` 严格不升写，映射为 `SourceState::Corrupt`（附 `libra fsck` 修复提示）。
-- [ ] `gui::data::repo` 在只读权限受限目录保留原始文件系统 `ErrorKind` 映射为 `SourceState::Unreadable`。
-- [ ] SQLite 仓库下既有 `src/gui/data/tests.rs` 全部用例零回归。
+- [x] `gui::data::repo::read_context` 在 `Redb` 仓库（无 `libra.db`）上经 `open_read_only` 成功返回 `RepoContext`（HEAD、分支、hash kind），不修改磁盘文件。
+- [x] `gui::data::state` 将 `redb` `META_SCHEMA` 过新精确映射至 `SourceState::SchemaNew`。
+- [x] `gui::data::state` 将 `redb` `META_SCHEMA` 过旧精确映射至 `SourceState::SchemaOld`。
+- [x] `gui::data::repo` 遇 `DatabaseError::RepairAborted` 严格不升写，映射为 `SourceState::Corrupt`（附 `libra fsck` 修复提示）。
+- [x] `gui::data::repo` 在只读权限受限目录保留原始文件系统 `ErrorKind` 映射为 `SourceState::Unreadable`。
+- [x] SQLite 仓库下既有 `src/gui/data/tests.rs` 全部用例零回归。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=gui::data::tests::redb_window_readonly_context_and_source_state_mapping)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=gui::data::tests::redb_window_readonly_context_and_source_state_mapping)'`（new，覆盖 AC1–AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^gui::data::tests::/)'`（覆盖 AC6）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=gui::data::tests::redb_window_readonly_context_and_source_state_mapping)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=gui::data::tests::redb_window_readonly_context_and_source_state_mapping)'`（new，覆盖 AC1–AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^gui::data::tests::/)'`（覆盖 AC6）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8869,7 +8869,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/cloud.rs` 与 `src/command/cloud/{agent_capture,metadata,snapshot,sync}.rs`（2 目录、5 文件）接入 `crate::storage`，落实 `ADR-RB-06` 跨库意图对账与三步代际一致快照协议（`git_rtx(g1) → capture_rtx(c1) → git_rtx2(g2)`，仅接受 `g1 == c1 && g1 == g2`，最多重试 5 次否则 fail-closed 报 `LBR-IO-001` 指引 `agent doctor --repair`），并保持远端 D1/R2 协议字节不变。
 
@@ -8884,15 +8884,15 @@
 | `command/cloud/{sync,snapshot,agent_capture,metadata}.rs` 直接操作 SQLite `libra.db` 与 `capture.db` | `src/command/cloud/sync.rs`；`src/command/cloud/snapshot.rs`；`ADR-RB-06` |
 
 **Acceptance criteria:**
-- [ ] `cloud sync` 与 `cloud snapshot` 在 `Redb` 仓库上按 `ADR-RB-06` 校验 `g1 == c1 && g1 == g2` 后才导出快照，绝不导出跨代撕裂快照。
-- [ ] 并发写入导致代际反复变化超过 5 次重试时，`cloud snapshot` fail-closed 返回 `LBR-IO-001`（不上传不一致备份）。
-- [ ] 故障注入（Git 已提交、Capture 尚未提交的半提交态）：`cloud snapshot` fail-closed 引导运行 `agent doctor --repair`，修复重放 `META_CROSS_STORE_INTENT` 后重跑快照成功。
-- [ ] `cloud agent_capture` 与 `cloud metadata` 在 `Redb` 仓库上经 `CaptureStore`/`GitStore` 读写并保持 D1/R2 线协议不变。
+- [x] `cloud sync` 与 `cloud snapshot` 在 `Redb` 仓库上按 `ADR-RB-06` 校验 `g1 == c1 && g1 == g2` 后才导出快照，绝不导出跨代撕裂快照。
+- [x] 并发写入导致代际反复变化超过 5 次重试时，`cloud snapshot` fail-closed 返回 `LBR-IO-001`（不上传不一致备份）。
+- [x] 故障注入（Git 已提交、Capture 尚未提交的半提交态）：`cloud snapshot` fail-closed 引导运行 `agent doctor --repair`，修复重放 `META_CROSS_STORE_INTENT` 后重跑快照成功。
+- [x] `cloud agent_capture` 与 `cloud metadata` 在 `Redb` 仓库上经 `CaptureStore`/`GitStore` 读写并保持 D1/R2 线协议不变。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::snapshot::tests::redb_cross_store_gen_consistent_snapshot_and_wire_protocol) | test(=command::cloud::snapshot::tests::redb_partial_commit_fails_closed_then_recovers_after_doctor_repair)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::snapshot::tests::redb_cross_store_gen_consistent_snapshot_and_wire_protocol)'`（new，覆盖 AC1、AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::snapshot::tests::redb_partial_commit_fails_closed_then_recovers_after_doctor_repair)'`（new，覆盖 AC2、AC3）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::snapshot::tests::redb_cross_store_gen_consistent_snapshot_and_wire_protocol) | test(=command::cloud::snapshot::tests::redb_partial_commit_fails_closed_then_recovers_after_doctor_repair)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::snapshot::tests::redb_cross_store_gen_consistent_snapshot_and_wire_protocol)'`（new，覆盖 AC1、AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::snapshot::tests::redb_partial_commit_fails_closed_then_recovers_after_doctor_repair)'`（new，覆盖 AC2、AC3）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8926,7 +8926,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/cloud/restore.rs`（1 目录、1 文件）接入 `crate::storage`，使并发检查点写入期间冻结的一致快照还原到空红库后精确匹配同一代际，并正确更新 `.libra/storage-format.json` 与 `META_GENERATION`，同时保持 SQLite `cloud_storage_backup_test` 零回归。
 
@@ -8940,15 +8940,15 @@
 | `src/command/cloud/restore.rs:626` 直接还原 SQLite `libra.db` 与 `capture.db` | `src/command/cloud/restore.rs:626`；`ADR-RB-06` |
 
 **Acceptance criteria:**
-- [ ] 并发检查点写入期间成功冻结的一致快照经 `cloud restore` 还原到空仓库后，Git ref 与捕获目录精确匹配同一代际。
-- [ ] `cloud restore` 在 `Redb` 目标仓库恢复完成后正确更新 `.libra/storage-format.json`。
-- [ ] `cloud restore` 在 `Redb` 目标仓库恢复完成后正确更新两库 `META_GENERATION`。
-- [ ] 既有 SQLite `cloud_storage_backup_test` 路径零回归。
+- [x] 并发检查点写入期间成功冻结的一致快照经 `cloud restore` 还原到空仓库后，Git ref 与捕获目录精确匹配同一代际。
+- [x] `cloud restore` 在 `Redb` 目标仓库恢复完成后正确更新 `.libra/storage-format.json`。
+- [x] `cloud restore` 在 `Redb` 目标仓库恢复完成后正确更新两库 `META_GENERATION`。
+- [x] 既有 SQLite `cloud_storage_backup_test` 路径零回归。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::restore::tests::redb_concurrent_snapshot_restore_manifest_and_gen_parity)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::restore::tests::redb_concurrent_snapshot_restore_manifest_and_gen_parity)'`（new，覆盖 AC1–AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test cloud_storage_backup_test`（覆盖 AC4）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::restore::tests::redb_concurrent_snapshot_restore_manifest_and_gen_parity)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::cloud::restore::tests::redb_concurrent_snapshot_restore_manifest_and_gen_parity)'`（new，覆盖 AC1–AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test cloud_storage_backup_test`（覆盖 AC4）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 

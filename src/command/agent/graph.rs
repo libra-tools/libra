@@ -12,13 +12,16 @@ use std::{
 };
 
 use clap::Args;
+#[cfg(feature = "storage-sqlite")]
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, QueryResult, Statement, TransactionTrait, TryGetable,
 };
 use serde::Serialize;
 
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::ai::{capture::store, observed_agents::CoverageSchemaVersion};
 use crate::{
-    internal::ai::{capture::store, observed_agents::CoverageSchemaVersion},
+    storage::StorageBackendKind,
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
@@ -105,6 +108,7 @@ struct CheckpointStructure {
     created_at: i64,
 }
 
+#[cfg(feature = "storage-sqlite")]
 #[derive(Debug)]
 struct ClaimRow {
     logical_turn_key: String,
@@ -142,30 +146,195 @@ pub async fn execute_safe(args: GraphArgs, output: &OutputConfig) -> CliResult<(
 }
 
 async fn load_agent_graph(storage_root: &Path, session_id: &str) -> CliResult<AgentGraphOutput> {
-    let connection = store::open(storage_root, std::time::Duration::from_secs(30))
-        .await
-        .map_err(|_| graph_store_error("open the repository capture catalog"))?;
-    let transaction = connection
-        .begin()
-        .await
-        .map_err(|_| graph_store_error("start a consistent capture-graph read"))?;
-
-    let result = load_agent_graph_from_connection(&transaction, session_id).await;
-    match result {
-        Ok(graph) => {
-            transaction
-                .commit()
-                .await
-                .map_err(|_| graph_store_error("finish the capture-graph read"))?;
-            Ok(graph)
+    match crate::storage::runtime::detect_repo_backend(storage_root).map_err(CliError::from)? {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let capture = crate::storage::runtime::open_capture_store_read_only(storage_root)
+                    .await
+                    .map_err(CliError::from)?;
+                load_agent_graph_from_store(capture.as_ref(), session_id).await
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = session_id;
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
         }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let connection = store::open(storage_root, std::time::Duration::from_secs(30))
+                    .await
+                    .map_err(|_| graph_store_error("open the repository capture catalog"))?;
+                let transaction = connection
+                    .begin()
+                    .await
+                    .map_err(|_| graph_store_error("start a consistent capture-graph read"))?;
+
+                let result = load_agent_graph_from_connection(&transaction, session_id).await;
+                match result {
+                    Ok(graph) => {
+                        transaction
+                            .commit()
+                            .await
+                            .map_err(|_| graph_store_error("finish the capture-graph read"))?;
+                        Ok(graph)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = session_id;
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
         }
     }
 }
 
+#[cfg(feature = "storage-redb")]
+async fn load_agent_graph_from_store(
+    capture: &dyn crate::storage::CaptureStore,
+    session_id: &str,
+) -> CliResult<AgentGraphOutput> {
+    let tombstones = capture
+        .list_import_tombstones()
+        .await
+        .map_err(CliError::from)?;
+    if tombstones.iter().any(|t| t.erased_session_id == session_id) {
+        return Ok(AgentGraphOutput {
+            schema_version: 1,
+            state: "erased".to_string(),
+            session: None,
+            turns: Vec::new(),
+            subagents: SubagentsOutput {
+                available: false,
+                unavailable_reason: Some("erased".to_string()),
+                nodes: Vec::new(),
+            },
+        });
+    }
+
+    let session_rec = capture
+        .get_session(session_id)
+        .await
+        .map_err(CliError::from)?
+        .ok_or_else(|| {
+            CliError::fatal(format!(
+                "captured agent session '{}' is unknown",
+                safe_display(session_id)
+            ))
+            .with_stable_code(StableErrorCode::AgentGraphSessionUnknown)
+            .with_hint("run `libra agent session list` and pass its exact session_id.")
+        })?;
+    let session = SessionOutput {
+        session_id: session_rec.session_id,
+        agent_kind: session_rec.agent_kind.as_str().to_string(),
+        state: session_rec.state.as_str().to_string(),
+        created_at: session_rec.started_at,
+        updated_at: session_rec.last_event_at,
+    };
+
+    let cp_rows = capture
+        .list_checkpoints_by_session(session_id)
+        .await
+        .map_err(CliError::from)?;
+    let mut checkpoints = BTreeMap::new();
+    for cp in cp_rows {
+        checkpoints.insert(
+            cp.checkpoint_id.clone(),
+            CheckpointStructure {
+                checkpoint_id: cp.checkpoint_id,
+                created_at: cp.created_at,
+            },
+        );
+    }
+
+    let mut chronology = checkpoints.values().collect::<Vec<_>>();
+    chronology.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.checkpoint_id.cmp(&right.checkpoint_id))
+    });
+    let turns = chronology
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, checkpoint)| TurnOutput {
+            logical_turn_key: format!("checkpoint:{}", checkpoint.checkpoint_id),
+            ordinal,
+            coverage_schema_version: None,
+            coverage_state: "unindexed".to_string(),
+            completeness: None,
+            current_revision: None,
+            checkpoint_id: Some(checkpoint.checkpoint_id.clone()),
+            source_channel: None,
+            revisions: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    validate_turn_checkpoints(&turns, &checkpoints)?;
+
+    let mut nodes = Vec::new();
+    for (cp_id, cp_struct) in &checkpoints {
+        if let Some(link) = capture
+            .get_subagent_link(cp_id)
+            .await
+            .map_err(CliError::from)?
+            && link.parent_session_id == session_id
+        {
+            if link
+                .boundary_checkpoint_id
+                .as_ref()
+                .is_some_and(|boundary| !checkpoints.contains_key(boundary))
+            {
+                return Err(graph_store_error(
+                    "validate subagent links within the captured session",
+                ));
+            }
+            nodes.push(SubagentNodeOutput {
+                checkpoint_id: link.content_checkpoint_id,
+                link_state: link.link_state.as_str().to_string(),
+                boundary_checkpoint_id: link.boundary_checkpoint_id,
+                created_at: cp_struct.created_at,
+            });
+        }
+    }
+    nodes.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.checkpoint_id.cmp(&right.checkpoint_id))
+    });
+
+    Ok(AgentGraphOutput {
+        schema_version: 1,
+        state: "present".to_string(),
+        session: Some(session),
+        turns,
+        subagents: SubagentsOutput {
+            available: true,
+            unavailable_reason: None,
+            nodes,
+        },
+    })
+}
+
+#[cfg(feature = "storage-sqlite")]
 async fn load_agent_graph_from_connection<C: ConnectionTrait>(
     connection: &C,
     session_id: &str,
@@ -229,6 +398,7 @@ async fn load_agent_graph_from_connection<C: ConnectionTrait>(
     })
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn tombstone_exists<C: ConnectionTrait>(connection: &C, session_id: &str) -> CliResult<bool> {
     let row = connection
         .query_one_raw(Statement::from_sql_and_values(
@@ -242,6 +412,7 @@ async fn tombstone_exists<C: ConnectionTrait>(connection: &C, session_id: &str) 
     Ok(row.is_some())
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn load_session<C: ConnectionTrait>(
     connection: &C,
     session_id: &str,
@@ -268,6 +439,7 @@ async fn load_session<C: ConnectionTrait>(
     .transpose()
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn load_checkpoints<C: ConnectionTrait>(
     connection: &C,
     session_id: &str,
@@ -294,6 +466,7 @@ async fn load_checkpoints<C: ConnectionTrait>(
     Ok(checkpoints)
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn load_indexed_turns<C: ConnectionTrait>(
     connection: &C,
     session_id: &str,
@@ -428,6 +601,7 @@ fn validate_turn_checkpoints(
     Ok(())
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn load_subagents<C: ConnectionTrait>(
     connection: &C,
     session_id: &str,
@@ -490,11 +664,13 @@ async fn load_subagents<C: ConnectionTrait>(
     })
 }
 
+#[cfg(feature = "storage-sqlite")]
 fn required<T: TryGetable>(row: &QueryResult, column: &str) -> CliResult<T> {
     row.try_get("", column)
         .map_err(|_| graph_store_error("decode capture-graph metadata"))
 }
 
+#[cfg(feature = "storage-sqlite")]
 fn coverage_version(row: &QueryResult) -> CliResult<i64> {
     let version: i64 = required(row, "coverage_schema_version")?;
     CoverageSchemaVersion::try_from(version)

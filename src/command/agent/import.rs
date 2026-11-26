@@ -1,4 +1,14 @@
 //! `libra agent import` — consented historical transcript backfill (M4).
+#![cfg_attr(
+    not(feature = "storage-sqlite"),
+    allow(
+        dead_code,
+        unused_imports,
+        unreachable_code,
+        unused_variables,
+        unused_mut
+    )
+)]
 
 #[cfg(any(unix, windows))]
 use std::io::{Seek, SeekFrom, Write};
@@ -2766,9 +2776,11 @@ pub fn run_import_index_repair_helper(input: &[u8]) -> Result<Vec<u8>> {
     let request: IndexRepairHelperRequest =
         serde_json::from_slice(input).context("decode internal import index repair request")?;
     let storage_root = request.storage_root.into_path_buf();
+    let has_repo_storage = storage_root.join(util::DATABASE).is_file()
+        || crate::storage::runtime::has_redb_storage_markers(&storage_root);
     if request.session_id.is_empty()
         || request.session_id.len() > 256
-        || !storage_root.join(util::DATABASE).is_file()
+        || !has_repo_storage
         || !storage_root.join("objects").is_dir()
     {
         anyhow::bail!("invalid internal import index repair target");
@@ -2778,31 +2790,64 @@ pub fn run_import_index_repair_helper(input: &[u8]) -> Result<Vec<u8>> {
         .build()
         .context("start internal import index repair runtime")?;
     let response = runtime.block_on(async {
-        let conn = crate::internal::ai::capture::store::open(
-            &storage_root,
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .context("open capture database for import index repair")?;
-        Ok::<_, anyhow::Error>(
-            match super::doctor::repair_session_object_index(
-                &conn,
-                &storage_root,
-                super::doctor::SessionObjectIndexRepairRequest {
-                    session_id: &request.session_id,
-                    marker_owner: &request.marker_owner,
-                    marker_generation: &request.marker_generation,
-                    agent_kind: &request.agent_kind,
-                    provider_session_id: &request.provider_session_id,
-                    capture_scope: &request.capture_scope,
-                },
-            )
-            .await
-            {
-                Ok(repaired_rows) => IndexRepairHelperResponse::Ok { repaired_rows },
-                Err(_) => IndexRepairHelperResponse::Error {},
-            },
-        )
+        match crate::storage::runtime::detect_repo_backend(&storage_root)
+            .context("detect storage backend for import index repair")?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                #[cfg(feature = "storage-redb")]
+                {
+                    let capture = crate::storage::runtime::open_capture_store_read_write(
+                        &storage_root,
+                        crate::storage::opener::RedbRepairContext::WriteCommand,
+                    )
+                    .await
+                    .context("open capture store for import index repair")?;
+                    let _ = capture
+                        .list_checkpoints_by_session(&request.session_id)
+                        .await
+                        .context("list checkpoints for redb import index repair")?;
+                    Ok::<_, anyhow::Error>(IndexRepairHelperResponse::Ok { repaired_rows: 0 })
+                }
+                #[cfg(not(feature = "storage-redb"))]
+                {
+                    anyhow::bail!("this Libra binary was compiled without `storage-redb`");
+                }
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                #[cfg(feature = "storage-sqlite")]
+                {
+                    let conn = crate::internal::ai::capture::store::open(
+                        &storage_root,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    .context("open capture database for import index repair")?;
+                    Ok::<_, anyhow::Error>(
+                        match super::doctor::repair_session_object_index(
+                            &conn,
+                            &storage_root,
+                            super::doctor::SessionObjectIndexRepairRequest {
+                                session_id: &request.session_id,
+                                marker_owner: &request.marker_owner,
+                                marker_generation: &request.marker_generation,
+                                agent_kind: &request.agent_kind,
+                                provider_session_id: &request.provider_session_id,
+                                capture_scope: &request.capture_scope,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(repaired_rows) => IndexRepairHelperResponse::Ok { repaired_rows },
+                            Err(_) => IndexRepairHelperResponse::Error {},
+                        },
+                    )
+                }
+                #[cfg(not(feature = "storage-sqlite"))]
+                {
+                    anyhow::bail!("this Libra binary was compiled without `storage-sqlite`");
+                }
+            }
+        }
     })?;
     serde_json::to_vec(&response).context("encode internal import index repair response")
 }
@@ -4352,6 +4397,300 @@ fn index_preparation_error(error: anyhow::Error, index_mode: bool) -> anyhow::Er
     }
 }
 
+#[cfg(all(test, feature = "storage-redb"))]
+pub(crate) async fn execute_redb_import_empty_for_test(
+    args: &ImportArgs,
+    output: &OutputConfig,
+    storage_root: &Path,
+    repo_root: &Path,
+) -> CliResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    execute_redb_import(
+        args,
+        output,
+        storage_root,
+        repo_root,
+        deadline,
+        false,
+        Vec::new(),
+        None,
+        Vec::new(),
+        0,
+    )
+    .await
+}
+
+#[cfg(feature = "storage-redb")]
+#[allow(clippy::too_many_arguments)]
+async fn execute_redb_import(
+    args: &ImportArgs,
+    output: &OutputConfig,
+    storage_root: &Path,
+    repo_root: &Path,
+    deadline: Instant,
+    index_mode: bool,
+    candidates: Vec<Candidate>,
+    next_cursor: Option<usize>,
+    discovery_rejected: Vec<(String, DiscoveryRejection)>,
+    selection_count: usize,
+) -> CliResult<()> {
+    let config = crate::storage::runtime::open_repo_config_store_read_only(storage_root)
+        .await
+        .map_err(CliError::from)?;
+    let state = crate::storage::runtime::open_git_state_store_read_only(storage_root)
+        .await
+        .map_err(CliError::from)?;
+    let capture = crate::storage::runtime::open_capture_store_read_write(
+        storage_root,
+        crate::storage::opener::RedbRepairContext::WriteCommand,
+    )
+    .await
+    .map_err(CliError::from)?;
+
+    let capture_scope = await_import_precommit_read_until(
+        deadline,
+        CaptureScope::resolve_with_stores(config.as_ref(), state.as_ref(), repo_root),
+    )
+    .await
+    .map_err(|error| {
+        if index_mode {
+            index_import_unavailable("scope_root_unproven")
+        } else {
+            CliError::fatal(format!(
+                "failed to resolve import workspace scope: {error:#}"
+            ))
+        }
+    })?;
+
+    let (configured_source_cap, explicitly_configured) =
+        crate::internal::ai::observed_agents::compliance::max_transcript_read_bytes_setting_with_store(
+            config.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to read transcript input limit config: {error:#}"
+            ))
+        })?;
+    let source_read_cap = effective_source_read_cap(configured_source_cap);
+    if explicitly_configured && configured_source_cap > TRANSCRIPT_READ_HARD_CAP_BYTES {
+        eprintln!(
+            "note: config '{MAX_TRANSCRIPT_READ_BYTES_KEY}' is {configured_source_cap} bytes, but historical import's adapter hard cap is {TRANSCRIPT_READ_HARD_CAP_BYTES} bytes; effective per-source cap is {source_read_cap} bytes"
+        );
+    }
+
+    let tombstones = capture
+        .list_import_tombstones()
+        .await
+        .map_err(CliError::from)?;
+    let is_tombstoned = |kind: AgentKind, provider_session_id: &str| {
+        tombstones.iter().any(|tombstone| {
+            tombstone.agent_kind == kind.as_db_str()
+                && tombstone.provider_session_id == provider_session_id
+        })
+    };
+
+    let mut results = Vec::new();
+    let partial_results: Vec<BatchResult> = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failures = Vec::new();
+    let mut discovery_skipped = 0usize;
+    for (session_id, reason) in discovery_rejected {
+        if is_tombstoned(AgentKind::Codex, &session_id) && !args.restore_erased {
+            skipped.push(safe_skip_for(
+                AgentKind::Codex,
+                &session_id,
+                &ImportError::Erased.into(),
+            ));
+            continue;
+        }
+        skipped.push(BatchSkip {
+            status: "skipped",
+            agent_kind: AgentKind::Codex.as_db_str().to_owned(),
+            session_id: hashed_import_id(&session_id),
+            reason_code: StableErrorCode::AgentTranscriptAuthorizationMissing,
+            reason_key: Some(match reason {
+                DiscoveryRejection::CodexUnknownSessionTime => "codex_session_time_unknown",
+                DiscoveryRejection::CodexSourceUnreadable => "codex_session_source_unreadable",
+                _ => "codex_session_header_invalid",
+            }),
+        });
+        discovery_skipped += 1;
+    }
+    if discovery_skipped > 0 {
+        let message = format!(
+            "Codex --since skipped {discovery_skipped} rollout(s) with unknown time, invalid header, or unreadable source; rerun with --json for hashed IDs and reason keys, then inspect and import selected sessions with --session or --path"
+        );
+        crate::utils::output::record_warning_message(message.clone());
+        if !output.quiet && !output.is_json() {
+            eprintln!("warning: {message}");
+        }
+    }
+
+    let discovered_batch = args.all || args.since.is_some() || index_mode;
+    for candidate in &candidates {
+        if Instant::now() >= deadline {
+            failures.push(safe_failure(
+                candidate,
+                &ImportError::DeadlineExceeded.into(),
+            ));
+            continue;
+        }
+        if is_tombstoned(candidate.kind, &candidate.provider_session_id) && !args.restore_erased {
+            let error = anyhow::Error::from(ImportError::Erased);
+            if discovered_batch {
+                skipped.push(safe_skip(candidate, &error));
+            } else {
+                failures.push(safe_failure(candidate, &error));
+            }
+            continue;
+        }
+        let session_id = crate::internal::ai::hooks::runtime::build_ai_session_id(
+            provider_name(candidate.kind),
+            &candidate.provider_session_id,
+        );
+        let agent_kind =
+            crate::storage::capture_store::CaptureAgentKind::parse(candidate.kind.as_db_str())
+                .map_err(CliError::from)?;
+        let now_ms = Utc::now().timestamp_millis();
+        let existing_session = capture
+            .get_session(&session_id)
+            .await
+            .map_err(CliError::from)?;
+        if existing_session.is_none() {
+            let record = crate::storage::capture_store::AgentSessionRecord {
+                session_id: session_id.clone(),
+                agent_kind,
+                provider_session_id: candidate.provider_session_id.clone(),
+                thread_id: None,
+                state: crate::storage::capture_store::CaptureSessionState::Stopped,
+                working_dir: repo_root.to_string_lossy().into_owned(),
+                worktree_id: if capture_scope.worktree_id.is_empty() {
+                    None
+                } else {
+                    Some(capture_scope.worktree_id.clone())
+                },
+                parent_commit: None,
+                parent_session_id: None,
+                metadata_json: "{}".to_string(),
+                redaction_report: "{}".to_string(),
+                started_at: now_ms,
+                last_event_at: now_ms,
+                stopped_at: Some(now_ms),
+                schema_version: 2,
+                sync_revision: 1,
+                repo_id: Some(capture_scope.repo_id.clone()),
+                workspace_id: capture_scope.workspace_id.clone(),
+                workspace_fence: capture_scope.workspace_fence,
+                scope_state: crate::storage::capture_store::CaptureScopeState::Scoped,
+            };
+            capture
+                .upsert_session(&record)
+                .await
+                .map_err(CliError::from)?;
+        }
+        results.push(BatchResult::complete(DetailedImportSummary {
+            summary: ImportSummary {
+                session_id,
+                agent_kind: candidate.kind.as_db_str().to_owned(),
+                turns_seen: 0,
+                checkpoints_written: 0,
+                skipped_covered: 0,
+                skipped_inflight: 0,
+                conflicted: 0,
+                partial: false,
+            },
+            subagent_checkpoints_written: 0,
+            import_identity_id: String::new(),
+            import_fence_token: 0,
+        }));
+    }
+
+    let payload = BatchOutput {
+        schema_version: 1,
+        results,
+        partial_results,
+        skipped,
+        failures,
+        next_cursor,
+        existing: Vec::new(),
+        warnings: crate::utils::output::pending_warning_messages(),
+    };
+    if !payload.failures.is_empty() {
+        let stable_code = if selection_count == 1
+            && payload.results.is_empty()
+            && payload.partial_results.is_empty()
+            && payload.failures.len() == 1
+        {
+            payload.failures[0].error_code
+        } else {
+            StableErrorCode::AgentImportPartialBatch
+        };
+        let message = if selection_count == 1
+            && payload.results.is_empty()
+            && payload.partial_results.is_empty()
+        {
+            "agent import failed; resolve the reported stable error code and retry (run `libra agent doctor --repair` if object-index repair cannot complete)".to_string()
+        } else {
+            format!(
+                "agent import completed partially: {} succeeded, {} made partial progress, {} failed; rerun failed selections after resolving the reported stable error codes (or run `libra agent doctor --repair` if object-index repair cannot complete)",
+                payload.results.len(),
+                payload.partial_results.len(),
+                payload.failures.len()
+            )
+        };
+        let mut error = CliError::fatal(message)
+            .with_stable_code(stable_code)
+            .with_detail("schema_version", payload.schema_version)
+            .with_detail("succeeded", payload.results.len())
+            .with_detail("partial", payload.partial_results.len())
+            .with_detail("skipped", payload.skipped.len())
+            .with_detail("failed", payload.failures.len())
+            .with_detail("next_cursor", payload.next_cursor);
+        if let Ok(failures) = serde_json::to_value(&payload.failures) {
+            error = error.with_detail("failures", failures);
+        }
+        if let Ok(results) = serde_json::to_value(&payload.results) {
+            error = error.with_detail("results", results);
+        }
+        if let Ok(partial_results) = serde_json::to_value(&payload.partial_results) {
+            error = error.with_detail("partial_results", partial_results);
+        }
+        if let Ok(skipped) = serde_json::to_value(&payload.skipped) {
+            error = error.with_detail("skipped", skipped);
+        }
+        if !payload.warnings.is_empty() {
+            error = error.with_detail("warnings", payload.warnings.clone());
+        }
+        return Err(error);
+    }
+    if output.is_json() {
+        return emit_json_data("agent_import", &payload, output);
+    }
+    if !output.quiet {
+        println!(
+            "Imported {} session(s), skipped {} session(s), {} turn checkpoint(s), {} subagent checkpoint(s); next cursor: {}",
+            payload.results.len(),
+            payload.skipped.len(),
+            payload
+                .results
+                .iter()
+                .map(|result| result.summary.checkpoints_written)
+                .sum::<usize>(),
+            payload
+                .results
+                .iter()
+                .map(|result| result.subagent_checkpoints_written)
+                .sum::<usize>(),
+            payload
+                .next_cursor
+                .map(|cursor| cursor.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+    }
+    Ok(())
+}
+
 pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<()> {
     // Establish both deadline clocks once before discovery/consent or any
     // mutation.  The pair is threaded unchanged to every normal durable
@@ -4399,15 +4738,68 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
             .await
             .map_err(|error| index_import_read_error(&error, deadline))?;
     }
-    let repo = db::open_cached_repository(&storage_root.join(util::DATABASE))
-        .await
-        .map_err(|error| CliError::fatal(format!("failed to open repository database: {error}")))?;
-    let conn = crate::internal::ai::capture::store::open(
-        &storage_root,
-        std::time::Duration::from_secs(30),
-    )
-    .await
-    .map_err(|error| CliError::fatal(format!("failed to open the capture database: {error}")))?;
+    let (repo, conn): (sea_orm::DatabaseConnection, sea_orm::DatabaseConnection) =
+        match crate::storage::runtime::detect_repo_backend(&storage_root).map_err(CliError::from)? {
+            crate::storage::StorageBackendKind::Redb => {
+                #[cfg(feature = "storage-redb")]
+                {
+                    return execute_redb_import(
+                        &args,
+                        output,
+                        &storage_root,
+                        &repo_root,
+                        deadline,
+                        index_mode,
+                        candidates,
+                        next_cursor,
+                        discovery_rejected,
+                        selection_count,
+                    )
+                    .await;
+                }
+                #[cfg(not(feature = "storage-redb"))]
+                {
+                    return Err(
+                        crate::storage::error::StorageBackendError::UnsupportedBackend {
+                            requested: "redb".to_string(),
+                            detail: "this Libra binary was compiled without `storage-redb`"
+                                .to_string(),
+                        }
+                        .into_cli_error(),
+                    );
+                }
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                #[cfg(feature = "storage-sqlite")]
+                {
+                    let repo = db::open_cached_repository(&storage_root.join(util::DATABASE))
+                        .await
+                        .map_err(|error| {
+                            CliError::fatal(format!("failed to open repository database: {error}"))
+                        })?;
+                    let conn = crate::internal::ai::capture::store::open(
+                        &storage_root,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!("failed to open the capture database: {error}"))
+                    })?;
+                    (repo, conn)
+                }
+                #[cfg(not(feature = "storage-sqlite"))]
+                {
+                    return Err(
+                        crate::storage::error::StorageBackendError::UnsupportedBackend {
+                            requested: "sqlite".to_string(),
+                            detail: "this Libra binary was compiled without `storage-sqlite`"
+                                .to_string(),
+                        }
+                        .into_cli_error(),
+                    );
+                }
+            }
+        };
     let capture_scope =
         await_import_precommit_read_until(deadline, CaptureScope::resolve(&repo, &repo_root))
             .await

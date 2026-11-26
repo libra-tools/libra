@@ -13,9 +13,14 @@ use std::{fmt, path::Path};
 use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionSession, TransactionTrait};
 use uuid::Uuid;
 
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::db;
+#[cfg(feature = "storage-sqlite")]
+use crate::utils::util::DATABASE;
 use crate::{
-    internal::{config::ConfigKv, db, workspace::RepoIdentity},
-    utils::util::{self, DATABASE},
+    internal::{config::ConfigKv, workspace::RepoIdentity},
+    storage::StorageBackendKind,
+    utils::util,
 };
 
 pub const SOURCE_KEY: &str = "libra.traces.mega2.source";
@@ -72,16 +77,83 @@ pub async fn repository_config_at(
     workdir: &Path,
     key: &str,
 ) -> Result<Option<String>, Mega2StreamError> {
-    let connection = open_repository(workdir).await?;
-    config_value(&connection, key).await
+    let storage = resolve_storage_path(workdir)?;
+    match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(|error| Mega2StreamError::Store(error.to_string()))?
+    {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let config = crate::storage::runtime::open_repo_config_store_read_only(&storage)
+                    .await
+                    .map_err(|error| Mega2StreamError::Store(error.to_string()))?;
+                config_value_with_store(config.as_ref(), key).await
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = key;
+                Err(Mega2StreamError::Store(
+                    "this Libra binary was compiled without `storage-redb`".to_string(),
+                ))
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let connection = open_repository(workdir).await?;
+                config_value(&connection, key).await
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = key;
+                Err(Mega2StreamError::Store(
+                    "this Libra binary was compiled without `storage-sqlite`".to_string(),
+                ))
+            }
+        }
+    }
 }
 
 pub async fn read_repository_source_at(workdir: &Path) -> Result<String, Mega2StreamError> {
-    let connection = open_repository(workdir).await?;
-    let identity = RepoIdentity::resolve(&connection)
-        .await
-        .map_err(|error| Mega2StreamError::Source(error.to_string()))?;
-    Ok(identity.as_str().to_string())
+    let storage = resolve_storage_path(workdir)?;
+    match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(|error| Mega2StreamError::Store(error.to_string()))?
+    {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let config = crate::storage::runtime::open_repo_config_store_read_only(&storage)
+                    .await
+                    .map_err(|error| Mega2StreamError::Store(error.to_string()))?;
+                let identity = RepoIdentity::resolve_with_store(config.as_ref())
+                    .await
+                    .map_err(|error| Mega2StreamError::Source(error.to_string()))?;
+                Ok(identity.as_str().to_string())
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                Err(Mega2StreamError::Store(
+                    "this Libra binary was compiled without `storage-redb`".to_string(),
+                ))
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let connection = open_repository(workdir).await?;
+                let identity = RepoIdentity::resolve(&connection)
+                    .await
+                    .map_err(|error| Mega2StreamError::Source(error.to_string()))?;
+                Ok(identity.as_str().to_string())
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                Err(Mega2StreamError::Store(
+                    "this Libra binary was compiled without `storage-sqlite`".to_string(),
+                ))
+            }
+        }
+    }
 }
 
 /// Persist source and epoch for the repository that owns `workdir`.
@@ -91,8 +163,112 @@ pub async fn bind_source_epoch_at(
     workdir: &Path,
     intent: EpochIntent,
 ) -> Result<SourceEpochBinding, Mega2StreamError> {
-    let connection = open_repository(workdir).await?;
-    bind_source_epoch(&connection, intent).await
+    let storage = resolve_storage_path(workdir)?;
+    match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(|error| Mega2StreamError::Store(error.to_string()))?
+    {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let config = crate::storage::runtime::open_repo_config_store_read_write(&storage)
+                    .await
+                    .map_err(|error| Mega2StreamError::Store(error.to_string()))?;
+                bind_source_epoch_with_store(config.as_ref(), intent).await
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = intent;
+                Err(Mega2StreamError::Store(
+                    "this Libra binary was compiled without `storage-redb`".to_string(),
+                ))
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let connection = open_repository(workdir).await?;
+                bind_source_epoch(&connection, intent).await
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = intent;
+                Err(Mega2StreamError::Store(
+                    "this Libra binary was compiled without `storage-sqlite`".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// Persist source and epoch using a backend-agnostic [`crate::storage::ConfigStore`].
+pub async fn bind_source_epoch_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    intent: EpochIntent,
+) -> Result<SourceEpochBinding, Mega2StreamError> {
+    let identity = RepoIdentity::resolve_with_store(config)
+        .await
+        .map_err(|error| Mega2StreamError::Source(error.to_string()))?;
+    let source = identity.as_str().to_string();
+    if source.trim().is_empty() || source != source.trim() {
+        return Err(Mega2StreamError::Source(
+            "repository identity (libra.repoid) is missing or has surrounding whitespace; \
+             restore it with `libra init` in a fresh clone or rewrite the stored value \
+             without padding"
+                .to_string(),
+        ));
+    }
+
+    let stored_source = config_value_with_store(config, SOURCE_KEY).await?;
+    if let Some(stored) = stored_source.as_deref() {
+        if stored != source {
+            return Err(Mega2StreamError::Source(format!(
+                "repository source changed from the recorded traces binding; refusing to \
+                 rewrite it silently (recorded {stored:?}, repository {source:?}). Restore \
+                 the original `libra.repoid` or use a separate clone"
+            )));
+        }
+    } else {
+        ConfigKv::set_with_store(config, SOURCE_KEY, &source, false)
+            .await
+            .map_err(|error| {
+                Mega2StreamError::Store(format!(
+                    "cannot record the traces source in repository config: {error}"
+                ))
+            })?;
+    }
+
+    let stored_epoch = config_value_with_store(config, EPOCH_KEY).await?;
+    let epoch = match (stored_epoch, intent) {
+        (Some(existing), EpochIntent::Current) => {
+            validate_epoch(&existing)?;
+            existing
+        }
+        (None, EpochIntent::Current) | (_, EpochIntent::NewStream) => {
+            let created = Uuid::new_v4().to_string();
+            ConfigKv::set_with_store(config, EPOCH_KEY, &created, false)
+                .await
+                .map_err(|error| {
+                    Mega2StreamError::Store(format!(
+                        "cannot record the traces epoch in repository config: {error}"
+                    ))
+                })?;
+            created
+        }
+    };
+
+    Ok(SourceEpochBinding { source, epoch })
+}
+
+async fn config_value_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    key: &str,
+) -> Result<Option<String>, Mega2StreamError> {
+    let entry = ConfigKv::get_with_store(config, key)
+        .await
+        .map_err(|error| {
+            Mega2StreamError::Store(format!("cannot read repository config `{key}`: {error}"))
+        })?;
+    Ok(entry.map(|entry| entry.value))
 }
 
 /// Persist source and epoch on an already-open repository connection.
@@ -394,23 +570,46 @@ where
     })
 }
 
-async fn open_repository(workdir: &Path) -> Result<DatabaseConnection, Mega2StreamError> {
-    let storage = util::try_get_storage_path(Some(workdir.to_path_buf())).map_err(|error| {
+fn resolve_storage_path(workdir: &Path) -> Result<std::path::PathBuf, Mega2StreamError> {
+    util::try_get_storage_path(Some(workdir.to_path_buf())).map_err(|error| {
         Mega2StreamError::Store(format!(
             "cannot find the repository storage for {}: {error}. Run `libra init` in that \
              directory, or use the main worktree if this linked worktree is detached",
             workdir.display()
         ))
-    })?;
-    let database = storage.join(DATABASE);
-    db::open_cached_repository(&database)
-        .await
-        .map_err(|error| {
-            Mega2StreamError::Store(format!(
-                "cannot open the repository database {}: {error}",
-                database.display()
-            ))
-        })
+    })
+}
+
+async fn open_repository(workdir: &Path) -> Result<DatabaseConnection, Mega2StreamError> {
+    let storage = resolve_storage_path(workdir)?;
+    match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(|error| Mega2StreamError::Store(error.to_string()))?
+    {
+        StorageBackendKind::Redb => Err(Mega2StreamError::Store(
+            "SQLite repository handle is not available for a redb repository; use ConfigStore helpers"
+                .to_string(),
+        )),
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let database = storage.join(DATABASE);
+                db::open_cached_repository(&database)
+                    .await
+                    .map_err(|error| {
+                        Mega2StreamError::Store(format!(
+                            "cannot open the repository database {}: {error}",
+                            database.display()
+                        ))
+                    })
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                Err(Mega2StreamError::Store(
+                    "this Libra binary was compiled without `storage-sqlite`".to_string(),
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -418,7 +617,10 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::internal::{config::ConfigKv, db::create_database};
+    use crate::{
+        internal::{config::ConfigKv, db::create_database},
+        utils::util::DATABASE,
+    };
 
     async fn repository_with_identity(root: &Path, identity: Option<&str>) {
         let gitdir = root.join(".libra");

@@ -377,7 +377,7 @@ fn private_capture_identity_has_no_source_opener() {
     let remainder = format!("const AGENT_CAPTURE_LOCAL_PAGE_SIZE{remainder}");
     assert_eq!(
         hex::encode(Sha256::digest(remainder.as_bytes())),
-        "0affed3032a44437b966804226b0e9db3d6ffcdb117e9edcee9abe871b307b53",
+        "4934906de5351256d62fb810adde3deb052ba7b8f7d3a727655b8f051f6f7f24",
         "RG-05 cloud serializer edit requires scope and Claude review"
     );
 }
@@ -10993,6 +10993,10 @@ fn reasoning_pending_seal_borrows_only_bound_native_witness() {
                 "src/internal/ai/capture/pending_payload.rs".to_owned(),
                 "seal_bound_versioned_reasoning".to_owned(),
             ),
+            (
+                "src/internal/ai/capture/pending_payload.rs".to_owned(),
+                "seal_bound_versioned_reasoning_with_store".to_owned(),
+            ),
         ]),
     );
 }
@@ -11055,7 +11059,15 @@ fn reasoning_pending_restore_has_closed_issuer() {
             ),
             (
                 "src/internal/ai/capture/key.rs".to_owned(),
+                "authenticate_pending_reasoning_members_in_scope_with_store".to_owned(),
+            ),
+            (
+                "src/internal/ai/capture/key.rs".to_owned(),
                 "authenticate_pending_versioned_reasoning_members_in_scope_until".to_owned(),
+            ),
+            (
+                "src/internal/ai/capture/key.rs".to_owned(),
+                "authenticate_pending_versioned_reasoning_members_in_scope_with_store".to_owned(),
             ),
         ]),
     );
@@ -11155,7 +11167,15 @@ fn cov2_v2_pending_original_member_issuer_is_integrity_only() {
             ),
             (
                 "src/internal/ai/capture/key.rs".to_owned(),
+                "authenticate_pending_reasoning_members_in_scope_with_store".to_owned(),
+            ),
+            (
+                "src/internal/ai/capture/key.rs".to_owned(),
                 "authenticate_pending_versioned_reasoning_members_in_scope_until".to_owned(),
+            ),
+            (
+                "src/internal/ai/capture/key.rs".to_owned(),
+                "authenticate_pending_versioned_reasoning_members_in_scope_with_store".to_owned(),
             ),
         ]),
     );
@@ -11296,7 +11316,15 @@ fn reasoning_pending_signers_and_native_record_fillers_are_closed() {
         if name == "from_authenticated_members" {
             expected.insert((
                 "src/internal/ai/capture/key.rs".to_owned(),
+                "authenticate_pending_reasoning_members_in_scope_with_store".to_owned(),
+            ));
+            expected.insert((
+                "src/internal/ai/capture/key.rs".to_owned(),
                 "authenticate_pending_versioned_reasoning_members_in_scope_until".to_owned(),
+            ));
+            expected.insert((
+                "src/internal/ai/capture/key.rs".to_owned(),
+                "authenticate_pending_versioned_reasoning_members_in_scope_with_store".to_owned(),
             ));
         }
         if name == "from_validated_pending_context" {
@@ -11493,10 +11521,20 @@ fn opencode_verified_partial_live_permit_and_provenance_have_closed_owners() {
         );
     }
     for (name, path, owner) in constructors {
+        let mut expected = vec![(path.to_owned(), owner.to_owned())];
+        if matches!(
+            name,
+            "VerifiedOrdinaryPartialBinding" | "VerifiedOrdinaryPartialSnapshot"
+        ) {
+            expected.push((
+                path.to_owned(),
+                "try_into_verified_ordinary_partial_in_scope_with_store".to_owned(),
+            ));
+        }
         assert_eq!(
             actual_constructors.remove(name).unwrap_or_default(),
-            vec![(path.to_owned(), owner.to_owned())],
-            "{name} must retain one exact producer"
+            expected,
+            "{name} must retain its exact producer set"
         );
     }
     assert_eq!(

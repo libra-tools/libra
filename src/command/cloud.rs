@@ -810,6 +810,9 @@ pub(crate) enum CloudError {
     /// allowlist (PI-05). Raised before credentials, D1 or R2; maps to
     /// `LBR-CONFLICT-002` with the local-only capture hints.
     LocalCaptureKindRefused(String),
+    /// Local storage I/O or cross-store generation consistency failure
+    /// (`ADR-RB-06`, maps to `LBR-IO-001` / [`StableErrorCode::IoReadFailed`]).
+    StorageIo(String),
     /// Anything else — kept as the original detail string.
     Generic(String),
 }
@@ -961,6 +964,7 @@ impl fmt::Display for CloudError {
             | CloudError::AmbiguousObjectFormat(detail)
             | CloudError::RemoteCaptureKindRefused(detail)
             | CloudError::LocalCaptureKindRefused(detail)
+            | CloudError::StorageIo(detail)
             | CloudError::Generic(detail) => write!(f, "{detail}"),
         }
     }
@@ -1012,6 +1016,7 @@ impl CloudError {
             CloudError::LocalCaptureKindRefused(detail) => {
                 CloudError::LocalCaptureKindRefused(add(detail))
             }
+            CloudError::StorageIo(detail) => CloudError::StorageIo(add(detail)),
             CloudError::Generic(detail) => CloudError::Generic(add(detail)),
         }
     }
@@ -1085,6 +1090,9 @@ impl CloudError {
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint(LOCAL_CAPTURE_KIND_REFUSAL_HINT)
                 .with_hint(LOCAL_CAPTURE_KIND_BACKUP_HINT),
+            CloudError::StorageIo(detail) => {
+                CliError::fatal(detail).with_stable_code(StableErrorCode::IoReadFailed)
+            }
             CloudError::Generic(detail) => CliError::fatal(format!("{operation} failed: {detail}")),
         }
     }
@@ -1461,10 +1469,186 @@ async fn execute_status(args: StatusArgs) -> CloudResult<()> {
 }
 
 async fn run_cloud_status(args: StatusArgs) -> CliResult<CloudStatusOutput> {
-    // Get database connection
-    let db_conn = db::get_db_conn_instance().await;
+    let storage = util::try_get_storage_path(None).map_err(|e| {
+        CliError::fatal(format!("failed to resolve repository storage: {e}"))
+            .with_stable_code(StableErrorCode::RepoNotFound)
+    })?;
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(|e| e.into_cli_error())? {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                run_cloud_status_redb(&storage, args).await
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                Err(
+                    CliError::fatal("this Libra binary was compiled without `storage-redb`")
+                        .with_stable_code(StableErrorCode::CliInvalidTarget),
+                )
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            // Get database connection
+            let db_conn = db::get_db_conn_instance().await;
 
-    // Count total and synced objects
+            // Count total and synced objects
+            let repo_id = ConfigKv::get("libra.repoid")
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.value)
+                .unwrap_or_else(|| "unknown-repo".to_string());
+
+            let status_error = |e| {
+                CliError::fatal(format!("failed to read cloud status: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            };
+            let view = db_conn.begin().await.map_err(status_error)?;
+            let indexed = object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq(&repo_id))
+                .all(&view)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to query cloud object index: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+
+            let missing = coverage::missing_rows(&view, &repo_id)
+                .await
+                .map_err(|e| cloud_cli_error_typed("status", e))?;
+            view.commit().await.map_err(status_error)?;
+            let total_objects = indexed.len() + missing.len();
+            let mut synced_count = 0usize;
+            let mut unsynced_objects = Vec::new();
+            let mut by_type: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+            let indexed = indexed
+                .into_iter()
+                .map(|row| (row.o_id, row.o_type, row.o_size, row.is_synced == 1));
+            for (oid, object_type, size, synced) in indexed.chain(
+                missing
+                    .into_iter()
+                    .map(|(id, kind, size)| (id, kind, size, false)),
+            ) {
+                let entry = by_type.entry(object_type.clone()).or_default();
+                entry.0 += 1;
+                if synced {
+                    entry.1 += 1;
+                    synced_count += 1;
+                } else if args.verbose && unsynced_objects.len() < 20 {
+                    unsynced_objects.push(CloudStatusObjectOutput {
+                        oid,
+                        object_type,
+                        size,
+                    });
+                }
+            }
+            let by_type = by_type
+                .into_iter()
+                .map(|(object_type, (total, synced))| CloudStatusTypeOutput {
+                    object_type,
+                    total,
+                    synced,
+                    pending: total - synced,
+                })
+                .collect();
+            Ok(CloudStatusOutput {
+                repo_id,
+                total_objects,
+                synced: synced_count,
+                pending: total_objects - synced_count,
+                synced_percent: (synced_count * 100).checked_div(total_objects).unwrap_or(0),
+                by_type,
+                unsynced_objects,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+pub(crate) fn missing_object_index_rows_redb(
+    storage_dir: &std::path::Path,
+    refs: &[crate::storage::git_store::RefRecord],
+    indexed_oids: &HashSet<String>,
+) -> CloudResult<Vec<(String, String, i64)>> {
+    use git_internal::internal::object::types::ObjectType;
+
+    use crate::{
+        command::maintenance::{extend_object_references, parse_object_hash},
+        storage::git_store::RefTarget,
+        utils::client_storage::ClientStorage,
+    };
+
+    const PAGE_SIZE: usize = 256;
+
+    let object_storage =
+        ClientStorage::init_local_existing_with_alternates(storage_dir.join("objects"));
+    let mut stack = Vec::new();
+    for rec in refs {
+        if let RefTarget::Direct(tip) = &rec.target {
+            let oid = parse_object_hash(tip).ok_or_else(|| {
+                CloudError::Generic(format!("invalid cloud reference target {tip}"))
+            })?;
+            stack.push(oid);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    while !stack.is_empty() {
+        let mut page = Vec::new();
+        while page.len() < PAGE_SIZE
+            && let Some(oid) = stack.pop()
+        {
+            if seen.insert(oid) {
+                page.push(oid);
+            }
+        }
+        if page.is_empty() {
+            continue;
+        }
+        let kinds = object_storage
+            .get_object_types_bounded_many(&page)
+            .map_err(|error| {
+                CloudError::Generic(format!("inspect reachable objects for backup: {error}"))
+            })?;
+        let mut gaps = Vec::new();
+        for oid in page {
+            let kind = kinds.get(&oid).ok_or_else(|| {
+                CloudError::Generic(format!(
+                    "reachable object {oid} is missing; fetch the full history and hydrate missing objects before backing up"
+                ))
+            })?;
+            if *kind != ObjectType::Blob {
+                let data = object_storage.get(&oid).map_err(|e| {
+                    CloudError::Generic(format!("read reachable {kind} {oid}: {e}"))
+                })?;
+                extend_object_references(oid, *kind, &data, false, &mut stack).map_err(|e| {
+                    CloudError::Generic(format!("read references in {kind} {oid}: {e}"))
+                })?;
+            }
+            if !indexed_oids.contains(&oid.to_string()) {
+                gaps.push(oid);
+            }
+        }
+        let sizes = object_storage
+            .decoded_object_sizes(&gaps)
+            .map_err(|e| CloudError::Generic(format!("read reachable object sizes: {e}")))?;
+        for (oid, size) in gaps.into_iter().zip(sizes) {
+            let size = size.and_then(|s| i64::try_from(s).ok()).ok_or_else(|| {
+                CloudError::Generic(format!(
+                    "cannot determine the size of reachable object {oid}"
+                ))
+            })?;
+            missing.push((oid.to_string(), kinds[&oid].to_string(), size));
+        }
+    }
+    Ok(missing)
+}
+
+#[cfg(feature = "storage-redb")]
+async fn run_cloud_status_redb(
+    storage: &std::path::Path,
+    args: StatusArgs,
+) -> CliResult<CloudStatusOutput> {
     let repo_id = ConfigKv::get("libra.repoid")
         .await
         .ok()
@@ -1472,32 +1656,46 @@ async fn run_cloud_status(args: StatusArgs) -> CliResult<CloudStatusOutput> {
         .map(|e| e.value)
         .unwrap_or_else(|| "unknown-repo".to_string());
 
-    let status_error = |e| {
-        CliError::fatal(format!("failed to read cloud status: {e}"))
-            .with_stable_code(StableErrorCode::IoReadFailed)
-    };
-    let view = db_conn.begin().await.map_err(status_error)?;
-    let indexed = object_index::Entity::find()
-        .filter(object_index::Column::RepoId.eq(&repo_id))
-        .all(&view)
+    let git_store = crate::storage::runtime::open_git_store_read_only(storage)
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!(
+                "failed to open redb git store for cloud status: {e}"
+            ))
+            .with_stable_code(e.stable_error_code())
+        })?;
+    let indexed = git_store
+        .list_object_index_by_repo(&repo_id, None)
         .await
         .map_err(|e| {
             CliError::fatal(format!("failed to query cloud object index: {e}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)
         })?;
-
-    let missing = coverage::missing_rows(&view, &repo_id)
-        .await
+    let mut refs = git_store.list_refs(None).await.map_err(|e| {
+        CliError::fatal(format!("failed to read references for cloud status: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    let local_heads = git_store.list_all_local_heads().await.map_err(|e| {
+        CliError::fatal(format!("failed to read local HEADs for cloud status: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    for head in local_heads {
+        if !refs.iter().any(|existing| existing.key == head.key) {
+            refs.push(head);
+        }
+    }
+    let indexed_oids: HashSet<String> = indexed.iter().map(|r| r.o_id.clone()).collect();
+    let missing = missing_object_index_rows_redb(storage, &refs, &indexed_oids)
         .map_err(|e| cloud_cli_error_typed("status", e))?;
-    view.commit().await.map_err(status_error)?;
+
     let total_objects = indexed.len() + missing.len();
     let mut synced_count = 0usize;
     let mut unsynced_objects = Vec::new();
     let mut by_type: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    let indexed = indexed
+    let indexed_iter = indexed
         .into_iter()
-        .map(|row| (row.o_id, row.o_type, row.o_size, row.is_synced == 1));
-    for (oid, object_type, size, synced) in indexed.chain(
+        .map(|row| (row.o_id, row.o_type, row.o_size, row.is_synced));
+    for (oid, object_type, size, synced) in indexed_iter.chain(
         missing
             .into_iter()
             .map(|(id, kind, size)| (id, kind, size, false)),
@@ -1533,6 +1731,116 @@ async fn run_cloud_status(args: StatusArgs) -> CliResult<CloudStatusOutput> {
         by_type,
         unsynced_objects,
     })
+}
+
+#[cfg(feature = "storage-redb")]
+pub(super) async fn preflight_agent_capture_prune_fences_redb(
+    storage: &std::path::Path,
+    d1_client: &D1Client,
+    repo_id: &str,
+) -> CloudResult<()> {
+    let checkpoint_ids = agent_capture::read_redb_prune_tombstone_checkpoint_ids(
+        storage,
+        AGENT_CAPTURE_RESTORE_MAX_ROWS.saturating_add(1),
+    )
+    .await?;
+    if checkpoint_ids.len() > AGENT_CAPTURE_RESTORE_MAX_ROWS {
+        return Err(CloudError::PartialTransfer(format!(
+            "local checkpoint prune fences exceed the {}-row restore safety bound; run `libra cloud sync` before restoring",
+            AGENT_CAPTURE_RESTORE_MAX_ROWS
+        )));
+    }
+    if checkpoint_ids.is_empty() {
+        return Ok(());
+    }
+
+    let generation_table_present = d1_client
+        .agent_capture_generation_table_exists()
+        .await
+        .map_err(|error| {
+            cloud_d1_failure(
+                "probe agent-capture generation before prune preflight",
+                &error,
+            )
+        })?;
+    if !generation_table_present {
+        let has_capture_rows = d1_client
+            .agent_capture_catalog_has_rows(repo_id)
+            .await
+            .map_err(|error| {
+                cloud_d1_failure(
+                    "probe unmanifested agent capture before prune preflight",
+                    &error,
+                )
+            })?;
+        if !has_capture_rows {
+            return Ok(());
+        }
+        return Err(CloudError::PartialTransfer(
+            "cannot verify local checkpoint prune fences because the remote capture has no generation manifest; run `libra cloud sync` before restoring"
+                .to_string(),
+        ));
+    }
+
+    for _ in 0..3 {
+        let before = d1_client
+            .get_agent_capture_generation(repo_id)
+            .await
+            .map_err(|error| {
+                cloud_d1_failure(
+                    "read agent-capture generation before prune preflight",
+                    &error,
+                )
+            })?;
+        let Some(before) = before else {
+            let has_capture_rows = d1_client
+                .agent_capture_catalog_has_rows(repo_id)
+                .await
+                .map_err(|error| {
+                    cloud_d1_failure(
+                        "probe agent capture without a generation before prune preflight",
+                        &error,
+                    )
+                })?;
+            if !has_capture_rows {
+                return Ok(());
+            }
+            return Err(CloudError::PartialTransfer(
+                "cannot verify local checkpoint prune fences because the remote capture has no completed generation; run `libra cloud sync` before restoring"
+                    .to_string(),
+            ));
+        };
+        if before.state != "complete" {
+            return Err(CloudError::PartialTransfer(
+                "remote agent capture publication is incomplete; retry `libra cloud sync`, then restore"
+                    .to_string(),
+            ));
+        }
+        let conflicts = d1_client
+            .find_agent_checkpoint_ids_by_ids(repo_id, &checkpoint_ids)
+            .await
+            .map_err(|error| {
+                cloud_d1_failure("compare checkpoint prune fences with agent capture", &error)
+            })?;
+        let after = d1_client
+            .get_agent_capture_generation(repo_id)
+            .await
+            .map_err(|error| {
+                cloud_d1_failure(
+                    "recheck agent-capture generation after prune preflight",
+                    &error,
+                )
+            })?;
+        if after.as_ref() != Some(&before) {
+            continue;
+        }
+        reject_local_prune_conflicts(&checkpoint_ids, &conflicts)?;
+        return Ok(());
+    }
+    Err(CloudError::PartialTransfer(
+        "remote agent capture changed during three checkpoint-prune preflight reads; retry when cloud sync is idle"
+            .to_string(),
+    ))
 }
 
 fn render_cloud_status_output(status: &CloudStatusOutput, output: &OutputConfig) -> CliResult<()> {
@@ -1714,12 +2022,47 @@ async fn ensure_repo_id() -> String {
     let repo_id = Uuid::new_v4().to_string();
     let _ = ConfigKv::set("libra.repoid", &repo_id, false).await;
 
-    let db_conn = db::get_db_conn_instance().await;
-    let _ = object_index::Entity::update_many()
-        .filter(object_index::Column::RepoId.eq("unknown-repo"))
-        .col_expr(object_index::Column::RepoId, Expr::value(repo_id.clone()))
-        .exec(&db_conn)
-        .await;
+    if let Ok(storage) = util::try_get_storage_path(None) {
+        match crate::storage::runtime::detect_repo_backend(&storage) {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                #[cfg(feature = "storage-redb")]
+                if let Ok(git_store) =
+                    crate::storage::runtime::open_git_store_read_write(&storage).await
+                    && let Ok(rows) = git_store
+                        .list_object_index_by_repo("unknown-repo", None)
+                        .await
+                    && !rows.is_empty()
+                {
+                    let migrated: Vec<crate::storage::git_store::ObjectIndexRecord> = rows
+                        .iter()
+                        .map(|row| crate::storage::git_store::ObjectIndexRecord {
+                            repo_id: repo_id.clone(),
+                            o_id: row.o_id.clone(),
+                            o_type: row.o_type.clone(),
+                            o_size: row.o_size,
+                            created_at: row.created_at,
+                            is_synced: row.is_synced,
+                        })
+                        .collect();
+                    let old_oids: Vec<String> = rows.into_iter().map(|row| row.o_id).collect();
+                    if git_store.upsert_object_index_batch(&migrated).await.is_ok() {
+                        let _ = git_store
+                            .delete_object_index_rows("unknown-repo", &old_oids)
+                            .await;
+                    }
+                }
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) => {
+                let db_conn = db::get_db_conn_instance().await;
+                let _ = object_index::Entity::update_many()
+                    .filter(object_index::Column::RepoId.eq("unknown-repo"))
+                    .col_expr(object_index::Column::RepoId, Expr::value(repo_id.clone()))
+                    .exec(&db_conn)
+                    .await;
+            }
+            Err(_) => {}
+        }
+    }
 
     repo_id
 }

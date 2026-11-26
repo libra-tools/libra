@@ -4352,3 +4352,434 @@ async fn uid07_production_context_failure_preserves_probe() {
             .any(|row| row.capability == "capture" && row.data == "available")
     );
 }
+
+#[cfg(feature = "storage-redb")]
+#[tokio::test]
+#[serial_test::serial(cwd, env)]
+async fn redb_window_readonly_context_and_source_state_mapping() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use crate::{
+        internal::db::DatabaseRole,
+        storage::{
+            RefKey, RefTarget, StorageBackendError,
+            codec::encode_versioned,
+            manifest::{
+                INITIAL_STORAGE_GENERATION, StorageFormatManifest, publish_storage_manifest,
+            },
+            meta::{
+                MAX_SUPPORTED_READER_VERSION, META_SCHEMA_CODEC_VERSION, META_SCHEMA_SINGLETON_KEY,
+                META_SCHEMA_TABLE, MetaSchemaRecord, MetaSchemaRole,
+            },
+            opener::{
+                RedbRepairContext, begin_write_bounded_blocking, open_redb_read_only,
+                open_redb_writable,
+            },
+            runtime,
+        },
+        utils::util,
+    };
+
+    struct HashKindGuard(git_internal::hash::HashKind);
+    impl Drop for HashKindGuard {
+        fn drop(&mut self) {
+            git_internal::hash::set_hash_kind(self.0);
+        }
+    }
+    let _hash_guard = HashKindGuard(git_internal::hash::get_hash_kind());
+
+    #[derive(Debug)]
+    struct CrashBackend {
+        inner: redb::backends::FileBackend,
+        dead: Arc<AtomicBool>,
+    }
+
+    impl redb::StorageBackend for CrashBackend {
+        fn len(&self) -> Result<u64, redb::BackendError> {
+            self.inner.len()
+        }
+
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::BackendError> {
+            self.inner.read(offset, out)
+        }
+
+        fn set_len(&self, len: u64) -> Result<(), redb::BackendError> {
+            if self.dead.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.inner.set_len(len)
+        }
+
+        fn sync_data(&self) -> Result<(), redb::BackendError> {
+            if self.dead.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.inner.sync_data()
+        }
+
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), redb::BackendError> {
+            if self.dead.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.inner.write(offset, data)
+        }
+    }
+
+    fn create_unrecovered_redb_fixture(path: &std::path::Path) {
+        const KV: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("rb27_crash_kv");
+        let dead = Arc::new(AtomicBool::new(false));
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .expect("create crash fixture file");
+        let db = redb::Builder::new()
+            .create_with_backend(CrashBackend {
+                inner: redb::backends::FileBackend::new(file),
+                dead: Arc::clone(&dead),
+            })
+            .expect("create redb database on crash backend");
+        let wtx =
+            begin_write_bounded_blocking(&db, DatabaseRole::Repository, Duration::from_secs(2))
+                .expect("begin fixture seed write");
+        {
+            let mut table = wtx.open_table(KV).expect("open fixture kv table");
+            table
+                .insert("seed", "intact")
+                .expect("insert committed seed entry");
+        }
+        wtx.commit().expect("commit fixture seed write");
+        dead.store(true, Ordering::SeqCst);
+        drop(db);
+    }
+
+    fn overwrite_meta_schema(path: &std::path::Path, record: &MetaSchemaRecord) {
+        let db = open_redb_writable(path, DatabaseRole::Repository, RedbRepairContext::Migrate)
+            .expect("open redb writable to seed META_SCHEMA");
+        let wtx =
+            begin_write_bounded_blocking(&db, DatabaseRole::Repository, Duration::from_secs(2))
+                .expect("begin META_SCHEMA seed write");
+        {
+            let mut table = wtx
+                .open_table(META_SCHEMA_TABLE)
+                .expect("open META_SCHEMA table");
+            let encoded = encode_versioned(META_SCHEMA_CODEC_VERSION, record)
+                .expect("encode META_SCHEMA record");
+            table
+                .insert(META_SCHEMA_SINGLETON_KEY, encoded.as_slice())
+                .expect("insert META_SCHEMA record");
+        }
+        wtx.commit().expect("commit META_SCHEMA record");
+    }
+
+    // AC1: Pure-Redb repository (no `libra.db`) returns accurate RepoContext
+    // (HEAD, branch, hash kind) via strict `open_read_only` without mutating
+    // on-disk bytes or mtime.
+    let repo_dir = tempdir().expect("temp redb repo");
+    let storage = repo_dir.path().join(util::ROOT_DIR);
+    let paths = runtime::init_redb_repository_storage(&storage)
+        .await
+        .expect("init pure-redb storage");
+    assert!(
+        !storage.join(util::DATABASE).exists(),
+        "pure-redb repository must not create libra.db"
+    );
+
+    let sha256_commit = "a".repeat(64);
+    {
+        let cfg = runtime::open_repo_config_store_read_write(&storage)
+            .await
+            .expect("open redb config store rw");
+        cfg.set("core.objectformat", "sha256", false)
+            .await
+            .expect("set sha256 objectformat");
+        drop(cfg);
+
+        let git = runtime::open_git_store_read_write(&storage)
+            .await
+            .expect("open redb git store rw");
+        let head_outcome = git
+            .update_ref_cas(
+                &RefKey::LocalHead { worktree_id: None },
+                None,
+                Some(&RefTarget::Symbolic("main".to_string())),
+                &[],
+            )
+            .await
+            .expect("seed HEAD");
+        assert!(matches!(
+            head_outcome,
+            crate::storage::RefCasOutcome::Applied { .. }
+        ));
+        let branch_outcome = git
+            .update_ref_cas(
+                &RefKey::LocalBranch {
+                    name: "main".to_string(),
+                },
+                None,
+                Some(&RefTarget::Direct(sha256_commit.clone())),
+                &[],
+            )
+            .await
+            .expect("seed main branch");
+        assert!(matches!(
+            branch_outcome,
+            crate::storage::RefCasOutcome::Applied { .. }
+        ));
+    }
+
+    let git_bytes_before = fs::read(&paths.git_db_path).expect("read git.redb bytes before");
+    let git_mtime_before = fs::metadata(&paths.git_db_path)
+        .expect("stat git.redb before")
+        .modified()
+        .expect("git.redb mtime before");
+    let manifest_path = storage.join(crate::storage::manifest::STORAGE_FORMAT_MANIFEST_FILE);
+    let manifest_bytes_before = fs::read(&manifest_path).expect("read manifest bytes before");
+
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("resolve pure-redb scope")
+        .expect("pure-redb repository scope");
+    let context = repo::read_context(&scope)
+        .await
+        .expect("read_context on pure-redb repository");
+    assert_eq!(context.storage_label, ".libra");
+    assert_eq!(context.branch, "main");
+    assert_eq!(context.object_format, "sha256");
+    assert_eq!(context.head_oid.as_deref(), Some(sha256_commit.as_str()));
+    assert_eq!(context.head, &sha256_commit[..12]);
+    assert_eq!(
+        git_internal::hash::get_hash_kind(),
+        git_internal::hash::HashKind::Sha256
+    );
+    assert!(
+        !storage.join(util::DATABASE).exists(),
+        "read_context must never create libra.db"
+    );
+    assert_eq!(
+        fs::read(&paths.git_db_path).expect("read git.redb bytes after"),
+        git_bytes_before,
+        "read_context must not modify git.redb bytes"
+    );
+    assert_eq!(
+        fs::metadata(&paths.git_db_path)
+            .expect("stat git.redb after")
+            .modified()
+            .expect("git.redb mtime after"),
+        git_mtime_before,
+        "read_context must not modify git.redb mtime"
+    );
+    assert_eq!(
+        fs::read(&manifest_path).expect("read manifest bytes after"),
+        manifest_bytes_before,
+        "read_context must not modify storage-format.json"
+    );
+
+    // AC2: `META_SCHEMA` too new -> `SourceState::SchemaNew` (without mutating disk).
+    let future_dir = tempdir().expect("temp future redb repo");
+    let future_storage = future_dir.path().join(util::ROOT_DIR);
+    let future_paths = runtime::init_redb_repository_storage(&future_storage)
+        .await
+        .expect("init future redb storage");
+    let future_record = MetaSchemaRecord {
+        role: MetaSchemaRole::Repository,
+        format_version: MAX_SUPPORTED_READER_VERSION + 1,
+        min_reader_version: MAX_SUPPORTED_READER_VERSION + 1,
+    };
+    assert_eq!(
+        state::classify_redb_meta_schema(&future_record, DatabaseRole::Repository),
+        SourceState::SchemaNew
+    );
+    assert_eq!(
+        state::classify_storage_error(&StorageBackendError::SchemaTooNew {
+            role: DatabaseRole::Repository,
+            found: MAX_SUPPORTED_READER_VERSION + 1,
+            max_supported: MAX_SUPPORTED_READER_VERSION,
+        }),
+        SourceState::SchemaNew
+    );
+    overwrite_meta_schema(&future_paths.git_db_path, &future_record);
+    let future_bytes_before = fs::read(&future_paths.git_db_path).expect("read future bytes");
+    let future_scope = repo::resolve_scope(future_dir.path().to_path_buf())
+        .expect("future scope")
+        .expect("future repo");
+    let future_err = repo::read_context(&future_scope)
+        .await
+        .expect_err("future META_SCHEMA must fail closed");
+    assert_eq!(future_err.state, SourceState::SchemaNew);
+    assert_eq!(
+        fs::read(&future_paths.git_db_path).expect("read future bytes after"),
+        future_bytes_before,
+        "SchemaNew read must not modify git.redb bytes"
+    );
+
+    // AC3: `META_SCHEMA` too old -> `SourceState::SchemaOld` (without mutating disk).
+    let old_dir = tempdir().expect("temp old redb repo");
+    let old_storage = old_dir.path().join(util::ROOT_DIR);
+    let old_paths = runtime::init_redb_repository_storage(&old_storage)
+        .await
+        .expect("init old redb storage");
+    let old_record = MetaSchemaRecord {
+        role: MetaSchemaRole::Repository,
+        format_version: 0,
+        min_reader_version: 0,
+    };
+    assert_eq!(
+        state::classify_redb_meta_schema(&old_record, DatabaseRole::Repository),
+        SourceState::SchemaOld
+    );
+    overwrite_meta_schema(&old_paths.git_db_path, &old_record);
+    let old_bytes_before = fs::read(&old_paths.git_db_path).expect("read old bytes");
+    let old_scope = repo::resolve_scope(old_dir.path().to_path_buf())
+        .expect("old scope")
+        .expect("old repo");
+    let old_err = repo::read_context(&old_scope)
+        .await
+        .expect_err("old META_SCHEMA must fail closed");
+    assert_eq!(old_err.state, SourceState::SchemaOld);
+    assert_eq!(
+        fs::read(&old_paths.git_db_path).expect("read old bytes after"),
+        old_bytes_before,
+        "SchemaOld read must not modify git.redb bytes"
+    );
+
+    // AC4: Dirty/unrecovered Redb needing repair (`RepairAborted`) ->
+    // `SourceState::Corrupt` mentioning `libra fsck`, NEVER upgrading to write.
+    let crash_dir = tempdir().expect("temp crash redb repo");
+    let crash_storage = crash_dir.path().join(util::ROOT_DIR);
+    let crash_redb_dir = crash_storage.join(crate::storage::manifest::REDB_SUBDIR);
+    fs::create_dir_all(&crash_redb_dir).expect("create crash redb dir");
+    let crash_manifest = StorageFormatManifest::new_redb_finalized(INITIAL_STORAGE_GENERATION)
+        .expect("create finalized manifest");
+    publish_storage_manifest(&crash_storage, &crash_manifest).expect("publish crash manifest");
+    let crash_git_path =
+        runtime::resolve_repo_git_redb_path(&crash_storage).expect("resolve crash git.redb path");
+    create_unrecovered_redb_fixture(&crash_git_path);
+    let ro_check = open_redb_read_only(&crash_git_path, DatabaseRole::Repository)
+        .err()
+        .expect("crash fixture must trigger RepairAborted on read-only open");
+    assert!(
+        matches!(ro_check, StorageBackendError::RepairAborted { .. }),
+        "expected RepairAborted on crash fixture, got {ro_check:?}"
+    );
+    assert_eq!(
+        state::classify_storage_error(&ro_check),
+        SourceState::Corrupt
+    );
+    let crash_bytes_before = fs::read(&crash_git_path).expect("read crash fixture bytes before");
+    let crash_mtime_before = fs::metadata(&crash_git_path)
+        .expect("stat crash fixture before")
+        .modified()
+        .expect("crash fixture mtime before");
+    let crash_scope = repo::resolve_scope(crash_dir.path().to_path_buf())
+        .expect("crash scope")
+        .expect("crash repo");
+    let crash_err = repo::read_context(&crash_scope)
+        .await
+        .expect_err("RepairAborted must fail closed");
+    assert_eq!(crash_err.state, SourceState::Corrupt);
+    assert!(
+        crash_err.message.contains("libra fsck"),
+        "RepairAborted error message must include `libra fsck` hint: {}",
+        crash_err.message
+    );
+    assert!(
+        crash_err
+            .state
+            .hint()
+            .is_some_and(|hint| hint.contains("libra fsck")),
+        "SourceState::Corrupt hint must include `libra fsck`"
+    );
+    assert_eq!(
+        fs::read(&crash_git_path).expect("read crash fixture bytes after"),
+        crash_bytes_before,
+        "RepairAborted read must NEVER upgrade to write or alter bytes on disk"
+    );
+    assert_eq!(
+        fs::metadata(&crash_git_path)
+            .expect("stat crash fixture after")
+            .modified()
+            .expect("crash fixture mtime after"),
+        crash_mtime_before,
+        "RepairAborted read must NEVER alter mtime on disk"
+    );
+
+    // AC5: Permission-denied / unreadable directory preserves original
+    // filesystem `ErrorKind::PermissionDenied` in `SourceState::Unreadable`.
+    assert_eq!(
+        state::classify_storage_error(&StorageBackendError::Io {
+            context: "stat redb directory",
+            kind: std::io::ErrorKind::PermissionDenied,
+            raw_os_error: None,
+        }),
+        SourceState::Unreadable {
+            kind: std::io::ErrorKind::PermissionDenied,
+        }
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreModeGuard {
+            path: PathBuf,
+            mode: u32,
+        }
+        impl Drop for RestoreModeGuard {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+            }
+        }
+
+        // Case 5a: `.libra/redb` directory unreadable (`chmod 0o000`).
+        let redb_dir = storage.join(crate::storage::manifest::REDB_SUBDIR);
+        let redb_orig_mode = fs::metadata(&redb_dir)
+            .expect("stat redb dir")
+            .permissions()
+            .mode();
+        {
+            let _guard = RestoreModeGuard {
+                path: redb_dir.clone(),
+                mode: redb_orig_mode,
+            };
+            fs::set_permissions(&redb_dir, fs::Permissions::from_mode(0o000))
+                .expect("chmod 0o000 redb dir");
+            let err = repo::read_context(&scope)
+                .await
+                .expect_err("unreadable redb dir must fail closed");
+            assert_eq!(
+                err.state,
+                SourceState::Unreadable {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                }
+            );
+        }
+
+        // Case 5b: `.libra` storage directory unreadable (`chmod 0o000`).
+        let storage_orig_mode = fs::metadata(&storage)
+            .expect("stat storage dir")
+            .permissions()
+            .mode();
+        {
+            let _guard = RestoreModeGuard {
+                path: storage.clone(),
+                mode: storage_orig_mode,
+            };
+            fs::set_permissions(&storage, fs::Permissions::from_mode(0o000))
+                .expect("chmod 0o000 storage dir");
+            let err = repo::read_context(&scope)
+                .await
+                .expect_err("unreadable storage dir must fail closed");
+            assert_eq!(
+                err.state,
+                SourceState::Unreadable {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                }
+            );
+        }
+    }
+}

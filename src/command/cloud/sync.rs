@@ -22,44 +22,88 @@ async fn unsupported_capture_kinds() -> CloudResult<Vec<String>> {
 
 /// Distinct local `agent_session.agent_kind` values, sorted.
 async fn local_capture_kinds() -> CloudResult<Vec<String>> {
-    use sea_orm::Statement;
-
-    let repository = db::get_db_conn_instance().await;
-    let db_conn = super::agent_capture::local_capture_catalog(&repository).await?;
-    let backend = db_conn.get_database_backend();
-    let present = db_conn
-        .query_one_raw(Statement::from_string(
-            backend,
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_session' LIMIT 1"
-                .to_string(),
+    let storage = util::try_get_storage_path(None).map_err(|error| {
+        CloudError::Generic(format!(
+            "locate repository storage before cloud sync: {error}"
         ))
-        .await
-        .map_err(|error| {
-            CloudError::Generic(format!("read agent_session before cloud sync: {error}"))
-        })?;
-    if present.is_none() {
-        return Ok(Vec::new());
-    }
-    let rows = db_conn
-        .query_all_raw(Statement::from_string(
-            backend,
-            "SELECT DISTINCT agent_kind FROM agent_session ORDER BY agent_kind".to_string(),
+    })?;
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(|error| {
+        CloudError::StorageIo(format!(
+            "detect repository storage backend before cloud sync: {error}"
         ))
-        .await
-        .map_err(|error| {
-            CloudError::Generic(format!(
-                "read agent_session.agent_kind before cloud sync: {error}"
-            ))
-        })?;
-    rows.into_iter()
-        .map(|row| {
-            row.try_get_by::<String, _>("agent_kind").map_err(|error| {
-                CloudError::Generic(format!(
-                    "decode agent_session.agent_kind before cloud sync: {error}"
+    })? {
+        crate::storage::backend::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let store = crate::storage::runtime::open_capture_store_read_only(&storage)
+                    .await
+                    .map_err(|error| {
+                        CloudError::StorageIo(format!(
+                            "open capture store before cloud sync: {error}"
+                        ))
+                    })?;
+                let sessions = store
+                    .list_sessions_by_started_desc()
+                    .await
+                    .map_err(|error| {
+                        CloudError::StorageIo(format!(
+                            "read agent_session before cloud sync: {error}"
+                        ))
+                    })?;
+                let mut kinds = std::collections::BTreeSet::new();
+                for session in sessions {
+                    kinds.insert(session.agent_kind.as_str().to_string());
+                }
+                Ok(kinds.into_iter().collect())
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                Err(CloudError::Generic(
+                    "this Libra binary was compiled without `storage-redb`".to_string(),
                 ))
-            })
-        })
-        .collect()
+            }
+        }
+        crate::storage::backend::StorageBackendKind::Sqlite => {
+            use sea_orm::Statement;
+
+            let repository = db::get_db_conn_instance().await;
+            let db_conn = super::agent_capture::local_capture_catalog(&repository).await?;
+            let backend = db_conn.get_database_backend();
+            let present = db_conn
+                .query_one_raw(Statement::from_string(
+                    backend,
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_session' LIMIT 1"
+                        .to_string(),
+                ))
+                .await
+                .map_err(|error| {
+                    CloudError::Generic(format!("read agent_session before cloud sync: {error}"))
+                })?;
+            if present.is_none() {
+                return Ok(Vec::new());
+            }
+            let rows = db_conn
+                .query_all_raw(Statement::from_string(
+                    backend,
+                    "SELECT DISTINCT agent_kind FROM agent_session ORDER BY agent_kind".to_string(),
+                ))
+                .await
+                .map_err(|error| {
+                    CloudError::Generic(format!(
+                        "read agent_session.agent_kind before cloud sync: {error}"
+                    ))
+                })?;
+            rows.into_iter()
+                .map(|row| {
+                    row.try_get_by::<String, _>("agent_kind").map_err(|error| {
+                        CloudError::Generic(format!(
+                            "decode agent_session.agent_kind before cloud sync: {error}"
+                        ))
+                    })
+                })
+                .collect()
+        }
+    }
 }
 
 /// PI-18: refuse when an existing D1 capture table's `agent_kind` CHECK would
@@ -246,21 +290,6 @@ async fn sync_after_cleanup(
         .await
         .map_err(|error| with_notes(error, &residue_notes))?;
 
-    // Get database connection.
-    let db_conn = db::get_db_conn_instance().await;
-
-    // Check if object_index table exists locally, create if not.
-    let builder = db_conn.get_database_backend();
-    let schema = Schema::new(builder);
-    let stmt = schema
-        .create_table_from_entity(object_index::Entity)
-        .if_not_exists()
-        .to_owned();
-
-    let _ = db_conn.execute_raw(builder.build(&stmt)).await;
-
-    let repo_id = ensure_repo_id().await;
-
     // Freeze what this run uploads before any remote write (PI-09).
     let storage = util::try_get_storage_path(None).map_err(|error| {
         with_notes(
@@ -276,22 +305,89 @@ async fn sync_after_cleanup(
     } else {
         SpoolWarningSink::Stderr
     };
-    let mut spool = match SnapshotSpool::create(&storage, &raw_root, tuning, warning_sink) {
-        Ok(spool) => spool,
-        Err(error) => return Err(with_notes(error, &residue_notes)),
-    };
-    let result = sync_from_spool(
-        &mut spool,
-        ctx,
-        progress,
-        d1_client,
-        r2_override,
-        tuning,
-        &db_conn,
-        repo_id,
-        &storage,
-    )
-    .await;
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(|error| {
+        with_notes(
+            CloudError::StorageIo(format!(
+                "detect repository storage backend for cloud sync: {error}"
+            )),
+            &residue_notes,
+        )
+    })? {
+        crate::storage::backend::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let repo_id = ensure_repo_id().await;
+                let mut spool =
+                    match SnapshotSpool::create(&storage, &raw_root, tuning, warning_sink) {
+                        Ok(spool) => spool,
+                        Err(error) => return Err(with_notes(error, &residue_notes)),
+                    };
+                let result = sync_from_spool_redb(
+                    &mut spool,
+                    ctx,
+                    progress,
+                    d1_client,
+                    r2_override,
+                    tuning,
+                    repo_id,
+                    &storage,
+                )
+                .await;
+                finish_spool_result(spool, result, progress, residue_notes)
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                Err(with_notes(
+                    CloudError::Generic(
+                        "this Libra binary was compiled without `storage-redb`".to_string(),
+                    ),
+                    &residue_notes,
+                ))
+            }
+        }
+        crate::storage::backend::StorageBackendKind::Sqlite => {
+            // Get database connection.
+            let db_conn = db::get_db_conn_instance().await;
+
+            // Check if object_index table exists locally, create if not.
+            let builder = db_conn.get_database_backend();
+            let schema = Schema::new(builder);
+            let stmt = schema
+                .create_table_from_entity(object_index::Entity)
+                .if_not_exists()
+                .to_owned();
+
+            let _ = db_conn.execute_raw(builder.build(&stmt)).await;
+
+            let repo_id = ensure_repo_id().await;
+
+            let mut spool = match SnapshotSpool::create(&storage, &raw_root, tuning, warning_sink) {
+                Ok(spool) => spool,
+                Err(error) => return Err(with_notes(error, &residue_notes)),
+            };
+            let result = sync_from_spool(
+                &mut spool,
+                ctx,
+                progress,
+                d1_client,
+                r2_override,
+                tuning,
+                &db_conn,
+                repo_id,
+                &storage,
+            )
+            .await;
+            finish_spool_result(spool, result, progress, residue_notes)
+        }
+    }
+}
+
+fn finish_spool_result(
+    spool: SnapshotSpool,
+    result: CloudResult<CloudSyncReport>,
+    progress: &dyn CloudSyncProgress,
+    residue_notes: Vec<String>,
+) -> CloudResult<CloudSyncReport> {
     // Remove the spool on every outcome; a directory that cannot be removed
     // is reported, never silently kept, after any leftover of earlier runs.
     let mut notes = residue_notes;
@@ -305,6 +401,263 @@ async fn sync_after_cleanup(
             Ok(report)
         }
         Err(error) => Err(with_notes(error, &notes)),
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+#[allow(clippy::too_many_arguments)]
+async fn sync_from_spool_redb(
+    spool: &mut SnapshotSpool,
+    ctx: CloudSyncContext,
+    progress: &dyn CloudSyncProgress,
+    d1_client: D1Client,
+    r2_override: Option<RemoteStorage>,
+    tuning: &SnapshotTuning,
+    repo_id: String,
+    storage: &std::path::Path,
+) -> CloudResult<CloudSyncReport> {
+    let page_size = tuning.page_size();
+    spool
+        .freeze(&storage.join(util::DATABASE), &repo_id, ctx.force, tuning)
+        .await?;
+    #[cfg(test)]
+    if let Some(after_freeze) = &tuning.after_freeze {
+        after_freeze(spool.dir().to_path_buf()).await;
+    }
+
+    // Ensure D1 table exists before any operations.
+    d1_client
+        .ensure_object_index_table()
+        .await
+        .map_err(|error| cloud_d1_failure("ensure object-index table", &error))?;
+
+    let project_name = spool.repository()?.project_name;
+
+    d1_client
+        .ensure_repositories_table()
+        .await
+        .map_err(|error| cloud_d1_failure("ensure repositories table", &error))?;
+
+    let object_format = crate::internal::object_format::as_str(git_internal::hash::get_hash_kind());
+
+    let repo_row = d1_client
+        .upsert_repository_with_format(&repo_id, &project_name, Some(object_format))
+        .await
+        .map_err(|error| repository_upsert_failure(&project_name, &error))?;
+
+    if repo_row.repo_id != repo_id {
+        return Err(project_name_taken(&project_name));
+    }
+
+    let r2_storage = match r2_override {
+        Some(r2_storage) => r2_storage,
+        None => create_r2_storage(&repo_id).await?,
+    };
+
+    let total_unsynced = usize::try_from(spool.object_count()).map_err(|_| {
+        CloudError::Generic("the snapshot holds more objects than this platform can count".into())
+    })?;
+
+    if total_unsynced == 0 {
+        spool.object_pages(page_size)?.next_page()?;
+        progress.on_no_objects();
+        let metadata = sync_metadata(&r2_storage, progress, &spool.refs(tuning)?).await?;
+        let agent_capture = mirror_frozen_agent_capture_redb(
+            storage,
+            &d1_client,
+            &r2_storage,
+            &repo_id,
+            progress,
+            &frozen_agent_capture(spool),
+        )
+        .await;
+        return Ok(CloudSyncReport {
+            repo_id,
+            project_name,
+            total_unsynced: 0,
+            synced_count: 0,
+            failed_count: 0,
+            metadata,
+            agent_capture,
+            spool_warnings: Vec::new(),
+        });
+    }
+
+    progress.on_object_total(total_unsynced);
+
+    let objects_path = path::objects();
+    let local_storage = LocalStorage::try_new_with_alternates(objects_path)?;
+    let git_store = crate::storage::runtime::open_git_store_read_write(storage)
+        .await
+        .map_err(|error| {
+            CloudError::StorageIo(format!(
+                "open git store to update local sync status: {error}"
+            ))
+        })?;
+
+    let mut synced_count = 0usize;
+    let mut failed_count = 0usize;
+
+    let mut pages = spool.object_pages(page_size)?;
+    while let Some(page) = pages.next_page()? {
+        for batch in page.chunks(ctx.batch_size) {
+            let parsed: Vec<CloudResult<ObjectHash>> =
+                batch.iter().map(parse_object_index_hash).collect();
+            let probe_hashes: Vec<ObjectHash> = parsed
+                .iter()
+                .filter_map(|r| r.as_ref().ok().copied())
+                .collect();
+            let already_in_remote: std::collections::HashSet<ObjectHash> = {
+                let flags = r2_storage.exist_batch(&probe_hashes).await;
+                probe_hashes
+                    .iter()
+                    .copied()
+                    .zip(flags)
+                    .filter_map(|(hash, exists)| exists.then_some(hash))
+                    .collect()
+            };
+
+            for (obj, hash_result) in batch.iter().zip(parsed) {
+                let result = match hash_result {
+                    Ok(hash) => {
+                        let remote_has = already_in_remote.contains(&hash);
+                        sync_single_object(
+                            obj,
+                            &local_storage,
+                            &r2_storage,
+                            &d1_client,
+                            hash,
+                            remote_has,
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err),
+                };
+
+                match result {
+                    Ok(_) => match mark_frozen_object_synced_redb(git_store.as_ref(), obj, tuning)
+                        .await
+                    {
+                        Ok(()) => synced_count += 1,
+                        Err(e) => {
+                            progress.on_local_status_warning(&obj.o_id, &e);
+                            failed_count += 1;
+                        }
+                    },
+                    Err(e) => {
+                        let err = e.to_string();
+                        progress.on_object_error(&obj.o_id, &err);
+                        failed_count += 1;
+                    }
+                }
+            }
+            progress.on_batch_progress(synced_count, total_unsynced, failed_count);
+        }
+    }
+
+    drop(git_store);
+    progress.on_sync_complete(synced_count, failed_count);
+
+    if failed_count > 0 {
+        return Ok(CloudSyncReport {
+            repo_id,
+            project_name,
+            total_unsynced,
+            synced_count,
+            failed_count,
+            metadata: MetadataSyncOutcome::NotRun,
+            agent_capture: AgentCaptureSyncOutcome::NotRun,
+            spool_warnings: Vec::new(),
+        });
+    }
+
+    let metadata = sync_metadata(&r2_storage, progress, &spool.refs(tuning)?).await?;
+    let agent_capture = mirror_frozen_agent_capture_redb(
+        storage,
+        &d1_client,
+        &r2_storage,
+        &repo_id,
+        progress,
+        &frozen_agent_capture(spool),
+    )
+    .await;
+
+    Ok(CloudSyncReport {
+        repo_id,
+        project_name,
+        total_unsynced,
+        synced_count,
+        failed_count,
+        metadata,
+        agent_capture,
+        spool_warnings: Vec::new(),
+    })
+}
+
+#[cfg(feature = "storage-redb")]
+async fn mirror_frozen_agent_capture_redb(
+    storage: &std::path::Path,
+    d1_client: &D1Client,
+    r2_storage: &RemoteStorage,
+    repo_id: &str,
+    progress: &dyn CloudSyncProgress,
+    frozen: &super::agent_capture::FrozenAgentCapture,
+) -> AgentCaptureSyncOutcome {
+    match super::agent_capture::sync_frozen_agent_capture_tables_redb(
+        storage, d1_client, r2_storage, repo_id, progress, frozen,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let reason = agent_capture_sync_failure_reason(&error);
+            progress.on_agent_capture_warning(&reason);
+            AgentCaptureSyncOutcome::Failed { error: reason }
+        }
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+async fn mark_frozen_object_synced_redb(
+    git_store: &dyn crate::storage::git_store::GitStore,
+    obj: &FrozenObject,
+    tuning: &SnapshotTuning,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if tuning.fail_status_update {
+        return Err("injected local status update failure".to_string());
+    }
+    #[cfg(not(test))]
+    let _ = tuning;
+    let existing = git_store
+        .get_object_index(&obj.repo_id, &obj.o_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(row) = existing else {
+        return Err(format!(
+            "expected unchanged local object_index row for frozen id {}, row not found",
+            obj.id
+        ));
+    };
+    if row.o_type != obj.o_type || row.o_size != obj.o_size || row.created_at != obj.created_at {
+        return Err(format!(
+            "local object_index row for frozen id {} changed after snapshot freeze",
+            obj.id
+        ));
+    }
+    if row.is_synced {
+        return Ok(());
+    }
+    let updated = git_store
+        .mark_object_index_synced(&obj.repo_id, std::slice::from_ref(&obj.o_id))
+        .await
+        .map_err(|error| error.to_string())?;
+    match updated {
+        1 => Ok(()),
+        rows => Err(format!(
+            "expected to mark exactly one unchanged local object_index row for frozen id {}, updated {rows}",
+            obj.id
+        )),
     }
 }
 

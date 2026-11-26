@@ -15,18 +15,19 @@
 //! change (the JSON schema is versioned).
 
 use clap::{Args, Subcommand};
+#[cfg(feature = "storage-sqlite")]
 use sea_orm::{ConnectionTrait, Statement};
 use serde::Serialize;
 
 use super::checkpoint::{encode_page_cursor, load_checkpoint_metadata_blob, resolve_page_limit};
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::ai::capture::store;
 use crate::{
-    internal::ai::{
-        capture::store,
-        observed_agents::{
-            AgentKind, DiscoveredSkill, IndexedSkillEvent, SKILL_PROJECTION_SCHEMA_VERSION,
-            SkillEventProjection, SkillQuery, discover_skills,
-        },
+    internal::ai::observed_agents::{
+        AgentKind, DiscoveredSkill, IndexedSkillEvent, SKILL_PROJECTION_SCHEMA_VERSION,
+        SkillEventProjection, SkillQuery, discover_skills,
     },
+    storage::StorageBackendKind,
     utils::{
         error::{CliError, CliResult},
         output::{OutputConfig, emit_json_data},
@@ -221,41 +222,131 @@ async fn search(args: SkillSearchArgs, output: &OutputConfig) -> CliResult<()> {
 /// checkpoint).
 async fn build_projection(session: Option<&str>) -> CliResult<SkillEventProjection> {
     let mut projection = SkillEventProjection::new();
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
-    if !super::checkpoint::table_exists(&conn, "agent_checkpoint").await? {
-        return Ok(projection);
-    }
-    let backend = conn.get_database_backend();
-    let (sql, values): (String, Vec<sea_orm::Value>) = if let Some(session) = session {
-        (
-            "SELECT checkpoint_id, session_id, tree_oid, metadata_blob_oid FROM agent_checkpoint \
-             WHERE session_id = ? ORDER BY created_at DESC, checkpoint_id DESC"
-                .to_string(),
-            vec![session.into()],
-        )
-    } else {
-        (
-            "SELECT checkpoint_id, session_id, tree_oid, metadata_blob_oid FROM agent_checkpoint \
-             ORDER BY created_at DESC, checkpoint_id DESC"
-                .to_string(),
-            Vec::new(),
-        )
-    };
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(backend, &sql, values))
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
+    let storage =
+        crate::utils::util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
 
-    for row in rows {
-        let checkpoint_id: String = row.try_get_by("checkpoint_id").unwrap_or_default();
-        let session_id: String = row.try_get_by("session_id").unwrap_or_default();
-        let metadata_blob_oid: String = row.try_get_by("metadata_blob_oid").unwrap_or_default();
+    let entries: Vec<(String, String, String, String)> =
+        match crate::storage::runtime::detect_repo_backend(&storage).map_err(CliError::from)? {
+            StorageBackendKind::Redb => {
+                #[cfg(feature = "storage-redb")]
+                {
+                    let capture = crate::storage::runtime::open_capture_store_read_only(&storage)
+                        .await
+                        .map_err(CliError::from)?;
+                    let mut checkpoints = if let Some(sid) = session {
+                        capture
+                            .list_checkpoints_by_session(sid)
+                            .await
+                            .map_err(CliError::from)?
+                    } else {
+                        let sessions = capture
+                            .list_sessions_by_started_desc()
+                            .await
+                            .map_err(CliError::from)?;
+                        let mut all = Vec::new();
+                        for s in sessions {
+                            all.extend(
+                                capture
+                                    .list_checkpoints_by_session(&s.session_id)
+                                    .await
+                                    .map_err(CliError::from)?,
+                            );
+                        }
+                        all
+                    };
+                    checkpoints.sort_by(|a, b| {
+                        b.created_at
+                            .cmp(&a.created_at)
+                            .then_with(|| b.checkpoint_id.cmp(&a.checkpoint_id))
+                    });
+                    checkpoints
+                        .into_iter()
+                        .map(|cp| {
+                            (
+                                cp.checkpoint_id,
+                                cp.session_id,
+                                cp.tree_oid,
+                                cp.metadata_blob_oid,
+                            )
+                        })
+                        .collect()
+                }
+                #[cfg(not(feature = "storage-redb"))]
+                {
+                    let _ = session;
+                    return Err(
+                        crate::storage::error::StorageBackendError::UnsupportedBackend {
+                            requested: "redb".to_string(),
+                            detail: "this Libra binary was compiled without `storage-redb`"
+                                .to_string(),
+                        }
+                        .into_cli_error(),
+                    );
+                }
+            }
+            StorageBackendKind::Sqlite => {
+                #[cfg(feature = "storage-sqlite")]
+                {
+                    let conn = store::open_current().await.map_err(|error| {
+                        CliError::fatal(format!("failed to open the capture database: {error}"))
+                    })?;
+                    if !super::checkpoint::table_exists(&conn, "agent_checkpoint").await? {
+                        return Ok(projection);
+                    }
+                    let backend = conn.get_database_backend();
+                    let (sql, values): (String, Vec<sea_orm::Value>) = if let Some(session) =
+                        session
+                    {
+                        (
+                            "SELECT checkpoint_id, session_id, tree_oid, metadata_blob_oid FROM agent_checkpoint \
+                             WHERE session_id = ? ORDER BY created_at DESC, checkpoint_id DESC"
+                                .to_string(),
+                            vec![session.into()],
+                        )
+                    } else {
+                        (
+                            "SELECT checkpoint_id, session_id, tree_oid, metadata_blob_oid FROM agent_checkpoint \
+                             ORDER BY created_at DESC, checkpoint_id DESC"
+                                .to_string(),
+                            Vec::new(),
+                        )
+                    };
+                    let rows = conn
+                        .query_all_raw(Statement::from_sql_and_values(backend, &sql, values))
+                        .await
+                        .map_err(|e| {
+                            CliError::fatal(format!("failed to query agent_checkpoint: {e}"))
+                        })?;
+                    rows.into_iter()
+                        .map(|row| {
+                            (
+                                row.try_get_by("checkpoint_id").unwrap_or_default(),
+                                row.try_get_by("session_id").unwrap_or_default(),
+                                row.try_get_by("tree_oid").unwrap_or_default(),
+                                row.try_get_by("metadata_blob_oid").unwrap_or_default(),
+                            )
+                        })
+                        .collect()
+                }
+                #[cfg(not(feature = "storage-sqlite"))]
+                {
+                    let _ = session;
+                    return Err(
+                        crate::storage::error::StorageBackendError::UnsupportedBackend {
+                            requested: "sqlite".to_string(),
+                            detail: "this Libra binary was compiled without `storage-sqlite`"
+                                .to_string(),
+                        }
+                        .into_cli_error(),
+                    );
+                }
+            }
+        };
+
+    for (checkpoint_id, session_id, tree_oid, metadata_blob_oid) in entries {
         if metadata_blob_oid.is_empty() {
             continue;
         }
-        let tree_oid: String = row.try_get_by("tree_oid").unwrap_or_default();
         let Ok(metadata) =
             load_checkpoint_metadata_blob(&checkpoint_id, &tree_oid, &metadata_blob_oid)
         else {

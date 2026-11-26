@@ -15,6 +15,12 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement, Value};
 use sha2::{Digest, Sha256};
 
 use super::protocol::SOURCE_DEEPSEEK_HARNESS;
+use crate::storage::{
+    AgentBridgeCheckpointRecord, AgentBridgeOperationRecord, AgentBridgeSessionRecord,
+    AgentBridgeStore, BridgeEventAppendInput, BridgeEventStatus, BridgeLinkSourceType,
+    BridgeLinkWrite, BridgeOperationStatus, BridgeSessionOpenInput, BridgeSessionState,
+    StorageResult,
+};
 
 /// 256 KiB — the v1 per-event payload cap (mirrors `MAX_EVENT_BYTES`).
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -823,6 +829,424 @@ pub async fn insert_checkpoint<C: ConnectionTrait>(
     );
     let affected = conn.execute_raw(insert).await?;
     Ok(affected.rows_affected() > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Backend-agnostic `AgentBridgeStore` helpers (`RB-25`, works on Redb & SQLite)
+// ---------------------------------------------------------------------------
+
+fn session_row_from_record(rec: AgentBridgeSessionRecord) -> BridgeSessionRow {
+    BridgeSessionRow {
+        bridge_session_id: rec.bridge_session_id,
+        repository_id: rec.repository_id,
+        worktree_id: rec.worktree_id,
+        workspace_id: rec.workspace_id,
+        parent_session_id: rec.parent_session_id,
+        agent_id: rec.agent_id,
+        session_state: rec.session_state.as_str().to_string(),
+        last_event_seq: rec.last_event_seq,
+        last_acked_seq: rec.last_acked_seq,
+    }
+}
+
+fn event_status_from_store(status: BridgeEventStatus) -> EventStatus {
+    match status {
+        BridgeEventStatus::Accepted => EventStatus::Accepted,
+        BridgeEventStatus::Duplicate => EventStatus::Duplicate,
+        BridgeEventStatus::DigestConflict => EventStatus::DigestConflict,
+        BridgeEventStatus::Rejected => EventStatus::Rejected,
+    }
+}
+
+fn has_vcs_write_outcome_marker(method: &str, result_digest: Option<&str>) -> bool {
+    if !matches!(
+        method,
+        "commit.create"
+            | "checkpoint.restore"
+            | "review.run"
+            | "vcs.stage"
+            | "vcs.unstage"
+            | "vcs.commit"
+    ) {
+        return false;
+    }
+    result_digest
+        .and_then(|digest| serde_json::from_str::<serde_json::Value>(digest).ok())
+        .and_then(|value| value.get("vcsWriteOutcome").cloned())
+        .is_some_and(|v| !v.is_null())
+}
+
+/// Create (or return the existing) bridge session via [`AgentBridgeStore`].
+#[allow(clippy::too_many_arguments)]
+pub async fn open_session_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    bridge_session_id: &str,
+    repository_id: &str,
+    worktree_id: Option<&str>,
+    workspace_id: Option<&str>,
+    parent_session_id: Option<&str>,
+    agent_id: Option<&str>,
+    now_ms: i64,
+) -> StorageResult<(BridgeSessionRow, bool)> {
+    let (rec, created) = store
+        .open_bridge_session(&BridgeSessionOpenInput {
+            bridge_session_id: bridge_session_id.to_string(),
+            repository_id: repository_id.to_string(),
+            worktree_id: worktree_id.map(str::to_string),
+            workspace_id: workspace_id.map(str::to_string),
+            parent_session_id: parent_session_id.map(str::to_string),
+            agent_id: agent_id.map(str::to_string),
+            now_ms,
+        })
+        .await?;
+    Ok((session_row_from_record(rec), created))
+}
+
+/// Fetch one bridge session row via [`AgentBridgeStore`].
+pub async fn get_session_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    bridge_session_id: &str,
+) -> StorageResult<Option<BridgeSessionRow>> {
+    if bridge_session_id.is_empty() || bridge_session_id.contains('\0') {
+        return Ok(None);
+    }
+    Ok(store
+        .get_bridge_session(bridge_session_id)
+        .await?
+        .map(session_row_from_record))
+}
+
+/// Transition a bridge session state (`open`/`flushing`/`closed`/`quarantined`)
+/// via [`AgentBridgeStore`].
+pub async fn set_session_state_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    bridge_session_id: &str,
+    state: &str,
+    now_ms: i64,
+) -> StorageResult<()> {
+    let parsed = BridgeSessionState::parse(state)?;
+    store
+        .set_bridge_session_state(bridge_session_id, parsed, now_ms)
+        .await
+}
+
+/// Atomically append a batch of events and advance `last_event_seq` plus the
+/// contiguous `last_acked_seq` cursor in a single write transaction via
+/// [`AgentBridgeStore::append_and_ack_events`].
+pub async fn append_and_ack_events_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    bridge_session_id: &str,
+    events: &[AppendEvent],
+    now_ms: i64,
+) -> StorageResult<AppendOutcome> {
+    let inputs: Vec<BridgeEventAppendInput> = events
+        .iter()
+        .map(|ev| BridgeEventAppendInput {
+            event_seq: ev.event_seq,
+            event_type: ev.event_type.clone(),
+            payload: ev.payload.clone(),
+            operation_id: ev.operation_id.clone(),
+        })
+        .collect();
+    let outcome = store
+        .append_and_ack_events(bridge_session_id, &inputs, now_ms)
+        .await?;
+    Ok(AppendOutcome {
+        per_event: outcome
+            .per_event
+            .into_iter()
+            .map(event_status_from_store)
+            .collect(),
+        last_acked_seq: outcome.last_acked_seq,
+    })
+}
+
+/// Query the highest accepted sequence for a session via [`AgentBridgeStore`].
+pub async fn last_accepted_seq_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    bridge_session_id: &str,
+) -> StorageResult<i64> {
+    if bridge_session_id.is_empty() || bridge_session_id.contains('\0') {
+        return Ok(0);
+    }
+    let events = store.list_bridge_events(bridge_session_id).await?;
+    Ok(events.iter().map(|e| e.event_seq).max().unwrap_or(0))
+}
+
+/// Compute the highest contiguous accepted sequence (`1..=n`) for a session
+/// via [`AgentBridgeStore`].
+pub async fn contiguous_acked_seq_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    bridge_session_id: &str,
+) -> StorageResult<i64> {
+    if bridge_session_id.is_empty() || bridge_session_id.contains('\0') {
+        return Ok(0);
+    }
+    let events = store.list_bridge_events(bridge_session_id).await?;
+    let mut expect = 1i64;
+    for ev in events {
+        if ev.event_seq == expect {
+            expect += 1;
+        } else if ev.event_seq > expect {
+            break;
+        }
+    }
+    Ok(expect - 1)
+}
+
+/// Record a bridge operation idempotently via [`AgentBridgeStore`].
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_operation_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    operation_id: &str,
+    bridge_session_id: &str,
+    method: &str,
+    params_digest: &str,
+    repository_id: &str,
+    workspace_id: Option<&str>,
+    now_ms: i64,
+) -> StorageResult<(bool, Option<ExistingOperation>)> {
+    if let Some(existing) = store.get_bridge_operation(operation_id).await? {
+        return Ok((
+            false,
+            Some(ExistingOperation {
+                method: existing.method,
+                params_digest: existing.params_digest,
+                bridge_session_id: existing.bridge_session_id,
+                repository_id: existing.repository_id,
+            }),
+        ));
+    }
+    store
+        .put_bridge_operation(&AgentBridgeOperationRecord {
+            operation_id: operation_id.to_string(),
+            bridge_session_id: bridge_session_id.to_string(),
+            method: method.to_string(),
+            params_digest: params_digest.to_string(),
+            repository_id: repository_id.to_string(),
+            workspace_id: workspace_id.map(str::to_string),
+            status: BridgeOperationStatus::Pending,
+            result_digest: None,
+            created_at: now_ms,
+            completed_at: None,
+        })
+        .await?;
+    Ok((true, None))
+}
+
+/// Mark an operation that never started (`status == pending && result_digest.is_none()`)
+/// via [`AgentBridgeStore`].
+pub async fn finish_operation_if_not_started_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    operation_id: &str,
+    status: &str,
+    result_digest: Option<&str>,
+    now_ms: i64,
+) -> StorageResult<bool> {
+    let Some(mut row) = store.get_bridge_operation(operation_id).await? else {
+        return Ok(false);
+    };
+    if row.status != BridgeOperationStatus::Pending || row.result_digest.is_some() {
+        return Ok(false);
+    }
+    row.status = BridgeOperationStatus::parse(status)?;
+    row.result_digest = result_digest.map(str::to_string);
+    row.completed_at = Some(now_ms);
+    store.put_bridge_operation(&row).await?;
+    Ok(true)
+}
+
+/// Mark an operation completed unless a terminal VCS write outcome was already
+/// recorded via [`AgentBridgeStore`].
+pub async fn finish_operation_unless_terminal_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    operation_id: &str,
+    status: &str,
+    result_digest: Option<&str>,
+    now_ms: i64,
+) -> StorageResult<bool> {
+    let Some(mut row) = store.get_bridge_operation(operation_id).await? else {
+        return Ok(false);
+    };
+    if has_vcs_write_outcome_marker(&row.method, row.result_digest.as_deref()) {
+        return Ok(false);
+    }
+    row.status = BridgeOperationStatus::parse(status)?;
+    row.result_digest = result_digest.map(str::to_string);
+    row.completed_at = Some(now_ms);
+    store.put_bridge_operation(&row).await?;
+    Ok(true)
+}
+
+/// Mark an operation failed without downgrading an applied or terminal outcome
+/// via [`AgentBridgeStore`].
+pub async fn fail_operation_keep_result_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    operation_id: &str,
+    now_ms: i64,
+) -> StorageResult<bool> {
+    let Some(mut row) = store.get_bridge_operation(operation_id).await? else {
+        return Ok(false);
+    };
+    if row.status == BridgeOperationStatus::Applied
+        || has_vcs_write_outcome_marker(&row.method, row.result_digest.as_deref())
+    {
+        return Ok(false);
+    }
+    row.status = BridgeOperationStatus::Failed;
+    row.completed_at = Some(now_ms);
+    store.put_bridge_operation(&row).await?;
+    Ok(true)
+}
+
+/// Record an immutable terminal outcome unless the operation already has one
+/// via [`AgentBridgeStore`].
+pub async fn finish_operation_terminal_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    operation_id: &str,
+    result_digest: &str,
+    now_ms: i64,
+) -> StorageResult<bool> {
+    let Some(mut row) = store.get_bridge_operation(operation_id).await? else {
+        return Ok(false);
+    };
+    if has_vcs_write_outcome_marker(&row.method, row.result_digest.as_deref()) {
+        return Ok(false);
+    }
+    row.status = BridgeOperationStatus::Failed;
+    row.result_digest = Some(result_digest.to_string());
+    row.completed_at = Some(now_ms);
+    store.put_bridge_operation(&row).await?;
+    Ok(true)
+}
+
+/// Read an operation's status string via [`AgentBridgeStore`].
+pub async fn get_operation_status_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    operation_id: &str,
+) -> StorageResult<Option<String>> {
+    if operation_id.is_empty() || operation_id.contains('\0') {
+        return Ok(None);
+    }
+    Ok(store
+        .get_bridge_operation(operation_id)
+        .await?
+        .map(|row| row.status.as_str().to_string()))
+}
+
+/// Read when the operation row was first recorded (Unix milliseconds) via
+/// [`AgentBridgeStore`].
+pub async fn get_operation_created_at_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    operation_id: &str,
+) -> StorageResult<Option<i64>> {
+    if operation_id.is_empty() || operation_id.contains('\0') {
+        return Ok(None);
+    }
+    Ok(store
+        .get_bridge_operation(operation_id)
+        .await?
+        .map(|row| row.created_at))
+}
+
+/// Read an operation's durable status and replay payload via [`AgentBridgeStore`].
+pub async fn get_operation_result_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    operation_id: &str,
+) -> StorageResult<Option<OperationResult>> {
+    if operation_id.is_empty() || operation_id.contains('\0') {
+        return Ok(None);
+    }
+    Ok(store.get_bridge_operation(operation_id).await?.map(|row| {
+        let status = row.status.as_str().to_string();
+        let terminal_outcome =
+            has_terminal_outcome(&row.method, &status, row.result_digest.as_deref());
+        OperationResult {
+            method: row.method,
+            status,
+            result_digest: row.result_digest,
+            terminal_outcome,
+        }
+    }))
+}
+
+/// Insert an association link idempotently via [`AgentBridgeStore`], enforcing
+/// singular-relation conflict detection (GC-LB-09).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_link_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    bridge_session_id: &str,
+    source_type: &str,
+    source_id: &str,
+    target_type: &str,
+    target_id: &str,
+    singularity: LinkSingularity,
+    now_ms: i64,
+) -> StorageResult<LinkOutcome> {
+    let parsed_source = BridgeLinkSourceType::parse(source_type)?;
+    if singularity != LinkSingularity::Multi {
+        let existing = store.list_bridge_links(bridge_session_id).await?;
+        let found = existing.into_iter().find(|link| match singularity {
+            LinkSingularity::BySource => {
+                link.source_type == parsed_source && link.source_id == source_id
+            }
+            LinkSingularity::ByRelation => {
+                link.source_type == parsed_source
+                    && link.source_id == source_id
+                    && link.target_type == target_type
+            }
+            LinkSingularity::Multi => false,
+        });
+        if let Some(link) = found {
+            return Ok(if link.target_id == target_id {
+                LinkOutcome::Existing
+            } else {
+                LinkOutcome::Conflict {
+                    stored_target_id: link.target_id,
+                }
+            });
+        }
+    }
+    let (_rec, inserted) = store
+        .insert_bridge_link(&BridgeLinkWrite {
+            bridge_session_id: bridge_session_id.to_string(),
+            source_type: parsed_source,
+            source_id: source_id.to_string(),
+            target_type: target_type.to_string(),
+            target_id: target_id.to_string(),
+            created_at: now_ms,
+        })
+        .await?;
+    Ok(if inserted {
+        LinkOutcome::Inserted
+    } else {
+        LinkOutcome::Existing
+    })
+}
+
+/// Register a bridge checkpoint idempotently via [`AgentBridgeStore`].
+/// Returns `true` when newly created.
+pub async fn insert_checkpoint_with_store<S: AgentBridgeStore + ?Sized>(
+    store: &S,
+    checkpoint_id: &str,
+    bridge_session_id: &str,
+    agent_checkpoint_id: Option<&str>,
+    target_oid: Option<&str>,
+    now_ms: i64,
+) -> StorageResult<bool> {
+    if store.get_bridge_checkpoint(checkpoint_id).await?.is_some() {
+        return Ok(false);
+    }
+    store
+        .put_bridge_checkpoint(&AgentBridgeCheckpointRecord {
+            checkpoint_id: checkpoint_id.to_string(),
+            bridge_session_id: bridge_session_id.to_string(),
+            agent_checkpoint_id: agent_checkpoint_id.map(str::to_string),
+            target_oid: target_oid.map(str::to_string),
+            created_at: now_ms,
+        })
+        .await?;
+    Ok(true)
 }
 
 #[cfg(test)]

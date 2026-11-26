@@ -664,8 +664,11 @@ impl SandboxPolicy {
         verify_task_descriptor(descriptor)?;
         let common = descriptor.common_storage();
         let mut paths = Vec::new();
-        // Pin known sensitive files even if a concurrent host operation has not
-        // created them yet. The database contains repository configuration.
+        // Pin known sensitive files and directories even if a concurrent host
+        // operation or storage migration has not created them yet. Pinning the
+        // `redb` and `private` directories themselves ensures future generation
+        // files (`git.gen-<id>.redb`, `capture.gen-<id>.redb`) created after
+        // sandbox setup automatically fall inside the read-deny boundary.
         for name in [
             "libra.db",
             "libra.db-wal",
@@ -676,6 +679,12 @@ impl SandboxPolicy {
             "vault-keys",
             "vault-unseal-key",
             "sessions",
+            "redb",
+            "private",
+            "storage-format.json",
+            "sqlite-backup",
+            "redb-backup",
+            "git.redb",
         ] {
             paths.push(common.join(name));
         }
@@ -2053,5 +2062,103 @@ mod tests {
             SandboxPolicy::DangerFullAccess.with_network_restriction(&NetworkAccess::Denied),
             SandboxPolicy::DangerFullAccess,
         );
+    }
+
+    /// `RB-25b` (AC1–AC3): `task_workspace_sensitive_read_paths` must
+    /// unconditionally pin `redb`, `private`, `storage-format.json`,
+    /// `sqlite-backup`, `redb-backup`, and `git.redb` even before those
+    /// directories or files exist on disk, so future generation files created
+    /// after sandbox policy creation (e.g. `redb/git.gen-00000002.redb`,
+    /// `private/capture.gen-00000002.redb`) or concurrent migration backups
+    /// automatically fall inside the pinned read-deny prefixes.
+    #[cfg(feature = "storage-redb")]
+    #[test]
+    fn redb_generation_dir_pinned_against_future_and_concurrent_migration() {
+        let (_temp, descriptor) = task_fixture();
+        let common = descriptor.common_storage();
+
+        let required_pins = [
+            "redb",
+            "private",
+            "storage-format.json",
+            "sqlite-backup",
+            "redb-backup",
+            "git.redb",
+        ];
+
+        // AC1 precondition: none of the redb/private/backup paths exist yet.
+        for name in required_pins {
+            assert!(
+                !common.join(name).exists(),
+                "test precondition: '{name}' must not exist before policy generation"
+            );
+        }
+
+        // Generate the sandbox deny-read list BEFORE any migration or generation rotation.
+        let pinned = SandboxPolicy::task_workspace_sensitive_read_paths(&descriptor)
+            .expect("compute task_workspace_sensitive_read_paths");
+
+        // AC1: all 6 sensitive redb/private/backup/manifest paths are unconditionally pinned.
+        for name in required_pins {
+            assert!(
+                pinned.contains(&common.join(name)),
+                "expected '{name}' to be unconditionally pinned in task_workspace_sensitive_read_paths"
+            );
+        }
+        assert!(
+            !pinned.contains(&common.join("worktree")),
+            "worktree directory must remain excluded from read denials"
+        );
+        for deny in &pinned {
+            assert!(
+                !descriptor.canonical_path.starts_with(deny),
+                "pinned denial '{}' must not hide task workspace '{}'",
+                deny.display(),
+                descriptor.canonical_path.display()
+            );
+            assert!(
+                !descriptor.attempt_root().join("home").starts_with(deny),
+                "pinned denial '{}' must not hide task cache",
+                deny.display()
+            );
+        }
+
+        // AC2 & AC3: create future generation files and concurrent migration backups
+        // AFTER sandbox policy generation and verify every path falls under a pinned prefix.
+        std::fs::create_dir_all(common.join("redb")).expect("create .libra/redb");
+        std::fs::create_dir_all(common.join("private")).expect("create .libra/private");
+        std::fs::create_dir_all(common.join("sqlite-backup")).expect("create .libra/sqlite-backup");
+        std::fs::create_dir_all(common.join("redb-backup")).expect("create .libra/redb-backup");
+
+        let future_git_gen2 = common.join("redb").join("git.gen-00000002.redb");
+        let future_capture_gen2 = common.join("private").join("capture.gen-00000002.redb");
+        let future_manifest = common.join("storage-format.json");
+        let future_sqlite_backup = common.join("sqlite-backup").join("libra.db");
+        let future_redb_backup = common.join("redb-backup").join("git.gen-00000001.redb");
+        let future_legacy_git_redb = common.join("git.redb");
+
+        std::fs::write(&future_git_gen2, b"gen2-git").expect("write git.gen-00000002.redb");
+        std::fs::write(&future_capture_gen2, b"gen2-capture")
+            .expect("write capture.gen-00000002.redb");
+        std::fs::write(&future_manifest, br#"{"backend":"redb","generation":2}"#)
+            .expect("write storage-format.json");
+        std::fs::write(&future_sqlite_backup, b"sqlite-bak").expect("write sqlite backup");
+        std::fs::write(&future_redb_backup, b"redb-bak").expect("write redb backup");
+        std::fs::write(&future_legacy_git_redb, b"git-redb").expect("write git.redb");
+
+        for future_path in [
+            &future_git_gen2,
+            &future_capture_gen2,
+            &future_manifest,
+            &future_sqlite_backup,
+            &future_redb_backup,
+            &future_legacy_git_redb,
+        ] {
+            assert!(
+                pinned.iter().any(|deny| future_path.starts_with(deny)),
+                "post-sandbox path '{}' must fall inside a pinned sensitive read-deny prefix",
+                future_path.display()
+            );
+        }
     }
 }

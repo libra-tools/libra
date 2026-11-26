@@ -14,6 +14,7 @@ use git_internal::{
         tree::{Tree, TreeItemMode},
     },
 };
+#[cfg_attr(not(feature = "storage-sqlite"), allow(unused_imports))]
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::Serialize;
 
@@ -21,9 +22,11 @@ use super::{
     CheckpointListArgs, CheckpointRewindArgs, CheckpointShowArgs, CheckpointSubcommand,
     capture_source::{DerivedTranscriptSource, resolve_derived_transcript_source},
 };
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::ai::capture::store;
 use crate::{
     command::load_object,
-    internal::ai::capture::store,
+    storage::StorageBackendKind,
     utils::{
         error::{CliError, CliResult, StableErrorCode, emit_post_envelope_warning},
         object_ext::TreeExt,
@@ -269,149 +272,360 @@ async fn list(args: CheckpointListArgs, output: &OutputConfig) -> CliResult<()> 
     // is a pure usage error.
     let cursor = args.cursor.as_deref().map(decode_page_cursor).transpose()?;
 
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
-    if !table_exists(&conn, "agent_checkpoint").await? {
-        return emit_list(
-            &CheckpointListPage {
-                schema_version: PAGE_SCHEMA_VERSION,
-                checkpoints: Vec::new(),
-                next_cursor: None,
-            },
-            output,
-        );
-    }
-    let backend = conn.get_database_backend();
+    let storage = util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
 
-    let sql = checkpoint_page_sql(args.session.is_some(), cursor.is_some());
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    if let Some(session) = &args.session {
-        values.push(session.clone().into());
-    }
-    if let Some((timestamp, id)) = &cursor {
-        values.push((*timestamp).into());
-        values.push((*timestamp).into());
-        values.push(id.clone().into());
-    }
-    // Fetch one row beyond the page to learn whether another page exists
-    // without a second COUNT query.
-    values.push((limit as i64 + 1).into());
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(CliError::from)? {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let capture = crate::storage::runtime::open_capture_store_read_only(&storage)
+                    .await
+                    .map_err(CliError::from)?;
+                let mut rows = if let Some(session_id) = &args.session {
+                    capture
+                        .list_checkpoints_by_session(session_id)
+                        .await
+                        .map_err(CliError::from)?
+                } else {
+                    let sessions = capture
+                        .list_sessions_by_started_desc()
+                        .await
+                        .map_err(CliError::from)?;
+                    let mut all = Vec::new();
+                    for s in sessions {
+                        all.extend(
+                            capture
+                                .list_checkpoints_by_session(&s.session_id)
+                                .await
+                                .map_err(CliError::from)?,
+                        );
+                    }
+                    all
+                };
+                rows.sort_by(|a, b| {
+                    b.created_at
+                        .cmp(&a.created_at)
+                        .then_with(|| a.checkpoint_id.cmp(&b.checkpoint_id))
+                });
+                let mut out: Vec<CheckpointRow> = rows
+                    .into_iter()
+                    .filter(|row| {
+                        if let Some((cursor_ts, cursor_id)) = &cursor
+                            && !(row.created_at < *cursor_ts
+                                || (row.created_at == *cursor_ts
+                                    && row.checkpoint_id.as_str() > cursor_id.as_str()))
+                        {
+                            return false;
+                        }
+                        true
+                    })
+                    .take(limit as usize + 1)
+                    .map(|row| CheckpointRow {
+                        checkpoint_id: row.checkpoint_id,
+                        session_id: row.session_id,
+                        scope: row.scope.as_str().to_string(),
+                        parent_commit: row.parent_commit,
+                        tree_oid: row.tree_oid,
+                        metadata_blob_oid: row.metadata_blob_oid,
+                        traces_commit: row.traces_commit,
+                        created_at: row.created_at,
+                    })
+                    .collect();
+                let next_cursor = if out.len() as u64 > limit {
+                    out.truncate(limit as usize);
+                    out.last()
+                        .map(|row| encode_page_cursor(row.created_at, &row.checkpoint_id))
+                } else {
+                    None
+                };
+                emit_list(
+                    &CheckpointListPage {
+                        schema_version: PAGE_SCHEMA_VERSION,
+                        checkpoints: out,
+                        next_cursor,
+                    },
+                    output,
+                )
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (limit, cursor, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = store::open_current().await.map_err(|error| {
+                    CliError::fatal(format!("failed to open the capture database: {error}"))
+                })?;
+                if !table_exists(&conn, "agent_checkpoint").await? {
+                    return emit_list(
+                        &CheckpointListPage {
+                            schema_version: PAGE_SCHEMA_VERSION,
+                            checkpoints: Vec::new(),
+                            next_cursor: None,
+                        },
+                        output,
+                    );
+                }
+                let backend = conn.get_database_backend();
 
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(backend, &sql, values))
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(CheckpointRow {
-            checkpoint_id: row.try_get_by("checkpoint_id").unwrap_or_default(),
-            session_id: row.try_get_by("session_id").unwrap_or_default(),
-            scope: row.try_get_by("scope").unwrap_or_default(),
-            parent_commit: row.try_get_by("parent_commit").ok().flatten(),
-            tree_oid: row.try_get_by("tree_oid").unwrap_or_default(),
-            metadata_blob_oid: row.try_get_by("metadata_blob_oid").unwrap_or_default(),
-            traces_commit: row.try_get_by("traces_commit").unwrap_or_default(),
-            created_at: row.try_get_by("created_at").unwrap_or_default(),
-        });
+                let sql = checkpoint_page_sql(args.session.is_some(), cursor.is_some());
+                let mut values: Vec<sea_orm::Value> = Vec::new();
+                if let Some(session) = &args.session {
+                    values.push(session.clone().into());
+                }
+                if let Some((timestamp, id)) = &cursor {
+                    values.push((*timestamp).into());
+                    values.push((*timestamp).into());
+                    values.push(id.clone().into());
+                }
+                // Fetch one row beyond the page to learn whether another page exists
+                // without a second COUNT query.
+                values.push((limit as i64 + 1).into());
+
+                let rows = conn
+                    .query_all_raw(Statement::from_sql_and_values(backend, &sql, values))
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!("failed to query agent_checkpoint: {e}"))
+                    })?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(CheckpointRow {
+                        checkpoint_id: row.try_get_by("checkpoint_id").unwrap_or_default(),
+                        session_id: row.try_get_by("session_id").unwrap_or_default(),
+                        scope: row.try_get_by("scope").unwrap_or_default(),
+                        parent_commit: row.try_get_by("parent_commit").ok().flatten(),
+                        tree_oid: row.try_get_by("tree_oid").unwrap_or_default(),
+                        metadata_blob_oid: row.try_get_by("metadata_blob_oid").unwrap_or_default(),
+                        traces_commit: row.try_get_by("traces_commit").unwrap_or_default(),
+                        created_at: row.try_get_by("created_at").unwrap_or_default(),
+                    });
+                }
+                let next_cursor = if out.len() as u64 > limit {
+                    out.truncate(limit as usize);
+                    out.last()
+                        .map(|row| encode_page_cursor(row.created_at, &row.checkpoint_id))
+                } else {
+                    None
+                };
+                emit_list(
+                    &CheckpointListPage {
+                        schema_version: PAGE_SCHEMA_VERSION,
+                        checkpoints: out,
+                        next_cursor,
+                    },
+                    output,
+                )
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (limit, cursor, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
     }
-    let next_cursor = if out.len() as u64 > limit {
-        out.truncate(limit as usize);
-        out.last()
-            .map(|row| encode_page_cursor(row.created_at, &row.checkpoint_id))
-    } else {
-        None
-    };
-    emit_list(
-        &CheckpointListPage {
-            schema_version: PAGE_SCHEMA_VERSION,
-            checkpoints: out,
-            next_cursor,
-        },
-        output,
-    )
 }
 
 async fn show(args: CheckpointShowArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
-    if !table_exists(&conn, "agent_checkpoint").await? {
-        return Err(CliError::fatal(format!(
-            "no checkpoint matches '{}': agent_checkpoint table not yet present (run `libra init`?)",
-            args.checkpoint_id
-        )));
-    }
-    let backend = conn.get_database_backend();
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            backend,
-            "SELECT scope, parent_commit, created_at, tree_oid, session_id \
-             FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
-            [args.checkpoint_id.clone().into()],
-        ))
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
-    match row {
-        Some(row) => {
-            let parent_commit: Option<String> = row
-                .try_get_by("parent_commit")
-                .map_err(|_| checkpoint_show_store_inconsistent())?;
-            let created_at: i64 = row
-                .try_get_by("created_at")
-                .map_err(|_| checkpoint_show_store_inconsistent())?;
-            let scope: String = row
-                .try_get_by("scope")
-                .map_err(|_| checkpoint_show_store_inconsistent())?;
-            let artifacts =
-                if output.is_json() {
-                    let tree_oid: String = row
-                        .try_get_by("tree_oid")
-                        .map_err(|_| checkpoint_show_store_inconsistent())?;
-                    let storage = util::try_get_storage_path(None)
-                        .map_err(|_| checkpoint_show_store_inconsistent())?;
+    let storage = util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
+
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(CliError::from)? {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let capture = crate::storage::runtime::open_capture_store_read_only(&storage)
+                    .await
+                    .map_err(CliError::from)?;
+                let rec = capture
+                    .get_checkpoint(&args.checkpoint_id)
+                    .await
+                    .map_err(CliError::from)?
+                    .ok_or_else(|| {
+                        CliError::fatal(format!(
+                            "no checkpoint matches id '{}'",
+                            args.checkpoint_id
+                        ))
+                    })?;
+                let artifacts = if output.is_json() {
                     let entries = load_reasoning_artifact_entries_for_show(
                         &storage,
-                        &tree_oid,
+                        &rec.tree_oid,
                         &args.checkpoint_id,
                     )?
                     .unwrap_or_default();
                     if entries.is_empty() {
                         None
                     } else {
-                        Some(serde_json::Value::Array(entries.iter().map(|entry| serde_json::json!({
-                        "provider": entry.provider, "source_kind": entry.source_kind,
-                        "locator": entry.locator, "byte_len": entry.byte_len,
-                        "sha256": entry.sha256, "availability": entry.availability,
-                        "decrypt_capability": entry.decrypt_capability,
-                    })).collect()))
+                        Some(serde_json::Value::Array(
+                            entries
+                                .iter()
+                                .map(|entry| {
+                                    serde_json::json!({
+                                        "provider": entry.provider,
+                                        "source_kind": entry.source_kind,
+                                        "locator": entry.locator,
+                                        "byte_len": entry.byte_len,
+                                        "sha256": entry.sha256,
+                                        "availability": entry.availability,
+                                        "decrypt_capability": entry.decrypt_capability,
+                                    })
+                                })
+                                .collect(),
+                        ))
                     }
                 } else {
                     None
                 };
-            let reasoning = if output.is_json() {
-                checkpoint_reasoning(&conn, &row, &args.checkpoint_id).await
-            } else {
-                None
-            };
-            let summary = CheckpointShowSummary {
-                // The command's positional identifier is the only identity
-                // deliberately echoed by this read operation.  Do not take
-                // additional arbitrary identity strings from the catalog.
-                checkpoint_id: args.checkpoint_id,
-                // An unknown *textual* scope is deliberately projected into
-                // the closed `unknown` vocabulary; a failed DB decode is a
-                // store inconsistency and must not look like that safe case.
-                scope: CheckpointShowScope::from_catalog(Some(&scope)),
-                created_at,
-                parent_snapshot_recorded: parent_commit.is_some_and(|value| !value.is_empty()),
-            };
-            emit_one(&summary, artifacts.as_ref(), reasoning.as_ref(), output)
+                let reasoning = if output.is_json() {
+                    checkpoint_reasoning_with_store(&storage, capture.as_ref(), &rec).await
+                } else {
+                    None
+                };
+                let summary = CheckpointShowSummary {
+                    checkpoint_id: args.checkpoint_id,
+                    scope: CheckpointShowScope::from_catalog(Some(rec.scope.as_str())),
+                    created_at: rec.created_at,
+                    parent_snapshot_recorded: rec
+                        .parent_commit
+                        .is_some_and(|value| !value.is_empty()),
+                };
+                emit_one(&summary, artifacts.as_ref(), reasoning.as_ref(), output)
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (args, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
         }
-        None => Err(CliError::fatal(format!(
-            "no checkpoint matches id '{}'",
-            args.checkpoint_id
-        ))),
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = store::open_current().await.map_err(|error| {
+                    CliError::fatal(format!("failed to open the capture database: {error}"))
+                })?;
+                if !table_exists(&conn, "agent_checkpoint").await? {
+                    return Err(CliError::fatal(format!(
+                        "no checkpoint matches '{}': agent_checkpoint table not yet present (run `libra init`?)",
+                        args.checkpoint_id
+                    )));
+                }
+                let backend = conn.get_database_backend();
+                let row = conn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        backend,
+                        "SELECT scope, parent_commit, created_at, tree_oid, session_id \
+                         FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
+                        [args.checkpoint_id.clone().into()],
+                    ))
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!("failed to query agent_checkpoint: {e}"))
+                    })?;
+                match row {
+                    Some(row) => {
+                        let parent_commit: Option<String> = row
+                            .try_get_by("parent_commit")
+                            .map_err(|_| checkpoint_show_store_inconsistent())?;
+                        let created_at: i64 = row
+                            .try_get_by("created_at")
+                            .map_err(|_| checkpoint_show_store_inconsistent())?;
+                        let scope: String = row
+                            .try_get_by("scope")
+                            .map_err(|_| checkpoint_show_store_inconsistent())?;
+                        let artifacts = if output.is_json() {
+                            let tree_oid: String = row
+                                .try_get_by("tree_oid")
+                                .map_err(|_| checkpoint_show_store_inconsistent())?;
+                            let entries = load_reasoning_artifact_entries_for_show(
+                                &storage,
+                                &tree_oid,
+                                &args.checkpoint_id,
+                            )?
+                            .unwrap_or_default();
+                            if entries.is_empty() {
+                                None
+                            } else {
+                                Some(serde_json::Value::Array(
+                                    entries
+                                        .iter()
+                                        .map(|entry| {
+                                            serde_json::json!({
+                                                "provider": entry.provider,
+                                                "source_kind": entry.source_kind,
+                                                "locator": entry.locator,
+                                                "byte_len": entry.byte_len,
+                                                "sha256": entry.sha256,
+                                                "availability": entry.availability,
+                                                "decrypt_capability": entry.decrypt_capability,
+                                            })
+                                        })
+                                        .collect(),
+                                ))
+                            }
+                        } else {
+                            None
+                        };
+                        let reasoning = if output.is_json() {
+                            checkpoint_reasoning(&conn, &row, &args.checkpoint_id).await
+                        } else {
+                            None
+                        };
+                        let summary = CheckpointShowSummary {
+                            // The command's positional identifier is the only identity
+                            // deliberately echoed by this read operation.  Do not take
+                            // additional arbitrary identity strings from the catalog.
+                            checkpoint_id: args.checkpoint_id,
+                            // An unknown *textual* scope is deliberately projected into
+                            // the closed `unknown` vocabulary; a failed DB decode is a
+                            // store inconsistency and must not look like that safe case.
+                            scope: CheckpointShowScope::from_catalog(Some(&scope)),
+                            created_at,
+                            parent_snapshot_recorded: parent_commit
+                                .is_some_and(|value| !value.is_empty()),
+                        };
+                        emit_one(&summary, artifacts.as_ref(), reasoning.as_ref(), output)
+                    }
+                    None => Err(CliError::fatal(format!(
+                        "no checkpoint matches id '{}'",
+                        args.checkpoint_id
+                    ))),
+                }
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (args, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
     }
 }
 
@@ -431,31 +645,89 @@ fn checkpoint_show_store_inconsistent() -> CliError {
 /// transcripts untouched, and leaves HEAD plus `refs/heads/*` untouched per
 /// `docs/development/commands/_general.md` §7.3.
 async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
-    if !table_exists(&conn, "agent_checkpoint").await? {
-        return Err(CliError::fatal(format!(
-            "no checkpoint matches '{}': agent_checkpoint table not yet present (run `libra init`?)",
-            args.checkpoint_id
-        )));
-    }
-    let backend = conn.get_database_backend();
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            backend,
-            "SELECT parent_commit, traces_commit FROM agent_checkpoint \
-             WHERE checkpoint_id = ? LIMIT 1",
-            [args.checkpoint_id.clone().into()],
-        ))
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?
-        .ok_or_else(|| {
-            CliError::fatal(format!("no checkpoint matches id '{}'", args.checkpoint_id))
-        })?;
+    let storage = util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
 
-    let parent_commit: Option<String> = row.try_get_by("parent_commit").ok().flatten();
-    let traces_commit: String = row.try_get_by("traces_commit").unwrap_or_default();
+    let (parent_commit, traces_commit) = match crate::storage::runtime::detect_repo_backend(
+        &storage,
+    )
+    .map_err(CliError::from)?
+    {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let capture = crate::storage::runtime::open_capture_store_read_only(&storage)
+                    .await
+                    .map_err(CliError::from)?;
+                let rec = capture
+                    .get_checkpoint(&args.checkpoint_id)
+                    .await
+                    .map_err(CliError::from)?
+                    .ok_or_else(|| {
+                        CliError::fatal(format!(
+                            "no checkpoint matches id '{}'",
+                            args.checkpoint_id
+                        ))
+                    })?;
+                (rec.parent_commit, rec.traces_commit)
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (args, output);
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = store::open_current().await.map_err(|error| {
+                    CliError::fatal(format!("failed to open the capture database: {error}"))
+                })?;
+                if !table_exists(&conn, "agent_checkpoint").await? {
+                    return Err(CliError::fatal(format!(
+                        "no checkpoint matches '{}': agent_checkpoint table not yet present (run `libra init`?)",
+                        args.checkpoint_id
+                    )));
+                }
+                let backend = conn.get_database_backend();
+                let row = conn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        backend,
+                        "SELECT parent_commit, traces_commit FROM agent_checkpoint \
+                             WHERE checkpoint_id = ? LIMIT 1",
+                        [args.checkpoint_id.clone().into()],
+                    ))
+                    .await
+                    .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?
+                    .ok_or_else(|| {
+                        CliError::fatal(format!(
+                            "no checkpoint matches id '{}'",
+                            args.checkpoint_id
+                        ))
+                    })?;
+                let parent_commit: Option<String> = row.try_get_by("parent_commit").ok().flatten();
+                let traces_commit: String = row.try_get_by("traces_commit").unwrap_or_default();
+                (parent_commit, traces_commit)
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (args, output);
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+    };
 
     // Without a parent_commit (unborn HEAD at ingest time) there is nothing
     // to restore the worktree to. Surface a clear diagnostic rather than a
@@ -502,9 +774,7 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
     // Report whether `--apply` can safely rewrite the provider transcript.
     // The answer is deliberately false until an identity-checked atomic
     // replacement primitive exists; dry-run must mirror that apply policy.
-    let truncation_supported = lookup_truncation_support(&conn, &args.checkpoint_id)
-        .await
-        .unwrap_or(false);
+    let truncation_supported = false;
 
     if !args.apply {
         // dry-run path. We arrived here because either `--dry-run` was
@@ -678,10 +948,86 @@ impl TranscriptTruncationOutcome {
 async fn truncate_agent_transcript_for_checkpoint(
     checkpoint_id: &str,
 ) -> TranscriptTruncationOutcome {
-    let Ok(conn) = store::open_current().await else {
+    let Ok(storage) = util::try_get_storage_path(None) else {
         return TranscriptTruncationOutcome::Failed;
     };
-    truncate_agent_transcript_for_checkpoint_with_conn(&conn, checkpoint_id).await
+    match crate::storage::runtime::detect_repo_backend(&storage) {
+        Ok(StorageBackendKind::Redb) => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let Ok(capture) =
+                    crate::storage::runtime::open_capture_store_read_only(&storage).await
+                else {
+                    return TranscriptTruncationOutcome::Failed;
+                };
+                let Ok(Some(cp)) = capture.get_checkpoint(checkpoint_id).await else {
+                    return TranscriptTruncationOutcome::Failed;
+                };
+                let Ok(Some(session)) = capture.get_session(&cp.session_id).await else {
+                    return TranscriptTruncationOutcome::Failed;
+                };
+                classify_truncation_outcome(
+                    &session.session_id,
+                    session.agent_kind.as_str(),
+                    &session.provider_session_id,
+                    &session.working_dir,
+                )
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = checkpoint_id;
+                TranscriptTruncationOutcome::Failed
+            }
+        }
+        Ok(StorageBackendKind::Sqlite) => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let Ok(conn) = store::open_current().await else {
+                    return TranscriptTruncationOutcome::Failed;
+                };
+                truncate_agent_transcript_for_checkpoint_with_conn(&conn, checkpoint_id).await
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = checkpoint_id;
+                TranscriptTruncationOutcome::Failed
+            }
+        }
+        Err(_) => TranscriptTruncationOutcome::Failed,
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+fn classify_truncation_outcome(
+    session_id: &str,
+    agent_kind: &str,
+    provider_session_id: &str,
+    working_dir: &str,
+) -> TranscriptTruncationOutcome {
+    use crate::internal::ai::observed_agents::{AgentKind, truncator_for};
+    let Some(parsed_kind) = AgentKind::from_db_str(agent_kind) else {
+        return TranscriptTruncationOutcome::SkippedUnsupportedKind;
+    };
+    let Some(_) = truncator_for(parsed_kind) else {
+        return TranscriptTruncationOutcome::SkippedUnsupportedKind;
+    };
+    match resolve_derived_transcript_source(
+        agent_kind,
+        session_id,
+        working_dir,
+        provider_session_id,
+    ) {
+        Ok(DerivedTranscriptSource::Available(_)) => {
+            TranscriptTruncationOutcome::SkippedUnsafeMutation
+        }
+        Ok(DerivedTranscriptSource::Unavailable) => {
+            TranscriptTruncationOutcome::SkippedNoDerivedSource
+        }
+        Ok(DerivedTranscriptSource::UnsupportedKind) => {
+            TranscriptTruncationOutcome::SkippedUnsupportedKind
+        }
+        Err(_) => TranscriptTruncationOutcome::Failed,
+    }
 }
 
 /// Cheap "will `--apply` actually run a TranscriptTruncator for this
@@ -693,6 +1039,7 @@ async fn truncate_agent_transcript_for_checkpoint(
 /// exposes an atomic replacement primitive that can bind the expected target
 /// identity.  Returning false here keeps dry-run faithful to `--apply` and
 /// avoids ever treating `metadata_json.transcript_path` as authority.
+#[allow(dead_code)]
 async fn lookup_truncation_support(
     _conn: &sea_orm::DatabaseConnection,
     _checkpoint_id: &str,
@@ -703,6 +1050,7 @@ async fn lookup_truncation_support(
 /// Connection-bound core of [`truncate_agent_transcript_for_checkpoint`].
 /// Extracted so fixture tests can run against an in-memory SQLite without
 /// an injected connection, including an in-memory fixture.
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 async fn truncate_agent_transcript_for_checkpoint_with_conn(
     conn: &sea_orm::DatabaseConnection,
     checkpoint_id: &str,
@@ -915,11 +1263,432 @@ pub(crate) async fn resolve_checkpoint_input_spec(
 /// raw access (grant or deny) appends one row to the append-only
 /// `agent_audit_log`.
 async fn export(args: super::CheckpointExportArgs, output: &OutputConfig) -> CliResult<()> {
-    use crate::internal::ai::observed_agents::compliance::max_transcript_read_bytes;
+    let storage = util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
 
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(CliError::from)? {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                export_redb(&storage, args, output).await
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (args, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = store::open_current().await.map_err(|error| {
+                    CliError::fatal(format!("failed to open the capture database: {error}"))
+                })?;
+                export_sqlite(conn, args, output).await
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (args, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+async fn export_redb(
+    storage: &Path,
+    args: super::CheckpointExportArgs,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    use crate::internal::ai::observed_agents::compliance::{
+        AuditRecord, AuditScope, REASONING_ARTIFACT_EXPORT_ACTION,
+        max_transcript_read_bytes_with_store, write_audit_record_with_store,
+    };
+
+    let needs_audit_write = args.raw || args.reasoning_artifact.is_some();
+    let capture = if needs_audit_write {
+        crate::storage::runtime::open_capture_store_read_write(
+            storage,
+            crate::storage::opener::RedbRepairContext::WriteCommand,
+        )
+        .await
+        .map_err(CliError::from)?
+    } else {
+        crate::storage::runtime::open_capture_store_read_only(storage)
+            .await
+            .map_err(CliError::from)?
+    };
+    let config = crate::storage::runtime::open_repo_config_store_read_only(storage)
+        .await
+        .map_err(CliError::from)?;
+
+    let append_audit = |action: &'static str,
+                        export_path: Option<&str>,
+                        justification: Option<&str>,
+                        granted: bool| {
+        let user_name = std::env::var("GIT_COMMITTER_NAME")
+            .ok()
+            .or_else(|| std::env::var("GIT_AUTHOR_NAME").ok())
+            .or_else(|| std::env::var("LIBRA_COMMITTER_NAME").ok())
+            .filter(|s| !s.is_empty());
+        let user_email = std::env::var("GIT_COMMITTER_EMAIL")
+            .ok()
+            .or_else(|| std::env::var("EMAIL").ok())
+            .or_else(|| std::env::var("LIBRA_COMMITTER_EMAIL").ok())
+            .filter(|s| !s.is_empty());
+        AuditRecord::new(
+            uuid::Uuid::new_v4().to_string(),
+            chrono::Utc::now().to_rfc3339(),
+            (user_email, user_name),
+            action,
+            &args.checkpoint_id,
+            AuditScope::Transcript,
+            export_path.map(str::to_string),
+            justification.map(str::to_string),
+            granted,
+        )
+    };
+
+    if let Some(digest) = args.reasoning_artifact.as_deref() {
+        use std::io::Write;
+
+        let destination = args.output_path.as_deref().filter(|path| !path.is_empty());
+        let private_output_supported = cfg!(unix);
+        let authorized = private_output_supported
+            && args.allow_raw
+            && !args.raw
+            && args
+                .justification
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+            && destination.is_some()
+            && digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let audit = append_audit(
+            REASONING_ARTIFACT_EXPORT_ACTION,
+            destination,
+            args.justification.as_deref(),
+            authorized,
+        );
+        write_audit_record_with_store(capture.as_ref(), &audit)
+            .await
+            .map_err(|e| CliError::fatal(format!("append audit record: {e:#}")))?;
+        if !private_output_supported {
+            return Err(CliError::fatal(
+                "private opaque reasoning export is unavailable on this platform; use a supported macOS or Unix installation with owner-only file permissions",
+            )
+            .with_stable_code(StableErrorCode::AgentRawAccessDenied));
+        }
+        if !authorized {
+            return Err(CliError::fatal(
+                "opaque reasoning export requires --allow-raw, a nonempty --justification, a lowercase SHA256 and -o; do not combine it with --raw",
+            )
+            .with_stable_code(StableErrorCode::AgentRawAccessDenied)
+            .with_hint("choose a new private output path; artifact bytes are never sent to stdout"));
+        }
+        let dest_str = destination.ok_or_else(checkpoint_show_store_inconsistent)?;
+        let path = Path::new(dest_str);
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(CliError::fatal(
+                    "reasoning export destination already exists; choose a new path (no file is overwritten)",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(CliError::fatal(
+                    "cannot inspect reasoning export destination; check directory permissions and choose a new path",
+                ));
+            }
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|_| {
+            CliError::fatal(
+                "cannot create private reasoning export file; check that the output directory exists and is writable",
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            staged
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| {
+                    CliError::fatal(
+                        "cannot make reasoning export private; check output directory permissions",
+                    )
+                })?;
+        }
+        let rec = capture
+            .get_checkpoint(&args.checkpoint_id)
+            .await
+            .map_err(CliError::from)?
+            .ok_or_else(|| {
+                CliError::fatal(format!("no checkpoint matches '{}'", args.checkpoint_id))
+            })?;
+        let bytes =
+            load_reasoning_artifact_bytes(storage, &rec.tree_oid, &rec.checkpoint_id, digest)?;
+        staged
+            .write_all(&bytes)
+            .and_then(|()| staged.flush())
+            .and_then(|()| staged.as_file().sync_all())
+            .map_err(|_| {
+                CliError::fatal(
+                    "cannot finish private reasoning export; check free space and directory permissions (no output was published)",
+                )
+            })?;
+        staged.persist_noclobber(path).map_err(|_| {
+            CliError::fatal(
+                "cannot publish reasoning export without replacing a destination; choose a new writable path (existing files are preserved)",
+            )
+        })?;
+        if output.is_json() {
+            emit_json_data(
+                "agent_reasoning_artifact_export",
+                &serde_json::json!({
+                    "checkpoint_id": args.checkpoint_id,
+                    "sha256": digest,
+                    "bytes": bytes.len(),
+                    "output_path": destination,
+                    "decrypt_capability": "none",
+                }),
+                output,
+            )?;
+        } else if !output.quiet {
+            println!(
+                "Exported {} opaque reasoning artifact byte(s) to the private output file",
+                bytes.len()
+            );
+        }
+        return Ok(());
+    }
+
+    if args.raw && !args.allow_raw {
+        let audit = append_audit(
+            "raw_export",
+            args.output_path.as_deref(),
+            args.justification.as_deref(),
+            false,
+        );
+        write_audit_record_with_store(capture.as_ref(), &audit)
+            .await
+            .map_err(|e| CliError::fatal(format!("append audit record: {e:#}")))?;
+        return Err(CliError::fatal(
+            "raw (un-redacted) checkpoint export requires --allow-raw".to_string(),
+        )
+        .with_stable_code(StableErrorCode::AgentRawAccessDenied)
+        .with_hint("re-run with --allow-raw --raw to authorize (the access is audited)")
+        .with_hint("or omit --raw to export the redacted transcript (no authorization needed)"));
+    }
+
+    let rec = capture
+        .get_checkpoint(&args.checkpoint_id)
+        .await
+        .map_err(CliError::from)?
+        .ok_or_else(|| {
+            CliError::fatal(format!("no checkpoint matches '{}'", args.checkpoint_id))
+        })?;
+    let row = CheckpointRow {
+        checkpoint_id: rec.checkpoint_id,
+        session_id: rec.session_id,
+        scope: rec.scope.as_str().to_string(),
+        parent_commit: rec.parent_commit,
+        tree_oid: rec.tree_oid,
+        metadata_blob_oid: rec.metadata_blob_oid,
+        traces_commit: rec.traces_commit,
+        created_at: rec.created_at,
+    };
+    let wants_raw = args.raw && args.allow_raw;
+    let cap = max_transcript_read_bytes_with_store(config.as_ref())
+        .await
+        .map_err(|e| CliError::fatal(format!("read max_transcript_read_bytes config: {e:#}")))?;
+    let (bytes, truncated) = load_checkpoint_transcript_bytes(&row, cap)?;
+    let transcript_captured = !bytes.is_empty();
+
+    let emitted = if wants_raw {
+        let audit = append_audit(
+            "raw_export",
+            args.output_path.as_deref(),
+            args.justification.as_deref(),
+            true,
+        );
+        write_audit_record_with_store(capture.as_ref(), &audit)
+            .await
+            .map_err(|e| CliError::fatal(format!("append audit record: {e:#}")))?;
+        bytes
+    } else {
+        let ordinary = if bytes.is_empty() {
+            bytes
+        } else {
+            let kind = checkpoint_ordinary_kind_with_store(capture.as_ref(), &row).await?;
+            if kind == crate::internal::ai::observed_agents::AgentKind::OpenCode {
+                if truncated {
+                    return Err(CliError::fatal(
+                        "ordinary OpenCode export exceeds the configured read cap; increase agent.max_transcript_read_bytes or use --raw --allow-raw for an audited bounded inspection",
+                    ));
+                }
+                crate::internal::ai::observed_agents::opencode_export::strip_legacy_opencode_reader_bytes(&bytes)
+                    .map_err(|_| CliError::fatal("ordinary OpenCode export is invalid or incomplete; use --raw --allow-raw for an audited inspection"))?
+            } else if kind == crate::internal::ai::observed_agents::AgentKind::Codex {
+                let prepared = crate::internal::ai::observed_agents::codex_reasoning::prepare_ordinary_for_read(
+                    &bytes, None, cap,
+                )
+                .map_err(|error| {
+                    use crate::internal::ai::observed_agents::reasoning::ReasoningFieldError;
+                    let message = match error {
+                        ReasoningFieldError::SourceTooLarge => "ordinary Codex export exceeds its input or credential-masked output expansion limit",
+                        ReasoningFieldError::MalformedSource => "ordinary Codex export contains data that could not be credential-scanned",
+                        ReasoningFieldError::UnsupportedShape => "ordinary Codex export could not complete its credential scan",
+                    };
+                    CliError::fatal(message)
+                        .with_hint("check agent.max_transcript_read_bytes; use --raw --allow-raw for an audited inspection of the stored bytes")
+                })?
+                .0;
+                drop(bytes);
+                prepared
+            } else {
+                bytes
+            }
+        };
+        let (redacted, _report) =
+            crate::internal::ai::observed_agents::Redactor::new_default().redact(&ordinary);
+        redacted.as_ref().to_vec()
+    };
+
+    if let Some(path) = &args.output_path {
+        std::fs::write(path, &emitted)
+            .map_err(|e| CliError::fatal(format!("failed to write export to {path}: {e}")))?;
+        if output.is_json() {
+            emit_json_data(
+                "agent_checkpoint_export",
+                &serde_json::json!({
+                    "checkpoint_id": args.checkpoint_id,
+                    "raw": wants_raw,
+                    "bytes": emitted.len(),
+                    "truncated": truncated,
+                    "output_path": path,
+                }),
+                output,
+            )?;
+        } else if !output.quiet {
+            let kind = if wants_raw { "raw" } else { "redacted" };
+            println!(
+                "Exported {} {kind} transcript byte(s) to {path}{}",
+                emitted.len(),
+                if truncated { " (truncated at cap)" } else { "" }
+            );
+        }
+    } else {
+        use std::io::Write;
+        std::io::stdout()
+            .write_all(&emitted)
+            .map_err(|e| CliError::fatal(format!("failed to write export to stdout: {e}")))?;
+    }
+    if !transcript_captured {
+        let agent_kind = capture
+            .get_session(&row.session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| {
+                crate::internal::ai::observed_agents::AgentKind::from_db_str(s.agent_kind.as_str())
+            });
+        let hint = if agent_kind == Some(crate::internal::ai::observed_agents::AgentKind::OpenCode)
+        {
+            "; OpenCode content is captured only while its sandboxed export bridge is available \
+             (check `export_bridge` in `libra --json agent list --schema-version 2`)"
+        } else {
+            ""
+        };
+        emit_post_envelope_warning(format!(
+            "checkpoint {} has no captured transcript (metadata-only capture), so the export is \
+             empty{hint}",
+            row.checkpoint_id
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "storage-redb")]
+async fn checkpoint_ordinary_kind_with_store(
+    capture: &dyn crate::storage::CaptureStore,
+    row: &CheckpointRow,
+) -> CliResult<crate::internal::ai::observed_agents::AgentKind> {
+    let metadata =
+        load_checkpoint_metadata_blob(&row.checkpoint_id, &row.tree_oid, &row.metadata_blob_oid)?;
+    let document = crate::internal::ai::observed_agents::parse_canon_value(metadata.as_bytes())
+        .map_err(|_| checkpoint_show_store_inconsistent())?;
+    let session = capture
+        .get_session(&row.session_id)
+        .await
+        .map_err(|_| checkpoint_show_store_inconsistent())?
+        .ok_or_else(checkpoint_show_store_inconsistent)?;
+    let kind = session.agent_kind.as_str();
+    if document
+        .get("agent_kind")
+        .is_some_and(|value| value.as_str() != Some(kind))
+    {
+        return Err(checkpoint_show_store_inconsistent());
+    }
+    crate::internal::ai::observed_agents::AgentKind::from_db_str(kind)
+        .ok_or_else(checkpoint_show_store_inconsistent)
+}
+
+#[cfg(feature = "storage-redb")]
+async fn checkpoint_reasoning_with_store(
+    storage: &Path,
+    capture: &dyn crate::storage::CaptureStore,
+    rec: &crate::storage::capture_store::AgentCheckpointRecord,
+) -> Option<serde_json::Value> {
+    let session = capture.get_session(&rec.session_id).await.ok().flatten()?;
+    let kind = session.agent_kind.as_str();
+    if kind != "claude_code" {
+        return None;
+    }
+    let config = crate::storage::runtime::open_repo_config_store_read_only(storage)
+        .await
+        .ok()?;
+    let cap =
+        crate::internal::ai::observed_agents::compliance::max_transcript_read_bytes_with_store(
+            config.as_ref(),
+        )
+        .await
+        .unwrap_or(1_048_576);
+    let (bytes, _) = load_checkpoint_transcript_bytes_from_storage(
+        storage,
+        &rec.checkpoint_id,
+        &rec.tree_oid,
+        cap,
+    )
+    .ok()?;
+    claude_show_reasoning(&bytes)
+}
+
+#[cfg(feature = "storage-sqlite")]
+async fn export_sqlite(
+    conn: DatabaseConnection,
+    args: super::CheckpointExportArgs,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    use crate::internal::ai::observed_agents::compliance::max_transcript_read_bytes;
     if args.reasoning_artifact.is_some() {
         return export_reasoning_artifact(&conn, &args, output).await;
     }
@@ -1053,6 +1822,7 @@ async fn export(args: super::CheckpointExportArgs, output: &OutputConfig) -> Cli
 /// exports zero bytes. Say so once the export is written, so an empty file is
 /// never mistaken for captured content; for OpenCode, name the export bridge
 /// whose unavailability causes it.
+#[cfg(feature = "storage-sqlite")]
 async fn warn_empty_checkpoint_transcript(conn: &DatabaseConnection, row: &CheckpointRow) {
     use crate::internal::ai::observed_agents::AgentKind;
 
@@ -1083,6 +1853,7 @@ async fn warn_empty_checkpoint_transcript(conn: &DatabaseConnection, row: &Check
 /// Opaque artifact access is authorized and audited before any lookup/body
 /// read. Publication is private and no-clobber; an audit grant authorizes the
 /// attempt, and is retained even when a later lookup or file operation fails.
+#[cfg(feature = "storage-sqlite")]
 async fn export_reasoning_artifact(
     conn: &DatabaseConnection,
     args: &super::CheckpointExportArgs,
@@ -1225,6 +1996,7 @@ fn load_reasoning_artifact_bytes(
 }
 
 /// Load one checkpoint catalog row or fail with an actionable message.
+#[cfg(feature = "storage-sqlite")]
 async fn load_checkpoint_row(
     conn: &(impl ConnectionTrait + ?Sized),
     checkpoint_id: &str,
@@ -1368,6 +2140,7 @@ fn read_legacy_v1_transcript(
 
 /// Metadata may omit the provider in old checkpoints. A present value must
 /// agree with the catalog, and the metadata must belong to this ordinary tree.
+#[cfg(feature = "storage-sqlite")]
 async fn checkpoint_ordinary_kind(
     conn: &DatabaseConnection,
     row: &CheckpointRow,
@@ -1398,6 +2171,7 @@ async fn checkpoint_ordinary_kind(
         .ok_or_else(checkpoint_show_store_inconsistent)
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn checkpoint_reasoning(
     conn: &DatabaseConnection,
     row: &sea_orm::QueryResult,
@@ -1443,6 +2217,7 @@ async fn checkpoint_reasoning(
     claude_show_reasoning(&bytes)
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn codex_checkpoint_reasoning(
     conn: &DatabaseConnection,
     checkpoint_id: &str,
@@ -1537,6 +2312,7 @@ fn claude_show_reasoning(bytes: &[u8]) -> Option<serde_json::Value> {
 /// Append one `agent_audit_log` row for a raw checkpoint export (or its
 /// fail-closed refusal). Actor identity is resolved from the committer
 /// env vars (never the checkpoint's hardcoded `Libra <ai@libra>`).
+#[cfg(feature = "storage-sqlite")]
 async fn write_export_audit(
     conn: &DatabaseConnection,
     checkpoint_id: &str,
@@ -1555,6 +2331,7 @@ async fn write_export_audit(
     .await
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn write_export_audit_action(
     conn: &DatabaseConnection,
     checkpoint_id: &str,
@@ -1809,6 +2586,7 @@ fn emit_one(
     Ok(())
 }
 
+#[cfg(feature = "storage-sqlite")]
 pub(super) async fn table_exists(
     conn: &(impl ConnectionTrait + ?Sized),
     name: &str,
@@ -2607,6 +3385,7 @@ mod tests {
         (dir, conn)
     }
 
+    #[cfg(feature = "storage-sqlite")]
     #[tokio::test]
     async fn reasoning_artifact_audit_failure_has_zero_body_reads() {
         let (temp, conn) = fresh_db().await;

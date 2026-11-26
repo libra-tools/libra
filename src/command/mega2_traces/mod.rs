@@ -12,21 +12,23 @@ use serde::Serialize;
 use serde_json::Value;
 use url::Url;
 
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::{
+    db::{begin_write_transaction, get_db_conn_instance},
+    model::reference::{self, ConfigKind},
+};
 use crate::{
-    internal::{
-        db::{begin_write_transaction, get_db_conn_instance},
-        model::reference::{self, ConfigKind},
-        protocol::{
-            mega2_auth::resolve_token,
-            mega2_traces::{
-                self, HashKind, METADATA_LIMIT_DEFAULT, METADATA_LIMIT_MAX, PROTOCOL_ID,
-                RESPONSE_BYTES_MAX, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, TEXT_BYTES_DEFAULT,
-                TEXT_BYTES_MAX,
-            },
-            mega2_traces_git,
-            mega2_tree::validate_server_url,
+    internal::protocol::{
+        mega2_auth::resolve_token,
+        mega2_traces::{
+            self, HashKind, METADATA_LIMIT_DEFAULT, METADATA_LIMIT_MAX, PROTOCOL_ID,
+            RESPONSE_BYTES_MAX, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, TEXT_BYTES_DEFAULT,
+            TEXT_BYTES_MAX,
         },
+        mega2_traces_git,
+        mega2_tree::validate_server_url,
     },
+    storage::StorageBackendKind,
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{CommandOutput, OutputConfig},
@@ -739,48 +741,111 @@ async fn record_config(key: &str, value: &str) -> CliResult<()> {
         .map_err(|error| CliError::fatal(format!("cannot record {key}: {error}")))
 }
 
-async fn publish_archive_ref(name: &str, tip: &str) -> CliResult<()> {
-    let connection = get_db_conn_instance().await;
-    let transaction = begin_write_transaction(&connection)
-        .await
-        .map_err(|error| {
-            CliError::fatal(format!("cannot start the archive ref transaction: {error}"))
-        })?;
-    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-    // Re-fetching the same stream moves its archive ref; it never adds a
-    // second row with the same name.
-    if let Err(error) = reference::Entity::delete_many()
-        .filter(reference::Column::Name.eq(name))
-        .filter(reference::Column::Kind.eq(ConfigKind::Branch))
-        .filter(reference::Column::Remote.is_null())
-        .exec(&transaction)
-        .await
-    {
-        let _ = transaction.rollback().await;
-        return Err(CliError::fatal(format!(
-            "cannot replace archive ref '{name}': {error}"
-        )));
+pub(crate) async fn publish_archive_ref(name: &str, tip: &str) -> CliResult<()> {
+    let storage =
+        crate::utils::util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(CliError::from)? {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+                let git = crate::storage::runtime::open_git_store_read_write(&storage)
+                    .await
+                    .map_err(CliError::from)?;
+                let key = RefKey::LocalBranch {
+                    name: name.to_string(),
+                };
+                let target = RefTarget::Direct(tip.to_string());
+                for _ in 0..4 {
+                    let current = git.get_ref(&key).await.map_err(CliError::from)?;
+                    match git
+                        .update_ref_cas(&key, current.as_ref(), Some(&target), &[])
+                        .await
+                        .map_err(CliError::from)?
+                    {
+                        RefCasOutcome::Applied { .. } => return Ok(()),
+                        RefCasOutcome::CasConflict { .. } => continue,
+                    }
+                }
+                Err(CliError::fatal(format!(
+                    "cannot write archive ref '{name}': concurrent reference update conflict"
+                )))
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (name, tip);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let connection = get_db_conn_instance().await;
+                let transaction = begin_write_transaction(&connection)
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "cannot start the archive ref transaction: {error}"
+                        ))
+                    })?;
+                use sea_orm::{
+                    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter,
+                };
+                // Re-fetching the same stream moves its archive ref; it never adds a
+                // second row with the same name.
+                if let Err(error) = reference::Entity::delete_many()
+                    .filter(reference::Column::Name.eq(name))
+                    .filter(reference::Column::Kind.eq(ConfigKind::Branch))
+                    .filter(reference::Column::Remote.is_null())
+                    .exec(&transaction)
+                    .await
+                {
+                    let _ = transaction.rollback().await;
+                    return Err(CliError::fatal(format!(
+                        "cannot replace archive ref '{name}': {error}"
+                    )));
+                }
+                let inserted = reference::ActiveModel {
+                    name: Set(Some(name.to_string())),
+                    kind: Set(ConfigKind::Branch),
+                    commit: Set(Some(tip.to_string())),
+                    remote: Set(None),
+                    ..Default::default()
+                }
+                .insert(&transaction)
+                .await;
+                if let Err(error) = inserted {
+                    let _ = transaction.rollback().await;
+                    return Err(CliError::fatal(format!(
+                        "cannot write archive ref '{name}': {error}"
+                    )));
+                }
+                transaction.commit().await.map_err(|error| {
+                    CliError::fatal(format!("cannot commit archive ref '{name}': {error}"))
+                })?;
+                Ok(())
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (name, tip);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
     }
-    let inserted = reference::ActiveModel {
-        name: Set(Some(name.to_string())),
-        kind: Set(ConfigKind::Branch),
-        commit: Set(Some(tip.to_string())),
-        remote: Set(None),
-        ..Default::default()
-    }
-    .insert(&transaction)
-    .await;
-    if let Err(error) = inserted {
-        let _ = transaction.rollback().await;
-        return Err(CliError::fatal(format!(
-            "cannot write archive ref '{name}': {error}"
-        )));
-    }
-    transaction
-        .commit()
-        .await
-        .map_err(|error| CliError::fatal(format!("cannot commit archive ref '{name}': {error}")))?;
-    Ok(())
 }
 
 fn optional_time(value: Option<&str>) -> CliResult<Option<i64>> {

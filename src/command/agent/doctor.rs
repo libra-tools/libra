@@ -1,4 +1,14 @@
 //! `libra agent doctor [--repair]` — capture-store diagnostics and repair.
+#![cfg_attr(
+    not(feature = "storage-sqlite"),
+    allow(
+        dead_code,
+        unused_imports,
+        unreachable_code,
+        unused_variables,
+        unused_mut
+    )
+)]
 //!
 //! Detection surfaces hook installation state, stuck active sessions, orphan
 //! checkpoints, and — AG-20 (plan.md Task A5, `agent.md` doctor repair
@@ -1157,6 +1167,280 @@ async fn scan_legacy_code_residue(conn: &DatabaseConnection) -> CliResult<Legacy
     })
 }
 
+#[cfg(feature = "storage-redb")]
+fn verify_redb_repair_writable(
+    storage: &Path,
+    paths: &crate::storage::manifest::RedbGenerationPaths,
+) -> CliResult<()> {
+    let mut dirs_to_check = vec![storage.to_path_buf()];
+    if let Some(parent) = paths.git_db_path.parent() {
+        dirs_to_check.push(parent.to_path_buf());
+    }
+    if let Some(parent) = paths.capture_db_path.parent() {
+        dirs_to_check.push(parent.to_path_buf());
+    }
+    for dir in &dirs_to_check {
+        let meta = std::fs::metadata(dir).map_err(|err| {
+            crate::storage::error::StorageBackendError::io(
+                "inspect redb storage directory for agent doctor --repair",
+                err,
+            )
+            .into_cli_error()
+        })?;
+        if meta.permissions().readonly() {
+            return Err(crate::storage::error::StorageBackendError::Io {
+                context: "verify redb storage directory write access for agent doctor --repair",
+                kind: std::io::ErrorKind::PermissionDenied,
+                raw_os_error: None,
+            }
+            .into_cli_error());
+        }
+    }
+
+    let mut files_to_check = vec![paths.git_db_path.as_path()];
+    if paths.capture_db_path.exists() {
+        files_to_check.push(paths.capture_db_path.as_path());
+    }
+    for file in files_to_check {
+        let meta = std::fs::metadata(file).map_err(|err| {
+            crate::storage::error::StorageBackendError::io(
+                "inspect redb database file for agent doctor --repair",
+                err,
+            )
+            .into_cli_error()
+        })?;
+        if meta.permissions().readonly() {
+            return Err(crate::storage::error::StorageBackendError::Io {
+                context: "verify redb database write access for agent doctor --repair",
+                kind: std::io::ErrorKind::PermissionDenied,
+                raw_os_error: None,
+            }
+            .into_cli_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "storage-redb")]
+async fn execute_redb_doctor(
+    storage: &Path,
+    args: DoctorArgs,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let mut repaired_intents = 0usize;
+    if args.repair {
+        let paths = crate::storage::manifest::resolve_redb_generation_paths(storage)
+            .map_err(CliError::from)?
+            .ok_or_else(|| {
+                crate::storage::error::StorageBackendError::NotFound {
+                    resource: "finalized redb repository manifest (storage-format.json)"
+                        .to_string(),
+                }
+                .into_cli_error()
+            })?;
+        verify_redb_repair_writable(storage, &paths)?;
+
+        let git_path = paths.git_db_path.clone();
+        let cap_path = paths.capture_db_path.clone();
+        tokio::task::spawn_blocking(move || -> crate::storage::error::StorageResult<()> {
+            crate::storage::opener::repair_redb_explicit(
+                &git_path,
+                crate::internal::db::schema::DatabaseRole::Repository,
+                crate::storage::opener::RedbRepairContext::AgentDoctorRepair,
+            )?;
+            if cap_path.exists() {
+                crate::storage::opener::repair_redb_explicit(
+                    &cap_path,
+                    crate::internal::db::schema::DatabaseRole::Capture,
+                    crate::storage::opener::RedbRepairContext::AgentDoctorRepair,
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| {
+            CliError::fatal(format!("agent doctor redb repair task panicked: {err}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?
+        .map_err(CliError::from)?;
+
+        if paths.capture_db_path.exists() {
+            let git_store = crate::storage::git_store::RedbGitStore::open_read_write_with_context(
+                &paths.git_db_path,
+                crate::storage::opener::RedbRepairContext::AgentDoctorRepair,
+            )
+            .map_err(CliError::from)?;
+            let cap_store = crate::storage::capture_store::RedbCaptureStore::open_read_write(
+                &paths.capture_db_path,
+                crate::storage::opener::RedbRepairContext::AgentDoctorRepair,
+            )
+            .await
+            .map_err(CliError::from)?;
+            let outcome =
+                crate::storage::cross_store::reconcile_pending_intents(&git_store, &cap_store)
+                    .await
+                    .map_err(CliError::from)?;
+            repaired_intents = outcome.capture_applied;
+        }
+    }
+
+    let config = crate::storage::runtime::open_repo_config_store_read_only(storage)
+        .await
+        .map_err(CliError::from)?;
+    let git_store = crate::storage::runtime::open_git_store_read_only(storage)
+        .await
+        .map_err(CliError::from)?;
+    let capture = crate::storage::runtime::open_capture_store_read_only(storage)
+        .await
+        .map_err(CliError::from)?;
+
+    let object_format = ConfigKv::get_with_store(config.as_ref(), "core.objectformat")
+        .await
+        .map_err(|_| {
+            CliError::fatal(
+                "agent doctor could not read repository object format; repair the repository database and rerun doctor"
+                    .to_string(),
+            )
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?
+        .map(|entry| entry.value)
+        .unwrap_or_else(|| "sha1".to_string());
+    let hash_kind =
+        crate::internal::object_format::parse_config_value(&object_format).map_err(|_| {
+            CliError::fatal(
+                "agent doctor found an unsupported object format in the repository configuration; repair core.objectformat and rerun doctor"
+                    .to_string(),
+            )
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    set_hash_kind(hash_kind);
+
+    let sessions = capture
+        .list_sessions_by_started_desc()
+        .await
+        .map_err(CliError::from)?;
+    let mut active_sessions = 0i64;
+    let mut stopped_sessions = 0i64;
+    let mut catalog_rows = 0i64;
+    for session in &sessions {
+        match session.state {
+            crate::storage::capture_store::CaptureSessionState::Active => active_sessions += 1,
+            crate::storage::capture_store::CaptureSessionState::Stopped => stopped_sessions += 1,
+            _ => {}
+        }
+        let checkpoints = capture
+            .list_checkpoints_by_session(&session.session_id)
+            .await
+            .map_err(CliError::from)?;
+        catalog_rows += checkpoints.len() as i64;
+    }
+
+    let mut provider_hooks = vec![
+        check_provider(
+            "claude-code",
+            AgentStability::Stable,
+            Some(claude_provider()),
+        ),
+        check_provider("gemini", AgentStability::Stable, Some(gemini_provider())),
+        check_provider(
+            "pi",
+            AgentStability::Stable,
+            Some(crate::internal::ai::hooks::providers::pi_provider()),
+        ),
+    ];
+    for spec in STABLE_PROMOTED_SPECS {
+        provider_hooks.push(check_provider(
+            spec.provider_name,
+            AgentStability::Stable,
+            spec.hooks,
+        ));
+    }
+    for spec in PREVIEW_SPECS {
+        provider_hooks.push(check_provider(
+            spec.provider_name,
+            AgentStability::Preview,
+            None,
+        ));
+    }
+    let gemini_hooks_remnant = provider_hooks
+        .iter()
+        .any(|ph| ph.name == "gemini" && ph.installed == Some(true));
+
+    let intent_ref = git_store
+        .get_ref(&crate::storage::git_store::RefKey::LocalBranch {
+            name: crate::internal::ai::history::AI_REF.to_string(),
+        })
+        .await
+        .map_err(CliError::from)?
+        .map(|_| crate::internal::ai::history::AI_REF.to_string());
+    let legacy_code_residue = LegacyCodeResidue {
+        paths: legacy_code_residue_paths(storage),
+        intent_ref,
+        note: LEGACY_CODE_RESIDUE_NOTE,
+    };
+
+    let checkpoint_store = CheckpointStoreReport {
+        scanned: true,
+        note: None,
+        catalog_rows,
+        ref_reachable_checkpoints: 0,
+        legacy_v1_checkpoints: 0,
+        opencode_legacy_reasoning_checkpoints: Vec::new(),
+        live_inflight_markers: 0,
+        repair_applied: args.repair,
+        repaired: repaired_intents,
+        manual_required: 0,
+        findings: Vec::new(),
+    };
+    let findings_store = FindingsStoreReport {
+        scanned: true,
+        note: None,
+        runs_with_findings: 0,
+        repair_applied: args.repair,
+        repaired: 0,
+        manual_required: 0,
+        findings: Vec::new(),
+    };
+    let task_workspaces = scan_task_workspaces(storage);
+    let hermes_export =
+        crate::internal::ai::observed_agents::hermes_export::HermesBridgeStatus::from_store(
+            config.as_ref(),
+        )
+        .await
+        .unwrap_or(
+            crate::internal::ai::observed_agents::hermes_export::HermesBridgeStatus {
+                trusted: false,
+                source_qualified: true,
+                native_claimed: false,
+            },
+        );
+    emit_report(
+        &DoctorReport {
+            capture_diagnostics: diagnostics::summarize(storage),
+            commit_links: Some(
+                crate::internal::ai::commit_recovery::CommitRecoveryReport::unavailable(
+                    args.commit_link_page,
+                    args.repair,
+                ),
+            ),
+            codex_reconciliation: None,
+            schema_present: true,
+            active_sessions,
+            stopped_sessions,
+            orphan_checkpoints: 0,
+            provider_hooks,
+            gemini_hooks_remnant,
+            checkpoint_store,
+            findings_store,
+            task_workspaces,
+            legacy_code_residue,
+            hermes_export,
+            capture_queue: CaptureQueueReport::scan(storage),
+        },
+        output,
+    )
+}
+
 pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<()> {
     // `agent doctor` is the corruption diagnostic itself. It must return a
     // controlled, path-free error when the database is unavailable instead
@@ -1165,12 +1449,50 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
     // `LBR-REPO-001` / `LBR-REPO-003` mapping; this fallback keeps the same
     // stable codes for in-process callers.
     let storage = util::try_get_storage_path(None).map_err(doctor_storage_resolution_error)?;
-    let repo = db::open_cached_repository(&storage.join(util::DATABASE))
-        .await
-        .map_err(|error| doctor_database_open_error(error.kind()))?;
-    let conn = crate::internal::ai::capture::store::open(&storage, Duration::from_secs(30))
-        .await
-        .map_err(|error| doctor_capture_open_error(&error))?;
+    let (repo, conn) = match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(CliError::from)?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                return execute_redb_doctor(&storage, args, output).await;
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let repo = db::open_cached_repository(&storage.join(util::DATABASE))
+                    .await
+                    .map_err(|error| doctor_database_open_error(error.kind()))?;
+                let conn =
+                    crate::internal::ai::capture::store::open(&storage, Duration::from_secs(30))
+                        .await
+                        .map_err(|error| doctor_capture_open_error(&error))?;
+                (repo, conn)
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+    };
     pin_doctor_hash_kind(&repo).await?;
     let schema_present = table_exists(&conn, "agent_session").await?
         && table_exists(&conn, "agent_checkpoint").await?;
@@ -2357,23 +2679,41 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
     let Ok(storage) = util::try_get_storage_path(None) else {
         return Ok(());
     };
-    let database_path = storage.join(util::DATABASE);
-    let Some(database_path) = database_path.to_str() else {
-        return Ok(());
-    };
-    let Ok(repo) = crate::internal::db::open_connection_without_schema_management(
-        database_path,
-        Duration::from_millis(200),
-    )
-    .await
-    else {
-        return Ok(());
-    };
-    let Ok(capture) =
-        crate::internal::ai::capture::store::open(&storage, Duration::from_millis(200)).await
-    else {
-        return Ok(());
-    };
+    let (repo, capture): (sea_orm::DatabaseConnection, sea_orm::DatabaseConnection) =
+        match crate::storage::runtime::detect_repo_backend(&storage) {
+            Ok(crate::storage::StorageBackendKind::Redb) => return Ok(()),
+            Ok(crate::storage::StorageBackendKind::Sqlite) => {
+                #[cfg(feature = "storage-sqlite")]
+                {
+                    let database_path = storage.join(util::DATABASE);
+                    let Some(database_path) = database_path.to_str() else {
+                        return Ok(());
+                    };
+                    let Ok(repo) = crate::internal::db::open_connection_without_schema_management(
+                        database_path,
+                        Duration::from_millis(200),
+                    )
+                    .await
+                    else {
+                        return Ok(());
+                    };
+                    let Ok(capture) = crate::internal::ai::capture::store::open(
+                        &storage,
+                        Duration::from_millis(200),
+                    )
+                    .await
+                    else {
+                        return Ok(());
+                    };
+                    (repo, capture)
+                }
+                #[cfg(not(feature = "storage-sqlite"))]
+                {
+                    return Ok(());
+                }
+            }
+            Err(_) => return Ok(()),
+        };
     let schema_present = match (
         table_exists(&capture, "agent_session").await,
         table_exists(&capture, "agent_checkpoint").await,
@@ -5024,14 +5364,38 @@ async fn assert_doctor_catalog_repair_scope_live(
             .ok()
             .flatten();
         if workspace_table.is_none() {
-            let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
-                .await
-                .context("open repository database to verify the capture workspace lease")?;
-            scope
-                .assert_workspace_fence_live(&repo)
-                .await
-                .with_context(|| format!("verify capture workspace lease before {operation}"))?;
-            return Ok(());
+            let storage = util::try_get_storage_path(None)
+                .context("locate repository storage to verify the capture workspace lease")?;
+            match crate::storage::runtime::detect_repo_backend(&storage)
+                .context("detect repository backend to verify the capture workspace lease")?
+            {
+                crate::storage::StorageBackendKind::Redb => {
+                    anyhow::bail!("SQLite doctor catalog repair is not used on redb repositories");
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    #[cfg(feature = "storage-sqlite")]
+                    {
+                        let repo = crate::internal::db::open_cached_repository(
+                            &storage.join(util::DATABASE),
+                        )
+                        .await
+                        .context(
+                            "open repository database to verify the capture workspace lease",
+                        )?;
+                        scope
+                            .assert_workspace_fence_live(&repo)
+                            .await
+                            .with_context(|| {
+                                format!("verify capture workspace lease before {operation}")
+                            })?;
+                        return Ok(());
+                    }
+                    #[cfg(not(feature = "storage-sqlite"))]
+                    {
+                        anyhow::bail!("this Libra binary was compiled without `storage-sqlite`");
+                    }
+                }
+            }
         }
         scope
             .assert_workspace_fence_live(txn)
@@ -5090,21 +5454,53 @@ async fn commit_doctor_catalog_repair_transaction(
                 format!("verify capture workspace lease before committing {operation}")
             });
         }
-        let repo =
-            match crate::internal::db::open_cached_repository(&crate::utils::path::database()).await
-            {
-                Ok(repo) => repo,
-                Err(open_error) => {
-                    txn.rollback().await.ok();
-                    return Err(open_error)
-                        .context("open repository database to verify the capture workspace lease");
+        let storage = match util::try_get_storage_path(None) {
+            Ok(storage) => storage,
+            Err(storage_error) => {
+                txn.rollback().await.ok();
+                return Err(storage_error)
+                    .context("locate repository storage to verify the capture workspace lease");
+            }
+        };
+        match crate::storage::runtime::detect_repo_backend(&storage) {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                txn.rollback().await.ok();
+                anyhow::bail!("SQLite doctor catalog repair is not used on redb repositories");
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) => {
+                #[cfg(feature = "storage-sqlite")]
+                {
+                    let repo = match crate::internal::db::open_cached_repository(
+                        &storage.join(util::DATABASE),
+                    )
+                    .await
+                    {
+                        Ok(repo) => repo,
+                        Err(open_error) => {
+                            txn.rollback().await.ok();
+                            return Err(open_error).context(
+                                "open repository database to verify the capture workspace lease",
+                            );
+                        }
+                    };
+                    if let Err(peer_error) = scope.assert_workspace_fence_live(&repo).await {
+                        txn.rollback().await.ok();
+                        return Err(peer_error).with_context(|| {
+                            format!("verify capture workspace lease before committing {operation}")
+                        });
+                    }
                 }
-            };
-        if let Err(peer_error) = scope.assert_workspace_fence_live(&repo).await {
-            txn.rollback().await.ok();
-            return Err(peer_error).with_context(|| {
-                format!("verify capture workspace lease before committing {operation}")
-            });
+                #[cfg(not(feature = "storage-sqlite"))]
+                {
+                    txn.rollback().await.ok();
+                    anyhow::bail!("this Libra binary was compiled without `storage-sqlite`");
+                }
+            }
+            Err(detect_error) => {
+                txn.rollback().await.ok();
+                return Err(anyhow::Error::new(detect_error))
+                    .context("detect repository backend to verify the capture workspace lease");
+            }
         }
     }
     txn.commit()
@@ -8956,6 +9352,334 @@ mod tests {
             std::fs::symlink_metadata(run_dir.join("workspace-intents"))
                 .expect("intent symlink remains")
                 .is_symlink()
+        );
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_agent_doctor_readonly_vs_explicit_repair() {
+        use std::{
+            str::FromStr,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+
+        use crate::{
+            internal::config::ConfigKv,
+            storage::{
+                RedbCaptureStore, RedbGitStore,
+                capture_store::{
+                    AgentSessionRecord, CaptureAgentKind, CaptureBatchItem, CaptureBatchPayload,
+                    CaptureScopeState, CaptureSessionState,
+                },
+                cross_store::{CrossStoreCommitHook, CrossStoreCoordinator, CrossStoreRefCasOp},
+                git_store::{RefKey, RefTarget},
+                opener::RedbRepairContext,
+                runtime::{
+                    init_redb_repository_storage, open_capture_store_read_only,
+                    open_repo_config_store_read_write,
+                },
+            },
+        };
+
+        struct ChangeDirGuard {
+            prev: PathBuf,
+        }
+        impl ChangeDirGuard {
+            fn enter(path: &Path) -> Self {
+                let prev = std::env::current_dir().expect("read current dir");
+                std::env::set_current_dir(path).expect("switch current dir");
+                Self { prev }
+            }
+        }
+        impl Drop for ChangeDirGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.prev);
+            }
+        }
+
+        struct RestoreWritableGuard {
+            paths: Vec<PathBuf>,
+        }
+        impl Drop for RestoreWritableGuard {
+            fn drop(&mut self) {
+                for path in self.paths.iter().rev() {
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        let mut perms = meta.permissions();
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        perms.set_readonly(false);
+                        let _ = std::fs::set_permissions(path, perms);
+                    }
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestCrashBackend {
+            inner: redb::backends::FileBackend,
+            dead: Arc<AtomicBool>,
+        }
+        impl redb::StorageBackend for TestCrashBackend {
+            fn len(&self) -> Result<u64, redb::BackendError> {
+                self.inner.len()
+            }
+            fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::BackendError> {
+                self.inner.read(offset, out)
+            }
+            fn set_len(&self, len: u64) -> Result<(), redb::BackendError> {
+                if self.dead.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                self.inner.set_len(len)
+            }
+            fn sync_data(&self) -> Result<(), redb::BackendError> {
+                if self.dead.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                self.inner.sync_data()
+            }
+            fn write(&self, offset: u64, data: &[u8]) -> Result<(), redb::BackendError> {
+                if self.dead.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                self.inner.write(offset, data)
+            }
+        }
+
+        fn make_redb_unrecovered(path: &Path) {
+            const CRASH_TOUCH: redb::TableDefinition<&str, &str> =
+                redb::TableDefinition::new("test_doctor_crash_touch");
+            let dead = Arc::new(AtomicBool::new(false));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("open redb file for crash fixture");
+            let db = redb::Builder::new()
+                .create_with_backend(TestCrashBackend {
+                    inner: redb::backends::FileBackend::new(file),
+                    dead: Arc::clone(&dead),
+                })
+                .expect("open redb with crash backend");
+            let wtx = db.begin_write().expect("begin crash touch write");
+            {
+                let mut table = wtx.open_table(CRASH_TOUCH).expect("open crash touch table");
+                table.insert("touch", "1").expect("insert crash touch");
+            }
+            wtx.commit().expect("commit crash touch write");
+            dead.store(true, Ordering::SeqCst);
+            drop(db);
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        let dot_libra = repo_root.join(".libra");
+        std::fs::create_dir_all(dot_libra.join("objects")).expect("create objects dir");
+        let paths = init_redb_repository_storage(&dot_libra)
+            .await
+            .expect("init pure redb storage");
+        let _cwd = ChangeDirGuard::enter(repo_root);
+
+        let repo_id = "repo-doctor-redb-test".to_string();
+        let cfg = open_repo_config_store_read_write(&dot_libra)
+            .await
+            .expect("open redb config rw");
+        ConfigKv::set_with_store(cfg.as_ref(), "libra.repoid", &repo_id, false)
+            .await
+            .expect("set libra.repoid");
+        ConfigKv::set_with_store(cfg.as_ref(), "core.objectformat", "sha1", false)
+            .await
+            .expect("set objectformat");
+        drop(cfg);
+
+        // Seed a partial cross-store commit (git.redb committed gen 1 + intent,
+        // capture.redb crashed before applying Step 2).
+        let session_id = "sess-doctor-reconcile-01".to_string();
+        let now_ms = 1_700_000_000_000i64;
+        let commit_oid =
+            ObjectHash::from_str("1111111111111111111111111111111111111111").expect("valid sha1");
+        let git_op = CrossStoreRefCasOp {
+            key: RefKey::LocalBranch {
+                name: "doctor-reconcile-branch".to_string(),
+            },
+            expected: None,
+            new_target: Some(RefTarget::Direct(commit_oid.to_string())),
+            reflogs: Vec::new(),
+            publication: None,
+        };
+        let session_item = CaptureBatchItem {
+            dedup_key: format!("doctor-reconcile:{session_id}"),
+            payload: CaptureBatchPayload::UpsertSession(AgentSessionRecord {
+                session_id: session_id.clone(),
+                agent_kind: CaptureAgentKind::ClaudeCode,
+                provider_session_id: "prov-doctor-01".to_string(),
+                thread_id: None,
+                state: CaptureSessionState::Active,
+                working_dir: repo_root.to_string_lossy().into_owned(),
+                worktree_id: Some(String::new()),
+                parent_commit: Some(commit_oid.to_string()),
+                parent_session_id: None,
+                metadata_json: "{}".to_string(),
+                redaction_report: "{}".to_string(),
+                started_at: now_ms,
+                last_event_at: now_ms,
+                stopped_at: None,
+                schema_version: 2,
+                sync_revision: 1,
+                repo_id: Some(repo_id.clone()),
+                workspace_id: None,
+                workspace_fence: None,
+                scope_state: CaptureScopeState::Scoped,
+            }),
+        };
+        {
+            let git_store = RedbGitStore::open_read_write_with_context(
+                &paths.git_db_path,
+                RedbRepairContext::WriteCommand,
+            )
+            .expect("open git rw");
+            let cap_store = RedbCaptureStore::open_read_write(
+                &paths.capture_db_path,
+                RedbRepairContext::WriteCommand,
+            )
+            .await
+            .expect("open capture rw");
+            let coord = CrossStoreCoordinator::new(git_store, cap_store);
+            let partial_err = coord
+                .commit_ref_cas_with_capture_inner(
+                    &git_op,
+                    &[session_item],
+                    CrossStoreCommitHook::fail_after_git_commit(),
+                )
+                .await
+                .expect_err("injected crash after git commit must fail");
+            assert!(
+                partial_err.to_string().contains("injected crash"),
+                "unexpected error: {partial_err}"
+            );
+        }
+
+        // Confirm capture.redb does NOT have the session before repair.
+        {
+            let cap_ro = open_capture_store_read_only(&dot_libra)
+                .await
+                .expect("open capture ro before crash");
+            assert!(
+                cap_ro
+                    .get_session(&session_id)
+                    .await
+                    .expect("get session before repair")
+                    .is_none(),
+                "session must still be pending in cross-store outbox before repair"
+            );
+        }
+
+        // Leave both git.redb and capture.redb unrecovered so read-only opens hit RepairAborted.
+        make_redb_unrecovered(&paths.git_db_path);
+        make_redb_unrecovered(&paths.capture_db_path);
+        let git_bytes_unrecovered =
+            std::fs::read(&paths.git_db_path).expect("read unrecovered git.redb");
+        let cap_bytes_unrecovered =
+            std::fs::read(&paths.capture_db_path).expect("read unrecovered capture.redb");
+
+        let quiet_output = OutputConfig {
+            pager: false,
+            quiet: true,
+            ..OutputConfig::default()
+        };
+        let ro_args = || DoctorArgs {
+            repair: false,
+            commit_link_page: 1,
+            codex_legacy_after: None,
+            reset_commit_link_journal: false,
+            acknowledge_commit_link_loss: false,
+            codex_index_backup: None,
+            codex_index_page: None,
+        };
+        let repair_args = || DoctorArgs {
+            repair: true,
+            commit_link_page: 1,
+            codex_legacy_after: None,
+            reset_commit_link_journal: false,
+            acknowledge_commit_link_loss: false,
+            codex_index_backup: None,
+            codex_index_page: None,
+        };
+
+        // AC1: `agent doctor` WITHOUT `--repair` strictly uses open_*_read_only and fails closed
+        // on RepairAborted without upgrading to write or mutating bytes on disk.
+        let ro_err = execute_safe(ro_args(), &quiet_output)
+            .await
+            .expect_err("read-only doctor must fail closed on unrecovered redb");
+        assert_eq!(ro_err.stable_code(), StableErrorCode::IoReadFailed);
+        assert_eq!(
+            std::fs::read(&paths.git_db_path).expect("re-read git.redb after ro doctor"),
+            git_bytes_unrecovered,
+            "read-only doctor must not mutate git.redb"
+        );
+        assert_eq!(
+            std::fs::read(&paths.capture_db_path).expect("re-read capture.redb after ro doctor"),
+            cap_bytes_unrecovered,
+            "read-only doctor must not mutate capture.redb"
+        );
+
+        // AC4: `agent doctor --repair` on a read-only database/directory fails closed with LBR-IO-001.
+        {
+            let _guard = RestoreWritableGuard {
+                paths: vec![paths.capture_db_path.clone(), paths.git_db_path.clone()],
+            };
+            for file in [&paths.git_db_path, &paths.capture_db_path] {
+                let mut perms = std::fs::metadata(file).expect("stat redb").permissions();
+                perms.set_readonly(true);
+                std::fs::set_permissions(file, perms).expect("chmod readonly");
+            }
+            let ro_repair_err = execute_safe(repair_args(), &quiet_output)
+                .await
+                .expect_err("doctor --repair on read-only permissions must fail closed");
+            assert_eq!(ro_repair_err.stable_code(), StableErrorCode::IoReadFailed);
+            assert_eq!(
+                std::fs::read(&paths.git_db_path).expect("git.redb unchanged on ro repair"),
+                git_bytes_unrecovered
+            );
+            assert_eq!(
+                std::fs::read(&paths.capture_db_path).expect("capture.redb unchanged on ro repair"),
+                cap_bytes_unrecovered
+            );
+        }
+
+        // AC2 & AC3: `agent doctor --repair` explicitly performs Redb crash recovery AND runs
+        // `cross_store::reconcile_pending_intents` reconciling the partial cross-store intent.
+        execute_safe(repair_args(), &quiet_output)
+            .await
+            .expect("doctor --repair must recover redb and reconcile pending intents");
+
+        let cap_after = open_capture_store_read_only(&dot_libra)
+            .await
+            .expect("capture.redb readable after explicit doctor --repair");
+        let reconciled = cap_after
+            .get_session(&session_id)
+            .await
+            .expect("read reconciled session");
+        assert!(
+            reconciled.is_some(),
+            "doctor --repair must reconcile pending cross-store commit intent into capture.redb"
+        );
+        drop(cap_after);
+
+        // Subsequent read-only doctor succeeds cleanly without touching SQLite.
+        execute_safe(ro_args(), &quiet_output)
+            .await
+            .expect("read-only doctor succeeds after explicit repair");
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "pure-redb doctor must never create libra.db"
+        );
+        assert!(
+            !dot_libra.join("private").join("capture.db").exists(),
+            "pure-redb doctor must never create capture.db"
         );
     }
 }

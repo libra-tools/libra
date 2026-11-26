@@ -8,6 +8,8 @@
 //! means the redacted projection is durable, never that the Harness raw
 //! transcript has been taken over.
 
+use std::{fmt, path::PathBuf, sync::Arc};
+
 use sea_orm::{DatabaseConnection, DbErr};
 use serde_json::{Value, json};
 
@@ -15,6 +17,7 @@ use super::{
     protocol::{BridgeError, BridgeRequest, BridgeResponse, JSONRPC_VERSION},
     storage::{self, AppendEvent, EventStatus},
 };
+use crate::storage::{CaptureStore, ConfigStore, GitStateStore, GitStore, StorageBackendError};
 
 /// Trusted bridge scope derived from the repository/context at handshake
 /// (GC-LB-06/07). The request body never supplies these.
@@ -27,6 +30,33 @@ pub struct BridgeContext {
     pub repo: DatabaseConnection,
     pub repository_id: String,
     pub worktree_id: Option<String>,
+}
+
+/// Backend-agnostic trusted bridge scope backed by trait stores (`RB-25`).
+///
+/// Works identically over `redb` and SQLite storage backends without exposing
+/// raw SQLite connections to bridge ingress or read handlers.
+#[derive(Clone)]
+pub struct StoreBridgeContext {
+    pub storage: PathBuf,
+    pub git: Arc<dyn GitStore>,
+    pub config: Arc<dyn ConfigStore>,
+    pub git_state: Arc<dyn GitStateStore>,
+    pub capture: Arc<dyn CaptureStore>,
+    pub repository_id: String,
+    pub worktree_id: Option<String>,
+}
+
+impl fmt::Debug for StoreBridgeContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoreBridgeContext")
+            .field("storage", &self.storage)
+            .field("git_backend", &self.git.backend())
+            .field("capture_backend", &self.capture.backend_kind())
+            .field("repository_id", &self.repository_id)
+            .field("worktree_id", &self.worktree_id)
+            .finish()
+    }
 }
 
 fn now_ms() -> i64 {
@@ -378,6 +408,277 @@ async fn evidence_append(
     // Fail-closed: pointing the same source at a DIFFERENT target is a
     // digest conflict, never a silent no-op (GC-LB-09). A client that thinks
     // it re-pointed an evidence link must not get a false success.
+    match outcome {
+        storage::LinkOutcome::Inserted | storage::LinkOutcome::Existing => {}
+        storage::LinkOutcome::Conflict { stored_target_id } => {
+            return Err(BridgeError::digest_conflict(format!(
+                "association {source_type}:{source_id} already points at target '{stored_target_id}', not '{target_id}'; refusing conflicting relink"
+            )));
+        }
+    }
+
+    Ok(ok_result(
+        json!({
+            "session_id": session_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "target_id": target_id,
+            "linked": true,
+        }),
+        id,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Store-backed ingress dispatch (`RB-25`, works on Redb and SQLite)
+// ---------------------------------------------------------------------------
+
+fn store_error(context: &'static str) -> impl Fn(StorageBackendError) -> BridgeError {
+    move |err| super::vcs::internal_hiding_host_paths(context, err)
+}
+
+async fn require_session_in_repo_with_store(
+    ctx: &StoreBridgeContext,
+    session_id: &str,
+) -> Result<(), BridgeError> {
+    let session = storage::get_session_with_store(ctx.capture.as_ref(), session_id)
+        .await
+        .map_err(store_error("look up bridge session"))?;
+    match session {
+        Some(row) if row.repository_id == ctx.repository_id => Ok(()),
+        Some(_) => Err(BridgeError::scope_mismatch(format!(
+            "bridge session '{session_id}' belongs to a different repository; refusing cross-repository write"
+        ))),
+        None => Err(BridgeError::scope_mismatch(format!(
+            "bridge session '{session_id}' is not open in this connection; call session.open first"
+        ))),
+    }
+}
+
+/// Dispatch the session/event ingress methods against [`StoreBridgeContext`].
+/// Returns `Ok(None)` when `request.method` is not an ingress method.
+pub async fn dispatch_with_store(
+    ctx: &StoreBridgeContext,
+    request: &BridgeRequest,
+) -> Result<Option<BridgeResponse>, BridgeError> {
+    let id = request.id.clone().unwrap_or(Value::Null);
+    match request.method.as_str() {
+        "session.open" => Ok(Some(session_open_with_store(ctx, request, id).await?)),
+        "event.append" => Ok(Some(event_append_with_store(ctx, request, id).await?)),
+        "session.flush" => Ok(Some(session_flush_with_store(ctx, request, id).await?)),
+        "session.close" => Ok(Some(session_close_with_store(ctx, request, id).await?)),
+        "evidence.append" => Ok(Some(
+            evidence_append_with_store(ctx, request, id, "evidence").await?,
+        )),
+        "provenance.append" => Ok(Some(
+            evidence_append_with_store(ctx, request, id, "provenance").await?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+async fn session_open_with_store(
+    ctx: &StoreBridgeContext,
+    request: &BridgeRequest,
+    id: Value,
+) -> Result<BridgeResponse, BridgeError> {
+    let session_id = param_str(&request.params, "session_id")?;
+    let parent_session_id = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("parent_session_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let agent_id = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("agent_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let workspace_id = request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("workspace_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let (row, created) = storage::open_session_with_store(
+        ctx.capture.as_ref(),
+        &session_id,
+        &ctx.repository_id,
+        ctx.worktree_id.as_deref(),
+        workspace_id.as_deref(),
+        parent_session_id.as_deref(),
+        agent_id.as_deref(),
+        now_ms(),
+    )
+    .await
+    .map_err(store_error("open bridge session"))?;
+
+    if row.repository_id != ctx.repository_id {
+        return Err(BridgeError::scope_mismatch(format!(
+            "bridge session '{session_id}' already belongs to repository '{}', not '{}'",
+            row.repository_id, ctx.repository_id
+        )));
+    }
+
+    if !created {
+        for (label, requested, stored) in [
+            (
+                "workspace_id",
+                workspace_id.as_deref(),
+                row.workspace_id.as_deref(),
+            ),
+            (
+                "parent_session_id",
+                parent_session_id.as_deref(),
+                row.parent_session_id.as_deref(),
+            ),
+            ("agent_id", agent_id.as_deref(), row.agent_id.as_deref()),
+        ] {
+            if requested != stored {
+                return Err(BridgeError::scope_mismatch(format!(
+                    "bridge session '{session_id}' already has {label}={:?}, not {:?}; refusing scope drift",
+                    stored, requested
+                )));
+            }
+        }
+    }
+
+    Ok(ok_result(
+        json!({
+            "session_id": session_id,
+            "repository_id": ctx.repository_id,
+            "created": created,
+            "last_acked_seq": row.last_acked_seq,
+        }),
+        id,
+    ))
+}
+
+async fn event_append_with_store(
+    ctx: &StoreBridgeContext,
+    request: &BridgeRequest,
+    id: Value,
+) -> Result<BridgeResponse, BridgeError> {
+    let session_id = param_str(&request.params, "session_id")?;
+    require_session_in_repo_with_store(ctx, &session_id).await?;
+
+    let events = parse_event_batch(request)?;
+
+    let mut redacted: Vec<AppendEvent> = Vec::with_capacity(events.len());
+    for ev in events {
+        let redacted_payload = super::redaction::redact_payload(&ev.payload)?.to_string();
+        if redacted_payload.len() > storage::MAX_EVENT_PAYLOAD_BYTES {
+            return Err(super::redaction::redaction_failed(format!(
+                "redacted event {seq} payload still exceeds {max} bytes; refusing (no raw fallback)",
+                seq = ev.event_seq,
+                max = storage::MAX_EVENT_PAYLOAD_BYTES,
+            )));
+        }
+        redacted.push(AppendEvent {
+            event_seq: ev.event_seq,
+            event_type: ev.event_type,
+            payload: redacted_payload,
+            operation_id: ev.operation_id,
+        });
+    }
+
+    // Single write transaction atomically appends events and advances the
+    // contiguous `last_acked_seq` cursor (`AgentBridgeStore::append_and_ack_events`).
+    let outcome = storage::append_and_ack_events_with_store(
+        ctx.capture.as_ref(),
+        &session_id,
+        &redacted,
+        now_ms(),
+    )
+    .await
+    .map_err(store_error("append bridge events"))?;
+
+    let per_event: Vec<Value> = redacted
+        .iter()
+        .zip(outcome.per_event.iter())
+        .map(|(ev, status)| {
+            json!({
+                "seq": ev.event_seq,
+                "status": status_name(status),
+            })
+        })
+        .collect();
+
+    Ok(ok_result(
+        json!({
+            "session_id": session_id,
+            "per_event": per_event,
+            "last_acked_seq": outcome.last_acked_seq,
+        }),
+        id,
+    ))
+}
+
+async fn session_flush_with_store(
+    ctx: &StoreBridgeContext,
+    request: &BridgeRequest,
+    id: Value,
+) -> Result<BridgeResponse, BridgeError> {
+    let session_id = param_str(&request.params, "session_id")?;
+    require_session_in_repo_with_store(ctx, &session_id).await?;
+    storage::set_session_state_with_store(ctx.capture.as_ref(), &session_id, "flushing", now_ms())
+        .await
+        .map_err(store_error("flush bridge session"))?;
+    let last_acked = storage::contiguous_acked_seq_with_store(ctx.capture.as_ref(), &session_id)
+        .await
+        .map_err(store_error("read ack"))?;
+    Ok(ok_result(
+        json!({ "session_id": session_id, "flushed": true, "last_acked_seq": last_acked }),
+        id,
+    ))
+}
+
+async fn session_close_with_store(
+    ctx: &StoreBridgeContext,
+    request: &BridgeRequest,
+    id: Value,
+) -> Result<BridgeResponse, BridgeError> {
+    let session_id = param_str(&request.params, "session_id")?;
+    require_session_in_repo_with_store(ctx, &session_id).await?;
+    storage::set_session_state_with_store(ctx.capture.as_ref(), &session_id, "closed", now_ms())
+        .await
+        .map_err(store_error("close bridge session"))?;
+    let last_acked = storage::contiguous_acked_seq_with_store(ctx.capture.as_ref(), &session_id)
+        .await
+        .map_err(store_error("read ack"))?;
+    Ok(ok_result(
+        json!({ "session_id": session_id, "closed": true, "last_acked_seq": last_acked }),
+        id,
+    ))
+}
+
+async fn evidence_append_with_store(
+    ctx: &StoreBridgeContext,
+    request: &BridgeRequest,
+    id: Value,
+    source_type: &str,
+) -> Result<BridgeResponse, BridgeError> {
+    let session_id = param_str(&request.params, "session_id")?;
+    require_session_in_repo_with_store(ctx, &session_id).await?;
+    let source_id = param_str(&request.params, "source_id")?;
+    let target_type = param_str(&request.params, "target_type")?;
+    let target_id = param_str(&request.params, "target_id")?;
+
+    let outcome = storage::insert_link_with_store(
+        ctx.capture.as_ref(),
+        &session_id,
+        source_type,
+        &source_id,
+        &target_type,
+        &target_id,
+        storage::LinkSingularity::BySource,
+        now_ms(),
+    )
+    .await
+    .map_err(store_error("record bridge association link"))?;
+
     match outcome {
         storage::LinkOutcome::Inserted | storage::LinkOutcome::Existing => {}
         storage::LinkOutcome::Conflict { stored_target_id } => {

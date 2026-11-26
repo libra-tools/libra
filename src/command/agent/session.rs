@@ -14,6 +14,7 @@ use std::{
 };
 
 use clap::{Args, Subcommand};
+#[cfg_attr(not(feature = "storage-sqlite"), allow(unused_imports))]
 use sea_orm::{ConnectionTrait, QueryResult, Statement, TransactionTrait};
 use serde::Serialize;
 use tempfile::NamedTempFile;
@@ -22,18 +23,21 @@ use super::{
     capture_source::{DerivedTranscriptSource, resolve_derived_transcript_source},
     checkpoint::{PAGE_SCHEMA_VERSION, decode_page_cursor, encode_page_cursor, resolve_page_limit},
 };
-use crate::{
-    internal::ai::{
-        capture::{
-            catalog::{
-                CAPTURE_DIAGNOSTIC_METADATA_CAP_BYTES, CaptureCatalogStore,
-                CaptureTerminalDiagnostic,
-            },
-            store,
-            summary::{SessionSummaryRead, SessionSummaryView},
-        },
-        observed_agents::{AgentKind, TRANSCRIPT_READ_HARD_CAP_BYTES},
+#[cfg(not(feature = "storage-sqlite"))]
+use crate::internal::ai::capture::{
+    catalog::CaptureTerminalDiagnostic, summary::SessionSummaryView,
+};
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::ai::capture::{
+    catalog::{
+        CAPTURE_DIAGNOSTIC_METADATA_CAP_BYTES, CaptureCatalogStore, CaptureTerminalDiagnostic,
     },
+    store,
+    summary::{SessionSummaryRead, SessionSummaryView},
+};
+use crate::{
+    internal::ai::observed_agents::{AgentKind, TRANSCRIPT_READ_HARD_CAP_BYTES},
+    storage::StorageBackendKind,
     utils::{
         error::{CliError, CliResult},
         output::{OutputConfig, emit_json_data},
@@ -225,6 +229,7 @@ struct SessionTranscriptExtractionOutput {
     extracted_transcript: TranscriptExtraction,
 }
 
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 fn decode_session_show_text(
     row: &QueryResult,
     column: &str,
@@ -238,6 +243,7 @@ fn decode_session_show_text(
     })
 }
 
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 fn decode_session_show_i64(
     row: &QueryResult,
     column: &str,
@@ -429,300 +435,527 @@ async fn list(args: SessionListArgs, output: &OutputConfig) -> CliResult<()> {
     // is a pure usage error.
     let cursor = args.cursor.as_deref().map(decode_page_cursor).transpose()?;
 
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
-    let backend = conn.get_database_backend();
+    let storage =
+        crate::utils::util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
 
-    if !table_exists(&conn, "agent_session").await? {
-        return emit_list(
-            &SessionListPage {
-                schema_version: PAGE_SCHEMA_VERSION,
-                sessions: Vec::new(),
-                next_cursor: None,
-            },
-            output,
-        );
-    }
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(CliError::from)? {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let capture = crate::storage::runtime::open_capture_store_read_only(&storage)
+                    .await
+                    .map_err(CliError::from)?;
+                let normalized_agent =
+                    args.agent
+                        .as_deref()
+                        .map(|agent| match AgentKind::from_cli_slug(agent) {
+                            Some(kind) => kind.as_db_str().to_string(),
+                            None => agent.to_string(),
+                        });
+                let mut rows = capture
+                    .list_sessions_by_started_desc()
+                    .await
+                    .map_err(CliError::from)?;
+                rows.sort_by(|a, b| {
+                    b.started_at
+                        .cmp(&a.started_at)
+                        .then_with(|| a.session_id.cmp(&b.session_id))
+                });
+                let mut out: Vec<SessionRow> = rows
+                    .into_iter()
+                    .filter(|row| {
+                        if let Some(agent) = &normalized_agent
+                            && row.agent_kind.as_str() != agent.as_str()
+                        {
+                            return false;
+                        }
+                        if let Some(state) = &args.state
+                            && row.state.as_str() != state.as_str()
+                        {
+                            return false;
+                        }
+                        if let Some((cursor_ts, cursor_id)) = &cursor
+                            && !(row.started_at < *cursor_ts
+                                || (row.started_at == *cursor_ts
+                                    && row.session_id.as_str() > cursor_id.as_str()))
+                        {
+                            return false;
+                        }
+                        true
+                    })
+                    .take(limit as usize + 1)
+                    .map(|row| SessionRow {
+                        session_id: row.session_id,
+                        agent_kind: row.agent_kind.as_str().to_string(),
+                        state: row.state.as_str().to_string(),
+                        working_dir: row.working_dir,
+                        started_at: row.started_at,
+                        last_event_at: row.last_event_at,
+                        capture_status: None,
+                        capture_error_code: None,
+                        capture_error_stage: None,
+                        capture_failed_at: None,
+                    })
+                    .collect();
+                let next_cursor = if out.len() as u64 > limit {
+                    out.truncate(limit as usize);
+                    out.last()
+                        .map(|row| encode_page_cursor(row.started_at, &row.session_id))
+                } else {
+                    None
+                };
+                emit_list(
+                    &SessionListPage {
+                        schema_version: PAGE_SCHEMA_VERSION,
+                        sessions: out,
+                        next_cursor,
+                    },
+                    output,
+                )
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (limit, cursor, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = store::open_current().await.map_err(|error| {
+                    CliError::fatal(format!("failed to open the capture database: {error}"))
+                })?;
+                let backend = conn.get_database_backend();
 
-    let sql = session_page_sql(args.agent.is_some(), args.state.is_some(), cursor.is_some());
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    if let Some(agent) = &args.agent {
-        // The CLI accepts hyphenated slugs (`claude-code`) but the database
-        // stores the snake_case `agent_kind` (`claude_code`). Translate to
-        // the storage form so a `--agent claude-code` filter actually
-        // matches rows. Codex review P1 #6.
-        let normalized = match AgentKind::from_cli_slug(agent) {
-            Some(kind) => kind.as_db_str().to_string(),
-            None => agent.clone(),
-        };
-        values.push(normalized.into());
-    }
-    if let Some(state) = &args.state {
-        values.push(state.clone().into());
-    }
-    if let Some((timestamp, id)) = &cursor {
-        values.push((*timestamp).into());
-        values.push((*timestamp).into());
-        values.push(id.clone().into());
-    }
-    // Fetch one row beyond the page to learn whether another page exists
-    // without a second COUNT query.
-    values.push((limit as i64 + 1).into());
+                if !table_exists(&conn, "agent_session").await? {
+                    return emit_list(
+                        &SessionListPage {
+                            schema_version: PAGE_SCHEMA_VERSION,
+                            sessions: Vec::new(),
+                            next_cursor: None,
+                        },
+                        output,
+                    );
+                }
 
-    let stmt = Statement::from_sql_and_values(backend, &sql, values);
-    let rows = conn
-        .query_all_raw(stmt)
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
+                let sql =
+                    session_page_sql(args.agent.is_some(), args.state.is_some(), cursor.is_some());
+                let mut values: Vec<sea_orm::Value> = Vec::new();
+                if let Some(agent) = &args.agent {
+                    // The CLI accepts hyphenated slugs (`claude-code`) but the database
+                    // stores the snake_case `agent_kind` (`claude_code`). Translate to
+                    // the storage form so a `--agent claude-code` filter actually
+                    // matches rows. Codex review P1 #6.
+                    let normalized = match AgentKind::from_cli_slug(agent) {
+                        Some(kind) => kind.as_db_str().to_string(),
+                        None => agent.clone(),
+                    };
+                    values.push(normalized.into());
+                }
+                if let Some(state) = &args.state {
+                    values.push(state.clone().into());
+                }
+                if let Some((timestamp, id)) = &cursor {
+                    values.push((*timestamp).into());
+                    values.push((*timestamp).into());
+                    values.push(id.clone().into());
+                }
+                // Fetch one row beyond the page to learn whether another page exists
+                // without a second COUNT query.
+                values.push((limit as i64 + 1).into());
 
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(SessionRow {
-            session_id: row
-                .try_get_by::<String, _>("session_id")
-                .unwrap_or_default(),
-            agent_kind: row
-                .try_get_by::<String, _>("agent_kind")
-                .unwrap_or_default(),
-            state: row.try_get_by::<String, _>("state").unwrap_or_default(),
-            working_dir: row
-                .try_get_by::<String, _>("working_dir")
-                .unwrap_or_default(),
-            started_at: row.try_get_by::<i64, _>("started_at").unwrap_or_default(),
-            last_event_at: row
-                .try_get_by::<i64, _>("last_event_at")
-                .unwrap_or_default(),
-            capture_status: None,
-            capture_error_code: None,
-            capture_error_stage: None,
-            capture_failed_at: None,
-        });
+                let stmt = Statement::from_sql_and_values(backend, &sql, values);
+                let rows = conn
+                    .query_all_raw(stmt)
+                    .await
+                    .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
+
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(SessionRow {
+                        session_id: row
+                            .try_get_by::<String, _>("session_id")
+                            .unwrap_or_default(),
+                        agent_kind: row
+                            .try_get_by::<String, _>("agent_kind")
+                            .unwrap_or_default(),
+                        state: row.try_get_by::<String, _>("state").unwrap_or_default(),
+                        working_dir: row
+                            .try_get_by::<String, _>("working_dir")
+                            .unwrap_or_default(),
+                        started_at: row.try_get_by::<i64, _>("started_at").unwrap_or_default(),
+                        last_event_at: row
+                            .try_get_by::<i64, _>("last_event_at")
+                            .unwrap_or_default(),
+                        capture_status: None,
+                        capture_error_code: None,
+                        capture_error_stage: None,
+                        capture_failed_at: None,
+                    });
+                }
+                let next_cursor = if out.len() as u64 > limit {
+                    out.truncate(limit as usize);
+                    out.last()
+                        .map(|row| encode_page_cursor(row.started_at, &row.session_id))
+                } else {
+                    None
+                };
+                emit_list(
+                    &SessionListPage {
+                        schema_version: PAGE_SCHEMA_VERSION,
+                        sessions: out,
+                        next_cursor,
+                    },
+                    output,
+                )
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (limit, cursor, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
     }
-    let next_cursor = if out.len() as u64 > limit {
-        out.truncate(limit as usize);
-        out.last()
-            .map(|row| encode_page_cursor(row.started_at, &row.session_id))
-    } else {
-        None
-    };
-    emit_list(
-        &SessionListPage {
-            schema_version: PAGE_SCHEMA_VERSION,
-            sessions: out,
-            next_cursor,
-        },
-        output,
-    )
 }
 
 async fn show(args: SessionShowArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
-    let backend = conn.get_database_backend();
+    let storage =
+        crate::utils::util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
 
-    if !table_exists(&conn, "agent_session").await? {
-        return Err(CliError::fatal(format!(
-            "no captured session matches '{}': agent_session table not yet present (run `libra init`?)",
-            args.session_id
-        )));
-    }
-
-    let stmt = Statement::from_sql_and_values(
-        backend,
-        format!(
-            "SELECT session_id, agent_kind, provider_session_id, state, working_dir, \
-                started_at, last_event_at, \
-                CASE WHEN agent_kind='codex' AND (typeof(metadata_json) <> 'text' OR \
-                    length(CAST(metadata_json AS BLOB)) > {CAPTURE_DIAGNOSTIC_METADATA_CAP_BYTES}) \
-                THEN '{{}}' ELSE COALESCE(metadata_json, '{{}}') END AS metadata_json \
-         FROM agent_session WHERE session_id = ? LIMIT 1"
-        ),
-        [args.session_id.clone().into()],
-    );
-    let snapshot = conn
-        .begin()
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to start session diagnostic read: {e}")))?;
-    let row = snapshot
-        .query_one_raw(stmt)
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
-    // Keep the visible lifecycle and terminal/owner view in one read snapshot.
-    // A malformed kind is still diagnosed by the existing row decoder below.
-    let terminal_capture = if row
-        .as_ref()
-        .and_then(|r| r.try_get_by::<String, _>("agent_kind").ok())
-        .as_deref()
-        == Some("codex")
-    {
-        Some(
-            CaptureCatalogStore::terminal_diagnostic_for_session(
-                &snapshot,
-                &args.session_id,
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .await
-            .unwrap_or_else(|_| CaptureTerminalDiagnostic::unavailable("catalog_unavailable")),
-        )
-    } else {
-        None
-    };
-    let summary_read = if terminal_capture.is_some() {
-        Some(match crate::utils::util::try_get_storage_path(None) {
-            Ok(storage) => SessionSummaryRead::prepare(&snapshot, &storage, &args.session_id).await,
-            Err(_) => Err(anyhow::anyhow!("session summary storage is unavailable")),
-        })
-    } else {
-        None
-    };
-    let commit_links = if terminal_capture.is_some() {
-        Some(read_session_commit_links(&snapshot, &args.session_id, args.commit_page).await)
-    } else {
-        None
-    };
-    snapshot
-        .commit()
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to finish session diagnostic read: {e}")))?;
-    let summary = match summary_read {
-        Some(Ok(read)) => Some(read.finish().await),
-        Some(Err(_)) => Some(SessionSummaryView::unavailable()),
-        None => None,
-    };
-    match row {
-        Some(row) => {
-            let metadata_json =
-                match decode_session_show_text(&row, "metadata_json", &args.session_id) {
-                    Ok(value) => value,
-                    // The catalog already made malformed Codex metadata explicit.
-                    // Keep that unavailable diagnostic visible even for invalid UTF-8.
-                    Err(_)
-                        if terminal_capture
-                            .as_ref()
-                            .is_some_and(|d| d.reason == "invalid_receipt_metadata") =>
-                    {
-                        "{}".to_owned()
-                    }
-                    Err(error) => return Err(error),
+    match crate::storage::runtime::detect_repo_backend(&storage).map_err(CliError::from)? {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let capture = crate::storage::runtime::open_capture_store_read_only(&storage)
+                    .await
+                    .map_err(CliError::from)?;
+                let rec = capture
+                    .get_session(&args.session_id)
+                    .await
+                    .map_err(CliError::from)?
+                    .ok_or_else(|| {
+                        CliError::fatal(format!(
+                            "no captured session matches id '{}'",
+                            args.session_id
+                        ))
+                    })?;
+                let capture_diag = capture_diagnostic_from_metadata(&rec.metadata_json);
+                let agent_kind = rec.agent_kind.as_str().to_string();
+                let payload = SessionRow {
+                    session_id: rec.session_id.clone(),
+                    agent_kind: agent_kind.clone(),
+                    state: rec.state.as_str().to_string(),
+                    working_dir: rec.working_dir.clone(),
+                    started_at: rec.started_at,
+                    last_event_at: rec.last_event_at,
+                    capture_status: capture_diag.status,
+                    capture_error_code: capture_diag.error_code,
+                    capture_error_stage: capture_diag.error_stage,
+                    capture_failed_at: capture_diag.failed_at,
                 };
-            let capture = capture_diagnostic_from_metadata(&metadata_json);
-            let session_id = decode_session_show_text(&row, "session_id", &args.session_id)?;
-            let agent_kind = decode_session_show_text(&row, "agent_kind", &args.session_id)?;
-            let provider_session_id =
-                decode_session_show_text(&row, "provider_session_id", &args.session_id)?;
-            let working_dir = decode_session_show_text(&row, "working_dir", &args.session_id)?;
-            let payload = SessionRow {
-                session_id: session_id.clone(),
-                agent_kind: agent_kind.clone(),
-                state: decode_session_show_text(&row, "state", &args.session_id)?,
-                working_dir: working_dir.clone(),
-                started_at: decode_session_show_i64(&row, "started_at", &args.session_id)?,
-                last_event_at: decode_session_show_i64(&row, "last_event_at", &args.session_id)?,
-                capture_status: capture.status,
-                capture_error_code: capture.error_code,
-                capture_error_stage: capture.error_stage,
-                capture_failed_at: capture.failed_at,
-            };
-            let transcript = if let Some(path) = args.extract_transcript.as_deref() {
-                Some(extract_transcript_from_capture_identity(
-                    &agent_kind,
-                    &session_id,
-                    &working_dir,
-                    &provider_session_id,
-                    path,
-                )?)
-            } else {
-                None
-            };
-            if output.is_json()
-                && let Some(transcript) = transcript
-            {
-                return emit_json_data(
-                    "agent_session",
-                    &SessionTranscriptExtractionOutput {
-                        session: payload,
-                        extracted_transcript: transcript,
-                    },
-                    output,
-                );
-            }
-            if output.is_json() && terminal_capture.is_some() {
-                emit_json_data(
-                    "agent_session",
-                    &SessionShowOutput {
-                        session: &payload,
-                        terminal_capture: terminal_capture.as_ref(),
-                        summary: summary.as_ref(),
-                        commit_links: commit_links.as_ref(),
-                    },
-                    output,
-                )?;
-            } else {
-                emit_one(&payload, output)?;
-                if !output.quiet
-                    && let Some(summary) = summary.as_ref()
+                let transcript = if let Some(path) = args.extract_transcript.as_deref() {
+                    Some(extract_transcript_from_capture_identity(
+                        &agent_kind,
+                        &rec.session_id,
+                        &rec.working_dir,
+                        &rec.provider_session_id,
+                        path,
+                    )?)
+                } else {
+                    None
+                };
+                if output.is_json()
+                    && let Some(transcript) = transcript
                 {
-                    emit_summary(summary);
-                }
-                if !output.quiet
-                    && let Some(terminal) = terminal_capture
-                {
-                    println!("terminal_state: {}", terminal.status);
-                    println!("terminal_owner: {}", terminal.owner);
-                    println!("terminal_reason: {}", terminal.reason);
-                    println!("terminal_superseded: {}", terminal.superseded);
-                    if terminal.status == "completed" {
-                        println!(
-                            "terminal_help : receipt completed; inspect checkpoint show/export for thinking availability"
-                        );
-                    } else {
-                        println!(
-                            "terminal_help : inspect `libra agent doctor`; repair requires the original worktree/workspace and explicit `--repair`"
-                        );
-                    }
-                }
-                if !output.quiet
-                    && let Some(links) = &commit_links
-                {
-                    println!(
-                        "commit_links: {} (page {}; evidence completeness unknown)",
-                        links.links.len(),
-                        links.page
+                    return emit_json_data(
+                        "agent_session",
+                        &SessionTranscriptExtractionOutput {
+                            session: payload,
+                            extracted_transcript: transcript,
+                        },
+                        output,
                     );
-                    for link in &links.links {
-                        println!("  {} {}", link.hash_kind, link.commit_oid);
+                }
+                emit_one(&payload, output)?;
+                if let Some(transcript) = transcript
+                    && !output.quiet
+                    && !output.is_json()
+                {
+                    println!("transcript     : {}", transcript.output_path);
+                    println!("transcript_len : {} bytes", transcript.bytes);
+                }
+                Ok(())
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (args, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
                     }
-                    if links.has_more {
-                        println!("  more: use --commit-page {}", links.page + 1);
+                    .into_cli_error(),
+                )
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = store::open_current().await.map_err(|error| {
+                    CliError::fatal(format!("failed to open the capture database: {error}"))
+                })?;
+                let backend = conn.get_database_backend();
+
+                if !table_exists(&conn, "agent_session").await? {
+                    return Err(CliError::fatal(format!(
+                        "no captured session matches '{}': agent_session table not yet present (run `libra init`?)",
+                        args.session_id
+                    )));
+                }
+
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    format!(
+                        "SELECT session_id, agent_kind, provider_session_id, state, working_dir, \
+                            started_at, last_event_at, \
+                            CASE WHEN agent_kind='codex' AND (typeof(metadata_json) <> 'text' OR \
+                                length(CAST(metadata_json AS BLOB)) > {CAPTURE_DIAGNOSTIC_METADATA_CAP_BYTES}) \
+                            THEN '{{}}' ELSE COALESCE(metadata_json, '{{}}') END AS metadata_json \
+                     FROM agent_session WHERE session_id = ? LIMIT 1"
+                    ),
+                    [args.session_id.clone().into()],
+                );
+                let snapshot = conn.begin().await.map_err(|e| {
+                    CliError::fatal(format!("failed to start session diagnostic read: {e}"))
+                })?;
+                let row = snapshot
+                    .query_one_raw(stmt)
+                    .await
+                    .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
+                // Keep the visible lifecycle and terminal/owner view in one read snapshot.
+                // A malformed kind is still diagnosed by the existing row decoder below.
+                let terminal_capture = if row
+                    .as_ref()
+                    .and_then(|r| r.try_get_by::<String, _>("agent_kind").ok())
+                    .as_deref()
+                    == Some("codex")
+                {
+                    Some(
+                        CaptureCatalogStore::terminal_diagnostic_for_session(
+                            &snapshot,
+                            &args.session_id,
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            CaptureTerminalDiagnostic::unavailable("catalog_unavailable")
+                        }),
+                    )
+                } else {
+                    None
+                };
+                let summary_read = if terminal_capture.is_some() {
+                    Some(match crate::utils::util::try_get_storage_path(None) {
+                        Ok(storage) => {
+                            SessionSummaryRead::prepare(&snapshot, &storage, &args.session_id).await
+                        }
+                        Err(_) => Err(anyhow::anyhow!("session summary storage is unavailable")),
+                    })
+                } else {
+                    None
+                };
+                let commit_links = if terminal_capture.is_some() {
+                    Some(
+                        read_session_commit_links(&snapshot, &args.session_id, args.commit_page)
+                            .await,
+                    )
+                } else {
+                    None
+                };
+                snapshot.commit().await.map_err(|e| {
+                    CliError::fatal(format!("failed to finish session diagnostic read: {e}"))
+                })?;
+                let summary = match summary_read {
+                    Some(Ok(read)) => Some(read.finish().await),
+                    Some(Err(_)) => Some(SessionSummaryView::unavailable()),
+                    None => None,
+                };
+                match row {
+                    Some(row) => {
+                        let metadata_json =
+                            match decode_session_show_text(&row, "metadata_json", &args.session_id)
+                            {
+                                Ok(value) => value,
+                                // The catalog already made malformed Codex metadata explicit.
+                                // Keep that unavailable diagnostic visible even for invalid UTF-8.
+                                Err(_)
+                                    if terminal_capture.as_ref().is_some_and(|d| {
+                                        d.reason == "invalid_receipt_metadata"
+                                    }) =>
+                                {
+                                    "{}".to_owned()
+                                }
+                                Err(error) => return Err(error),
+                            };
+                        let capture = capture_diagnostic_from_metadata(&metadata_json);
+                        let session_id =
+                            decode_session_show_text(&row, "session_id", &args.session_id)?;
+                        let agent_kind =
+                            decode_session_show_text(&row, "agent_kind", &args.session_id)?;
+                        let provider_session_id = decode_session_show_text(
+                            &row,
+                            "provider_session_id",
+                            &args.session_id,
+                        )?;
+                        let working_dir =
+                            decode_session_show_text(&row, "working_dir", &args.session_id)?;
+                        let payload = SessionRow {
+                            session_id: session_id.clone(),
+                            agent_kind: agent_kind.clone(),
+                            state: decode_session_show_text(&row, "state", &args.session_id)?,
+                            working_dir: working_dir.clone(),
+                            started_at: decode_session_show_i64(
+                                &row,
+                                "started_at",
+                                &args.session_id,
+                            )?,
+                            last_event_at: decode_session_show_i64(
+                                &row,
+                                "last_event_at",
+                                &args.session_id,
+                            )?,
+                            capture_status: capture.status,
+                            capture_error_code: capture.error_code,
+                            capture_error_stage: capture.error_stage,
+                            capture_failed_at: capture.failed_at,
+                        };
+                        let transcript = if let Some(path) = args.extract_transcript.as_deref() {
+                            Some(extract_transcript_from_capture_identity(
+                                &agent_kind,
+                                &session_id,
+                                &working_dir,
+                                &provider_session_id,
+                                path,
+                            )?)
+                        } else {
+                            None
+                        };
+                        if output.is_json()
+                            && let Some(transcript) = transcript
+                        {
+                            return emit_json_data(
+                                "agent_session",
+                                &SessionTranscriptExtractionOutput {
+                                    session: payload,
+                                    extracted_transcript: transcript,
+                                },
+                                output,
+                            );
+                        }
+                        if output.is_json() && terminal_capture.is_some() {
+                            emit_json_data(
+                                "agent_session",
+                                &SessionShowOutput {
+                                    session: &payload,
+                                    terminal_capture: terminal_capture.as_ref(),
+                                    summary: summary.as_ref(),
+                                    commit_links: commit_links.as_ref(),
+                                },
+                                output,
+                            )?;
+                        } else {
+                            emit_one(&payload, output)?;
+                            if !output.quiet
+                                && let Some(summary) = summary.as_ref()
+                            {
+                                emit_summary(summary);
+                            }
+                            if !output.quiet
+                                && let Some(terminal) = terminal_capture
+                            {
+                                println!("terminal_state: {}", terminal.status);
+                                println!("terminal_owner: {}", terminal.owner);
+                                println!("terminal_reason: {}", terminal.reason);
+                                println!("terminal_superseded: {}", terminal.superseded);
+                                if terminal.status == "completed" {
+                                    println!(
+                                        "terminal_help : receipt completed; inspect checkpoint show/export for thinking availability"
+                                    );
+                                } else {
+                                    println!(
+                                        "terminal_help : inspect `libra agent doctor`; repair requires the original worktree/workspace and explicit `--repair`"
+                                    );
+                                }
+                            }
+                            if !output.quiet
+                                && let Some(links) = &commit_links
+                            {
+                                println!(
+                                    "commit_links: {} (page {}; evidence completeness unknown)",
+                                    links.links.len(),
+                                    links.page
+                                );
+                                for link in &links.links {
+                                    println!("  {} {}", link.hash_kind, link.commit_oid);
+                                }
+                                if links.has_more {
+                                    println!("  more: use --commit-page {}", links.page + 1);
+                                }
+                                if links.page_limit_reached {
+                                    println!(
+                                        "  page limit reached; additional links are outside this bounded view"
+                                    );
+                                }
+                                if links.evidence_state != "available" {
+                                    println!("  link evidence: unavailable for the current scope");
+                                }
+                            }
+                        }
+                        if let Some(transcript) = transcript
+                            && !output.quiet
+                            && !output.is_json()
+                        {
+                            println!("transcript     : {}", transcript.output_path);
+                            println!("transcript_len : {} bytes", transcript.bytes);
+                        }
+                        Ok(())
                     }
-                    if links.page_limit_reached {
-                        println!(
-                            "  page limit reached; additional links are outside this bounded view"
-                        );
-                    }
-                    if links.evidence_state != "available" {
-                        println!("  link evidence: unavailable for the current scope");
-                    }
+                    None => Err(CliError::fatal(format!(
+                        "no captured session matches id '{}'",
+                        args.session_id
+                    ))),
                 }
             }
-            if let Some(transcript) = transcript
-                && !output.quiet
-                && !output.is_json()
+            #[cfg(not(feature = "storage-sqlite"))]
             {
-                println!("transcript     : {}", transcript.output_path);
-                println!("transcript_len : {} bytes", transcript.bytes);
+                let _ = (args, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                )
             }
-            Ok(())
         }
-        None => Err(CliError::fatal(format!(
-            "no captured session matches id '{}'",
-            args.session_id
-        ))),
     }
 }
 
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 #[derive(Serialize)]
 struct SessionShowOutput<'a> {
     #[serde(flatten)]
@@ -735,12 +968,14 @@ struct SessionShowOutput<'a> {
     commit_links: Option<&'a SessionCommitLinks>,
 }
 
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 #[derive(Serialize)]
 struct SessionCommitLink {
     hash_kind: String,
     commit_oid: String,
 }
 
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 #[derive(Serialize)]
 struct SessionCommitLinks {
     page: u16,
@@ -751,6 +986,7 @@ struct SessionCommitLinks {
     links: Vec<SessionCommitLink>,
 }
 
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 impl SessionCommitLinks {
     fn unavailable(page: u16) -> Self {
         Self {
@@ -764,6 +1000,7 @@ impl SessionCommitLinks {
     }
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn read_session_commit_links<C: ConnectionTrait>(
     conn: &C,
     session_id: &str,
@@ -800,20 +1037,32 @@ async fn read_session_commit_links<C: ConnectionTrait>(
         }
         scope
     } else {
-        let Ok(repo) =
-            crate::internal::db::open_cached_repository(&crate::utils::path::database()).await
-        else {
+        let Ok(storage) = crate::utils::util::try_get_storage_path(None) else {
             return SessionCommitLinks::unavailable(page);
         };
-        let Ok(scope) =
-            crate::internal::ai::capture_scope::CaptureScope::resolve(&repo, &worktree_root).await
-        else {
-            return SessionCommitLinks::unavailable(page);
-        };
-        if scope.assert_workspace_fence_live(&repo).await.is_err() {
-            return SessionCommitLinks::unavailable(page);
+        match crate::storage::runtime::detect_repo_backend(&storage) {
+            Ok(StorageBackendKind::Redb) | Err(_) => return SessionCommitLinks::unavailable(page),
+            Ok(StorageBackendKind::Sqlite) => {
+                let Ok(repo) =
+                    crate::internal::db::open_cached_repository(&crate::utils::path::database())
+                        .await
+                else {
+                    return SessionCommitLinks::unavailable(page);
+                };
+                let Ok(scope) = crate::internal::ai::capture_scope::CaptureScope::resolve(
+                    &repo,
+                    &worktree_root,
+                )
+                .await
+                else {
+                    return SessionCommitLinks::unavailable(page);
+                };
+                if scope.assert_workspace_fence_live(&repo).await.is_err() {
+                    return SessionCommitLinks::unavailable(page);
+                }
+                scope
+            }
         }
-        scope
     };
     let mut values = vec![session_id.into()];
     values.extend(scope.sql_values());
@@ -879,6 +1128,7 @@ async fn read_session_commit_links<C: ConnectionTrait>(
     }
 }
 
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 fn emit_summary(summary: &SessionSummaryView) {
     println!("summary_status: {}", summary.status);
     println!("summary_source_status: {}", summary.source_status);
@@ -925,21 +1175,218 @@ fn emit_summary(summary: &SessionSummaryView) {
 }
 
 async fn stop(args: SessionStopArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
-    let result = mutate_session_state(&conn, &args.session_id, SessionMutationKind::Stop).await?;
+    let storage =
+        crate::utils::util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
+    let result = match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(CliError::from)?
+    {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let capture = crate::storage::runtime::open_capture_store_read_write(
+                    &storage,
+                    crate::storage::opener::RedbRepairContext::WriteCommand,
+                )
+                .await
+                .map_err(CliError::from)?;
+                mutate_session_state_with_store(
+                    capture.as_ref(),
+                    &args.session_id,
+                    SessionMutationKind::Stop,
+                )
+                .await?
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (args, output);
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = store::open_current().await.map_err(|error| {
+                    CliError::fatal(format!("failed to open the capture database: {error}"))
+                })?;
+                mutate_session_state(&conn, &args.session_id, SessionMutationKind::Stop).await?
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (args, output);
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+    };
     emit_session_mutation(&result, output)
 }
 
 async fn resume(args: SessionResumeArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
-    let result = mutate_session_state(&conn, &args.session_id, SessionMutationKind::Resume).await?;
+    let storage =
+        crate::utils::util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
+    let result = match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(CliError::from)?
+    {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let capture = crate::storage::runtime::open_capture_store_read_write(
+                    &storage,
+                    crate::storage::opener::RedbRepairContext::WriteCommand,
+                )
+                .await
+                .map_err(CliError::from)?;
+                mutate_session_state_with_store(
+                    capture.as_ref(),
+                    &args.session_id,
+                    SessionMutationKind::Resume,
+                )
+                .await?
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (args, output);
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = store::open_current().await.map_err(|error| {
+                    CliError::fatal(format!("failed to open the capture database: {error}"))
+                })?;
+                mutate_session_state(&conn, &args.session_id, SessionMutationKind::Resume).await?
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (args, output);
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+    };
     emit_session_mutation(&result, output)
 }
 
+#[cfg(feature = "storage-redb")]
+async fn mutate_session_state_with_store(
+    capture: &dyn crate::storage::CaptureStore,
+    session_id: &str,
+    kind: SessionMutationKind,
+) -> CliResult<SessionMutationOutput> {
+    use crate::storage::capture_store::{CaptureScopeState, CaptureSessionState};
+
+    let mut rec = capture
+        .get_session(session_id)
+        .await
+        .map_err(CliError::from)?
+        .ok_or_else(|| CliError::fatal(format!("no captured session matches id '{session_id}'")))?;
+
+    if rec.state == CaptureSessionState::Quarantined {
+        return Err(CliError::fatal(format!(
+            "cannot {} captured session '{session_id}' because it is quarantined; inspect the capture state before mutating it",
+            kind.action()
+        )));
+    }
+
+    let current_state = rec.state.as_str().to_string();
+    match kind {
+        SessionMutationKind::Stop if rec.state == CaptureSessionState::Stopped => {
+            return Ok(SessionMutationOutput {
+                action: kind.action(),
+                session_id: session_id.to_string(),
+                previous_state: current_state.clone(),
+                state: current_state,
+                updated: false,
+                stopped_at: rec.stopped_at,
+                last_event_at: rec.last_event_at,
+            });
+        }
+        SessionMutationKind::Resume if rec.state == CaptureSessionState::Active => {
+            return Ok(SessionMutationOutput {
+                action: kind.action(),
+                session_id: session_id.to_string(),
+                previous_state: current_state.clone(),
+                state: current_state,
+                updated: false,
+                stopped_at: rec.stopped_at,
+                last_event_at: rec.last_event_at,
+            });
+        }
+        SessionMutationKind::Resume if rec.state != CaptureSessionState::Stopped => {
+            return Err(CliError::fatal(format!(
+                "cannot resume captured session '{session_id}' from state '{current_state}'; only stopped sessions can be resumed"
+            )));
+        }
+        _ => {}
+    }
+
+    if rec.scope_state == CaptureScopeState::LegacyUnknown {
+        return Err(CliError::fatal(format!(
+            "session '{session_id}' predates workspace scoping and is excluded from new \
+             writes; adopt it first with `libra worktree doctor <workspace-id> \
+             --adopt-capture-session {session_id} --confirm`"
+        )));
+    }
+    if rec.scope_state == CaptureScopeState::Scoped {
+        let row_worktree = rec.worktree_id.as_deref().unwrap_or_default();
+        let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+        let current_worktree = scope.worktree_id().unwrap_or_default();
+        if row_worktree != current_worktree {
+            return Err(CliError::fatal(format!(
+                "session '{session_id}' is owned by another worktree scope ('{row_worktree}'); \
+                 run this from that worktree, or inspect with `libra worktree doctor`"
+            )));
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let (new_state, new_stopped_at) = match kind {
+        SessionMutationKind::Stop => (CaptureSessionState::Stopped, Some(now)),
+        SessionMutationKind::Resume => (CaptureSessionState::Active, None),
+    };
+    rec.state = new_state;
+    rec.last_event_at = now;
+    rec.stopped_at = new_stopped_at;
+    rec.sync_revision = rec.sync_revision.saturating_add(1);
+    capture.upsert_session(&rec).await.map_err(CliError::from)?;
+
+    Ok(SessionMutationOutput {
+        action: kind.action(),
+        session_id: session_id.to_string(),
+        previous_state: current_state,
+        state: new_state.as_str().to_string(),
+        updated: true,
+        stopped_at: new_stopped_at,
+        last_event_at: now,
+    })
+}
+
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 async fn mutate_session_state(
     conn: &(impl ConnectionTrait + ?Sized),
     session_id: &str,
@@ -1259,6 +1706,7 @@ fn capture_diagnostic_from_metadata(metadata_json: &str) -> CaptureDiagnostic {
     }
 }
 
+#[cfg_attr(not(feature = "storage-sqlite"), allow(dead_code))]
 async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> CliResult<bool> {
     let backend = conn.get_database_backend();
     let stmt = Statement::from_sql_and_values(

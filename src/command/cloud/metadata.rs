@@ -390,6 +390,103 @@ pub(super) fn serialize_reference_projection(
     Ok((sorted_refs, json))
 }
 
+/// Convert a storage-layer [`crate::storage::git_store::RefRecord`] into the
+/// cloud wire [`reference::Model`] representation, keeping the R2 metadata JSON
+/// wire protocol identical between SQLite and Redb backends.
+#[cfg(feature = "storage-redb")]
+pub(super) fn ref_record_to_model(
+    id: i64,
+    record: crate::storage::git_store::RefRecord,
+) -> reference::Model {
+    use crate::storage::git_store::{RefKey, RefTarget};
+
+    match (record.key, record.target) {
+        (RefKey::LocalHead { worktree_id }, RefTarget::Symbolic(branch_name)) => reference::Model {
+            id,
+            name: Some(branch_name),
+            kind: reference::ConfigKind::Head,
+            commit: None,
+            remote: None,
+            worktree_id,
+        },
+        (RefKey::LocalHead { worktree_id }, RefTarget::Direct(oid)) => reference::Model {
+            id,
+            name: None,
+            kind: reference::ConfigKind::Head,
+            commit: Some(oid),
+            remote: None,
+            worktree_id,
+        },
+        (RefKey::RemoteHead { remote }, RefTarget::Symbolic(branch_name)) => reference::Model {
+            id,
+            name: Some(branch_name),
+            kind: reference::ConfigKind::Head,
+            commit: None,
+            remote: Some(remote),
+            worktree_id: None,
+        },
+        (RefKey::RemoteHead { remote }, RefTarget::Direct(oid)) => reference::Model {
+            id,
+            name: None,
+            kind: reference::ConfigKind::Head,
+            commit: Some(oid),
+            remote: Some(remote),
+            worktree_id: None,
+        },
+        (RefKey::LocalBranch { name }, target) => {
+            let commit = match target {
+                RefTarget::Direct(oid) | RefTarget::Symbolic(oid) => Some(oid),
+            };
+            reference::Model {
+                id,
+                name: Some(name),
+                kind: reference::ConfigKind::Branch,
+                commit,
+                remote: None,
+                worktree_id: None,
+            }
+        }
+        (RefKey::RemoteBranch { remote, name }, target) => {
+            let commit = match target {
+                RefTarget::Direct(oid) | RefTarget::Symbolic(oid) => Some(oid),
+            };
+            reference::Model {
+                id,
+                name: Some(name),
+                kind: reference::ConfigKind::Branch,
+                commit,
+                remote: Some(remote),
+                worktree_id: None,
+            }
+        }
+        (RefKey::Tag { name }, target) => {
+            let commit = match target {
+                RefTarget::Direct(oid) | RefTarget::Symbolic(oid) => Some(oid),
+            };
+            reference::Model {
+                id,
+                name: Some(name),
+                kind: reference::ConfigKind::Tag,
+                commit,
+                remote: None,
+                worktree_id: None,
+            }
+        }
+    }
+}
+
+/// Sort [`reference::Model`] rows in the exact cloud metadata projection order
+/// (`name`, `remote`, `kind`, with `id` tie-breaking) used by
+/// [`reference_projection_page`] and [`serialize_reference_projection`].
+#[cfg(feature = "storage-redb")]
+pub(super) fn sort_reference_models(references: &mut [reference::Model]) {
+    references.sort_by(|a, b| {
+        let a_kind = format!("{:?}", a.kind);
+        let b_kind = format!("{:?}", b.kind);
+        (&a.name, &a.remote, a_kind, a.id).cmp(&(&b.name, &b.remote, b_kind, b.id))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};

@@ -193,3 +193,85 @@ pub fn classify_schema(compatibility: &SchemaCompatibility) -> SourceState {
         SchemaCompatibility::UnsupportedFuture { .. } => SourceState::SchemaNew,
     }
 }
+
+/// Map a unified [`crate::storage::StorageBackendError`] into the window's
+/// [`SourceState`], preserving filesystem [`ErrorKind`] values on unreadable
+/// paths and classifying schema-version and repair errors accurately.
+pub fn classify_storage_error(error: &crate::storage::StorageBackendError) -> SourceState {
+    use crate::storage::StorageBackendError;
+
+    match error {
+        StorageBackendError::SchemaTooNew { .. }
+        | StorageBackendError::UnsupportedSchemaVersion { .. } => SourceState::SchemaNew,
+        StorageBackendError::RepairAborted { .. } => SourceState::Corrupt,
+        StorageBackendError::WriteLockBusy { .. } | StorageBackendError::QueueBusy { .. } => {
+            SourceState::Busy
+        }
+        StorageBackendError::NotFound { .. } => SourceState::Absent,
+        StorageBackendError::Io { kind, .. } => match *kind {
+            ErrorKind::NotFound => SourceState::Absent,
+            ErrorKind::WouldBlock | ErrorKind::TimedOut => SourceState::Busy,
+            ErrorKind::UnexpectedEof | ErrorKind::InvalidData => SourceState::Corrupt,
+            other => SourceState::Unreadable { kind: other },
+        },
+        StorageBackendError::BackendInternal { detail } => {
+            let lower = detail.to_ascii_lowercase();
+            if lower.contains("legacy redb format version") || lower.contains("upgrade required") {
+                SourceState::SchemaOld
+            } else if lower.contains("exclusively locked")
+                || lower.contains("would block")
+                || lower.contains("locked")
+                || lower.contains("busy")
+                || lower.contains("timed out")
+                || lower.contains("timedout")
+            {
+                SourceState::Busy
+            } else {
+                SourceState::Corrupt
+            }
+        }
+        StorageBackendError::CodecEncode { .. }
+        | StorageBackendError::TruncatedHeader { .. }
+        | StorageBackendError::TruncatedPayload { .. }
+        | StorageBackendError::CorruptPayload { .. }
+        | StorageBackendError::UnsupportedBackend { .. }
+        | StorageBackendError::PreReleaseGateLocked { .. }
+        | StorageBackendError::ManifestNotFinalized { .. }
+        | StorageBackendError::BackendMismatch { .. }
+        | StorageBackendError::RepositoryMigrated { .. }
+        | StorageBackendError::RoleMismatch { .. }
+        | StorageBackendError::CorruptCommittedFrame { .. }
+        | StorageBackendError::QueueFull { .. } => SourceState::Corrupt,
+    }
+}
+
+/// Map a decoded `redb` [`crate::storage::meta::MetaSchemaRecord`] to the
+/// window's [`SourceState`].
+///
+/// Distinguishes future `META_SCHEMA` versions (`SchemaNew`), older
+/// `META_SCHEMA` versions (`SchemaOld`), role or migration-tombstone
+/// mismatches (`Corrupt`), and compatible schemas (`Available`).
+#[cfg(feature = "storage-redb")]
+pub fn classify_redb_meta_schema(
+    record: &crate::storage::meta::MetaSchemaRecord,
+    expected_role: crate::internal::db::schema::DatabaseRole,
+) -> SourceState {
+    use crate::storage::meta::{CURRENT_REDB_FORMAT_VERSION, MAX_SUPPORTED_READER_VERSION};
+
+    if record.role.into_database_role() != expected_role {
+        return SourceState::Corrupt;
+    }
+    if record.is_migration_tombstone() {
+        return SourceState::Corrupt;
+    }
+    if record.min_reader_version > MAX_SUPPORTED_READER_VERSION {
+        return SourceState::SchemaNew;
+    }
+    if record.format_version < CURRENT_REDB_FORMAT_VERSION {
+        return SourceState::SchemaOld;
+    }
+    if record.min_reader_version == 0 {
+        return SourceState::Corrupt;
+    }
+    SourceState::Available
+}

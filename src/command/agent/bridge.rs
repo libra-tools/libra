@@ -13,22 +13,31 @@
 
 use async_trait::async_trait;
 use clap::Args;
+#[cfg(feature = "storage-sqlite")]
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use tracing::Instrument;
 
+#[cfg(feature = "storage-redb")]
+use crate::internal::ai::agent_bridge::{
+    ingress::{StoreBridgeContext, dispatch_with_store as dispatch_ingress_with_store},
+    methods::dispatch_with_store as dispatch_read_with_store,
+};
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::db;
 use crate::{
-    internal::{
-        ai::agent_bridge::{
-            ingress::{BridgeContext, dispatch as dispatch_ingress},
-            methods::dispatch as dispatch_read,
-            mutations::dispatch as dispatch_mutation,
-            protocol::{BridgeError, BridgeRequest, BridgeResponse, dispatch_handshake},
-            transport::{BridgeHandler, run},
-            workspace::dispatch as dispatch_workspace,
-        },
-        db,
+    internal::ai::agent_bridge::{
+        ingress::{BridgeContext, dispatch as dispatch_ingress},
+        methods::dispatch as dispatch_read,
+        mutations::dispatch as dispatch_mutation,
+        protocol::{BridgeError, BridgeRequest, BridgeResponse, dispatch_handshake},
+        transport::{BridgeHandler, run},
+        workspace::dispatch as dispatch_workspace,
     },
-    utils::{error::CliResult, output::OutputConfig},
+    storage::StorageBackendKind,
+    utils::{
+        error::{CliError, CliResult},
+        output::OutputConfig,
+    },
 };
 
 #[derive(Args, Debug)]
@@ -104,6 +113,52 @@ impl BridgeHandler for IngressBridgeHandler {
     }
 }
 
+/// Store-backed bridge command handler for `redb` repositories (`RB-25`/`RB-26`).
+#[cfg(feature = "storage-redb")]
+pub struct RedbIngressBridgeHandler {
+    pub ctx: StoreBridgeContext,
+}
+
+#[cfg(feature = "storage-redb")]
+impl RedbIngressBridgeHandler {
+    /// Build a store-backed handler over a trusted repository scope.
+    pub fn new(ctx: StoreBridgeContext) -> Self {
+        Self { ctx }
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+#[async_trait(?Send)]
+impl BridgeHandler for RedbIngressBridgeHandler {
+    async fn handle(&self, request: &BridgeRequest) -> Result<Option<BridgeResponse>, BridgeError> {
+        let span = tracing::info_span!(
+            "agent.bridge.request",
+            method = %request.method,
+            id = ?request.id,
+            repository_id = %self.ctx.repository_id,
+        );
+        async move {
+            match request.method.as_str() {
+                "initialize" => dispatch_handshake(request),
+                _ => {
+                    if let Some(resp) = dispatch_read_with_store(&self.ctx, request).await? {
+                        return Ok(Some(resp));
+                    }
+                    if let Some(resp) = dispatch_ingress_with_store(&self.ctx, request).await? {
+                        return Ok(Some(resp));
+                    }
+                    Ok(Some(
+                        BridgeError::not_implemented(&request.method)
+                            .into_object(request.id.clone().unwrap_or(serde_json::Value::Null)),
+                    ))
+                }
+            }
+        }
+        .instrument(span)
+        .await
+    }
+}
+
 /// Run `libra agent bridge --stdio`. Reads NDJSON from stdin and writes one
 /// NDJSON frame per response to stdout. Repository/worktree scope is resolved
 /// from the trusted context (GC-LB-06/07), never from the request body.
@@ -111,52 +166,131 @@ impl BridgeHandler for IngressBridgeHandler {
 /// are answered as JSON-RPC error frames (ER-LB-09).
 pub async fn execute_safe(args: BridgeArgs, _output: &OutputConfig) -> CliResult<()> {
     if !args.stdio {
-        return Err(crate::utils::error::CliError::command_usage(
+        return Err(CliError::command_usage(
             "libra agent bridge requires --stdio (the bridge has no other transport)",
         ));
     }
 
-    let repo = db::open_cached_repository(&crate::utils::path::database())
-        .await
-        .map_err(|error| {
-            crate::utils::error::CliError::fatal(format!(
-                "libra agent bridge: failed to open repository database: {error}"
-            ))
-        })?;
-    let repository_id = resolve_repository_id(&repo).await.map_err(|msg| {
-        crate::utils::error::CliError::fatal(format!("libra agent bridge: {msg}"))
-    })?;
-    let conn = crate::internal::ai::capture::store::open_current()
-        .await
-        .map_err(|error| {
-            crate::utils::error::CliError::fatal(format!(
-                "libra agent bridge: failed to open the capture database: {error}"
-            ))
-        })?;
+    let storage =
+        crate::utils::util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
 
-    let ctx = BridgeContext {
-        repo,
-        conn,
-        repository_id,
-        // Worktree binding is refined in LB-06; the bridge command currently
-        // binds repository scope only.
-        worktree_id: None,
-    };
+    let outcome = match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(CliError::from)?
+    {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                use crate::storage::opener::RedbRepairContext;
 
-    let handler = IngressBridgeHandler::new(ctx);
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let outcome = {
-        let stdout = stdout.lock();
-        run(
-            stdin.lock(),
-            stdout,
-            &handler,
-            std::time::Duration::from_secs(
-                crate::internal::ai::agent_bridge::REQUEST_DEADLINE_SECS,
-            ),
-        )
-        .await
+                let git = crate::storage::runtime::open_git_store_read_write(&storage)
+                    .await
+                    .map_err(CliError::from)?;
+                let config = crate::storage::runtime::open_repo_config_store_read_write(&storage)
+                    .await
+                    .map_err(CliError::from)?;
+                let git_state = crate::storage::runtime::open_git_state_store_read_write(&storage)
+                    .await
+                    .map_err(CliError::from)?;
+                let repository_id = resolve_repository_id_with_store(config.as_ref())
+                    .await
+                    .map_err(|msg| CliError::fatal(format!("libra agent bridge: {msg}")))?;
+                let capture = crate::storage::runtime::open_capture_store_read_write(
+                    &storage,
+                    RedbRepairContext::WriteCommand,
+                )
+                .await
+                .map_err(CliError::from)?;
+
+                let ctx = StoreBridgeContext {
+                    storage,
+                    git,
+                    config,
+                    git_state,
+                    capture,
+                    repository_id,
+                    worktree_id: None,
+                };
+                let handler = RedbIngressBridgeHandler::new(ctx);
+                let stdin = std::io::stdin();
+                let stdout = std::io::stdout();
+                let stdout = stdout.lock();
+                run(
+                    stdin.lock(),
+                    stdout,
+                    &handler,
+                    std::time::Duration::from_secs(
+                        crate::internal::ai::agent_bridge::REQUEST_DEADLINE_SECS,
+                    ),
+                )
+                .await
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let repo = db::open_cached_repository(&crate::utils::path::database())
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "libra agent bridge: failed to open repository database: {error}"
+                        ))
+                    })?;
+                let repository_id = resolve_repository_id(&repo)
+                    .await
+                    .map_err(|msg| CliError::fatal(format!("libra agent bridge: {msg}")))?;
+                let conn = crate::internal::ai::capture::store::open_current()
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "libra agent bridge: failed to open the capture database: {error}"
+                        ))
+                    })?;
+
+                let ctx = BridgeContext {
+                    repo,
+                    conn,
+                    repository_id,
+                    // Worktree binding is refined in LB-06; the bridge command currently
+                    // binds repository scope only.
+                    worktree_id: None,
+                };
+
+                let handler = IngressBridgeHandler::new(ctx);
+                let stdin = std::io::stdin();
+                let stdout = std::io::stdout();
+                let stdout = stdout.lock();
+                run(
+                    stdin.lock(),
+                    stdout,
+                    &handler,
+                    std::time::Duration::from_secs(
+                        crate::internal::ai::agent_bridge::REQUEST_DEADLINE_SECS,
+                    ),
+                )
+                .await
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
     };
     // GC-LB-10: whatever ended the loop — EOF, broken pipe, or a fatal I/O
     // error — no review run this bridge started may outlive it. Cancel and
@@ -164,16 +298,35 @@ pub async fn execute_safe(args: BridgeArgs, _output: &OutputConfig) -> CliResult
     // leave orphaned reviewer process groups behind.
     crate::internal::ai::agent_bridge::vcs::supervisor::shutdown().await;
     outcome.map_err(|error| {
-        crate::utils::error::CliError::fatal(format!(
+        CliError::fatal(format!(
             "libra agent bridge: fatal I/O error on the stdio transport: {error}"
         ))
     })?;
     Ok(())
 }
 
+#[cfg(feature = "storage-redb")]
+async fn resolve_repository_id_with_store(
+    config: &dyn crate::storage::ConfigStore,
+) -> Result<String, String> {
+    let entry = config
+        .get("libra.repoid")
+        .await
+        .map_err(|e| format!("cannot read this repository's identity: {e}"))?;
+    entry
+        .map(|entry| entry.value)
+        .filter(|v| !v.trim().is_empty() && v != "unknown-repo")
+        .ok_or_else(|| {
+            "this repository has no recorded identity (`libra.repoid`); run `libra status` once \
+             to record one before starting the bridge"
+                .to_string()
+        })
+}
+
 /// Resolve the trusted repository identity from `libra.repoid` (the same
 /// identity the workspace store and sequencer control use). A repository
 /// without a recorded identity cannot be a bridge target.
+#[cfg(feature = "storage-sqlite")]
 async fn resolve_repository_id(conn: &sea_orm::DatabaseConnection) -> Result<String, String> {
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(

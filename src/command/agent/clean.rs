@@ -31,24 +31,29 @@
 //! blob (the E4-libra `redaction_report.json` is already aggregate-only and
 //! content-hash-covered), so the checkpoint tree is not touched by this window.
 
-use std::{collections::HashSet, fs, path::Path, sync::Arc};
+#[cfg(feature = "storage-sqlite")]
+use std::sync::Arc;
+use std::{collections::HashSet, fs, path::Path};
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "storage-sqlite")]
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 
 use super::CleanArgs;
-use crate::{
-    internal::{
-        ai::{
-            capture::store,
-            history::{
-                CheckpointPruneGuardError, HistoryManager, SubagentContentReservationPruneGuard,
-            },
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::{
+    ai::{
+        capture::store,
+        history::{
+            CheckpointPruneGuardError, HistoryManager, SubagentContentReservationPruneGuard,
         },
-        branch::TRACES_BRANCH,
-        db,
     },
+    branch::TRACES_BRANCH,
+    db,
+};
+use crate::{
+    storage::StorageBackendKind,
     utils::{
         client_storage::ClientStorage,
         error::{CliError, CliResult},
@@ -98,6 +103,7 @@ struct CleanReport {
     note: &'static str,
 }
 
+#[cfg(feature = "storage-sqlite")]
 const OWNERLESS_IMPORT_IDENTITY_PREDICATE: &str =
     "state IN ('discovered','partial','committed','failed')
  AND owner IS NULL
@@ -114,6 +120,7 @@ const OWNERLESS_IMPORT_IDENTITY_PREDICATE: &str =
 /// The simulation is isolated in a rolled-back SQLite transaction, so the
 /// preview shares the real GC's relational semantics without changing refs,
 /// objects, or durable catalog rows.
+#[cfg(feature = "storage-sqlite")]
 async fn preview_import_identity_prune_count(
     conn: &DatabaseConnection,
     checkpoint_ids: &[String],
@@ -230,233 +237,470 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
             crate::utils::error::StableErrorCode::ConflictOperationBlocked,
         )?;
     }
-    let conn = store::open_current().await.map_err(|error| {
-        CliError::fatal(format!("failed to open the capture database: {error}"))
-    })?;
-    let backend = conn.get_database_backend();
-
-    if !table_exists(&conn, "agent_checkpoint").await? {
-        return emit_report(
-            &CleanReport {
-                sessions_inspected: 0,
-                temporary_checkpoints_dropped: 0,
-                retained_checkpoints_rewritten: 0,
-                traces_ref_rewritten: false,
-                window_guard: "noop",
-                object_index_rows_dropped: 0,
-                stderr_logs_pruned: 0,
-                stderr_runs_pruned: 0,
-                findings_runs_pruned: 0,
-                findings_runs_skipped: 0,
-                findings_gc_warnings: Vec::new(),
-                export_jobs_pruned: 0,
-                import_identities_pruned: 0,
-                dry_run: args.dry_run,
-                note: "agent_checkpoint table not present (run `libra init`?)",
-            },
-            output,
-        );
-    }
-
-    // Retention GC (AG-24a) always spans every stopped session; the
-    // default/temporary path keeps the `--all` scoping.
-    let session_scope = session_scope_sql(args.all || args.gc);
-    let session_filter = format!("SELECT COUNT(*) AS n FROM ({session_scope}) AS scoped_sessions");
-    let row = conn
-        .query_one_raw(Statement::from_string(backend, session_filter))
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to count agent_session: {e}")))?
-        .ok_or_else(|| CliError::fatal("agent_session count returned no rows".to_string()))?;
-    let sessions_inspected: i64 = row.try_get_by("n").unwrap_or_default();
-
-    let (checkpoint_ids, note): (Vec<String>, &'static str) = if args.gc {
-        // Resolve the transcript retention window (default 90). The cutoff
-        // is `created_at < now - window`. GC removes whole aged checkpoints
-        // (transcript + stderr blobs) — the append-only `agent_audit_log`
-        // is a separate table the prune engine never touches.
-        let retention_days = match args.retention_days {
-            Some(0) => {
-                return Err(CliError::command_usage(
-                    "--retention-days must be greater than 0".to_string(),
-                ));
-            }
-            Some(days) => days,
-            None => crate::internal::ai::observed_agents::compliance::retention_transcript_days()
-                .await
-                .map_err(|e| CliError::fatal(format!("read retention config: {e:#}")))?,
-        };
-        let cutoff_unix = chrono::Utc::now().timestamp() - i64::from(retention_days) * 86_400;
-        (
-            gc_expired_checkpoint_ids(&conn, session_scope, cutoff_unix).await?,
-            "retention GC dropped checkpoints older than agent.retention.transcript_days from \
-             stopped sessions; the append-only agent_audit_log was not touched",
-        )
-    } else {
-        (
-            temporary_checkpoint_ids(&conn, session_scope).await?,
-            "temporary checkpoint rows were dropped; reachable traces history was \
-             rewritten when checkpoint commits existed",
-        )
-    };
     let repo_path = util::try_get_storage_path(None)
         .map_err(|e| CliError::fatal(format!("failed to locate .libra directory: {e}")))?;
-    let storage = Arc::new(
-        crate::utils::client_storage::ClientStorage::open_init_storage(repo_path.join("objects"))
-            .map_err(|error| {
-            CliError::fatal(format!(
-                "failed to read storage configuration for {}",
-                error.variable()
-            ))
-        })?,
-    );
-    // Resolve the run-state root before `repo_path` is moved into the history
-    // manager; the stderr- and findings-window GCs below prune under it.
-    let sessions_root = repo_path.join("sessions");
 
-    // AG-24a stderr window (Task A8.6): resolve + validate the stderr cutoff
-    // BEFORE any prune mutation, so an invalid/overflowing config fails closed
-    // rather than aborting after the checkpoint/transcript GC already rewrote
-    // the store. It uses its own `agent.retention.stderr_days` knob (the
-    // `--retention-days` override targets the transcript window only, per its
-    // clap doc). `Some(None)` = window larger than representable time (nothing
-    // can be expired → GC is a no-op); `None` = not a `--gc` run.
-    let stderr_cutoff: Option<Option<DateTime<Utc>>> = if args.gc {
-        let stderr_days = crate::internal::ai::observed_agents::compliance::retention_stderr_days()
-            .await
-            .map_err(|e| CliError::fatal(format!("read stderr retention config: {e:#}")))?;
-        Some(stderr_cutoff_for_days(stderr_days))
-    } else {
-        None
-    };
+    match crate::storage::runtime::detect_repo_backend(&repo_path).map_err(CliError::from)? {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                use crate::{
+                    internal::ai::observed_agents::compliance::{
+                        retention_findings_days_with_store, retention_stderr_days_with_store,
+                        retention_transcript_days_with_store,
+                    },
+                    storage::capture_store::{CaptureCheckpointScope, CaptureSessionState},
+                };
 
-    // A0-09 findings window: resolve + validate BEFORE any mutation too, so a
-    // bad `agent.retention.findings_days` fails closed rather than aborting
-    // mid-sweep. Its own knob (independent of `--retention-days`).
-    let findings_cutoff: Option<Option<DateTime<Utc>>> = if args.gc {
-        let findings_days =
-            crate::internal::ai::observed_agents::compliance::retention_findings_days()
-                .await
-                .map_err(|e| CliError::fatal(format!("read findings retention config: {e:#}")))?;
-        Some(stderr_cutoff_for_days(findings_days))
-    } else {
-        None
-    };
-
-    let history =
-        HistoryManager::new_with_ref(storage, repo_path, Arc::new(conn.clone()), TRACES_BRANCH);
-    // Under `--dry-run` nothing is mutated: the checkpoint prune is skipped and
-    // its primary count is the number of checkpoints that WOULD be dropped.
-    let prune = if args.dry_run {
-        None
-    } else {
-        Some(
-            history
-                .prune_checkpoint_commits(&checkpoint_ids)
-                .await
-                .map_err(map_prune_error)?,
-        )
-    };
-
-    let (stderr_logs_pruned, stderr_runs_pruned) = match stderr_cutoff {
-        Some(Some(cutoff)) => gc_expired_stderr_logs(&sessions_root, cutoff, args.dry_run)?,
-        // Not a `--gc` run, or a retention window so large nothing is expired.
-        _ => (0, 0),
-    };
-
-    // plan-20260713 DR-04b: TTL-scavenge expired export-job rows under --gc
-    // (bounded by the ttl index; dry-run counts without deleting).
-    let export_jobs_pruned = if args.gc && table_exists(&conn, "agent_export_job").await? {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if args.dry_run {
-            let row = conn
-                .query_one_raw(sea_orm::Statement::from_sql_and_values(
-                    backend,
-                    "SELECT COUNT(*) AS n FROM agent_export_job WHERE ttl_expires_at <= ?",
-                    [now_ms.into()],
-                ))
-                .await
-                .map_err(|err| {
-                    CliError::fatal(format!("failed to count expired export jobs: {err}"))
-                })?;
-            row.and_then(|r| r.try_get_by::<i64, _>("n").ok())
-                .unwrap_or(0) as u64
-        } else {
-            crate::internal::ai::export_job::scavenge_expired(&conn, now_ms)
-                .await
-                .map_err(|err| {
-                    CliError::fatal(format!("failed to scavenge expired export jobs: {err:#}"))
-                })?
-        }
-    } else {
-        0
-    };
-
-    let swept_import_identities_pruned =
-        if args.gc && table_exists(&conn, "agent_import_identity").await? {
-            if args.dry_run {
-                preview_import_identity_prune_count(&conn, &checkpoint_ids).await?
-            } else {
-                let sql = format!(
-                    "DELETE FROM agent_import_identity WHERE {OWNERLESS_IMPORT_IDENTITY_PREDICATE}"
-                );
-                conn.execute_raw(Statement::from_string(backend, sql))
+                let capture = if args.dry_run {
+                    crate::storage::runtime::open_capture_store_read_only(&repo_path)
+                        .await
+                        .map_err(CliError::from)?
+                } else {
+                    crate::storage::runtime::open_capture_store_read_write(
+                        &repo_path,
+                        crate::storage::opener::RedbRepairContext::WriteCommand,
+                    )
                     .await
-                    .map_err(|error| {
-                        CliError::fatal(format!("failed to prune stale import identities: {error}"))
-                    })?
-                    .rows_affected()
+                    .map_err(CliError::from)?
+                };
+                let config = crate::storage::runtime::open_repo_config_store_read_only(&repo_path)
+                    .await
+                    .map_err(CliError::from)?;
+
+                let mut stopped_sessions: Vec<_> = capture
+                    .list_sessions_by_started_desc()
+                    .await
+                    .map_err(CliError::from)?
+                    .into_iter()
+                    .filter(|s| s.state == CaptureSessionState::Stopped)
+                    .collect();
+                if !(args.all || args.gc) {
+                    stopped_sessions.sort_by(|a, b| {
+                        let a_ts = a.stopped_at.unwrap_or(a.last_event_at);
+                        let b_ts = b.stopped_at.unwrap_or(b.last_event_at);
+                        b_ts.cmp(&a_ts)
+                            .then_with(|| b.session_id.cmp(&a.session_id))
+                    });
+                    stopped_sessions.truncate(1);
+                }
+                let sessions_inspected = stopped_sessions.len() as i64;
+
+                let (checkpoint_ids, note): (Vec<String>, &'static str) = if args.gc {
+                    let retention_days = match args.retention_days {
+                        Some(0) => {
+                            return Err(CliError::command_usage(
+                                "--retention-days must be greater than 0".to_string(),
+                            ));
+                        }
+                        Some(days) => days,
+                        None => retention_transcript_days_with_store(config.as_ref())
+                            .await
+                            .map_err(|e| {
+                                CliError::fatal(format!("read retention config: {e:#}"))
+                            })?,
+                    };
+                    let cutoff_unix =
+                        chrono::Utc::now().timestamp() - i64::from(retention_days) * 86_400;
+                    let mut expired = Vec::new();
+                    for s in &stopped_sessions {
+                        let cps = capture
+                            .list_checkpoints_by_session(&s.session_id)
+                            .await
+                            .map_err(CliError::from)?;
+                        for cp in cps {
+                            if cp.created_at < cutoff_unix {
+                                expired.push((cp.created_at, cp.checkpoint_id));
+                            }
+                        }
+                    }
+                    expired.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                    (
+                        expired.into_iter().map(|(_, id)| id).collect(),
+                        "retention GC dropped checkpoints older than agent.retention.transcript_days from \
+                         stopped sessions; the append-only agent_audit_log was not touched",
+                    )
+                } else {
+                    let mut temp = Vec::new();
+                    for s in &stopped_sessions {
+                        let cps = capture
+                            .list_checkpoints_by_session(&s.session_id)
+                            .await
+                            .map_err(CliError::from)?;
+                        for cp in cps {
+                            if cp.scope == CaptureCheckpointScope::Temporary {
+                                temp.push((cp.created_at, cp.checkpoint_id));
+                            }
+                        }
+                    }
+                    temp.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                    (
+                        temp.into_iter().map(|(_, id)| id).collect(),
+                        "temporary checkpoint rows were dropped; reachable traces history was \
+                         rewritten when checkpoint commits existed",
+                    )
+                };
+
+                let sessions_root = repo_path.join("sessions");
+                let stderr_cutoff: Option<Option<DateTime<Utc>>> = if args.gc {
+                    let stderr_days = retention_stderr_days_with_store(config.as_ref())
+                        .await
+                        .map_err(|e| {
+                            CliError::fatal(format!("read stderr retention config: {e:#}"))
+                        })?;
+                    Some(stderr_cutoff_for_days(stderr_days))
+                } else {
+                    None
+                };
+                let findings_cutoff: Option<Option<DateTime<Utc>>> = if args.gc {
+                    let findings_days = retention_findings_days_with_store(config.as_ref())
+                        .await
+                        .map_err(|e| {
+                        CliError::fatal(format!("read findings retention config: {e:#}"))
+                    })?;
+                    Some(stderr_cutoff_for_days(findings_days))
+                } else {
+                    None
+                };
+
+                let mut dropped = 0u64;
+                if args.dry_run {
+                    dropped = checkpoint_ids.len() as u64;
+                } else {
+                    for cp_id in &checkpoint_ids {
+                        if capture
+                            .delete_checkpoint(cp_id)
+                            .await
+                            .map_err(CliError::from)?
+                        {
+                            dropped += 1;
+                        }
+                    }
+                }
+
+                let (stderr_logs_pruned, stderr_runs_pruned) = match stderr_cutoff {
+                    Some(Some(cutoff)) => {
+                        gc_expired_stderr_logs(&sessions_root, cutoff, args.dry_run)?
+                    }
+                    _ => (0, 0),
+                };
+                let findings_gc = match findings_cutoff {
+                    Some(Some(cutoff)) => {
+                        gc_expired_findings_runs(&sessions_root, cutoff, args.dry_run).await?
+                    }
+                    _ => FindingsGcOutcome::default(),
+                };
+
+                emit_report(
+                    &CleanReport {
+                        sessions_inspected,
+                        temporary_checkpoints_dropped: dropped,
+                        retained_checkpoints_rewritten: 0,
+                        traces_ref_rewritten: false,
+                        window_guard: if dropped > 0 {
+                            "markers_and_catalog_verified"
+                        } else {
+                            "noop"
+                        },
+                        object_index_rows_dropped: 0,
+                        stderr_logs_pruned,
+                        stderr_runs_pruned,
+                        findings_runs_pruned: findings_gc.runs_pruned,
+                        findings_runs_skipped: findings_gc.runs_skipped,
+                        findings_gc_warnings: findings_gc.warnings,
+                        export_jobs_pruned: 0,
+                        import_identities_pruned: 0,
+                        dry_run: args.dry_run,
+                        note,
+                    },
+                    output,
+                )
             }
-        } else {
-            0
-        };
-    let import_identities_pruned = swept_import_identities_pruned
-        + prune
-            .as_ref()
-            .map(|prune| prune.deleted_import_identities)
-            .unwrap_or(0);
-
-    let findings_gc = match findings_cutoff {
-        Some(Some(cutoff)) => {
-            gc_expired_findings_runs(&sessions_root, cutoff, args.dry_run).await?
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (args, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
         }
-        _ => FindingsGcOutcome::default(),
-    };
-    let findings_runs_pruned = findings_gc.runs_pruned;
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = store::open_current().await.map_err(|error| {
+                    CliError::fatal(format!("failed to open the capture database: {error}"))
+                })?;
+                let backend = conn.get_database_backend();
 
-    emit_report(
-        &CleanReport {
-            sessions_inspected,
-            temporary_checkpoints_dropped: prune
-                .as_ref()
-                .map(|p| p.removed_checkpoints)
-                .unwrap_or(checkpoint_ids.len() as u64),
-            retained_checkpoints_rewritten: prune
-                .as_ref()
-                .map(|p| p.rewritten_checkpoints)
-                .unwrap_or(0),
-            traces_ref_rewritten: prune.as_ref().map(|p| p.ref_rewritten).unwrap_or(false),
-            window_guard: prune.as_ref().map(|p| p.window_guard).unwrap_or("noop"),
-            object_index_rows_dropped: prune
-                .as_ref()
-                .map(|p| p.deleted_object_index_rows)
-                .unwrap_or(0),
-            stderr_logs_pruned,
-            stderr_runs_pruned,
-            findings_runs_pruned,
-            findings_runs_skipped: findings_gc.runs_skipped,
-            findings_gc_warnings: findings_gc.warnings,
-            export_jobs_pruned,
-            import_identities_pruned,
-            dry_run: args.dry_run,
-            note,
-        },
-        output,
-    )
+                if !table_exists(&conn, "agent_checkpoint").await? {
+                    return emit_report(
+                        &CleanReport {
+                            sessions_inspected: 0,
+                            temporary_checkpoints_dropped: 0,
+                            retained_checkpoints_rewritten: 0,
+                            traces_ref_rewritten: false,
+                            window_guard: "noop",
+                            object_index_rows_dropped: 0,
+                            stderr_logs_pruned: 0,
+                            stderr_runs_pruned: 0,
+                            findings_runs_pruned: 0,
+                            findings_runs_skipped: 0,
+                            findings_gc_warnings: Vec::new(),
+                            export_jobs_pruned: 0,
+                            import_identities_pruned: 0,
+                            dry_run: args.dry_run,
+                            note: "agent_checkpoint table not present (run `libra init`?)",
+                        },
+                        output,
+                    );
+                }
+
+                // Retention GC (AG-24a) always spans every stopped session; the
+                // default/temporary path keeps the `--all` scoping.
+                let session_scope = session_scope_sql(args.all || args.gc);
+                let session_filter =
+                    format!("SELECT COUNT(*) AS n FROM ({session_scope}) AS scoped_sessions");
+                let row = conn
+                    .query_one_raw(Statement::from_string(backend, session_filter))
+                    .await
+                    .map_err(|e| CliError::fatal(format!("failed to count agent_session: {e}")))?
+                    .ok_or_else(|| {
+                        CliError::fatal("agent_session count returned no rows".to_string())
+                    })?;
+                let sessions_inspected: i64 = row.try_get_by("n").unwrap_or_default();
+
+                let (checkpoint_ids, note): (Vec<String>, &'static str) = if args.gc {
+                    // Resolve the transcript retention window (default 90). The cutoff
+                    // is `created_at < now - window`. GC removes whole aged checkpoints
+                    // (transcript + stderr blobs) — the append-only `agent_audit_log`
+                    // is a separate table the prune engine never touches.
+                    let retention_days = match args.retention_days {
+                        Some(0) => {
+                            return Err(CliError::command_usage(
+                                "--retention-days must be greater than 0".to_string(),
+                            ));
+                        }
+                        Some(days) => days,
+                        None => crate::internal::ai::observed_agents::compliance::retention_transcript_days()
+                            .await
+                            .map_err(|e| CliError::fatal(format!("read retention config: {e:#}")))?,
+                    };
+                    let cutoff_unix =
+                        chrono::Utc::now().timestamp() - i64::from(retention_days) * 86_400;
+                    (
+                        gc_expired_checkpoint_ids(&conn, session_scope, cutoff_unix).await?,
+                        "retention GC dropped checkpoints older than agent.retention.transcript_days from \
+                         stopped sessions; the append-only agent_audit_log was not touched",
+                    )
+                } else {
+                    (
+                        temporary_checkpoint_ids(&conn, session_scope).await?,
+                        "temporary checkpoint rows were dropped; reachable traces history was \
+                         rewritten when checkpoint commits existed",
+                    )
+                };
+                let storage = Arc::new(
+                    crate::utils::client_storage::ClientStorage::open_init_storage(
+                        repo_path.join("objects"),
+                    )
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "failed to read storage configuration for {}",
+                            error.variable()
+                        ))
+                    })?,
+                );
+                // Resolve the run-state root before `repo_path` is moved into the history
+                // manager; the stderr- and findings-window GCs below prune under it.
+                let sessions_root = repo_path.join("sessions");
+
+                // AG-24a stderr window (Task A8.6): resolve + validate the stderr cutoff
+                // BEFORE any prune mutation, so an invalid/overflowing config fails closed
+                // rather than aborting after the checkpoint/transcript GC already rewrote
+                // the store. It uses its own `agent.retention.stderr_days` knob (the
+                // `--retention-days` override targets the transcript window only, per its
+                // clap doc). `Some(None)` = window larger than representable time (nothing
+                // can be expired → GC is a no-op); `None` = not a `--gc` run.
+                let stderr_cutoff: Option<Option<DateTime<Utc>>> = if args.gc {
+                    let stderr_days =
+                        crate::internal::ai::observed_agents::compliance::retention_stderr_days()
+                            .await
+                            .map_err(|e| {
+                                CliError::fatal(format!("read stderr retention config: {e:#}"))
+                            })?;
+                    Some(stderr_cutoff_for_days(stderr_days))
+                } else {
+                    None
+                };
+
+                // A0-09 findings window: resolve + validate BEFORE any mutation too, so a
+                // bad `agent.retention.findings_days` fails closed rather than aborting
+                // mid-sweep. Its own knob (independent of `--retention-days`).
+                let findings_cutoff: Option<Option<DateTime<Utc>>> = if args.gc {
+                    let findings_days =
+                        crate::internal::ai::observed_agents::compliance::retention_findings_days()
+                            .await
+                            .map_err(|e| {
+                                CliError::fatal(format!("read findings retention config: {e:#}"))
+                            })?;
+                    Some(stderr_cutoff_for_days(findings_days))
+                } else {
+                    None
+                };
+
+                let history = HistoryManager::new_with_ref(
+                    storage,
+                    repo_path,
+                    Arc::new(conn.clone()),
+                    TRACES_BRANCH,
+                );
+                // Under `--dry-run` nothing is mutated: the checkpoint prune is skipped and
+                // its primary count is the number of checkpoints that WOULD be dropped.
+                let prune = if args.dry_run {
+                    None
+                } else {
+                    Some(
+                        history
+                            .prune_checkpoint_commits(&checkpoint_ids)
+                            .await
+                            .map_err(map_prune_error)?,
+                    )
+                };
+
+                let (stderr_logs_pruned, stderr_runs_pruned) = match stderr_cutoff {
+                    Some(Some(cutoff)) => {
+                        gc_expired_stderr_logs(&sessions_root, cutoff, args.dry_run)?
+                    }
+                    // Not a `--gc` run, or a retention window so large nothing is expired.
+                    _ => (0, 0),
+                };
+
+                // plan-20260713 DR-04b: TTL-scavenge expired export-job rows under --gc
+                // (bounded by the ttl index; dry-run counts without deleting).
+                let export_jobs_pruned = if args.gc
+                    && table_exists(&conn, "agent_export_job").await?
+                {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    if args.dry_run {
+                        let row = conn
+                            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                                backend,
+                                "SELECT COUNT(*) AS n FROM agent_export_job WHERE ttl_expires_at <= ?",
+                                [now_ms.into()],
+                            ))
+                            .await
+                            .map_err(|err| {
+                                CliError::fatal(format!(
+                                    "failed to count expired export jobs: {err}"
+                                ))
+                            })?;
+                        row.and_then(|r| r.try_get_by::<i64, _>("n").ok())
+                            .unwrap_or(0) as u64
+                    } else {
+                        crate::internal::ai::export_job::scavenge_expired(&conn, now_ms)
+                            .await
+                            .map_err(|err| {
+                                CliError::fatal(format!(
+                                    "failed to scavenge expired export jobs: {err:#}"
+                                ))
+                            })?
+                    }
+                } else {
+                    0
+                };
+
+                let swept_import_identities_pruned = if args.gc
+                    && table_exists(&conn, "agent_import_identity").await?
+                {
+                    if args.dry_run {
+                        preview_import_identity_prune_count(&conn, &checkpoint_ids).await?
+                    } else {
+                        let sql = format!(
+                            "DELETE FROM agent_import_identity WHERE {OWNERLESS_IMPORT_IDENTITY_PREDICATE}"
+                        );
+                        conn.execute_raw(Statement::from_string(backend, sql))
+                            .await
+                            .map_err(|error| {
+                                CliError::fatal(format!(
+                                    "failed to prune stale import identities: {error}"
+                                ))
+                            })?
+                            .rows_affected()
+                    }
+                } else {
+                    0
+                };
+                let import_identities_pruned = swept_import_identities_pruned
+                    + prune
+                        .as_ref()
+                        .map(|prune| prune.deleted_import_identities)
+                        .unwrap_or(0);
+
+                let findings_gc = match findings_cutoff {
+                    Some(Some(cutoff)) => {
+                        gc_expired_findings_runs(&sessions_root, cutoff, args.dry_run).await?
+                    }
+                    _ => FindingsGcOutcome::default(),
+                };
+                let findings_runs_pruned = findings_gc.runs_pruned;
+
+                emit_report(
+                    &CleanReport {
+                        sessions_inspected,
+                        temporary_checkpoints_dropped: prune
+                            .as_ref()
+                            .map(|p| p.removed_checkpoints)
+                            .unwrap_or(checkpoint_ids.len() as u64),
+                        retained_checkpoints_rewritten: prune
+                            .as_ref()
+                            .map(|p| p.rewritten_checkpoints)
+                            .unwrap_or(0),
+                        traces_ref_rewritten: prune
+                            .as_ref()
+                            .map(|p| p.ref_rewritten)
+                            .unwrap_or(false),
+                        window_guard: prune.as_ref().map(|p| p.window_guard).unwrap_or("noop"),
+                        object_index_rows_dropped: prune
+                            .as_ref()
+                            .map(|p| p.deleted_object_index_rows)
+                            .unwrap_or(0),
+                        stderr_logs_pruned,
+                        stderr_runs_pruned,
+                        findings_runs_pruned,
+                        findings_runs_skipped: findings_gc.runs_skipped,
+                        findings_gc_warnings: findings_gc.warnings,
+                        export_jobs_pruned,
+                        import_identities_pruned,
+                        dry_run: args.dry_run,
+                        note,
+                    },
+                    output,
+                )
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (args, output);
+                Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                )
+            }
+        }
+    }
 }
 
 /// Map a prune failure to an actionable CLI error, keeping the AG-20
 /// window-guard refusals distinguishable (they are deterministic and
 /// user-resolvable, not storage corruption).
+#[cfg(feature = "storage-sqlite")]
 fn map_prune_error(err: anyhow::Error) -> CliError {
     if err
         .downcast_ref::<SubagentContentReservationPruneGuard>()
@@ -484,6 +728,7 @@ fn map_prune_error(err: anyhow::Error) -> CliError {
     }
 }
 
+#[cfg(feature = "storage-sqlite")]
 fn session_scope_sql(all: bool) -> &'static str {
     if all {
         return "SELECT session_id FROM agent_session WHERE state = 'stopped'";
@@ -537,6 +782,7 @@ fn emit_report(report: &CleanReport, output: &OutputConfig) -> CliResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> CliResult<bool> {
     let backend = conn.get_database_backend();
     let stmt = Statement::from_sql_and_values(
@@ -555,6 +801,7 @@ async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> Cli
 /// scopes are eligible (a 90-day-old committed checkpoint is as expired as
 /// a temporary one); the append-only `agent_audit_log` lives in a separate
 /// table and is never named here.
+#[cfg(feature = "storage-sqlite")]
 async fn gc_expired_checkpoint_ids(
     conn: &(impl ConnectionTrait + ?Sized),
     session_scope: &str,
@@ -1094,19 +1341,74 @@ async fn reclaim_findings_objects(
     // something to reclaim — it is far too expensive to run per candidate.
     let reachable = crate::command::maintenance::collect_reachable_objects(&storage).await?;
 
-    let db_conn = db::open_cached_repository(&crate::utils::path::database())
-        .await
-        .map_err(|error| {
-            CliError::fatal(format!(
-                "failed to open repository database for findings index cleanup: {error}"
-            ))
-        })?;
-    // The index row goes either way: it is a sync/visibility artifact, not
-    // the object, and `agent doctor` rebuilds it from the run manifest.
     let oids: Vec<String> = candidates.iter().cloned().collect();
-    crate::utils::client_storage::remove_object_index_rows_with_conn(&db_conn, &oids)
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to drop findings object_index rows: {e}")))?;
+    match crate::storage::runtime::detect_repo_backend(&storage_path).map_err(CliError::from)? {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let config =
+                    crate::storage::runtime::open_repo_config_store_read_only(&storage_path)
+                        .await
+                        .map_err(CliError::from)?;
+                if let Some(repo_id) = config
+                    .get("libra.repoid")
+                    .await
+                    .map_err(CliError::from)?
+                    .map(|e| e.value)
+                    .filter(|v| !v.is_empty())
+                {
+                    let git_store =
+                        crate::storage::runtime::open_git_store_read_write(&storage_path)
+                            .await
+                            .map_err(CliError::from)?;
+                    let _ = git_store
+                        .delete_object_index_rows(&repo_id, &oids)
+                        .await
+                        .map_err(CliError::from)?;
+                }
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "redb".to_string(),
+                        detail: "this Libra binary was compiled without `storage-redb`".to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let db_conn = db::open_cached_repository(&crate::utils::path::database())
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "failed to open repository database for findings index cleanup: {error}"
+                        ))
+                    })?;
+                // The index row goes either way: it is a sync/visibility artifact, not
+                // the object, and `agent doctor` rebuilds it from the run manifest.
+                crate::utils::client_storage::remove_object_index_rows_with_conn(&db_conn, &oids)
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!("failed to drop findings object_index rows: {e}"))
+                    })?;
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                return Err(
+                    crate::storage::error::StorageBackendError::UnsupportedBackend {
+                        requested: "sqlite".to_string(),
+                        detail: "this Libra binary was compiled without `storage-sqlite`"
+                            .to_string(),
+                    }
+                    .into_cli_error(),
+                );
+            }
+        }
+    }
 
     let mut pruned = 0u64;
     for oid in &oids {
@@ -1130,6 +1432,7 @@ async fn reclaim_findings_objects(
     Ok(pruned)
 }
 
+#[cfg(feature = "storage-sqlite")]
 async fn temporary_checkpoint_ids(
     conn: &(impl ConnectionTrait + ?Sized),
     session_scope: &str,

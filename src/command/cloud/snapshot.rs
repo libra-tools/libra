@@ -146,6 +146,14 @@ pub(super) struct SnapshotTuning {
     /// Run between hashing the frozen refs and uploading them.
     #[cfg(test)]
     pub(super) before_metadata_upload: Option<AfterFreezeHook>,
+    /// Test-only hook invoked between reading `capture_rtx` (`c1`) and opening
+    /// `git_rtx2` (`g2`) during the ADR-RB-06 3-step Redb snapshot protocol.
+    #[cfg(all(test, feature = "storage-redb"))]
+    pub(super) redb_between_c1_and_g2:
+        Option<crate::storage::cross_store::SnapshotBetweenC1AndG2Hook>,
+    /// Override retry backoff for the ADR-RB-06 3-step Redb snapshot protocol.
+    #[cfg(all(test, feature = "storage-redb"))]
+    pub(super) redb_retry_backoff: Option<std::time::Duration>,
 }
 
 /// Called with the freeze attempt number (1-based) after each page.
@@ -574,6 +582,8 @@ pub(super) struct SnapshotSpool {
     refs_digest: u64,
     catalog_bytes: u64,
     catalog_digest: u64,
+    #[cfg_attr(not(feature = "storage-redb"), allow(dead_code))]
+    cross_store_generation: Option<u64>,
     released: bool,
     #[cfg(test)]
     fail_release: bool,
@@ -859,6 +869,7 @@ impl SnapshotSpool {
             refs_digest: 0,
             catalog_bytes: 0,
             catalog_digest: 0,
+            cross_store_generation: None,
             released: false,
             #[cfg(test)]
             fail_release: tuning.fail_spool_release,
@@ -907,18 +918,24 @@ impl SnapshotSpool {
         self.objects
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(super) fn cross_store_generation(&self) -> Option<u64> {
+        self.cross_store_generation
+    }
+
     /// Freeze what this run uploads: the object identities (unsynced ones, or
     /// all of the repository's with `force`), the refs projection and the
     /// project name.
     ///
-    /// Every read runs as its own short statement on one dedicated read
-    /// connection, so no database lock is held across the scan and other
-    /// processes' writers wait at most one statement. SQLite's
-    /// `PRAGMA data_version` on that connection changes exactly when any
-    /// other connection commits, so an unchanged value before the first and
-    /// after the last read proves all of them saw one database state. A change
-    /// retries the freeze; after [`MAX_FREEZE_ATTEMPTS`] the run stops, still
-    /// before any remote write.
+    /// On Redb, uses the ADR-RB-06 three-step read-only consistent snapshot
+    /// protocol (`git_rtx(g1) -> capture_rtx(c1) -> git_rtx2(g2)` via
+    /// [`crate::storage::cross_store::CrossStoreCoordinator::snapshot_consistent_read_only`]),
+    /// accepting only `g1 == c1 && g1 == g2` with up to 5 retries and failing
+    /// closed with `LBR-IO-001` otherwise.
+    ///
+    /// On SQLite, every read runs as its own short statement on one dedicated
+    /// read connection with `PRAGMA data_version` change detection.
     pub(super) async fn freeze(
         &mut self,
         db_path: &Path,
@@ -926,75 +943,335 @@ impl SnapshotSpool {
         force: bool,
         tuning: &SnapshotTuning,
     ) -> CloudResult<()> {
-        let db_path_text = db_path.to_str().ok_or_else(|| {
+        let storage = db_path.parent().ok_or_else(|| {
             CloudError::Generic(format!(
-                "the repository database path {} is not valid UTF-8",
+                "the repository database path {} has no storage parent directory",
                 db_path.display()
             ))
         })?;
-        let conn = crate::internal::db::open_connection_without_schema_management(
-            db_path_text,
-            crate::internal::db::DEFAULT_CONNECTION_TIMEOUT,
-        )
-        .await
-        .map_err(|error| {
-            CloudError::Generic(format!(
-                "open the repository database for the snapshot: {error}; nothing was written to D1 or R2"
+        match crate::storage::runtime::detect_repo_backend(storage).map_err(|error| {
+            CloudError::StorageIo(format!(
+                "detect repository storage backend for snapshot: {error}; nothing was written to D1 or R2"
             ))
-        })?;
-        // TEMP objects (the connection marker and the refs copy) live in a
-        // temporary file rather than memory, so a large ref set never has to
-        // fit in memory.
-        if let Err(error) = conn.execute_unprepared("PRAGMA temp_store = FILE").await {
-            let _ = conn.close().await;
-            return Err(CloudError::Generic(format!(
-                "prepare the repository database for the snapshot: {error}; nothing was written to D1 or R2"
-            )));
-        }
-        // The capture catalog is a separate file once it moved out of
-        // `libra.db`; its reads get their own change detection below.
-        let catalog_conn = match super::agent_capture::local_capture_catalog(&conn).await {
-            Ok(catalog_conn) => catalog_conn,
-            Err(error) => {
-                let _ = conn.close().await;
-                return Err(error);
-            }
-        };
-        let split_catalog = match crate::internal::db::connection_has_table(&conn, "agent_session")
-            .await
-        {
-            Ok(combined) => !combined,
-            Err(error) => {
-                let _ = conn.close().await;
-                return Err(CloudError::Generic(format!(
-                    "inspect the repository database for the snapshot: {error}; nothing was written to D1 or R2"
-                )));
-            }
-        };
-        let catalog = split_catalog.then_some(&catalog_conn);
-        let mut outcome = Err(CloudError::Generic(String::new()));
-        for attempt in 1..=MAX_FREEZE_ATTEMPTS {
-            match self
-                .freeze_once(&conn, catalog, repo_id, force, tuning, attempt)
-                .await
-            {
-                Ok(true) => {
-                    outcome = Ok(());
-                    break;
+        })? {
+            crate::storage::backend::StorageBackendKind::Redb => {
+                #[cfg(feature = "storage-redb")]
+                {
+                    self.freeze_redb(storage, repo_id, force, tuning).await
                 }
-                Ok(false) => {
-                    outcome = Err(CloudError::Generic(format!(
-                        "the local repository database kept changing while cloud sync took its snapshot ({MAX_FREEZE_ATTEMPTS} attempts); nothing was written to D1 or R2. Re-run `libra cloud sync` when other Libra commands in this repository have finished"
+                #[cfg(not(feature = "storage-redb"))]
+                {
+                    Err(CloudError::Generic(
+                        "this Libra binary was compiled without `storage-redb`".to_string(),
+                    ))
+                }
+            }
+            crate::storage::backend::StorageBackendKind::Sqlite => {
+                let db_path_text = db_path.to_str().ok_or_else(|| {
+                    CloudError::Generic(format!(
+                        "the repository database path {} is not valid UTF-8",
+                        db_path.display()
+                    ))
+                })?;
+                let conn = crate::internal::db::open_connection_without_schema_management(
+                    db_path_text,
+                    crate::internal::db::DEFAULT_CONNECTION_TIMEOUT,
+                )
+                .await
+                .map_err(|error| {
+                    CloudError::Generic(format!(
+                        "open the repository database for the snapshot: {error}; nothing was written to D1 or R2"
+                    ))
+                })?;
+                // TEMP objects (the connection marker and the refs copy) live in a
+                // temporary file rather than memory, so a large ref set never has to
+                // fit in memory.
+                if let Err(error) = conn.execute_unprepared("PRAGMA temp_store = FILE").await {
+                    let _ = conn.close().await;
+                    return Err(CloudError::Generic(format!(
+                        "prepare the repository database for the snapshot: {error}; nothing was written to D1 or R2"
                     )));
                 }
-                Err(error) => {
-                    outcome = Err(error);
-                    break;
+                // The capture catalog is a separate file once it moved out of
+                // `libra.db`; its reads get their own change detection below.
+                let catalog_conn = match super::agent_capture::local_capture_catalog(&conn).await {
+                    Ok(catalog_conn) => catalog_conn,
+                    Err(error) => {
+                        let _ = conn.close().await;
+                        return Err(error);
+                    }
+                };
+                let split_catalog =
+                    match crate::internal::db::connection_has_table(&conn, "agent_session").await {
+                        Ok(combined) => !combined,
+                        Err(error) => {
+                            let _ = conn.close().await;
+                            return Err(CloudError::Generic(format!(
+                                "inspect the repository database for the snapshot: {error}; nothing was written to D1 or R2"
+                            )));
+                        }
+                    };
+                let catalog = split_catalog.then_some(&catalog_conn);
+                let mut outcome = Err(CloudError::Generic(String::new()));
+                for attempt in 1..=MAX_FREEZE_ATTEMPTS {
+                    match self
+                        .freeze_once(&conn, catalog, repo_id, force, tuning, attempt)
+                        .await
+                    {
+                        Ok(true) => {
+                            outcome = Ok(());
+                            break;
+                        }
+                        Ok(false) => {
+                            outcome = Err(CloudError::Generic(format!(
+                                "the local repository database kept changing while cloud sync took its snapshot ({MAX_FREEZE_ATTEMPTS} attempts); nothing was written to D1 or R2. Re-run `libra cloud sync` when other Libra commands in this repository have finished"
+                            )));
+                        }
+                        Err(error) => {
+                            outcome = Err(error);
+                            break;
+                        }
+                    }
                 }
+                let _ = conn.close().await;
+                outcome
             }
         }
-        let _ = conn.close().await;
-        outcome
+    }
+
+    /// Freeze a generation-consistent Redb snapshot spanning `git.redb` and
+    /// `capture.redb` using the ADR-RB-06 3-step read-only protocol
+    /// (`git_rtx(g1) -> capture_rtx(c1) -> git_rtx2(g2)`).
+    #[cfg(feature = "storage-redb")]
+    async fn freeze_redb(
+        &mut self,
+        storage: &Path,
+        repo_id: &str,
+        force: bool,
+        tuning: &SnapshotTuning,
+    ) -> CloudResult<()> {
+        use crate::storage::{
+            capture_store::RedbCaptureStore,
+            cross_store::CrossStoreCoordinator,
+            git_store::{GitStore, ObjectIndexRecord, RedbGitStore},
+            runtime::{resolve_repo_capture_redb_path, resolve_repo_git_redb_path},
+        };
+
+        let objects_path = self.dir.join(OBJECTS_FILE);
+        #[cfg(test)]
+        if tuning.fail_spool_write {
+            return Err(spool_failure(
+                "write",
+                &objects_path,
+                std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "no space left on device (injected)",
+                ),
+            ));
+        }
+        #[cfg(test)]
+        if tuning.fail_config_read {
+            return Err(CloudError::Generic(
+                "read cloud.name for the snapshot: injected config read failure; nothing was written to D1 or R2"
+                    .to_string(),
+            ));
+        }
+
+        let git_path = resolve_repo_git_redb_path(storage).map_err(|error| {
+            CloudError::StorageIo(format!(
+                "resolve git redb store path for snapshot: {error}; nothing was written to D1 or R2"
+            ))
+        })?;
+        let capture_path = resolve_repo_capture_redb_path(storage).map_err(|error| {
+            CloudError::StorageIo(format!(
+                "resolve capture redb store path for snapshot: {error}; nothing was written to D1 or R2"
+            ))
+        })?;
+
+        let mut frozen_payload = None;
+        for pass in 0..2 {
+            let git_ro = RedbGitStore::open_read_only(&git_path).map_err(|error| {
+                CloudError::StorageIo(format!(
+                    "open read-only git redb store for snapshot: {error}; nothing was written to D1 or R2"
+                ))
+            })?;
+            let capture_ro = RedbCaptureStore::open_read_only(&capture_path)
+                .await
+                .map_err(|error| {
+                    CloudError::StorageIo(format!(
+                        "open read-only capture redb store for snapshot: {error}; nothing was written to D1 or R2"
+                    ))
+                })?;
+
+            #[cfg_attr(not(test), allow(unused_mut))]
+            let mut coordinator = CrossStoreCoordinator::new(git_ro, capture_ro);
+            #[cfg(test)]
+            if let Some(backoff) = tuning.redb_retry_backoff {
+                coordinator = coordinator.with_snapshot_retry_backoff(backoff);
+            }
+
+            let consistent = acquire_redb_consistent_snapshot(&coordinator, tuning).await?;
+            let repo_id_owned = repo_id.to_string();
+            let payload = tokio::task::spawn_blocking(move || {
+                read_redb_snapshot_payload(&consistent, &repo_id_owned, force)
+            })
+            .await
+            .map_err(|error| {
+                CloudError::StorageIo(format!(
+                    "join redb snapshot read task: {error}; nothing was written to D1 or R2"
+                ))
+            })??;
+
+            let missing = missing_object_index_rows_redb(
+                storage,
+                &payload.ref_records,
+                &payload.all_indexed_oids,
+            )?;
+            if !missing.is_empty() && pass == 0 {
+                let git_rw = RedbGitStore::open_read_write(&git_path).map_err(|error| {
+                    CloudError::StorageIo(format!(
+                        "open writable git redb store to backfill missing object_index rows: {error}; nothing was written to D1 or R2"
+                    ))
+                })?;
+                let now = chrono::Utc::now().timestamp();
+                let backfill_records: Vec<ObjectIndexRecord> = missing
+                    .into_iter()
+                    .map(|(o_id, o_type, o_size)| ObjectIndexRecord {
+                        repo_id: repo_id.to_string(),
+                        o_id,
+                        o_type,
+                        o_size,
+                        created_at: now,
+                        is_synced: false,
+                    })
+                    .collect();
+                git_rw
+                    .upsert_object_index_batch(&backfill_records)
+                    .await
+                    .map_err(|error| {
+                        CloudError::StorageIo(format!(
+                            "backfill missing object_index rows before snapshot: {error}; nothing was written to D1 or R2"
+                        ))
+                    })?;
+                drop(git_rw);
+                continue;
+            }
+
+            frozen_payload = Some(payload);
+            break;
+        }
+
+        let payload = frozen_payload.ok_or_else(|| {
+            CloudError::StorageIo(
+                "redb snapshot freeze completed without a frozen payload; nothing was written to D1 or R2"
+                    .to_string(),
+            )
+        })?;
+
+        // 1. Write `objects.jsonl`.
+        let file = recreate_private_file(&objects_path)
+            .map_err(|error| spool_failure("create", &objects_path, error))?;
+        let mut writer = BufWriter::new(file);
+        let mut objects = 0u64;
+        for obj in &payload.objects {
+            serde_json::to_writer(&mut writer, obj)
+                .map_err(|error| spool_failure("write", &objects_path, error))?;
+            writer
+                .write_all(b"\n")
+                .map_err(|error| spool_failure("write", &objects_path, error))?;
+            objects += 1;
+        }
+        writer
+            .flush()
+            .map_err(|error| spool_failure("write", &objects_path, error))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| spool_failure("write", &objects_path, error))?;
+
+        // 2. Write `refs.json` in exact R2 wire-protocol order.
+        let refs_path = self.dir.join(REFS_FILE);
+        let refs_file = recreate_private_file(&refs_path)
+            .map_err(|error| spool_failure("create", &refs_path, error))?;
+        let mut refs_writer =
+            ReferenceProjectionWriter::new(DigestWriter::new(BufWriter::new(refs_file)))
+                .map_err(|error| spool_failure("write", &refs_path, error))?;
+        for model in &payload.ref_models {
+            refs_writer
+                .push(model)
+                .map_err(|error| spool_failure("write", &refs_path, error))?;
+        }
+        refs_writer
+            .flush()
+            .map_err(|error| spool_failure("write", &refs_path, error))?;
+        let (refs_out, references) = refs_writer
+            .finish()
+            .map_err(|error| spool_failure("write", &refs_path, error))?;
+        let refs_digest = refs_out.digest();
+        let refs_file = refs_out
+            .into_inner()
+            .into_inner()
+            .map_err(|error| spool_failure("write", &refs_path, error.into_error()))?;
+        refs_file
+            .sync_all()
+            .map_err(|error| spool_failure("write", &refs_path, error))?;
+        let refs_bytes = refs_file
+            .metadata()
+            .map_err(|error| spool_failure("write", &refs_path, error))?
+            .len();
+
+        // 3. Write `catalog.json` (frozen agent-capture catalog from the same generation).
+        let catalog_envelope =
+            super::agent_capture::FrozenAgentCapture::Catalog(Box::new(payload.catalog));
+        let catalog_path = self.dir.join(CATALOG_FILE);
+        let catalog_file = recreate_private_file(&catalog_path)
+            .map_err(|error| spool_failure("create", &catalog_path, error))?;
+        let mut catalog_out = DigestWriter::new(BufWriter::new(catalog_file));
+        serde_json::to_writer(&mut catalog_out, &catalog_envelope)
+            .map_err(|error| spool_failure("write", &catalog_path, error))?;
+        catalog_out
+            .flush()
+            .map_err(|error| spool_failure("write", &catalog_path, error))?;
+        let catalog_digest = catalog_out.digest();
+        let catalog_file = catalog_out
+            .into_inner()
+            .into_inner()
+            .map_err(|error| spool_failure("write", &catalog_path, error.into_error()))?;
+        catalog_file
+            .sync_all()
+            .map_err(|error| spool_failure("write", &catalog_path, error))?;
+        let catalog_bytes = catalog_file
+            .metadata()
+            .map_err(|error| spool_failure("write", &catalog_path, error))?
+            .len();
+
+        // 4. Write `repository.json`.
+        let repository = FrozenRepository {
+            project_name: payload.cloud_name.unwrap_or_else(|| {
+                util::working_dir()
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown-project".to_string())
+            }),
+        };
+        let repository_path = self.dir.join(REPOSITORY_FILE);
+        let repository_json = serde_json::to_vec(&repository)
+            .map_err(|error| spool_failure("write", &repository_path, error))?;
+        let mut repository_file = recreate_private_file(&repository_path)
+            .map_err(|error| spool_failure("create", &repository_path, error))?;
+        repository_file
+            .write_all(&repository_json)
+            .and_then(|()| repository_file.sync_all())
+            .map_err(|error| spool_failure("write", &repository_path, error))?;
+
+        self.objects = objects;
+        self.references = references;
+        self.refs_bytes = refs_bytes;
+        self.refs_digest = refs_digest;
+        self.catalog_bytes = catalog_bytes;
+        self.catalog_digest = catalog_digest;
+        self.cross_store_generation = Some(payload.generation);
+        Ok(())
     }
 
     /// One freeze attempt. Returns `false` when another connection committed
@@ -2089,5 +2366,1235 @@ impl FrozenObjectPages {
             }
         }
         Ok((!page.is_empty()).then_some(page))
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+struct RedbSnapshotPayload {
+    generation: u64,
+    ref_records: Vec<crate::storage::git_store::RefRecord>,
+    ref_models: Vec<reference::Model>,
+    all_indexed_oids: HashSet<String>,
+    objects: Vec<FrozenObject>,
+    cloud_name: Option<String>,
+    catalog: super::agent_capture::FrozenAgentCaptureCatalog,
+}
+
+#[cfg(feature = "storage-redb")]
+#[derive(serde::Deserialize)]
+struct RedbRefTargetStored {
+    target: crate::storage::git_store::RefTarget,
+}
+
+#[cfg(feature = "storage-redb")]
+#[derive(serde::Deserialize)]
+struct RedbObjectIndexStoredRow {
+    o_type: String,
+    o_size: i64,
+    created_at: i64,
+    is_synced: bool,
+    #[allow(dead_code)]
+    pack_id: Option<String>,
+}
+
+#[cfg(feature = "storage-redb")]
+#[derive(serde::Deserialize)]
+struct RedbConfigKvStoredRow {
+    #[allow(dead_code)]
+    key: String,
+    value: String,
+    #[allow(dead_code)]
+    encrypted: bool,
+}
+
+#[cfg(feature = "storage-redb")]
+async fn acquire_redb_consistent_snapshot(
+    coordinator: &crate::storage::cross_store::CrossStoreCoordinator,
+    tuning: &SnapshotTuning,
+) -> CloudResult<crate::storage::cross_store::CrossStoreConsistentSnapshot> {
+    #[cfg(test)]
+    let result = if let Some(hook) = &tuning.redb_between_c1_and_g2 {
+        coordinator
+            .snapshot_consistent_read_only_with_hook(hook.clone())
+            .await
+    } else {
+        coordinator.snapshot_consistent_read_only().await
+    };
+    #[cfg(not(test))]
+    let result = {
+        let _ = tuning;
+        coordinator.snapshot_consistent_read_only().await
+    };
+    result
+        .map_err(|error| CloudError::StorageIo(format!("{error}; nothing was written to D1 or R2")))
+}
+
+#[cfg(feature = "storage-redb")]
+fn decode_redb_ref_key(raw: (u8, &str, &str)) -> CloudResult<crate::storage::git_store::RefKey> {
+    use crate::storage::git_store::RefKey;
+
+    let (tag, p1, p2) = raw;
+    match tag {
+        0 => Ok(RefKey::LocalHead { worktree_id: None }),
+        1 => {
+            if p1.is_empty() {
+                return Err(CloudError::StorageIo(
+                    "corrupt redb linked LocalHead key with empty worktree_id; nothing was written to D1 or R2"
+                        .to_string(),
+                ));
+            }
+            Ok(RefKey::LocalHead {
+                worktree_id: Some(p1.to_string()),
+            })
+        }
+        2 => {
+            if p1.is_empty() {
+                return Err(CloudError::StorageIo(
+                    "corrupt redb RemoteHead key with empty remote; nothing was written to D1 or R2"
+                        .to_string(),
+                ));
+            }
+            Ok(RefKey::RemoteHead {
+                remote: p1.to_string(),
+            })
+        }
+        3 => {
+            if p2.is_empty() {
+                return Err(CloudError::StorageIo(
+                    "corrupt redb LocalBranch key with empty name; nothing was written to D1 or R2"
+                        .to_string(),
+                ));
+            }
+            Ok(RefKey::LocalBranch {
+                name: p2.to_string(),
+            })
+        }
+        4 => {
+            if p1.is_empty() || p2.is_empty() {
+                return Err(CloudError::StorageIo(
+                    "corrupt redb RemoteBranch key with empty remote or name; nothing was written to D1 or R2"
+                        .to_string(),
+                ));
+            }
+            Ok(RefKey::RemoteBranch {
+                remote: p1.to_string(),
+                name: p2.to_string(),
+            })
+        }
+        5 => {
+            if p2.is_empty() {
+                return Err(CloudError::StorageIo(
+                    "corrupt redb Tag key with empty name; nothing was written to D1 or R2"
+                        .to_string(),
+                ));
+            }
+            Ok(RefKey::Tag {
+                name: p2.to_string(),
+            })
+        }
+        _ => Err(CloudError::StorageIo(format!(
+            "corrupt redb reference key tag {tag}; nothing was written to D1 or R2"
+        ))),
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+fn read_redb_snapshot_payload(
+    consistent: &crate::storage::cross_store::CrossStoreConsistentSnapshot,
+    repo_id: &str,
+    force: bool,
+) -> CloudResult<RedbSnapshotPayload> {
+    use redb::ReadableTable;
+
+    use crate::storage::{
+        codec::decode_versioned,
+        git_store::{
+            RefRecord,
+            redb::{
+                GIT_OBJECT_INDEX_CODEC_VERSION, GIT_REF_CODEC_VERSION, OBJECT_INDEX_TABLE,
+                OBJECT_OBLITERATION_TABLE, REFERENCE_TABLE,
+            },
+        },
+        redb::config_store::{CONFIG_KV_BY_KEY_INDEX, CONFIG_KV_CODEC_VERSION, CONFIG_KV_TABLE},
+    };
+
+    let git_rtx = consistent.git_rtx();
+    let generation = consistent.generation();
+
+    // 1. Read all references from the frozen `git_rtx`.
+    let mut ref_records = Vec::new();
+    let mut ref_models = Vec::new();
+    {
+        let ref_table = git_rtx.open_table(REFERENCE_TABLE).map_err(|error| {
+            CloudError::StorageIo(format!(
+                "open redb reference table in snapshot: {error}; nothing was written to D1 or R2"
+            ))
+        })?;
+        for (next_ref_id, entry) in (1i64..).zip(ref_table.iter().map_err(|error| {
+            CloudError::StorageIo(format!(
+                "iterate redb reference table in snapshot: {error}; nothing was written to D1 or R2"
+            ))
+        })?) {
+            let (k, v) = entry.map_err(|error| {
+                CloudError::StorageIo(format!(
+                    "read redb reference entry in snapshot: {error}; nothing was written to D1 or R2"
+                ))
+            })?;
+            let key = decode_redb_ref_key(k.value())?;
+            let stored: RedbRefTargetStored =
+                decode_versioned(v.value(), GIT_REF_CODEC_VERSION).map_err(|error| {
+                    CloudError::StorageIo(format!(
+                        "decode redb reference target in snapshot: {error}; nothing was written to D1 or R2"
+                    ))
+                })?;
+            let record = RefRecord {
+                key,
+                target: stored.target,
+            };
+            ref_models.push(super::metadata::ref_record_to_model(
+                next_ref_id,
+                record.clone(),
+            ));
+            ref_records.push(record);
+        }
+    }
+    super::metadata::sort_reference_models(&mut ref_models);
+
+    // 2. Read obliterated OIDs from the same frozen `git_rtx` so tombstoned
+    //    objects are never included in the backup snapshot.
+    let mut obliterated_oids = HashSet::new();
+    match git_rtx.open_table(OBJECT_OBLITERATION_TABLE) {
+        Ok(oblit_table) => {
+            for entry in oblit_table.iter().map_err(|error| {
+                CloudError::StorageIo(format!(
+                    "iterate redb object_obliteration table in snapshot: {error}; nothing was written to D1 or R2"
+                ))
+            })? {
+                let (k, _) = entry.map_err(|error| {
+                    CloudError::StorageIo(format!(
+                        "read redb object_obliteration entry in snapshot: {error}; nothing was written to D1 or R2"
+                    ))
+                })?;
+                let (oid, _hash_kind) = k.value();
+                obliterated_oids.insert(oid.to_string());
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(error) => {
+            return Err(CloudError::StorageIo(format!(
+                "open redb object_obliteration table in snapshot: {error}; nothing was written to D1 or R2"
+            )));
+        }
+    }
+
+    // 3. Read live `object_index` rows for `repo_id` from the same frozen `git_rtx`.
+    let mut all_indexed_oids = HashSet::new();
+    let mut objects = Vec::new();
+    {
+        let obj_table = git_rtx.open_table(OBJECT_INDEX_TABLE).map_err(|error| {
+            CloudError::StorageIo(format!(
+                "open redb object_index table in snapshot: {error}; nothing was written to D1 or R2"
+            ))
+        })?;
+        let mut next_obj_id = 1i64;
+        for entry in obj_table.range((repo_id, "")..).map_err(|error| {
+            CloudError::StorageIo(format!(
+                "range redb object_index table in snapshot: {error}; nothing was written to D1 or R2"
+            ))
+        })? {
+            let (k, v) = entry.map_err(|error| {
+                CloudError::StorageIo(format!(
+                    "read redb object_index entry in snapshot: {error}; nothing was written to D1 or R2"
+                ))
+            })?;
+            let (row_repo_id, o_id) = k.value();
+            if row_repo_id != repo_id {
+                break;
+            }
+            if obliterated_oids.contains(o_id) {
+                continue;
+            }
+            let stored: RedbObjectIndexStoredRow =
+                decode_versioned(v.value(), GIT_OBJECT_INDEX_CODEC_VERSION).map_err(|error| {
+                    CloudError::StorageIo(format!(
+                        "decode redb object_index row in snapshot: {error}; nothing was written to D1 or R2"
+                    ))
+                })?;
+            all_indexed_oids.insert(o_id.to_string());
+            if force || !stored.is_synced {
+                objects.push(FrozenObject {
+                    id: next_obj_id,
+                    o_id: o_id.to_string(),
+                    o_type: stored.o_type,
+                    o_size: stored.o_size,
+                    repo_id: repo_id.to_string(),
+                    created_at: stored.created_at,
+                });
+                next_obj_id += 1;
+            }
+        }
+    }
+
+    // 4. Read `cloud.name` from `config_kv` inside the same frozen `git_rtx`.
+    let cloud_name = match (
+        git_rtx.open_table(CONFIG_KV_BY_KEY_INDEX),
+        git_rtx.open_table(CONFIG_KV_TABLE),
+    ) {
+        (Ok(idx_table), Ok(kv_table)) => {
+            let mut latest_id: Option<u64> = None;
+            for entry in idx_table
+                .range(("cloud.name", 0u64)..=("cloud.name", u64::MAX))
+                .map_err(|error| {
+                    CloudError::StorageIo(format!(
+                        "read cloud.name index in snapshot: {error}; nothing was written to D1 or R2"
+                    ))
+                })?
+            {
+                let (k, _) = entry.map_err(|error| {
+                    CloudError::StorageIo(format!(
+                        "iterate cloud.name index in snapshot: {error}; nothing was written to D1 or R2"
+                    ))
+                })?;
+                let (_, row_id) = k.value();
+                latest_id = Some(latest_id.map_or(row_id, |prev| prev.max(row_id)));
+            }
+            match latest_id {
+                Some(row_id) => kv_table
+                    .get(row_id)
+                    .map_err(|error| {
+                        CloudError::StorageIo(format!(
+                            "read cloud.name value in snapshot: {error}; nothing was written to D1 or R2"
+                        ))
+                    })?
+                    .map(|guard| {
+                        decode_versioned::<RedbConfigKvStoredRow>(
+                            guard.value(),
+                            CONFIG_KV_CODEC_VERSION,
+                        )
+                        .map(|row| row.value)
+                        .map_err(|error| {
+                            CloudError::StorageIo(format!(
+                                "decode cloud.name value in snapshot: {error}; nothing was written to D1 or R2"
+                            ))
+                        })
+                    })
+                    .transpose()?,
+                None => None,
+            }
+        }
+        (Err(redb::TableError::TableDoesNotExist(_)), _)
+        | (_, Err(redb::TableError::TableDoesNotExist(_))) => None,
+        (Err(error), _) | (_, Err(error)) => {
+            return Err(CloudError::StorageIo(format!(
+                "open redb config_kv tables for cloud.name in snapshot: {error}; nothing was written to D1 or R2"
+            )));
+        }
+    };
+
+    // 5. Read the full agent-capture catalog from the SAME frozen
+    //    `(git_rtx, capture_rtx)` pair (`g1 == c1 == g2`).
+    let catalog = super::agent_capture::read_redb_agent_capture_catalog_in_snapshot(consistent)?;
+
+    Ok(RedbSnapshotPayload {
+        generation,
+        ref_records,
+        ref_models,
+        all_indexed_oids,
+        objects,
+        cloud_name,
+        catalog,
+    })
+}
+
+#[cfg(all(test, feature = "storage-redb"))]
+pub(super) mod redb_test_helpers {
+    use std::path::Path;
+
+    use git_internal::internal::object::{
+        ObjectTrait,
+        commit::Commit,
+        signature::{Signature, SignatureType},
+        tree::{Tree, TreeItem, TreeItemMode},
+    };
+
+    use crate::{
+        internal::config::ConfigKv,
+        storage::{
+            capture_store::{
+                AgentCheckpointRecord, AgentSessionRecord, CaptureAgentKind, CaptureBatchItem,
+                CaptureBatchPayload, CaptureCheckpointScope, CaptureScopeState,
+                CaptureSessionState, RedbCaptureStore,
+            },
+            cross_store::{CrossStoreCoordinator, CrossStoreRefCasOp},
+            git_store::{GitStore, ObjectIndexRecord, RedbGitStore, RefKey, RefTarget},
+            opener::RedbRepairContext,
+            runtime::{
+                init_redb_repository_storage, resolve_repo_capture_redb_path,
+                resolve_repo_git_redb_path,
+            },
+        },
+        utils::object::{read_git_object_bounded_validated, write_git_object},
+    };
+
+    pub(crate) struct SeededCheckpoint {
+        pub(crate) checkpoint_id: String,
+        pub(crate) tree_oid: String,
+        pub(crate) metadata_blob_oid: String,
+        pub(crate) traces_commit: String,
+    }
+
+    pub(crate) async fn init_empty_redb_repo(
+        repo_root: &Path,
+        repo_id: Option<&str>,
+        cloud_name: Option<&str>,
+    ) -> std::path::PathBuf {
+        let storage = repo_root.join(".libra");
+        std::fs::create_dir_all(storage.join("objects/pack")).expect("create objects/pack");
+        std::fs::create_dir_all(storage.join("objects/info")).expect("create objects/info");
+        init_redb_repository_storage(&storage)
+            .await
+            .expect("init redb repository storage");
+        git_internal::hash::set_hash_kind(git_internal::hash::HashKind::Sha1);
+        ConfigKv::set("core.objectformat", "sha1", false)
+            .await
+            .expect("set core.objectformat");
+        if let Some(id) = repo_id {
+            ConfigKv::set("libra.repoid", id, false)
+                .await
+                .expect("set libra.repoid");
+        }
+        if let Some(name) = cloud_name {
+            ConfigKv::set("cloud.name", name, false)
+                .await
+                .expect("set cloud.name");
+        }
+        storage
+    }
+
+    pub(crate) fn write_worktree_commit(
+        storage: &Path,
+        file_name: &str,
+        content: &[u8],
+        message: &str,
+    ) -> String {
+        let blob_oid = write_git_object(storage, "blob", content).expect("write blob");
+        let tree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob_oid,
+            file_name.to_string(),
+        )])
+        .expect("build tree");
+        let tree_oid = write_git_object(storage, "tree", &tree.to_data().expect("encode tree"))
+            .expect("write tree");
+        let sig = |kind| Signature::new(kind, "Libra Test".into(), "test@libra.dev".into());
+        let commit = Commit::new(
+            sig(SignatureType::Author),
+            sig(SignatureType::Committer),
+            tree_oid,
+            vec![],
+            message,
+        );
+        write_git_object(storage, "commit", &commit.to_data().expect("encode commit"))
+            .expect("write commit")
+            .to_string()
+    }
+
+    pub(crate) fn write_checkpoint_objects(
+        storage: &Path,
+        checkpoint_id: &str,
+        session_id: &str,
+        parent_traces_commit: Option<&str>,
+    ) -> SeededCheckpoint {
+        let metadata_blob = write_git_object(
+            storage,
+            "blob",
+            format!("{{\"checkpoint_id\":\"{checkpoint_id}\"}}").as_bytes(),
+        )
+        .expect("write metadata blob");
+        let inner = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            metadata_blob,
+            "metadata.json".to_string(),
+        )])
+        .expect("inner tree");
+        let inner_oid = write_git_object(storage, "tree", &inner.to_data().expect("encode inner"))
+            .expect("write inner");
+        let prefix = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Tree,
+            inner_oid,
+            checkpoint_id[2..].to_string(),
+        )])
+        .expect("prefix tree");
+        let prefix_oid =
+            write_git_object(storage, "tree", &prefix.to_data().expect("encode prefix"))
+                .expect("write prefix");
+        let cp_dir = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Tree,
+            prefix_oid,
+            checkpoint_id[..2].to_string(),
+        )])
+        .expect("cp_dir tree");
+        let cp_dir_oid =
+            write_git_object(storage, "tree", &cp_dir.to_data().expect("encode cp_dir"))
+                .expect("write cp_dir");
+        let root = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Tree,
+            cp_dir_oid,
+            "checkpoint".to_string(),
+        )])
+        .expect("root tree");
+        let root_oid = write_git_object(storage, "tree", &root.to_data().expect("encode root"))
+            .expect("write root");
+
+        let parents = parent_traces_commit
+            .map(|oid| {
+                vec![
+                    crate::internal::object_format::parse_repo_oid(oid)
+                        .expect("parse parent traces commit"),
+                ]
+            })
+            .unwrap_or_default();
+        let sig = |kind| Signature::new(kind, "Libra".into(), "traces@libra".into());
+        let commit = Commit::new(
+            sig(SignatureType::Author),
+            sig(SignatureType::Committer),
+            root_oid,
+            parents,
+            &format!(
+                "traces: committed checkpoint {checkpoint_id}\n\nLibra-Session: {session_id}\nLibra-Agent: claude_code\nLibra-Checkpoint-ID: {checkpoint_id}\nLibra-Scope: committed\n"
+            ),
+        );
+        let traces_commit =
+            write_git_object(storage, "commit", &commit.to_data().expect("encode traces"))
+                .expect("write traces commit");
+
+        SeededCheckpoint {
+            checkpoint_id: checkpoint_id.to_string(),
+            tree_oid: root_oid.to_string(),
+            metadata_blob_oid: metadata_blob.to_string(),
+            traces_commit: traces_commit.to_string(),
+        }
+    }
+
+    pub(crate) async fn index_all_loose_objects_redb(storage: &Path, repo_id: &str) {
+        let git_path = resolve_repo_git_redb_path(storage).expect("git redb path");
+        let git_rw = RedbGitStore::open_read_write(&git_path).expect("open git rw");
+        let objects_dir = storage.join("objects");
+        let mut records = Vec::new();
+        for prefix in std::fs::read_dir(&objects_dir)
+            .expect("read objects dir")
+            .flatten()
+        {
+            let name = prefix.file_name().to_string_lossy().into_owned();
+            if name.len() != 2 || !prefix.path().is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(prefix.path())
+                .expect("read shard")
+                .flatten()
+            {
+                let oid = format!("{name}{}", file.file_name().to_string_lossy());
+                let Ok(hash) = crate::internal::object_format::parse_repo_oid(&oid) else {
+                    continue;
+                };
+                let (o_type, bytes) =
+                    read_git_object_bounded_validated(storage, &hash, 4 * 1024 * 1024)
+                        .expect("read loose object");
+                records.push(ObjectIndexRecord {
+                    repo_id: repo_id.to_string(),
+                    o_id: oid,
+                    o_type,
+                    o_size: bytes.len() as i64,
+                    created_at: 1_700_000_000,
+                    is_synced: false,
+                });
+            }
+        }
+        git_rw
+            .upsert_object_index_batch(&records)
+            .await
+            .expect("upsert object_index batch");
+    }
+
+    pub(crate) fn sample_session(session_id: &str, working_dir: &Path) -> AgentSessionRecord {
+        AgentSessionRecord {
+            session_id: session_id.to_string(),
+            agent_kind: CaptureAgentKind::ClaudeCode,
+            provider_session_id: format!("provider-{session_id}"),
+            thread_id: None,
+            state: CaptureSessionState::Stopped,
+            working_dir: working_dir.to_string_lossy().into_owned(),
+            worktree_id: None,
+            parent_commit: None,
+            parent_session_id: None,
+            metadata_json: "{}".to_string(),
+            redaction_report: "{}".to_string(),
+            started_at: 1_700_000_001,
+            last_event_at: 1_700_000_010,
+            stopped_at: Some(1_700_000_010),
+            schema_version: 2,
+            sync_revision: 1,
+            repo_id: None,
+            workspace_id: None,
+            workspace_fence: None,
+            scope_state: CaptureScopeState::LegacyUnknown,
+        }
+    }
+
+    pub(crate) fn sample_checkpoint(
+        seeded: &SeededCheckpoint,
+        session_id: &str,
+        parent_checkpoint_id: Option<&str>,
+        created_at: i64,
+    ) -> AgentCheckpointRecord {
+        AgentCheckpointRecord {
+            checkpoint_id: seeded.checkpoint_id.clone(),
+            session_id: session_id.to_string(),
+            parent_checkpoint_id: parent_checkpoint_id.map(str::to_string),
+            scope: CaptureCheckpointScope::Committed,
+            parent_commit: None,
+            tree_oid: seeded.tree_oid.clone(),
+            metadata_blob_oid: seeded.metadata_blob_oid.clone(),
+            traces_commit: seeded.traces_commit.clone(),
+            tool_use_id: None,
+            subagent_session_id: None,
+            description: Some(format!("checkpoint {}", seeded.checkpoint_id)),
+            created_at,
+            sync_revision: 1,
+        }
+    }
+
+    pub(crate) async fn commit_checkpoint_cross_store(
+        storage: &Path,
+        expected_traces: Option<&str>,
+        session: Option<&AgentSessionRecord>,
+        checkpoint: &AgentCheckpointRecord,
+    ) -> u64 {
+        let git_path = resolve_repo_git_redb_path(storage).expect("git redb path");
+        let cap_path = resolve_repo_capture_redb_path(storage).expect("capture redb path");
+        let git_rw = RedbGitStore::open_read_write(&git_path).expect("open git rw");
+        let cap_rw = RedbCaptureStore::open_read_write(&cap_path, RedbRepairContext::WriteCommand)
+            .await
+            .expect("open capture rw");
+        let coordinator = CrossStoreCoordinator::new(git_rw, cap_rw);
+
+        let mut items = Vec::new();
+        if let Some(sess) = session {
+            items.push(CaptureBatchItem {
+                dedup_key: format!("sess:{}", sess.session_id),
+                payload: CaptureBatchPayload::UpsertSession(sess.clone()),
+            });
+        }
+        items.push(CaptureBatchItem {
+            dedup_key: format!("cp:{}", checkpoint.checkpoint_id),
+            payload: CaptureBatchPayload::UpsertCheckpoint(checkpoint.clone()),
+        });
+
+        let op = CrossStoreRefCasOp {
+            key: RefKey::LocalBranch {
+                name: crate::internal::branch::TRACES_BRANCH.to_string(),
+            },
+            expected: expected_traces.map(|oid| RefTarget::Direct(oid.to_string())),
+            new_target: Some(RefTarget::Direct(checkpoint.traces_commit.clone())),
+            reflogs: vec![],
+            publication: None,
+        };
+        let outcome = coordinator
+            .commit_ref_cas_with_capture(&op, &items)
+            .await
+            .expect("cross-store checkpoint commit");
+        outcome.generation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_cross_store_gen_consistent_snapshot_and_wire_protocol() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+
+        use super::{redb_test_helpers::*, *};
+        use crate::{
+            internal::metadata::{MetadataKv, MetadataScope, MetadataValueType},
+            storage::{
+                capture_store::{CaptureBatchItem, CaptureBatchPayload, RedbCaptureStore},
+                cross_store::{CrossStoreCoordinator, CrossStoreRefCasOp},
+                git_store::{GitStore, RedbGitStore, RefKey, RefTarget},
+                opener::RedbRepairContext,
+                runtime::{resolve_repo_capture_redb_path, resolve_repo_git_redb_path},
+            },
+            utils::{
+                d1_client::test_support::MockD1, storage::remote::RemoteStorage,
+                test::ChangeDirGuard,
+            },
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = ChangeDirGuard::new(dir.path());
+        let repo_id = "11111111-2222-4333-8444-555555555555";
+        let storage = init_empty_redb_repo(dir.path(), Some(repo_id), Some("rb28-wire-demo")).await;
+
+        // Seed main commit + HEAD + main ref.
+        let main_commit =
+            write_worktree_commit(&storage, "README.md", b"hello redb cloud\n", "init");
+        {
+            let git_path = resolve_repo_git_redb_path(&storage).expect("git path");
+            let git_rw = RedbGitStore::open_read_write(&git_path).expect("git rw");
+            git_rw
+                .update_ref_cas(
+                    &RefKey::LocalBranch {
+                        name: "main".to_string(),
+                    },
+                    None,
+                    Some(&RefTarget::Direct(main_commit.clone())),
+                    &[],
+                )
+                .await
+                .expect("set main ref");
+            git_rw
+                .update_ref_cas(
+                    &RefKey::LocalHead { worktree_id: None },
+                    None,
+                    Some(&RefTarget::Symbolic("main".to_string())),
+                    &[],
+                )
+                .await
+                .expect("set HEAD ref");
+        }
+
+        // Seed private metadata canaries that must NEVER enter the cloud wire payload.
+        const PRIVATE_CANARY: &str = "RB28_PRIVATE_REASONING_CANARY_NEVER_EXPORT";
+        MetadataKv::set(
+            MetadataScope::AgentReasoningIdentity,
+            "canary-target",
+            "secret-key",
+            PRIVATE_CANARY,
+            MetadataValueType::Text,
+        )
+        .await
+        .expect("seed private metadata canary");
+
+        // Pre-write checkpoint objects for gen 1, gen 2, and gen 3 so all objects are indexed.
+        let session = sample_session("rb28-sess-1", dir.path());
+        let cp1_objs =
+            write_checkpoint_objects(&storage, "aabbcc112233", &session.session_id, None);
+        let cp2_objs = write_checkpoint_objects(
+            &storage,
+            "bbccdd223344",
+            &session.session_id,
+            Some(&cp1_objs.traces_commit),
+        );
+        let cp3_objs = write_checkpoint_objects(
+            &storage,
+            "ccddee334455",
+            &session.session_id,
+            Some(&cp2_objs.traces_commit),
+        );
+        index_all_loose_objects_redb(&storage, repo_id).await;
+
+        let cp1 = sample_checkpoint(&cp1_objs, &session.session_id, None, 1_700_000_002);
+        let cp2 = sample_checkpoint(
+            &cp2_objs,
+            &session.session_id,
+            Some(&cp1.checkpoint_id),
+            1_700_000_003,
+        );
+        let cp3 = sample_checkpoint(
+            &cp3_objs,
+            &session.session_id,
+            Some(&cp2.checkpoint_id),
+            1_700_000_004,
+        );
+
+        let g1 = commit_checkpoint_cross_store(&storage, None, Some(&session), &cp1).await;
+        assert_eq!(g1, 1);
+        let g2 =
+            commit_checkpoint_cross_store(&storage, Some(&cp1.traces_commit), None, &cp2).await;
+        assert_eq!(g2, 2);
+
+        // Inject a concurrent cross-store commit (gen 2 -> gen 3) right between
+        // capture_rtx(c1) and git_rtx2(g2) on attempt 0 so the 3-step protocol
+        // observes g1=2, c1=2, g2=3, retries, and freezes gen 3 cleanly.
+        let hook_hits = Arc::new(AtomicUsize::new(0));
+        let hook_hits_cb = Arc::clone(&hook_hits);
+        let storage_for_hook = storage.clone();
+        let cp2_traces_for_hook = cp2.traces_commit.clone();
+        let cp3_for_hook = cp3.clone();
+        let handle = tokio::runtime::Handle::current();
+
+        let tuning = SnapshotTuning {
+            redb_retry_backoff: Some(Duration::ZERO),
+            redb_between_c1_and_g2: Some(Arc::new(move |attempt, obs_g1, obs_c1| {
+                if attempt == 0 {
+                    hook_hits_cb.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(obs_g1, 2);
+                    assert_eq!(obs_c1, 2);
+                    let git_path = resolve_repo_git_redb_path(&storage_for_hook).expect("git path");
+                    let cap_path =
+                        resolve_repo_capture_redb_path(&storage_for_hook).expect("cap path");
+                    let cp2_ref = cp2_traces_for_hook.clone();
+                    let cp3_rec = cp3_for_hook.clone();
+                    handle.block_on(async move {
+                        let git_rw = RedbGitStore::open_read_write(&git_path).expect("git rw");
+                        let cap_rw = RedbCaptureStore::open_read_write(
+                            &cap_path,
+                            RedbRepairContext::WriteCommand,
+                        )
+                        .await
+                        .expect("cap rw");
+                        let coord = CrossStoreCoordinator::new(git_rw, cap_rw);
+                        let op = CrossStoreRefCasOp {
+                            key: RefKey::LocalBranch {
+                                name: crate::internal::branch::TRACES_BRANCH.to_string(),
+                            },
+                            expected: Some(RefTarget::Direct(cp2_ref)),
+                            new_target: Some(RefTarget::Direct(cp3_rec.traces_commit.clone())),
+                            reflogs: vec![],
+                            publication: None,
+                        };
+                        let outcome = coord
+                            .commit_ref_cas_with_capture(
+                                &op,
+                                &[CaptureBatchItem {
+                                    dedup_key: format!("cp:{}", cp3_rec.checkpoint_id),
+                                    payload: CaptureBatchPayload::UpsertCheckpoint(cp3_rec),
+                                }],
+                            )
+                            .await
+                            .expect("concurrent gen 2 -> gen 3 commit");
+                        assert_eq!(outcome.generation, 3);
+                    });
+                }
+            })),
+            ..Default::default()
+        };
+
+        let mock_d1 = MockD1::spawn().await;
+        let memory_r2: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let r2 = RemoteStorage::new(Arc::clone(&memory_r2));
+
+        let report = super::super::sync::run_cloud_sync_from_snapshot(
+            CloudSyncContext {
+                batch_size: 32,
+                force: false,
+            },
+            &SilentCloudSyncProgress,
+            mock_d1.client(),
+            Some(r2),
+            &tuning,
+        )
+        .await
+        .expect("redb cloud sync should retry past torn window and freeze gen 3");
+
+        assert_eq!(
+            hook_hits.load(Ordering::SeqCst),
+            1,
+            "hook must have fired on attempt 0"
+        );
+        assert_eq!(report.repo_id, repo_id);
+        assert_eq!(report.project_name, "rb28-wire-demo");
+        assert_eq!(report.failed_count, 0);
+        assert!(matches!(
+            report.metadata,
+            MetadataSyncOutcome::Synced { references: 3 }
+        ));
+        assert!(
+            matches!(
+                report.agent_capture,
+                AgentCaptureSyncOutcome::Completed {
+                    sessions_synced: 1,
+                    checkpoints_synced: 3,
+                    ..
+                }
+            ),
+            "expected all 3 checkpoints from consistent gen 3, got {:?}",
+            report.agent_capture
+        );
+
+        // Zero SQLite sidecars created in pure Redb mode.
+        assert!(!storage.join("libra.db").exists());
+        assert!(!storage.join("private/capture.db").exists());
+
+        // Verify R2 metadata wire protocol bytes match `serialize_reference_projection`
+        // identically and never leak private metadata canaries.
+        let r2_check = RemoteStorage::new(Arc::clone(&memory_r2));
+        let uploaded_refs_bytes = r2_check.get_metadata().await.expect("uploaded refs.json");
+        let uploaded_refs_text =
+            String::from_utf8(uploaded_refs_bytes.clone()).expect("utf8 refs.json");
+        assert!(!uploaded_refs_text.contains(PRIVATE_CANARY));
+        let parsed_refs: Vec<reference::Model> =
+            serde_json::from_slice(&uploaded_refs_bytes).expect("parse uploaded refs.json");
+        let (_canonical_models, canonical_wire_bytes) =
+            super::super::metadata::serialize_reference_projection(parsed_refs.clone())
+                .expect("canonical wire serialization");
+        assert_eq!(
+            uploaded_refs_bytes, canonical_wire_bytes,
+            "Redb R2 metadata JSON must match canonical wire protocol byte-for-byte"
+        );
+        let traces_ref_in_wire = parsed_refs
+            .iter()
+            .find(|r| r.name.as_deref() == Some(crate::internal::branch::TRACES_BRANCH))
+            .expect("traces ref in wire metadata");
+        assert_eq!(
+            traces_ref_in_wire.commit.as_deref(),
+            Some(cp3.traces_commit.as_str()),
+            "uploaded refs.json traces head must match frozen gen 3"
+        );
+
+        // Verify D1 generation manifest and rows match gen 3.
+        let d1_client = mock_d1.client();
+        let d1_gen = d1_client
+            .get_agent_capture_generation(repo_id)
+            .await
+            .expect("read d1 generation")
+            .expect("d1 generation exists");
+        assert_eq!(d1_gen.state, "complete");
+        assert_eq!(
+            d1_gen.traces_head.as_deref(),
+            Some(cp3.traces_commit.as_str()),
+            "D1 fenced traces_head must match gen 3"
+        );
+        let d1_checkpoints = d1_client
+            .list_agent_checkpoint_v2_rows(repo_id)
+            .await
+            .expect("list d1 checkpoints");
+        assert_eq!(d1_checkpoints.len(), 3);
+        assert!(
+            d1_checkpoints
+                .iter()
+                .any(|c| c.checkpoint_id == cp3.checkpoint_id)
+        );
+
+        // Verify second sync skips metadata upload via Redb `cloud.metadata_hash`.
+        let second_report = super::super::sync::run_cloud_sync_with_clients(
+            CloudSyncContext {
+                batch_size: 32,
+                force: false,
+            },
+            &SilentCloudSyncProgress,
+            mock_d1.client(),
+            Some(RemoteStorage::new(Arc::clone(&memory_r2))),
+        )
+        .await
+        .expect("second redb cloud sync");
+        assert_eq!(second_report.metadata, MetadataSyncOutcome::Skipped);
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_partial_commit_fails_closed_then_recovers_after_doctor_repair() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicU64, Ordering},
+            },
+            time::Duration,
+        };
+
+        use super::{redb_test_helpers::*, *};
+        use crate::{
+            storage::{
+                capture_store::{CaptureBatchItem, CaptureBatchPayload, RedbCaptureStore},
+                cross_store::{
+                    CrossStoreCommitHook, CrossStoreCoordinator, CrossStoreRefCasOp,
+                    reconcile_pending_intents,
+                },
+                git_store::{GitStore, RedbGitStore, RefKey, RefTarget},
+                opener::RedbRepairContext,
+                runtime::{resolve_repo_capture_redb_path, resolve_repo_git_redb_path},
+            },
+            utils::{
+                d1_client::test_support::MockD1, error::StableErrorCode,
+                storage::remote::RemoteStorage, test::ChangeDirGuard,
+            },
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _cwd = ChangeDirGuard::new(dir.path());
+        let repo_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let storage =
+            init_empty_redb_repo(dir.path(), Some(repo_id), Some("rb28-fault-demo")).await;
+
+        let main_commit = write_worktree_commit(&storage, "app.txt", b"fault test\n", "init");
+        {
+            let git_path = resolve_repo_git_redb_path(&storage).expect("git path");
+            let git_rw = RedbGitStore::open_read_write(&git_path).expect("git rw");
+            git_rw
+                .update_ref_cas(
+                    &RefKey::LocalBranch {
+                        name: "main".to_string(),
+                    },
+                    None,
+                    Some(&RefTarget::Direct(main_commit.clone())),
+                    &[],
+                )
+                .await
+                .expect("set main");
+            git_rw
+                .update_ref_cas(
+                    &RefKey::LocalHead { worktree_id: None },
+                    None,
+                    Some(&RefTarget::Symbolic("main".to_string())),
+                    &[],
+                )
+                .await
+                .expect("set HEAD");
+        }
+
+        let session = sample_session("rb28-fault-sess", dir.path());
+        let cp1_objs =
+            write_checkpoint_objects(&storage, "112233aabbcc", &session.session_id, None);
+        let cp2_objs = write_checkpoint_objects(
+            &storage,
+            "223344bbccdd",
+            &session.session_id,
+            Some(&cp1_objs.traces_commit),
+        );
+        index_all_loose_objects_redb(&storage, repo_id).await;
+
+        let cp1 = sample_checkpoint(&cp1_objs, &session.session_id, None, 1_700_000_100);
+        let cp2 = sample_checkpoint(
+            &cp2_objs,
+            &session.session_id,
+            Some(&cp1.checkpoint_id),
+            1_700_000_101,
+        );
+        let g1 = commit_checkpoint_cross_store(&storage, None, Some(&session), &cp1).await;
+        assert_eq!(g1, 1);
+
+        // ---- Part 1 (AC2): >5 concurrent retries fail closed with LBR-IO-001 ----
+        let mock_d1_retry = MockD1::spawn().await;
+        let memory_r2_retry: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let storage_hook = storage.clone();
+        let bumped_gen = Arc::new(AtomicU64::new(1));
+        let bumped_gen_cb = Arc::clone(&bumped_gen);
+        let handle = tokio::runtime::Handle::current();
+
+        let retry_exhaust_tuning = SnapshotTuning {
+            redb_retry_backoff: Some(Duration::ZERO),
+            redb_between_c1_and_g2: Some(Arc::new(move |_attempt, _g1, _c1| {
+                // Advance BOTH git.redb and capture.redb META_GENERATION between c1 and g2
+                // on every single attempt so g1 == c1 != g2 persists for all 6 attempts (>5 retries).
+                let next_gen = bumped_gen_cb.fetch_add(1, Ordering::SeqCst) + 1;
+                let git_path = resolve_repo_git_redb_path(&storage_hook).expect("git path");
+                let cap_path = resolve_repo_capture_redb_path(&storage_hook).expect("cap path");
+                handle.block_on(async move {
+                    let git_rw = RedbGitStore::open_read_write(&git_path).expect("git rw");
+                    let cap_rw = RedbCaptureStore::open_read_write(
+                        &cap_path,
+                        RedbRepairContext::WriteCommand,
+                    )
+                    .await
+                    .expect("cap rw");
+                    let git_wtx = git_rw.begin_checked_write_tx().expect("git wtx");
+                    let cap_wtx = cap_rw.begin_checked_write_tx().expect("cap wtx");
+                    RedbGitStore::write_cross_store_generation_in_wtx(&git_wtx, next_gen)
+                        .expect("write git gen");
+                    RedbCaptureStore::write_cross_store_generation_in_wtx(&cap_wtx, next_gen)
+                        .expect("write cap gen");
+                    git_wtx.commit().expect("commit git gen");
+                    cap_wtx.commit().expect("commit cap gen");
+                });
+            })),
+            ..Default::default()
+        };
+
+        let retry_err = super::super::sync::run_cloud_sync_from_snapshot(
+            CloudSyncContext {
+                batch_size: 32,
+                force: false,
+            },
+            &SilentCloudSyncProgress,
+            mock_d1_retry.client(),
+            Some(RemoteStorage::new(Arc::clone(&memory_r2_retry))),
+            &retry_exhaust_tuning,
+        )
+        .await
+        .expect_err("persistent concurrent generation mismatch (>5 retries) must fail closed");
+
+        assert!(
+            matches!(retry_err, CloudError::StorageIo(_)),
+            "expected CloudError::StorageIo, got {retry_err:?}"
+        );
+        let retry_cli = retry_err.into_cli_error("sync");
+        assert_eq!(retry_cli.stable_code(), StableErrorCode::IoReadFailed);
+        assert_eq!(retry_cli.stable_code().as_str(), "LBR-IO-001");
+        assert!(
+            mock_d1_retry
+                .client()
+                .find_repository(repo_id)
+                .await
+                .is_err()
+                || mock_d1_retry
+                    .client()
+                    .find_repository(repo_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_none(),
+            "failed snapshot must never upload repository rows to D1"
+        );
+        assert!(
+            RemoteStorage::new(Arc::clone(&memory_r2_retry))
+                .get_metadata()
+                .await
+                .is_err(),
+            "failed snapshot must never upload metadata to R2"
+        );
+
+        // ---- Part 2 (AC3): Partial commit fault injection -> fail closed -> doctor repair -> succeed ----
+        let git_path = resolve_repo_git_redb_path(&storage).expect("git path");
+        let cap_path = resolve_repo_capture_redb_path(&storage).expect("cap path");
+        {
+            let git_rw = RedbGitStore::open_read_write(&git_path).expect("git rw");
+            let cap_rw =
+                RedbCaptureStore::open_read_write(&cap_path, RedbRepairContext::WriteCommand)
+                    .await
+                    .expect("cap rw");
+            let coord = CrossStoreCoordinator::new(git_rw.clone(), cap_rw.clone());
+            let op = CrossStoreRefCasOp {
+                key: RefKey::LocalBranch {
+                    name: crate::internal::branch::TRACES_BRANCH.to_string(),
+                },
+                expected: Some(RefTarget::Direct(cp1.traces_commit.clone())),
+                new_target: Some(RefTarget::Direct(cp2.traces_commit.clone())),
+                reflogs: vec![],
+                publication: None,
+            };
+            let injected = coord
+                .commit_ref_cas_with_capture_inner(
+                    &op,
+                    &[CaptureBatchItem {
+                        dedup_key: format!("cp:{}", cp2.checkpoint_id),
+                        payload: CaptureBatchPayload::UpsertCheckpoint(cp2.clone()),
+                    }],
+                    CrossStoreCommitHook::fail_after_git_commit(),
+                )
+                .await;
+            assert!(
+                injected.is_err(),
+                "partial-commit hook must fail after git commit"
+            );
+
+            let git_gen = git_rw.read_cross_store_generation().expect("git gen");
+            let cap_gen = cap_rw.read_cross_store_generation().expect("cap gen");
+            assert_eq!(git_gen, cap_gen + 1, "git.redb must be 1 generation ahead");
+            assert_eq!(
+                git_rw
+                    .list_cross_store_intent_generations()
+                    .expect("pending intents"),
+                vec![git_gen],
+                "pending META_CROSS_STORE_INTENT must exist for the uncommitted capture generation"
+            );
+        }
+
+        // Snapshot/sync during partial commit must fail closed with LBR-IO-001 advising doctor repair.
+        let mock_d1_partial = MockD1::spawn().await;
+        let memory_r2_partial: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let fast_tuning = SnapshotTuning {
+            redb_retry_backoff: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let partial_err = super::super::sync::run_cloud_sync_from_snapshot(
+            CloudSyncContext {
+                batch_size: 32,
+                force: false,
+            },
+            &SilentCloudSyncProgress,
+            mock_d1_partial.client(),
+            Some(RemoteStorage::new(Arc::clone(&memory_r2_partial))),
+            &fast_tuning,
+        )
+        .await
+        .expect_err("partial-commit state must fail closed on cloud snapshot/sync");
+
+        let partial_msg = partial_err.to_string();
+        assert!(
+            partial_msg.contains("libra agent doctor --repair"),
+            "partial-commit failure must advise `libra agent doctor --repair`, got: {partial_msg}"
+        );
+        let partial_cli = partial_err.into_cli_error("sync");
+        assert_eq!(partial_cli.stable_code(), StableErrorCode::IoReadFailed);
+        assert_eq!(partial_cli.stable_code().as_str(), "LBR-IO-001");
+        assert!(
+            RemoteStorage::new(Arc::clone(&memory_r2_partial))
+                .get_metadata()
+                .await
+                .is_err(),
+            "partial-commit failure must not upload metadata to R2"
+        );
+
+        // Run doctor repair (`reconcile_pending_intents`) to replay the pending outbox intent.
+        {
+            let git_rw = RedbGitStore::open_read_write(&git_path).expect("git rw");
+            let cap_rw =
+                RedbCaptureStore::open_read_write(&cap_path, RedbRepairContext::WriteCommand)
+                    .await
+                    .expect("cap rw");
+            let reconcile = reconcile_pending_intents(&git_rw, &cap_rw)
+                .await
+                .expect("doctor repair reconcile_pending_intents");
+            assert_eq!(reconcile.replayed_generations.len(), 1);
+            assert_eq!(
+                git_rw
+                    .read_cross_store_generation()
+                    .expect("repaired git gen"),
+                cap_rw
+                    .read_cross_store_generation()
+                    .expect("repaired cap gen")
+            );
+            assert!(
+                git_rw
+                    .list_cross_store_intent_generations()
+                    .expect("intents pruned")
+                    .is_empty()
+            );
+        }
+
+        // Re-running cloud sync now succeeds cleanly and uploads the repaired generation!
+        let recovered = super::super::sync::run_cloud_sync_with_clients(
+            CloudSyncContext {
+                batch_size: 32,
+                force: false,
+            },
+            &SilentCloudSyncProgress,
+            mock_d1_partial.client(),
+            Some(RemoteStorage::new(Arc::clone(&memory_r2_partial))),
+        )
+        .await
+        .expect("cloud sync must succeed after doctor repair");
+
+        assert_eq!(recovered.failed_count, 0);
+        assert!(matches!(
+            recovered.agent_capture,
+            AgentCaptureSyncOutcome::Completed {
+                sessions_synced: 1,
+                checkpoints_synced: 2,
+                ..
+            }
+        ));
+        let d1_gen = mock_d1_partial
+            .client()
+            .get_agent_capture_generation(repo_id)
+            .await
+            .expect("d1 gen")
+            .expect("d1 gen row");
+        assert_eq!(d1_gen.state, "complete");
+        assert_eq!(
+            d1_gen.traces_head.as_deref(),
+            Some(cp2.traces_commit.as_str())
+        );
     }
 }
