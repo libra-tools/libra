@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     command::config::{ConfigScope, ScopedConfig},
-    internal::{config::ConfigKv, vault},
+    internal::vault,
 };
 
 /// Namespace prefix in the global config store (locked away from `libra
@@ -238,13 +238,11 @@ impl BackendKind {
 /// the actionable message for the AUTH COMMAND surface; the network hot path
 /// must instead degrade (see [`lookup`]).
 pub async fn resolve_backend() -> Result<BackendKind> {
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-    let value = ConfigKv::get_with_conn(&conn, "auth.backend")
-        .await
-        .map_err(|error| anyhow!("failed to read auth.backend: {error}"))?
-        .map(|entry| entry.value.trim().to_ascii_lowercase());
+    let value = match ScopedConfig::get(ConfigScope::Global, "auth.backend").await {
+        Ok(entry) => entry.map(|entry| entry.value.trim().to_ascii_lowercase()),
+        Err(error) if error.starts_with("NOT_FOUND:") => None,
+        Err(error) => return Err(anyhow!("failed to read auth.backend: {error}")),
+    };
     match value.as_deref() {
         None | Some("") | Some("file") => Ok(BackendKind::File),
         Some("keyring") => {
@@ -391,12 +389,11 @@ pub async fn store_token(
             // If this scope previously lived in the OS keyring, the old
             // secret must not survive the overwrite (an orphaned entry is
             // rediscoverable by a later keyring-enabled build).
-            let conn = ScopedConfig::get_connection(ConfigScope::Global)
-                .await
-                .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-            let prior = ConfigKv::get_with_conn(&conn, &scope.storage_key())
-                .await
-                .map_err(|error| anyhow!("failed to read the token record: {error}"))?;
+            let prior = match ScopedConfig::get(ConfigScope::Global, &scope.storage_key()).await {
+                Ok(entry) => entry,
+                Err(error) if error.starts_with("NOT_FOUND:") => None,
+                Err(error) => return Err(anyhow!("failed to read the token record: {error}")),
+            };
             if prior.is_some_and(|entry| entry.value == KEYRING_MARKER) {
                 #[cfg(feature = "keyring")]
                 {
@@ -420,12 +417,14 @@ pub async fn store_token(
             keyring_backend::set(scope.storage_key(), secret).await?;
             // Non-secret marker row: enables enumeration; a pre-2.7 binary
             // classifies it as undecryptable (non-hex — pinned by test).
-            let conn = ScopedConfig::get_connection(ConfigScope::Global)
-                .await
-                .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-            ConfigKv::set_with_conn(&conn, &scope.storage_key(), KEYRING_MARKER, false)
-                .await
-                .map_err(|error| anyhow!("failed to persist the keyring marker: {error}"))?;
+            ScopedConfig::set(
+                ConfigScope::Global,
+                &scope.storage_key(),
+                KEYRING_MARKER,
+                false,
+            )
+            .await
+            .map_err(|error| anyhow!("failed to persist the keyring marker: {error}"))?;
             repair_global_modes();
             Ok(())
         }
@@ -443,14 +442,16 @@ async fn store_record_file(scope: &HostScope, record: &StoredAuthToken) -> Resul
     let encrypted = vault::encrypt_token(&unseal_key, &plaintext)
         // The vault error never contains the secret.
         .map_err(|_| anyhow!("failed to encrypt the token"))?;
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
     // Pre-encrypted hex with secret=false — the credential.rs precedent (the
     // config `encrypted` flag drives the vault door, which this bypasses).
-    ConfigKv::set_with_conn(&conn, &scope.storage_key(), &hex::encode(encrypted), false)
-        .await
-        .map_err(|error| anyhow!("failed to persist the token record: {error}"))?;
+    ScopedConfig::set(
+        ConfigScope::Global,
+        &scope.storage_key(),
+        &hex::encode(encrypted),
+        false,
+    )
+    .await
+    .map_err(|error| anyhow!("failed to persist the token record: {error}"))?;
     repair_global_modes();
     Ok(())
 }
@@ -516,17 +517,16 @@ pub async fn lookup(scope: &HostScope) -> Lookup {
 /// Remove one scope's token (idempotent; works without decryption so revoke
 /// survives key rotation). Returns whether something was removed.
 pub async fn remove(scope: &HostScope) -> Result<bool> {
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
     // Revocation must reach BOTH backends (a revoked token that still
     // attaches is a defect). A featureless binary REFUSES to remove a
     // keyring-marked scope — deleting only the marker would leave the OS
     // secret alive and rediscoverable (never report success on a
     // half-revoke). The marker row is deleted AFTER the OS entry.
-    let entry = ConfigKv::get_with_conn(&conn, &scope.storage_key())
-        .await
-        .map_err(|error| anyhow!("failed to read the token record: {error}"))?;
+    let entry = match ScopedConfig::get(ConfigScope::Global, &scope.storage_key()).await {
+        Ok(entry) => entry,
+        Err(error) if error.starts_with("NOT_FOUND:") => return Ok(false),
+        Err(error) => return Err(anyhow!("failed to read the token record: {error}")),
+    };
     if entry
         .as_ref()
         .is_some_and(|entry| entry.value == KEYRING_MARKER)
@@ -544,7 +544,7 @@ pub async fn remove(scope: &HostScope) -> Result<bool> {
             );
         }
     }
-    let rows = ConfigKv::unset_all_with_conn(&conn, &scope.storage_key())
+    let rows = ScopedConfig::unset_all(ConfigScope::Global, &scope.storage_key())
         .await
         .map_err(|error| anyhow!("failed to remove the token record: {error}"))?;
     Ok(rows > 0)
@@ -552,12 +552,11 @@ pub async fn remove(scope: &HostScope) -> Result<bool> {
 
 /// Remove every stored token. Returns the count.
 pub async fn remove_all() -> Result<usize> {
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-    let entries = ConfigKv::list_all_with_conn(&conn)
-        .await
-        .map_err(|error| anyhow!("failed to list the global config store: {error}"))?;
+    let entries = match ScopedConfig::list_all(ConfigScope::Global).await {
+        Ok(entries) => entries,
+        Err(error) if error.starts_with("NOT_FOUND:") => return Ok(0),
+        Err(error) => return Err(anyhow!("failed to list the global config store: {error}")),
+    };
     // PRE-SCAN (featureless builds): refuse BEFORE deleting anything if any
     // scope is keyring-marked — a partial clear that reports progress while
     // OS secrets stay alive is a half-revoke.
@@ -580,10 +579,9 @@ pub async fn remove_all() -> Result<usize> {
         if entry.value == KEYRING_MARKER {
             keyring_backend::delete(entry.key.clone()).await?;
         }
-        removed += ConfigKv::unset_all_with_conn(&conn, &entry.key)
+        removed += ScopedConfig::unset_all(ConfigScope::Global, &entry.key)
             .await
-            .map_err(|error| anyhow!("failed to remove a token record: {error}"))?
-            as usize;
+            .map_err(|error| anyhow!("failed to remove a token record: {error}"))?;
     }
     Ok(removed)
 }
@@ -619,12 +617,11 @@ pub async fn migrate_tokens(target: BackendKind) -> Result<usize> {
             bail!("the OS keyring probe did not read back");
         }
     }
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-    let entries = ConfigKv::list_all_with_conn(&conn)
-        .await
-        .map_err(|error| anyhow!("failed to list the global config store: {error}"))?;
+    let entries = match ScopedConfig::list_all(ConfigScope::Global).await {
+        Ok(entries) => entries,
+        Err(error) if error.starts_with("NOT_FOUND:") => Vec::new(),
+        Err(error) => return Err(anyhow!("failed to list the global config store: {error}")),
+    };
     let mut moved = 0usize;
     for entry in entries {
         if !entry.key.starts_with(AUTH_TOKEN_PREFIX) || entry.key.ends_with("migrate-probe") {
@@ -664,7 +661,7 @@ pub async fn migrate_tokens(target: BackendKind) -> Result<usize> {
                 // Verify readback via the file path before deleting the
                 // keyring copy.
                 if decrypt_record(
-                    &ConfigKv::get_with_conn(&conn, &entry.key)
+                    &ScopedConfig::get(ConfigScope::Global, &entry.key)
                         .await
                         .map_err(|error| anyhow!("verify read failed: {error}"))?
                         .map(|row| row.value)
@@ -692,7 +689,7 @@ pub async fn migrate_tokens(target: BackendKind) -> Result<usize> {
                 {
                     bail!("migration verify-readback failed; the file copy was kept");
                 }
-                ConfigKv::set_with_conn(&conn, &entry.key, KEYRING_MARKER, false)
+                ScopedConfig::set(ConfigScope::Global, &entry.key, KEYRING_MARKER, false)
                     .await
                     .map_err(|error| anyhow!("failed to write the keyring marker: {error}"))?;
                 moved += 1;
@@ -700,7 +697,7 @@ pub async fn migrate_tokens(target: BackendKind) -> Result<usize> {
             _ => {} // already home
         }
     }
-    ConfigKv::set_with_conn(&conn, "auth.backend", target.as_str(), false)
+    ScopedConfig::set(ConfigScope::Global, "auth.backend", target.as_str(), false)
         .await
         .map_err(|error| anyhow!("failed to set auth.backend: {error}"))?;
     Ok(moved)
@@ -709,12 +706,11 @@ pub async fn migrate_tokens(target: BackendKind) -> Result<usize> {
 /// Status rows for every stored token (undecryptable entries reported, not
 /// hidden). No token material is ever included.
 pub async fn list() -> Result<Vec<TokenStatus>> {
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-    let entries = ConfigKv::list_all_with_conn(&conn)
-        .await
-        .map_err(|error| anyhow!("failed to list the global config store: {error}"))?;
+    let entries = match ScopedConfig::list_all(ConfigScope::Global).await {
+        Ok(entries) => entries,
+        Err(error) if error.starts_with("NOT_FOUND:") => return Ok(Vec::new()),
+        Err(error) => return Err(anyhow!("failed to list the global config store: {error}")),
+    };
     let now = now_unix();
     let mut rows = Vec::new();
     for entry in entries {
@@ -794,6 +790,7 @@ pub async fn list() -> Result<Vec<TokenStatus>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::internal::config::ConfigKv;
 
     #[test]
     fn host_scope_parse_matrix() {

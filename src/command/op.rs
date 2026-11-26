@@ -352,10 +352,16 @@ async fn v2_engine_for_repo(repo_id: &str) -> CliResult<RestoreEngine> {
 
 async fn v2_engine_and_ref(repo_id: &str, op_ref: &str) -> CliResult<(RestoreEngine, String)> {
     let engine = v2_engine_for_repo(repo_id).await?;
-    let entry = if let Some(state_store) = engine.store().state_store() {
-        resolve_op_ref_with_store(state_store.as_ref(), repo_id, op_ref).await?
-    } else {
-        resolve_v2_history_ref(engine.store().db(), repo_id, op_ref).await?
+    let entry = match engine.store().backend_kind() {
+        crate::storage::StorageBackendKind::Redb => {
+            let state_store = engine.store().state_store().ok_or_else(|| {
+                CliError::fatal("redb operation store is missing its GitStateStore handle")
+            })?;
+            resolve_op_ref_with_store(state_store.as_ref(), repo_id, op_ref).await?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            resolve_v2_history_ref(engine.store().db(), repo_id, op_ref).await?
+        }
     };
     Ok((engine, entry.op_id))
 }
@@ -507,14 +513,20 @@ async fn handle_op_revert(
     ensure_transition_clean(force).await?;
     let repo_id = current_repo_id().await?;
     let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
-    let parent_id = if let Some(state_store) = restore.store().state_store() {
-        resolve_op_ref_with_store(state_store.as_ref(), &repo_id, &parent)
-            .await?
-            .op_id
-    } else {
-        resolve_v2_history_ref(restore.store().db(), &repo_id, &parent)
-            .await?
-            .op_id
+    let parent_id = match restore.store().backend_kind() {
+        crate::storage::StorageBackendKind::Redb => {
+            let state_store = restore.store().state_store().ok_or_else(|| {
+                CliError::fatal("redb operation store is missing its GitStateStore handle")
+            })?;
+            resolve_op_ref_with_store(state_store.as_ref(), &repo_id, &parent)
+                .await?
+                .op_id
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            resolve_v2_history_ref(restore.store().db(), &repo_id, &parent)
+                .await?
+                .op_id
+        }
     };
     let receipt = UndoEngine::new(restore)
         .revert(op_id, parent_id, dry_run, confirm_repo_wide)
@@ -1438,9 +1450,12 @@ async fn render_restore_preview_with_backend(
                 .map(str::to_string)
         })
         .collect::<HashSet<_>>();
-    let pruned = match db {
-        Some(conn) => local_branches_to_prune(conn, &keep).await?,
-        None => local_branches_to_prune_redb(&keep).await?,
+    let pruned = match store.backend_kind() {
+        crate::storage::StorageBackendKind::Redb => local_branches_to_prune_redb(&keep).await?,
+        crate::storage::StorageBackendKind::Sqlite => match db {
+            Some(conn) => local_branches_to_prune(conn, &keep).await?,
+            None => local_branches_to_prune(store.db(), &keep).await?,
+        },
     };
     if pruned.is_empty() {
         println!("No branches would be pruned.");

@@ -256,19 +256,53 @@ impl Fingerprint {
     }
 }
 
+fn detect_config_path_backend(path: &Path) -> Result<crate::storage::StorageBackendKind, String> {
+    use crate::storage::{
+        StorageBackendKind,
+        config_store::{
+            CONFIG_REDB_FILE_NAME, ConfigScopeAuthority, inspect_config_scope_authority,
+        },
+    };
+    if path
+        .file_name()
+        .is_some_and(|name| name == CONFIG_REDB_FILE_NAME)
+    {
+        return Ok(StorageBackendKind::Redb);
+    }
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        match inspect_config_scope_authority(dir, ROLE) {
+            Ok(ConfigScopeAuthority::Manifest { manifest, .. }) => return Ok(manifest.backend),
+            Ok(ConfigScopeAuthority::UnmanifestedRedb { .. }) => {
+                return Ok(StorageBackendKind::Redb);
+            }
+            Ok(ConfigScopeAuthority::LegacySqlite { .. } | ConfigScopeAuthority::Empty)
+            | Err(_) => {}
+        }
+    }
+    Ok(StorageBackendKind::Sqlite)
+}
+
 /// `VACUUM INTO` the read-only legacy database, returning its fingerprint.
 async fn snapshot_legacy(legacy: &Path, staging: &Path) -> Result<Fingerprint, String> {
-    let conn = schema::open_readonly_connection_for_role(legacy, BUSY_TIMEOUT, ROLE)
-        .await
-        .map_err(|error| {
-            format!(
-                "cannot read the legacy global configuration database '{}': {error}",
-                legacy.display()
-            )
-        })?;
-    let result = snapshot_legacy_with_conn(&conn, legacy, staging).await;
-    close_connection(conn).await;
-    result
+    match detect_config_path_backend(legacy)? {
+        crate::storage::StorageBackendKind::Redb => Err(format!(
+            "'{}' is backed by redb storage and does not use legacy SQLite global migration",
+            legacy.display()
+        )),
+        crate::storage::StorageBackendKind::Sqlite => {
+            let conn = schema::open_readonly_connection_for_role(legacy, BUSY_TIMEOUT, ROLE)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "cannot read the legacy global configuration database '{}': {error}",
+                        legacy.display()
+                    )
+                })?;
+            let result = snapshot_legacy_with_conn(&conn, legacy, staging).await;
+            close_connection(conn).await;
+            result
+        }
+    }
 }
 
 async fn snapshot_legacy_with_conn(
@@ -312,14 +346,22 @@ async fn snapshot_legacy_with_conn(
 
 /// Prove the staged copy is intact and carries exactly the source's contents.
 async fn validate_snapshot(staging: &Path, source: &Fingerprint) -> Result<(), String> {
-    let conn = schema::open_readonly_connection_for_role(staging, BUSY_TIMEOUT, ROLE)
-        .await
-        .map_err(|error| format!("cannot verify the migrated snapshot: {error}"))?;
-    let result = validate_snapshot_with_conn(&conn, source).await;
-    // The handle MUST be gone before the rename: Windows refuses to move a
-    // file that still has an open handle.
-    close_connection(conn).await;
-    result
+    match detect_config_path_backend(staging)? {
+        crate::storage::StorageBackendKind::Redb => Err(format!(
+            "'{}' is in a redb-backed configuration scope and cannot be validated as a legacy SQLite snapshot",
+            staging.display()
+        )),
+        crate::storage::StorageBackendKind::Sqlite => {
+            let conn = schema::open_readonly_connection_for_role(staging, BUSY_TIMEOUT, ROLE)
+                .await
+                .map_err(|error| format!("cannot verify the migrated snapshot: {error}"))?;
+            let result = validate_snapshot_with_conn(&conn, source).await;
+            // The handle MUST be gone before the rename: Windows refuses to move a
+            // file that still has an open handle.
+            close_connection(conn).await;
+            result
+        }
+    }
 }
 
 async fn validate_snapshot_with_conn(

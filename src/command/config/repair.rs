@@ -505,38 +505,70 @@ mod supported {
         Ok(Eligibility::Legacy)
     }
 
+    fn detect_repair_backend(path: &Path) -> crate::storage::StorageBackendKind {
+        use crate::storage::{
+            StorageBackendKind,
+            config_store::{
+                CONFIG_REDB_FILE_NAME, ConfigScopeAuthority, inspect_config_scope_authority,
+            },
+        };
+        if path
+            .file_name()
+            .is_some_and(|name| name == CONFIG_REDB_FILE_NAME)
+        {
+            return StorageBackendKind::Redb;
+        }
+        match path
+            .parent()
+            .and_then(|dir| inspect_config_scope_authority(dir, ROLE).ok())
+        {
+            Some(ConfigScopeAuthority::Manifest { manifest, .. }) => manifest.backend,
+            Some(ConfigScopeAuthority::UnmanifestedRedb { .. }) => StorageBackendKind::Redb,
+            _ => StorageBackendKind::Sqlite,
+        }
+    }
+
     async fn inspect_readonly(target: &Target) -> CliResult<Eligibility> {
-        let before = target.stamp()?;
-        let conn = schema::open_readonly_connection_for_role(
-            &target.path,
-            Duration::from_millis(200),
-            ROLE,
-        )
-        .await
-        .map_err(|_| {
-            refused("cannot safely inspect the existing SQLite target; stop writers and run doctor")
-        })?;
-        let result = async {
-            let txn = conn
-                .begin()
+        match detect_repair_backend(&target.path) {
+            crate::storage::StorageBackendKind::Redb => Err(refused(
+                "global configuration uses redb storage; SQLite schema repair does not apply",
+            )),
+            crate::storage::StorageBackendKind::Sqlite => {
+                let before = target.stamp()?;
+                let conn = schema::open_readonly_connection_for_role(
+                    &target.path,
+                    Duration::from_millis(200),
+                    ROLE,
+                )
                 .await
-                .map_err(|_| refused("cannot acquire a read-only schema snapshot"))?;
-            let result = attest(&txn).await;
-            txn.rollback()
-                .await
-                .map_err(|_| refused("cannot close the read-only schema snapshot"))?;
-            result
+                .map_err(|_| {
+                    refused(
+                        "cannot safely inspect the existing SQLite target; stop writers and run doctor",
+                    )
+                })?;
+                let result = async {
+                    let txn = conn
+                        .begin()
+                        .await
+                        .map_err(|_| refused("cannot acquire a read-only schema snapshot"))?;
+                    let result = attest(&txn).await;
+                    txn.rollback()
+                        .await
+                        .map_err(|_| refused("cannot close the read-only schema snapshot"))?;
+                    result
+                }
+                .await;
+                let closed = conn.close().await;
+                target.verify_identity()?;
+                if before != target.stamp()? {
+                    return Err(refused(
+                        "target changed during repair eligibility inspection; stop writers and retry",
+                    ));
+                }
+                closed.map_err(|_| refused("cannot close the schema inspection connection"))?;
+                result
+            }
         }
-        .await;
-        let closed = conn.close().await;
-        target.verify_identity()?;
-        if before != target.stamp()? {
-            return Err(refused(
-                "target changed during repair eligibility inspection; stop writers and retry",
-            ));
-        }
-        closed.map_err(|_| refused("cannot close the schema inspection connection"))?;
-        result
     }
 
     #[derive(Serialize)]
@@ -675,10 +707,20 @@ mod supported {
         backup_file
             .sync_all()
             .map_err(|_| failed("cannot durably flush the SQLite backup; it is not verified"))?;
-        let reader =
-            schema::open_readonly_connection_for_role(&backup, Duration::from_millis(200), ROLE)
-                .await
-                .map_err(|_| failed("cannot reopen the SQLite backup; no repair is authorized"))?;
+        let reader = match detect_repair_backend(&backup) {
+            crate::storage::StorageBackendKind::Redb => {
+                return Err(failed(
+                    "unexpected redb storage detected for SQLite repair backup; no repair is authorized",
+                ));
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                schema::open_readonly_connection_for_role(&backup, Duration::from_millis(200), ROLE)
+                    .await
+                    .map_err(|_| {
+                        failed("cannot reopen the SQLite backup; no repair is authorized")
+                    })?
+            }
+        };
         let verified = async {
             let row = reader
                 .query_one_raw(Statement::from_string(
@@ -743,6 +785,14 @@ mod supported {
 
     pub(super) async fn execute(confirm: &Path, output: &OutputConfig) -> CliResult<()> {
         let target = Target::resolve(confirm)?;
+        match detect_repair_backend(&target.path) {
+            crate::storage::StorageBackendKind::Redb => {
+                return Err(refused(
+                    "global configuration uses redb storage; SQLite schema repair does not apply",
+                ));
+            }
+            crate::storage::StorageBackendKind::Sqlite => {}
+        }
         let eligibility = inspect_readonly(&target).await?;
         let mut report = Report::new(&target, eligibility == Eligibility::Legacy);
         if eligibility == Eligibility::Protected {

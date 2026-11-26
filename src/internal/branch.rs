@@ -361,40 +361,106 @@ impl Branch {
     /// the entire query. Useful for decoration metadata (log/show refs) where
     /// partial results are more valuable than an empty set.
     pub async fn list_branches_best_effort(remote: Option<&str>) -> Vec<Self> {
-        let db_conn = get_db_conn_instance().await;
-        let branches = match reference::Entity::find()
-            .filter(reference::Column::Kind.eq(reference::ConfigKind::Branch))
-            .filter(match remote {
-                Some(r) => reference::Column::Remote.eq(r),
-                None => reference::Column::Remote.is_null(),
-            })
-            .all(&db_conn)
-            .await
-        {
-            Ok(rows) => rows,
+        match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                let store = match crate::storage::runtime::open_current_git_store_read_only().await
+                {
+                    Ok(store) => store,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to open redb GitStore for decoration"
+                        );
+                        return Vec::new();
+                    }
+                };
+                let records = match store.list_refs(None).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to query branches for decoration"
+                        );
+                        return Vec::new();
+                    }
+                };
+                let mut resolved = Vec::new();
+                for rec in records {
+                    let (name, rec_remote) = match rec.key {
+                        crate::storage::RefKey::LocalBranch { name } if remote.is_none() => {
+                            (name, None)
+                        }
+                        crate::storage::RefKey::RemoteBranch { remote: r, name }
+                            if remote == Some(r.as_str()) =>
+                        {
+                            (name, Some(r))
+                        }
+                        _ => continue,
+                    };
+                    let crate::storage::RefTarget::Direct(commit_str) = rec.target else {
+                        continue;
+                    };
+                    match crate::internal::object_format::parse_repo_oid(&commit_str) {
+                        Ok(commit) => resolved.push(Self {
+                            name,
+                            commit,
+                            remote: rec_remote,
+                        }),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                branch = %name,
+                                "skipping corrupt branch row in decoration"
+                            );
+                        }
+                    }
+                }
+                resolved
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) => {
+                let db_conn = get_db_conn_instance().await;
+                let branches = match reference::Entity::find()
+                    .filter(reference::Column::Kind.eq(reference::ConfigKind::Branch))
+                    .filter(match remote {
+                        Some(r) => reference::Column::Remote.eq(r),
+                        None => reference::Column::Remote.is_null(),
+                    })
+                    .all(&db_conn)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to query branches for decoration"
+                        );
+                        return Vec::new();
+                    }
+                };
+
+                let mut resolved = Vec::new();
+                for branch in branches {
+                    match branch_from_model(branch) {
+                        Ok(Some(branch)) => resolved.push(branch),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "skipping corrupt branch row in decoration"
+                            );
+                        }
+                    }
+                }
+                resolved
+            }
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "failed to query branches for decoration"
+                    "failed to detect repository backend for branch decoration"
                 );
-                return Vec::new();
-            }
-        };
-
-        let mut resolved = Vec::new();
-        for branch in branches {
-            match branch_from_model(branch) {
-                Ok(Some(branch)) => resolved.push(branch),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "skipping corrupt branch row in decoration"
-                    );
-                }
+                Vec::new()
             }
         }
-        resolved
     }
 
     pub async fn list_branches_result_with_store(
@@ -886,8 +952,20 @@ impl Branch {
 
     /// Pool-acquiring counterpart of [`Branch::search_branch_result_with_conn`].
     pub async fn search_branch_result(branch_name: &str) -> Result<Vec<Self>, BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        Self::search_branch_result_with_conn(&db_conn, branch_name).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                Self::search_branch_result_with_conn(&db_conn, branch_name).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::search_branch_result_with_store(store.as_ref(), branch_name).await
+            }
+        }
     }
 
     /// Upsert a branch tip with retry-on-busy semantics.
@@ -1001,66 +1079,133 @@ impl Branch {
         remote: Option<&str>,
         provenance_key: Option<&str>,
     ) -> Result<(), BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        let txn = crate::internal::db::begin_write_transaction(&db_conn)
-            .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
-        let existing = query_reference_with_conn(&txn, branch_name, remote)
-            .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()));
-        let existing = match existing {
-            Ok(existing) => existing,
-            Err(error) => {
-                let _ = txn.rollback().await;
-                return Err(error);
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                Self::create_branch_exclusive_with_store(
+                    store.as_ref(),
+                    branch_name,
+                    commit_hash,
+                    remote,
+                )
+                .await?;
+                if let Some(provenance_key) = provenance_key {
+                    let encoded = serde_json::to_string(&(remote, branch_name))
+                        .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                    let meta =
+                        match crate::storage::runtime::open_current_repo_metadata_store_read_write()
+                            .await
+                        {
+                            Ok(meta) => meta,
+                            Err(error) => {
+                                let key = match remote {
+                                    Some(r) => crate::storage::RefKey::RemoteBranch {
+                                        remote: r.to_string(),
+                                        name: branch_name.to_string(),
+                                    },
+                                    None => crate::storage::RefKey::LocalBranch {
+                                        name: branch_name.to_string(),
+                                    },
+                                };
+                                let target =
+                                    crate::storage::RefTarget::Direct(commit_hash.to_string());
+                                let _ = store.update_ref_cas(&key, Some(&target), None, &[]).await;
+                                return Err(BranchStoreError::Query(error.to_string()));
+                            }
+                        };
+                    if let Err(error) = meta
+                        .set_metadata(
+                            "stash_branch_journal",
+                            provenance_key,
+                            "reference_id",
+                            &encoded,
+                            "text",
+                        )
+                        .await
+                    {
+                        let key = match remote {
+                            Some(r) => crate::storage::RefKey::RemoteBranch {
+                                remote: r.to_string(),
+                                name: branch_name.to_string(),
+                            },
+                            None => crate::storage::RefKey::LocalBranch {
+                                name: branch_name.to_string(),
+                            },
+                        };
+                        let target = crate::storage::RefTarget::Direct(commit_hash.to_string());
+                        let _ = store.update_ref_cas(&key, Some(&target), None, &[]).await;
+                        return Err(BranchStoreError::Query(error.to_string()));
+                    }
+                }
+                Ok(())
             }
-        };
-        if existing.is_some() {
-            let _ = txn.rollback().await;
-            return Err(BranchStoreError::AlreadyExists(branch_name.to_string()));
-        }
-        let insert = reference::ActiveModel {
-            name: Set(Some(branch_name.to_owned())),
-            kind: Set(reference::ConfigKind::Branch),
-            commit: Set(Some(commit_hash.to_owned())),
-            remote: Set(remote.map(|value| value.to_owned())),
-            ..Default::default()
-        }
-        .insert(&txn)
-        .await;
-        let inserted = match insert {
-            Ok(inserted) => inserted,
-            Err(error) => {
-                let _ = txn.rollback().await;
-                return Err(BranchStoreError::Query(error.to_string()));
-            }
-        };
-        // Provenance, committed ATOMICALLY with the creation (W2 r7 #1): the
-        // caller's crash-recovery must know whether THIS create ever
-        // committed, and a file written before or after the transaction
-        // cannot say that. The row also records the created reference's ID,
-        // so a later rollback deletes exactly the row this create made —
-        // never a same-name same-tip branch the user recreated (r7 #2).
-        if let Some(provenance_key) = provenance_key {
-            use sea_orm::{ConnectionTrait, Statement};
-            let recorded = txn
-                .execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Sqlite,
-                    "INSERT INTO metadata_kv \
-                     (scope, target, key, value, value_type, created_at, updated_at) \
-                     VALUES ('stash_branch_journal', ?, 'reference_id', ?, 'text', \
-                     datetime('now'), datetime('now'))",
-                    [provenance_key.into(), inserted.id.to_string().into()],
-                ))
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                let txn = crate::internal::db::begin_write_transaction(&db_conn)
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                let existing = query_reference_with_conn(&txn, branch_name, remote)
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()));
+                let existing = match existing {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        let _ = txn.rollback().await;
+                        return Err(error);
+                    }
+                };
+                if existing.is_some() {
+                    let _ = txn.rollback().await;
+                    return Err(BranchStoreError::AlreadyExists(branch_name.to_string()));
+                }
+                let insert = reference::ActiveModel {
+                    name: Set(Some(branch_name.to_owned())),
+                    kind: Set(reference::ConfigKind::Branch),
+                    commit: Set(Some(commit_hash.to_owned())),
+                    remote: Set(remote.map(|value| value.to_owned())),
+                    ..Default::default()
+                }
+                .insert(&txn)
                 .await;
-            if let Err(error) = recorded {
-                let _ = txn.rollback().await;
-                return Err(BranchStoreError::Query(error.to_string()));
+                let inserted = match insert {
+                    Ok(inserted) => inserted,
+                    Err(error) => {
+                        let _ = txn.rollback().await;
+                        return Err(BranchStoreError::Query(error.to_string()));
+                    }
+                };
+                // Provenance, committed ATOMICALLY with the creation (W2 r7 #1): the
+                // caller's crash-recovery must know whether THIS create ever
+                // committed, and a file written before or after the transaction
+                // cannot say that. The row also records the created reference's ID,
+                // so a later rollback deletes exactly the row this create made —
+                // never a same-name same-tip branch the user recreated (r7 #2).
+                if let Some(provenance_key) = provenance_key {
+                    use sea_orm::{ConnectionTrait, Statement};
+                    let recorded = txn
+                        .execute_raw(Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Sqlite,
+                            "INSERT INTO metadata_kv \
+                             (scope, target, key, value, value_type, created_at, updated_at) \
+                             VALUES ('stash_branch_journal', ?, 'reference_id', ?, 'text', \
+                             datetime('now'), datetime('now'))",
+                            [provenance_key.into(), inserted.id.to_string().into()],
+                        ))
+                        .await;
+                    if let Err(error) = recorded {
+                        let _ = txn.rollback().await;
+                        return Err(BranchStoreError::Query(error.to_string()));
+                    }
+                }
+                txn.commit()
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))
             }
         }
-        txn.commit()
-            .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()))
     }
 
     /// The fate a journaled `stash branch` creation is concluded to, by
@@ -1076,58 +1221,111 @@ impl Branch {
         provenance_key: &str,
         base_tip: &str,
     ) -> Result<JournaledBranchFate, BranchStoreError> {
-        use sea_orm::{ConnectionTrait, Statement};
-        let db_conn = get_db_conn_instance().await;
-        let txn = crate::internal::db::begin_write_transaction(&db_conn)
-            .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
-        let row = txn
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "SELECT value FROM metadata_kv WHERE scope = 'stash_branch_journal' \
-                 AND target = ? AND key = 'reference_id'",
-                [provenance_key.into()],
-            ))
-            .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
-        let Some(row) = row else {
-            // The create never COMMITTED: there is nothing of ours to remove.
-            let _ = txn.rollback().await;
-            return Ok(JournaledBranchFate::NeverCreated);
-        };
-        let reference_id: String = row
-            .try_get_by_index(0)
-            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
-        let deleted = txn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "DELETE FROM reference WHERE id = ? AND kind = 'Branch' AND `commit` = ?",
-                [reference_id.clone().into(), base_tip.into()],
-            ))
-            .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
-        let fate = if deleted.rows_affected() > 0 {
-            JournaledBranchFate::Deleted
-        } else {
-            // Row gone (user deleted it) or its tip moved (user committed):
-            // either way it is not ours to touch any more.
-            JournaledBranchFate::KeptOrGone
-        };
-        let cleared = txn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
-                [provenance_key.into()],
-            ))
-            .await;
-        if let Err(error) = cleared {
-            let _ = txn.rollback().await;
-            return Err(BranchStoreError::Query(error.to_string()));
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let meta = crate::storage::runtime::open_current_repo_metadata_store_read_write()
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                let Some(entry) = meta
+                    .get_metadata("stash_branch_journal", provenance_key, "reference_id")
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?
+                else {
+                    return Ok(JournaledBranchFate::NeverCreated);
+                };
+                let (remote_opt, branch_name): (Option<String>, String) =
+                    serde_json::from_str(&entry.value)
+                        .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                let key = match &remote_opt {
+                    Some(r) => crate::storage::RefKey::RemoteBranch {
+                        remote: r.clone(),
+                        name: branch_name.clone(),
+                    },
+                    None => crate::storage::RefKey::LocalBranch {
+                        name: branch_name.clone(),
+                    },
+                };
+                let expected = crate::storage::RefTarget::Direct(base_tip.to_string());
+                let fate = match store
+                    .update_ref_cas(&key, Some(&expected), None, &[])
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?
+                {
+                    crate::storage::RefCasOutcome::Applied { .. } => {
+                        if remote_opt.is_none() {
+                            let _ = meta.delete_metadata_target("branch", &branch_name).await;
+                        }
+                        JournaledBranchFate::Deleted
+                    }
+                    crate::storage::RefCasOutcome::CasConflict { .. } => {
+                        JournaledBranchFate::KeptOrGone
+                    }
+                };
+                meta.delete_metadata_target("stash_branch_journal", provenance_key)
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                Ok(fate)
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                use sea_orm::{ConnectionTrait, Statement};
+                let db_conn = get_db_conn_instance().await;
+                let txn = crate::internal::db::begin_write_transaction(&db_conn)
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                let row = txn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "SELECT value FROM metadata_kv WHERE scope = 'stash_branch_journal' \
+                         AND target = ? AND key = 'reference_id'",
+                        [provenance_key.into()],
+                    ))
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                let Some(row) = row else {
+                    // The create never COMMITTED: there is nothing of ours to remove.
+                    let _ = txn.rollback().await;
+                    return Ok(JournaledBranchFate::NeverCreated);
+                };
+                let reference_id: String = row
+                    .try_get_by_index(0)
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                let deleted = txn
+                    .execute_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "DELETE FROM reference WHERE id = ? AND kind = 'Branch' AND `commit` = ?",
+                        [reference_id.clone().into(), base_tip.into()],
+                    ))
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                let fate = if deleted.rows_affected() > 0 {
+                    JournaledBranchFate::Deleted
+                } else {
+                    // Row gone (user deleted it) or its tip moved (user committed):
+                    // either way it is not ours to touch any more.
+                    JournaledBranchFate::KeptOrGone
+                };
+                let cleared = txn
+                    .execute_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
+                        [provenance_key.into()],
+                    ))
+                    .await;
+                if let Err(error) = cleared {
+                    let _ = txn.rollback().await;
+                    return Err(BranchStoreError::Query(error.to_string()));
+                }
+                txn.commit()
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                Ok(fate)
+            }
         }
-        txn.commit()
-            .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
-        Ok(fate)
     }
 
     /// Whether a journaled creation's provenance row EXISTS — the read-only
@@ -1137,18 +1335,34 @@ impl Branch {
     pub async fn journaled_provenance_exists(
         provenance_key: &str,
     ) -> Result<bool, BranchStoreError> {
-        use sea_orm::{ConnectionTrait, Statement};
-        let db_conn = get_db_conn_instance().await;
-        let row = db_conn
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "SELECT 1 FROM metadata_kv WHERE scope = 'stash_branch_journal' \
-                 AND target = ? AND key = 'reference_id'",
-                [provenance_key.into()],
-            ))
-            .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
-        Ok(row.is_some())
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let meta = crate::storage::runtime::open_current_repo_metadata_store_read_only()
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                let entry = meta
+                    .get_metadata("stash_branch_journal", provenance_key, "reference_id")
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                Ok(entry.is_some())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                use sea_orm::{ConnectionTrait, Statement};
+                let db_conn = get_db_conn_instance().await;
+                let row = db_conn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "SELECT 1 FROM metadata_kv WHERE scope = 'stash_branch_journal' \
+                         AND target = ? AND key = 'reference_id'",
+                        [provenance_key.into()],
+                    ))
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                Ok(row.is_some())
+            }
+        }
     }
 
     /// Remove a journaled creation's provenance row WITHOUT touching the
@@ -1156,17 +1370,32 @@ impl Branch {
     pub async fn clear_journaled_branch_provenance(
         provenance_key: &str,
     ) -> Result<(), BranchStoreError> {
-        use sea_orm::{ConnectionTrait, Statement};
-        let db_conn = get_db_conn_instance().await;
-        db_conn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
-                [provenance_key.into()],
-            ))
-            .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
-        Ok(())
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let meta = crate::storage::runtime::open_current_repo_metadata_store_read_write()
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                meta.delete_metadata_target("stash_branch_journal", provenance_key)
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                Ok(())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                use sea_orm::{ConnectionTrait, Statement};
+                let db_conn = get_db_conn_instance().await;
+                db_conn
+                    .execute_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
+                        [provenance_key.into()],
+                    ))
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+                Ok(())
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Branch::update_branch_with_conn`].
@@ -1323,24 +1552,89 @@ impl Branch {
         branch_name: &str,
         expected_tip: &git_internal::hash::ObjectHash,
     ) -> Result<ConditionalDeleteOutcome, BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        // Compare-and-swap on the tip: reads the row, then deletes it.
-        let txn = crate::internal::db::begin_write_transaction(&db_conn)
-            .await
-            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
-        let found = Self::find_branch_result_with_conn(&txn, branch_name, None).await?;
-        let outcome = match found {
-            None => ConditionalDeleteOutcome::NotFound,
-            Some(branch) if branch.commit != *expected_tip => ConditionalDeleteOutcome::TipMoved,
-            Some(_) => {
-                Self::delete_branch_result_with_conn(&txn, branch_name, None).await?;
-                ConditionalDeleteOutcome::Deleted
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                let key = crate::storage::RefKey::LocalBranch {
+                    name: branch_name.to_string(),
+                };
+                let expected_target = crate::storage::RefTarget::Direct(expected_tip.to_string());
+                match store
+                    .get_ref(&key)
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?
+                {
+                    None => return Ok(ConditionalDeleteOutcome::NotFound),
+                    Some(ref current) if current != &expected_target => {
+                        return Ok(ConditionalDeleteOutcome::TipMoved);
+                    }
+                    Some(_) => {}
+                }
+                let scope = crate::internal::worktree_scope::WorktreeScope::current();
+                if let Some(other) =
+                    crate::internal::head::Head::branch_checked_out_elsewhere_for_scope_result_with_store(
+                        store.as_ref(),
+                        branch_name,
+                        &scope,
+                    )
+                    .await?
+                {
+                    return Err(BranchStoreError::CheckedOutElsewhere {
+                        name: branch_name.to_string(),
+                        worktree: other,
+                    });
+                }
+                match store
+                    .update_ref_cas(&key, Some(&expected_target), None, &[])
+                    .await
+                    .map_err(|err| BranchStoreError::Delete {
+                        name: branch_name.to_string(),
+                        detail: err.to_string(),
+                    })? {
+                    crate::storage::RefCasOutcome::Applied { .. } => {
+                        if let Ok(meta) =
+                            crate::storage::runtime::open_current_repo_metadata_store_read_write()
+                                .await
+                        {
+                            let _ = meta.delete_metadata_target("branch", branch_name).await;
+                        }
+                        Ok(ConditionalDeleteOutcome::Deleted)
+                    }
+                    crate::storage::RefCasOutcome::CasConflict { actual: None } => {
+                        Ok(ConditionalDeleteOutcome::NotFound)
+                    }
+                    crate::storage::RefCasOutcome::CasConflict { actual: Some(_) } => {
+                        Ok(ConditionalDeleteOutcome::TipMoved)
+                    }
+                }
             }
-        };
-        txn.commit()
-            .await
-            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
-        Ok(outcome)
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                // Compare-and-swap on the tip: reads the row, then deletes it.
+                let txn = crate::internal::db::begin_write_transaction(&db_conn)
+                    .await
+                    .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+                let found = Self::find_branch_result_with_conn(&txn, branch_name, None).await?;
+                let outcome = match found {
+                    None => ConditionalDeleteOutcome::NotFound,
+                    Some(branch) if branch.commit != *expected_tip => {
+                        ConditionalDeleteOutcome::TipMoved
+                    }
+                    Some(_) => {
+                        Self::delete_branch_result_with_conn(&txn, branch_name, None).await?;
+                        ConditionalDeleteOutcome::Deleted
+                    }
+                };
+                txn.commit()
+                    .await
+                    .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+                Ok(outcome)
+            }
+        }
     }
 }
 

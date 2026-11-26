@@ -2462,53 +2462,92 @@ async fn read_config_keys_by_prefix_from_db_path(
     prefix: &str,
     role: DatabaseRole,
 ) -> Result<BTreeSet<String>> {
-    let exists = db_path
-        .try_exists()
-        .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?;
-    if !exists {
-        return Ok(BTreeSet::new());
-    }
-
-    let conn = open_scoped_config_reader(db_path, role)
-        .await
-        .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
-    let mut keys = BTreeSet::new();
-    if scoped_config_has_kv(&conn, role).await? {
-        for row in config_kv::Entity::find()
-            .order_by_asc(config_kv::Column::Key)
-            .all(&conn)
-            .await
-            .with_context(|| format!("failed to query config keys in '{}'", db_path.display()))?
-        {
-            if config_key_has_prefix(&row.key, prefix) {
-                keys.insert(row.key);
+    match detect_config_backend_for_db_path(db_path, role) {
+        crate::storage::StorageBackendKind::Redb => {
+            let Some(store) = open_redb_config_store_for_db_path(db_path, role).await? else {
+                return Ok(BTreeSet::new());
+            };
+            let mut keys = BTreeSet::new();
+            for row in ConfigKv::list_all_with_store(store.as_ref())
+                .await
+                .with_context(|| {
+                    format!("failed to query config keys in '{}'", db_path.display())
+                })?
+            {
+                if config_key_has_prefix(&row.key, prefix) {
+                    keys.insert(row.key);
+                }
             }
-        }
-    }
-
-    if crate::internal::db::sqlite_schema_contains(&conn, "table", "config").await? {
-        for row in config::Entity::find()
-            .order_by_asc(config::Column::Id)
-            .all(&conn)
-            .await
-            .with_context(|| {
+            for row in store.list_legacy_entries().await.with_context(|| {
                 format!(
                     "failed to query legacy config keys in '{}'",
                     db_path.display()
                 )
-            })?
-        {
-            let key = match row.name {
-                Some(name) => format!("{}.{}.{}", row.configuration, name, row.key),
-                None => format!("{}.{}", row.configuration, row.key),
-            };
-            if config_key_has_prefix(&key, prefix) {
-                keys.insert(key);
+            })? {
+                let key = match row.name {
+                    Some(name) => format!("{}.{}.{}", row.configuration, name, row.key),
+                    None => format!("{}.{}", row.configuration, row.key),
+                };
+                if config_key_has_prefix(&key, prefix) {
+                    keys.insert(key);
+                }
             }
+            Ok(keys)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let exists = db_path.try_exists().with_context(|| {
+                format!("failed to inspect config database '{}'", db_path.display())
+            })?;
+            if !exists {
+                return Ok(BTreeSet::new());
+            }
+
+            let conn = open_scoped_config_reader(db_path, role)
+                .await
+                .with_context(|| {
+                    format!("failed to open config database '{}'", db_path.display())
+                })?;
+            let mut keys = BTreeSet::new();
+            if scoped_config_has_kv(&conn, role).await? {
+                for row in config_kv::Entity::find()
+                    .order_by_asc(config_kv::Column::Key)
+                    .all(&conn)
+                    .await
+                    .with_context(|| {
+                        format!("failed to query config keys in '{}'", db_path.display())
+                    })?
+                {
+                    if config_key_has_prefix(&row.key, prefix) {
+                        keys.insert(row.key);
+                    }
+                }
+            }
+
+            if crate::internal::db::sqlite_schema_contains(&conn, "table", "config").await? {
+                for row in config::Entity::find()
+                    .order_by_asc(config::Column::Id)
+                    .all(&conn)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to query legacy config keys in '{}'",
+                            db_path.display()
+                        )
+                    })?
+                {
+                    let key = match row.name {
+                        Some(name) => format!("{}.{}.{}", row.configuration, name, row.key),
+                        None => format!("{}.{}", row.configuration, row.key),
+                    };
+                    if config_key_has_prefix(&key, prefix) {
+                        keys.insert(key);
+                    }
+                }
+            }
+
+            Ok(keys)
         }
     }
-
-    Ok(keys)
 }
 
 fn config_key_has_prefix(key: &str, prefix: &str) -> bool {
@@ -2627,85 +2666,145 @@ async fn read_subsection_entries_from_db_path(
     variable: &str,
     role: DatabaseRole,
 ) -> Result<Vec<(String, ConfigKvEntry)>> {
-    let exists = db_path
-        .try_exists()
-        .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?;
-    if !exists {
-        return Ok(Vec::new());
-    }
-
-    let conn = open_scoped_config_reader(db_path, role)
-        .await
-        .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
-    let rows = if scoped_config_has_kv(&conn, role).await? {
-        config_kv::Entity::find()
-            .order_by_desc(config_kv::Column::Id)
-            .all(&conn)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to query {section}.*.{variable} from config database '{}'",
-                    db_path.display()
-                )
-            })?
-    } else {
-        Vec::new()
-    };
-    let mut seen = HashSet::new();
-    let mut entries = Vec::new();
-    for row in &rows {
-        let Some((stored_section, Some(subsection), stored_variable)) =
-            split_git_config_key(&row.key)
-        else {
-            continue;
-        };
-        if stored_section.eq_ignore_ascii_case(section)
-            && stored_variable.eq_ignore_ascii_case(variable)
-            && seen.insert(subsection.to_string())
-        {
-            entries.push((subsection.to_string(), ConfigKvEntry::from_model(row)));
-        }
-    }
-
-    let has_legacy_table = crate::internal::db::sqlite_schema_contains(&conn, "table", "config")
-        .await
-        .with_context(|| {
-            format!(
-                "failed to inspect legacy config schema in database '{}'",
-                db_path.display()
-            )
-        })?;
-    if has_legacy_table {
-        let legacy_rows = config::Entity::find()
-            .order_by_desc(config::Column::Id)
-            .all(&conn)
-            .await
-            .with_context(|| {
+    match detect_config_backend_for_db_path(db_path, role) {
+        crate::storage::StorageBackendKind::Redb => {
+            let Some(store) = open_redb_config_store_for_db_path(db_path, role).await? else {
+                return Ok(Vec::new());
+            };
+            let rows = ConfigKv::list_all_with_store(store.as_ref())
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to query {section}.*.{variable} from config database '{}'",
+                        db_path.display()
+                    )
+                })?;
+            let mut seen = HashSet::new();
+            let mut entries = Vec::new();
+            for row in rows.into_iter().rev() {
+                let Some((stored_section, Some(subsection), stored_variable)) =
+                    split_git_config_key(&row.key)
+                else {
+                    continue;
+                };
+                if stored_section.eq_ignore_ascii_case(section)
+                    && stored_variable.eq_ignore_ascii_case(variable)
+                    && seen.insert(subsection.to_string())
+                {
+                    entries.push((subsection.to_string(), row));
+                }
+            }
+            let legacy_rows = store.list_legacy_entries().await.with_context(|| {
                 format!(
                     "failed to query legacy {section}.*.{variable} config from database '{}'",
                     db_path.display()
                 )
             })?;
-        for row in legacy_rows {
-            let Some(subsection) = row.name else {
-                continue;
-            };
-            if row.configuration.eq_ignore_ascii_case(section)
-                && row.key.eq_ignore_ascii_case(variable)
-                && seen.insert(subsection.clone())
-            {
-                entries.push((
-                    subsection.clone(),
-                    ConfigKvEntry {
-                        key: format!("{section}.{subsection}.{variable}"),
-                        value: row.value,
-                        encrypted: false,
-                    },
-                ));
+            for row in legacy_rows.into_iter().rev() {
+                let Some(subsection) = row.name else {
+                    continue;
+                };
+                if row.configuration.eq_ignore_ascii_case(section)
+                    && row.key.eq_ignore_ascii_case(variable)
+                    && seen.insert(subsection.clone())
+                {
+                    entries.push((
+                        subsection.clone(),
+                        ConfigKvEntry {
+                            key: format!("{section}.{subsection}.{variable}"),
+                            value: row.value,
+                            encrypted: false,
+                        },
+                    ));
+                }
             }
+            Ok(entries)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let exists = db_path.try_exists().with_context(|| {
+                format!("failed to inspect config database '{}'", db_path.display())
+            })?;
+            if !exists {
+                return Ok(Vec::new());
+            }
+
+            let conn = open_scoped_config_reader(db_path, role)
+                .await
+                .with_context(|| {
+                    format!("failed to open config database '{}'", db_path.display())
+                })?;
+            let rows = if scoped_config_has_kv(&conn, role).await? {
+                config_kv::Entity::find()
+                    .order_by_desc(config_kv::Column::Id)
+                    .all(&conn)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to query {section}.*.{variable} from config database '{}'",
+                            db_path.display()
+                        )
+                    })?
+            } else {
+                Vec::new()
+            };
+            let mut seen = HashSet::new();
+            let mut entries = Vec::new();
+            for row in &rows {
+                let Some((stored_section, Some(subsection), stored_variable)) =
+                    split_git_config_key(&row.key)
+                else {
+                    continue;
+                };
+                if stored_section.eq_ignore_ascii_case(section)
+                    && stored_variable.eq_ignore_ascii_case(variable)
+                    && seen.insert(subsection.to_string())
+                {
+                    entries.push((subsection.to_string(), ConfigKvEntry::from_model(row)));
+                }
+            }
+
+            let has_legacy_table =
+                crate::internal::db::sqlite_schema_contains(&conn, "table", "config")
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to inspect legacy config schema in database '{}'",
+                            db_path.display()
+                        )
+                    })?;
+            if has_legacy_table {
+                let legacy_rows = config::Entity::find()
+                    .order_by_desc(config::Column::Id)
+                    .all(&conn)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to query legacy {section}.*.{variable} config from database '{}'",
+                            db_path.display()
+                        )
+                    })?;
+                for row in legacy_rows {
+                    let Some(subsection) = row.name else {
+                        continue;
+                    };
+                    if row.configuration.eq_ignore_ascii_case(section)
+                        && row.key.eq_ignore_ascii_case(variable)
+                        && seen.insert(subsection.clone())
+                    {
+                        entries.push((
+                            subsection.clone(),
+                            ConfigKvEntry {
+                                key: format!("{section}.{subsection}.{variable}"),
+                                value: row.value,
+                                encrypted: false,
+                            },
+                        ));
+                    }
+                }
+            }
+            Ok(entries)
         }
     }
-    Ok(entries)
 }
 
 async fn decrypt_strict_config_entry(
@@ -3133,56 +3232,98 @@ async fn read_cascaded_fresh_conn_at(
     }
 
     async fn fresh_conn_read(db_path: &Path, key: &str, role: DatabaseRole) -> ScopeRead {
-        // `try_exists`, not `exists` (Codex r13): `exists()` answers false
-        // for metadata/access ERRORS too, which would misclassify an
-        // unreadable store as Absent and let global answer for it. Only a
-        // proven NotFound is Absent; any other metadata failure is
-        // Unusable.
-        match db_path.try_exists() {
-            Ok(true) => {}
-            Ok(false) => return ScopeRead::Absent,
-            Err(_) => return ScopeRead::Unusable,
-        }
-        // No schema inspection/migration on open: this best-effort READ
-        // path must never mutate the store it reads (a 200 ms busy timeout
-        // against a concurrent writer could half-apply migrations). An
-        // incompatible schema surfaces as a query error → Unusable.
-        let conn = match schema::open_readonly_connection_for_role(
-            db_path,
-            std::time::Duration::from_millis(200),
-            role,
-        )
-        .await
-        {
-            Ok(conn) => conn,
-            Err(_) => return ScopeRead::Unusable,
-        };
-        match ConfigKv::get_with_conn(&conn, key).await {
-            Ok(Some(entry)) if entry.encrypted => ScopeRead::Unusable,
-            Ok(Some(entry)) => {
-                let trimmed = entry.value.trim();
-                if trimmed.is_empty() {
-                    ScopeRead::Absent
-                } else {
-                    ScopeRead::Value(trimmed.to_string())
+        match detect_config_backend_for_db_path(db_path, role) {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = match open_redb_config_store_for_db_path(db_path, role).await {
+                    Ok(Some(store)) => store,
+                    Ok(None) => return ScopeRead::Absent,
+                    Err(_) => return ScopeRead::Unusable,
+                };
+                match ConfigKv::get_with_store(store.as_ref(), key).await {
+                    Ok(Some(entry)) if entry.encrypted => ScopeRead::Unusable,
+                    Ok(Some(entry)) => {
+                        let trimmed = entry.value.trim();
+                        if trimmed.is_empty() {
+                            ScopeRead::Absent
+                        } else {
+                            ScopeRead::Value(trimmed.to_string())
+                        }
+                    }
+                    Ok(None) => match ConfigKv::list_all_with_store(store.as_ref()).await {
+                        Ok(entries) => match entries
+                            .into_iter()
+                            .rev()
+                            .find(|entry| entry.key.eq_ignore_ascii_case(key))
+                        {
+                            Some(entry) if entry.encrypted => ScopeRead::Unusable,
+                            Some(entry) => {
+                                let trimmed = entry.value.trim();
+                                if trimmed.is_empty() {
+                                    ScopeRead::Absent
+                                } else {
+                                    ScopeRead::Value(trimmed.to_string())
+                                }
+                            }
+                            None => ScopeRead::Absent,
+                        },
+                        Err(_) => ScopeRead::Unusable,
+                    },
+                    Err(_) => ScopeRead::Unusable,
                 }
             }
-            // Git config keys are case-insensitive; honour any spelling of the
-            // same key (e.g. `core.attributesfile` for `core.attributesFile`).
-            Ok(None) => match config_kv_ci_lookup(&conn, key).await {
-                Ok(Some((_value, true))) => ScopeRead::Unusable,
-                Ok(Some((value, false))) => {
-                    let trimmed = value.trim();
-                    if trimmed.is_empty() {
-                        ScopeRead::Absent
-                    } else {
-                        ScopeRead::Value(trimmed.to_string())
-                    }
+            crate::storage::StorageBackendKind::Sqlite => {
+                // `try_exists`, not `exists` (Codex r13): `exists()` answers false
+                // for metadata/access ERRORS too, which would misclassify an
+                // unreadable store as Absent and let global answer for it. Only a
+                // proven NotFound is Absent; any other metadata failure is
+                // Unusable.
+                match db_path.try_exists() {
+                    Ok(true) => {}
+                    Ok(false) => return ScopeRead::Absent,
+                    Err(_) => return ScopeRead::Unusable,
                 }
-                Ok(None) => ScopeRead::Absent,
-                Err(_) => ScopeRead::Unusable,
-            },
-            Err(_) => ScopeRead::Unusable,
+                // No schema inspection/migration on open: this best-effort READ
+                // path must never mutate the store it reads (a 200 ms busy timeout
+                // against a concurrent writer could half-apply migrations). An
+                // incompatible schema surfaces as a query error → Unusable.
+                let conn = match schema::open_readonly_connection_for_role(
+                    db_path,
+                    std::time::Duration::from_millis(200),
+                    role,
+                )
+                .await
+                {
+                    Ok(conn) => conn,
+                    Err(_) => return ScopeRead::Unusable,
+                };
+                match ConfigKv::get_with_conn(&conn, key).await {
+                    Ok(Some(entry)) if entry.encrypted => ScopeRead::Unusable,
+                    Ok(Some(entry)) => {
+                        let trimmed = entry.value.trim();
+                        if trimmed.is_empty() {
+                            ScopeRead::Absent
+                        } else {
+                            ScopeRead::Value(trimmed.to_string())
+                        }
+                    }
+                    // Git config keys are case-insensitive; honour any spelling of the
+                    // same key (e.g. `core.attributesfile` for `core.attributesFile`).
+                    Ok(None) => match config_kv_ci_lookup(&conn, key).await {
+                        Ok(Some((_value, true))) => ScopeRead::Unusable,
+                        Ok(Some((value, false))) => {
+                            let trimmed = value.trim();
+                            if trimmed.is_empty() {
+                                ScopeRead::Absent
+                            } else {
+                                ScopeRead::Value(trimmed.to_string())
+                            }
+                        }
+                        Ok(None) => ScopeRead::Absent,
+                        Err(_) => ScopeRead::Unusable,
+                    },
+                    Err(_) => ScopeRead::Unusable,
+                }
+            }
         }
     }
 
@@ -3205,23 +3346,29 @@ async fn open_scoped_config_reader(
     db_path: &Path,
     role: DatabaseRole,
 ) -> Result<DatabaseConnection> {
-    match role {
-        DatabaseRole::Repository => get_db_conn_instance_for_path(db_path)
-            .await
-            .map_err(Into::into),
-        DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => {
-            let conn = schema::open_readonly_connection_for_role(
-                db_path,
-                std::time::Duration::from_secs(30),
-                role,
-            )
-            .await?;
-            schema::check_configuration_schema(&conn, role).await?;
-            Ok(conn)
-        }
-        DatabaseRole::Derived | DatabaseRole::Capture => Err(anyhow!(
-            "{role} databases cannot supply configuration defaults; select the owning configuration scope"
+    match detect_config_backend_for_db_path(db_path, role) {
+        crate::storage::StorageBackendKind::Redb => Err(anyhow!(
+            "config database '{}' uses redb storage; SQLite reader is unavailable",
+            db_path.display()
         )),
+        crate::storage::StorageBackendKind::Sqlite => match role {
+            DatabaseRole::Repository => get_db_conn_instance_for_path(db_path)
+                .await
+                .map_err(Into::into),
+            DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => {
+                let conn = schema::open_readonly_connection_for_role(
+                    db_path,
+                    std::time::Duration::from_secs(30),
+                    role,
+                )
+                .await?;
+                schema::check_configuration_schema(&conn, role).await?;
+                Ok(conn)
+            }
+            DatabaseRole::Derived | DatabaseRole::Capture => Err(anyhow!(
+                "{role} databases cannot supply configuration defaults; select the owning configuration scope"
+            )),
+        },
     }
 }
 
@@ -3255,51 +3402,80 @@ async fn read_config_value_from_db_path(
 /// Returns `Ok(None)` when the file does not exist (so callers can probe
 /// optional config locations cheaply). Errors are wrapped with the path so
 /// the user can diagnose `permission denied`/`schema mismatch` problems.
-#[cfg(feature = "storage-redb")]
-async fn open_redb_config_reader_for_db_path(
+fn detect_config_backend_for_db_path(
     db_path: &Path,
     role: DatabaseRole,
-) -> Result<Option<std::sync::Arc<dyn crate::storage::ConfigStore>>> {
-    let Some(parent) = db_path.parent() else {
-        return Ok(None);
+) -> crate::storage::StorageBackendKind {
+    use crate::storage::{
+        StorageBackendKind,
+        config_store::{
+            CONFIG_REDB_FILE_NAME, ConfigScopeAuthority, inspect_config_scope_authority,
+        },
+    };
+    if db_path
+        .file_name()
+        .is_some_and(|name| name == CONFIG_REDB_FILE_NAME)
+        || db_path.extension().is_some_and(|ext| ext == "redb")
+    {
+        return StorageBackendKind::Redb;
+    }
+    let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return StorageBackendKind::Sqlite;
     };
     match role {
         DatabaseRole::Repository => {
-            if let Ok(crate::storage::StorageBackendKind::Redb) =
-                crate::storage::runtime::detect_repo_backend(parent)
+            if crate::storage::runtime::has_redb_storage_markers(parent)
+                && matches!(
+                    crate::storage::runtime::detect_repo_backend(parent),
+                    Ok(StorageBackendKind::Redb)
+                )
             {
-                let store = crate::storage::runtime::open_repo_config_store_read_only(parent)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to open redb repository config store at '{}'",
-                            parent.display()
-                        )
-                    })?;
-                return Ok(Some(store));
+                StorageBackendKind::Redb
+            } else {
+                StorageBackendKind::Sqlite
             }
-            Ok(None)
         }
         DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => {
-            if let Ok(crate::storage::config_store::ConfigScopeAuthority::Manifest {
-                manifest, ..
-            }) = crate::storage::config_store::inspect_config_scope_authority(parent, role)
-                && manifest.backend == crate::storage::StorageBackendKind::Redb
-            {
-                let store = crate::storage::config_store::open_config_scope_for_read(
-                    parent,
-                    role,
-                    crate::storage::StorageBackendKind::Redb,
-                )
-                .await
-                .with_context(|| {
-                    format!("failed to open redb config scope at '{}'", parent.display())
-                })?;
-                return Ok(Some(store));
+            match inspect_config_scope_authority(parent, role) {
+                Ok(ConfigScopeAuthority::Manifest { manifest, .. }) => manifest.backend,
+                Ok(ConfigScopeAuthority::UnmanifestedRedb { .. }) => StorageBackendKind::Redb,
+                _ => StorageBackendKind::Sqlite,
             }
-            Ok(None)
         }
-        _ => Ok(None),
+        _ => StorageBackendKind::Sqlite,
+    }
+}
+
+async fn open_redb_config_store_for_db_path(
+    db_path: &Path,
+    role: DatabaseRole,
+) -> Result<Option<std::sync::Arc<dyn crate::storage::ConfigStore>>> {
+    let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(None);
+    };
+    let result = match role {
+        DatabaseRole::Repository => {
+            crate::storage::runtime::open_repo_config_store_read_only(parent).await
+        }
+        DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => {
+            crate::storage::config_store::open_config_scope_for_read(
+                parent,
+                role,
+                crate::storage::StorageBackendKind::Redb,
+            )
+            .await
+        }
+        DatabaseRole::Derived | DatabaseRole::Capture => {
+            return Err(anyhow!(
+                "{role} databases cannot supply configuration defaults; select the owning configuration scope"
+            ));
+        }
+    };
+    match result {
+        Ok(store) => Ok(Some(store)),
+        Err(crate::storage::error::StorageBackendError::NotFound { .. }) => Ok(None),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to open redb config store at '{}'", parent.display())),
     }
 }
 
@@ -3308,37 +3484,43 @@ async fn read_config_entry_from_db_path(
     key: &str,
     role: DatabaseRole,
 ) -> Result<Option<ConfigKvEntry>> {
-    #[cfg(feature = "storage-redb")]
-    if let Some(store) = open_redb_config_reader_for_db_path(db_path, role).await? {
-        return ConfigKv::get_with_store(store.as_ref(), key)
-            .await
-            .with_context(|| {
+    match detect_config_backend_for_db_path(db_path, role) {
+        crate::storage::StorageBackendKind::Redb => {
+            let Some(store) = open_redb_config_store_for_db_path(db_path, role).await? else {
+                return Ok(None);
+            };
+            ConfigKv::get_with_store(store.as_ref(), key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to query '{key}' from redb config store '{}'",
+                        db_path.display()
+                    )
+                })
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            if !db_path.try_exists().with_context(|| {
+                format!("failed to inspect config database '{}'", db_path.display())
+            })? {
+                return Ok(None);
+            }
+
+            let conn = open_scoped_config_reader(db_path, role)
+                .await
+                .with_context(|| {
+                    format!("failed to open config database '{}'", db_path.display())
+                })?;
+            if !scoped_config_has_kv(&conn, role).await? {
+                return Ok(None);
+            }
+            ConfigKv::get_with_conn(&conn, key).await.with_context(|| {
                 format!(
-                    "failed to query '{key}' from redb config store '{}'",
+                    "failed to query '{key}' from config database '{}'",
                     db_path.display()
                 )
-            });
+            })
+        }
     }
-
-    if !db_path
-        .try_exists()
-        .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?
-    {
-        return Ok(None);
-    }
-
-    let conn = open_scoped_config_reader(db_path, role)
-        .await
-        .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
-    if !scoped_config_has_kv(&conn, role).await? {
-        return Ok(None);
-    }
-    ConfigKv::get_with_conn(&conn, key).await.with_context(|| {
-        format!(
-            "failed to query '{key}' from config database '{}'",
-            db_path.display()
-        )
-    })
 }
 
 pub async fn read_local_config_value_from_db_path(
@@ -3356,99 +3538,128 @@ async fn read_config_entry_from_db_path_case_insensitive(
     key: &str,
     role: DatabaseRole,
 ) -> Result<Option<ConfigKvEntry>> {
-    #[cfg(feature = "storage-redb")]
-    if let Some(store) = open_redb_config_reader_for_db_path(db_path, role).await? {
-        let entries = ConfigKv::list_all_with_store(store.as_ref())
-            .await
-            .with_context(|| {
+    match detect_config_backend_for_db_path(db_path, role) {
+        crate::storage::StorageBackendKind::Redb => {
+            let Some(store) = open_redb_config_store_for_db_path(db_path, role).await? else {
+                return Ok(None);
+            };
+            let entries = ConfigKv::list_all_with_store(store.as_ref())
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to query '{key}' from redb config store '{}'",
+                        db_path.display()
+                    )
+                })?;
+            if let Some(entry) = entries
+                .into_iter()
+                .rev()
+                .find(|entry| git_config_key_matches(&entry.key, key))
+            {
+                return Ok(Some(entry));
+            }
+            let Some((section, subsection, variable)) = split_git_config_key(key) else {
+                return Ok(None);
+            };
+            let legacy_entries = store.list_legacy_entries().await.with_context(|| {
                 format!(
-                    "failed to query '{key}' from redb config store '{}'",
+                    "failed to query legacy config for '{key}' from redb config store '{}'",
                     db_path.display()
                 )
             })?;
-        if let Some(entry) = entries
-            .into_iter()
-            .rev()
-            .find(|entry| git_config_key_matches(&entry.key, key))
-        {
-            return Ok(Some(entry));
+            Ok(legacy_entries
+                .into_iter()
+                .rev()
+                .find(|entry| {
+                    entry.configuration.eq_ignore_ascii_case(section)
+                        && entry.name.as_deref() == subsection
+                        && entry.key.eq_ignore_ascii_case(variable)
+                })
+                .map(|entry| ConfigKvEntry {
+                    key: key.to_string(),
+                    value: entry.value,
+                    encrypted: false,
+                }))
         }
-        return Ok(None);
-    }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let exists = db_path.try_exists().with_context(|| {
+                format!("failed to inspect config database '{}'", db_path.display())
+            })?;
+            if !exists {
+                return Ok(None);
+            }
 
-    let exists = db_path
-        .try_exists()
-        .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?;
-    if !exists {
-        return Ok(None);
-    }
+            let Some((section, subsection, variable)) = split_git_config_key(key) else {
+                return Ok(None);
+            };
+            let conn = open_scoped_config_reader(db_path, role)
+                .await
+                .with_context(|| {
+                    format!("failed to open config database '{}'", db_path.display())
+                })?;
 
-    let Some((section, subsection, variable)) = split_git_config_key(key) else {
-        return Ok(None);
-    };
-    let conn = open_scoped_config_reader(db_path, role)
-        .await
-        .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
+            let entries = if scoped_config_has_kv(&conn, role).await? {
+                config_kv::Entity::find()
+                    .order_by_desc(config_kv::Column::Id)
+                    .all(&conn)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to query '{key}' from config database '{}'",
+                            db_path.display()
+                        )
+                    })?
+            } else {
+                Vec::new()
+            };
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| git_config_key_matches(&entry.key, key))
+            {
+                return Ok(Some(ConfigKvEntry::from_model(entry)));
+            }
 
-    let entries = if scoped_config_has_kv(&conn, role).await? {
-        config_kv::Entity::find()
-            .order_by_desc(config_kv::Column::Id)
-            .all(&conn)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to query '{key}' from config database '{}'",
-                    db_path.display()
-                )
-            })?
-    } else {
-        Vec::new()
-    };
-    if let Some(entry) = entries
-        .iter()
-        .find(|entry| git_config_key_matches(&entry.key, key))
-    {
-        return Ok(Some(ConfigKvEntry::from_model(entry)));
+            // A database missing the legacy `config` table entirely has no legacy rows
+            // by construction. Probing first keeps a store whose bootstrap omitted the
+            // table from failing every lookup with `no such table: config` (which made
+            // `libra init` unusable from `$HOME`, where the config cascade reads the
+            // home DB as the local scope).
+            let has_legacy_table =
+                crate::internal::db::sqlite_schema_contains(&conn, "table", "config")
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to inspect legacy config schema in database '{}'",
+                            db_path.display()
+                        )
+                    })?;
+            if !has_legacy_table {
+                return Ok(None);
+            }
+            let legacy_entries = config::Entity::find()
+                .order_by_desc(config::Column::Id)
+                .all(&conn)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to query legacy config for '{key}' from database '{}'",
+                        db_path.display()
+                    )
+                })?;
+            Ok(legacy_entries
+                .iter()
+                .find(|entry| {
+                    entry.configuration.eq_ignore_ascii_case(section)
+                        && entry.name.as_deref() == subsection
+                        && entry.key.eq_ignore_ascii_case(variable)
+                })
+                .map(|entry| ConfigKvEntry {
+                    key: key.to_string(),
+                    value: entry.value.clone(),
+                    encrypted: false,
+                }))
+        }
     }
-
-    // A database missing the legacy `config` table entirely has no legacy rows
-    // by construction. Probing first keeps a store whose bootstrap omitted the
-    // table from failing every lookup with `no such table: config` (which made
-    // `libra init` unusable from `$HOME`, where the config cascade reads the
-    // home DB as the local scope).
-    let has_legacy_table = crate::internal::db::sqlite_schema_contains(&conn, "table", "config")
-        .await
-        .with_context(|| {
-            format!(
-                "failed to inspect legacy config schema in database '{}'",
-                db_path.display()
-            )
-        })?;
-    if !has_legacy_table {
-        return Ok(None);
-    }
-    let legacy_entries = config::Entity::find()
-        .order_by_desc(config::Column::Id)
-        .all(&conn)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to query legacy config for '{key}' from database '{}'",
-                db_path.display()
-            )
-        })?;
-    Ok(legacy_entries
-        .iter()
-        .find(|entry| {
-            entry.configuration.eq_ignore_ascii_case(section)
-                && entry.name.as_deref() == subsection
-                && entry.key.eq_ignore_ascii_case(variable)
-        })
-        .map(|entry| ConfigKvEntry {
-            key: key.to_string(),
-            value: entry.value.clone(),
-            encrypted: false,
-        }))
 }
 
 /// Split a Git-style dotted config key into section, optional subsection, and
@@ -3879,63 +4090,196 @@ impl Config {
         Ok(())
     }
 
+    fn legacy_dotted_key(configuration: &str, name: Option<&str>, key: &str) -> String {
+        match name {
+            Some(n) => format!("{configuration}.{n}.{key}"),
+            None => format!("{configuration}.{key}"),
+        }
+    }
+
+    fn detect_current_backend() -> crate::storage::StorageBackendKind {
+        crate::storage::runtime::detect_current_repo_backend()
+            .unwrap_or(crate::storage::StorageBackendKind::Sqlite)
+    }
+
     /// Pool-acquiring counterpart of [`Self::insert_with_conn`]. Deprecated.
     pub async fn insert(configuration: &str, name: Option<&str>, key: &str, value: &str) {
-        let db = get_db_conn_instance().await;
-        Self::insert_with_conn(&db, configuration, name, key, value).await;
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .expect("legacy Config::insert: failed to open redb config store");
+                let dotted = Self::legacy_dotted_key(configuration, name, key);
+                store
+                    .add(&dotted, value, false)
+                    .await
+                    .expect("legacy Config::insert: redb store add failed");
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::insert_with_conn(&db, configuration, name, key, value).await;
+            }
+        }
     }
 
     /// Update one configuration entry in database using given configuration, name, key and value.
     pub async fn update(configuration: &str, name: Option<&str>, key: &str, value: &str) -> Model {
-        let db = get_db_conn_instance().await;
-        Self::update_with_conn(&db, configuration, name, key, value).await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .expect("legacy Config::update: failed to open redb config store");
+                let dotted = Self::legacy_dotted_key(configuration, name, key);
+                store
+                    .set(&dotted, value, false)
+                    .await
+                    .expect("legacy Config::update: redb store set failed");
+                Model {
+                    id: 0,
+                    configuration: configuration.to_string(),
+                    name: name.map(str::to_string),
+                    key: key.to_string(),
+                    value: value.to_string(),
+                }
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::update_with_conn(&db, configuration, name, key, value).await
+            }
+        }
     }
 
     /// Get one configuration value (legacy table). Deprecated.
     pub async fn get(configuration: &str, name: Option<&str>, key: &str) -> Option<String> {
-        let db = get_db_conn_instance().await;
-        Self::get_with_conn(&db, configuration, name, key).await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .expect("legacy Config::get: failed to open redb config store");
+                let dotted = Self::legacy_dotted_key(configuration, name, key);
+                store
+                    .get_all(&dotted)
+                    .await
+                    .expect("legacy Config::get: redb store query failed")
+                    .into_iter()
+                    .next()
+                    .map(|e| e.value)
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_with_conn(&db, configuration, name, key).await
+            }
+        }
     }
 
     /// Get remote repo name by branch name (legacy).
     /// - Returns `None` when `branch.<name>.remote` is unset; callers usually
     ///   need to `branch --set-upstream` first.
     pub async fn get_remote(branch: &str) -> Option<String> {
-        let db = get_db_conn_instance().await;
-        Self::get_remote_with_conn(&db, branch).await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => {
+                Self::get("branch", Some(branch), "remote").await
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_remote_with_conn(&db, branch).await
+            }
+        }
     }
 
     /// Get remote repo name of current branch (legacy).
     /// Returns `Err(())` when HEAD is detached.
     pub async fn get_current_remote() -> Result<Option<String>> {
-        let db = get_db_conn_instance().await;
-        Self::get_current_remote_with_conn(&db).await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => match Head::current().await {
+                Head::Branch(name) => Ok(Self::get_remote(&name).await),
+                Head::Detached(_) => anyhow::bail!("HEAD is detached, cannot get remote"),
+            },
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_current_remote_with_conn(&db).await
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Self::get_remote_url_with_conn`].
     /// Panics when no URL is configured (legacy behaviour).
     pub async fn get_remote_url(remote: &str) -> String {
-        let db = get_db_conn_instance().await;
-        Self::get_remote_url_with_conn(&db, remote).await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => {
+                match Self::get("remote", Some(remote), "url").await {
+                    Some(url) => url,
+                    None => panic!("fatal: No URL configured for remote '{remote}'."),
+                }
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_remote_url_with_conn(&db, remote).await
+            }
+        }
     }
 
     /// Returns `None` if no remote is set on the current branch.
     pub async fn get_current_remote_url() -> Option<String> {
-        let db = get_db_conn_instance().await;
-        Self::get_current_remote_url_with_conn(&db).await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => match Self::get_current_remote()
+                .await
+                .expect("legacy Config::get_current_remote_url: HEAD is detached")
+            {
+                Some(remote) => Some(Self::get_remote_url(&remote).await),
+                None => None,
+            },
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_current_remote_url_with_conn(&db).await
+            }
+        }
     }
 
     /// Get all configuration values (legacy multi-value reader).
     /// e.g. `remote.origin.fetch` may have multiple entries.
     pub async fn get_all(configuration: &str, name: Option<&str>, key: &str) -> Vec<String> {
-        let db = get_db_conn_instance().await;
-        Self::get_all_with_conn(&db, configuration, name, key).await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .expect("legacy Config::get_all: failed to open redb config store");
+                let dotted = Self::legacy_dotted_key(configuration, name, key);
+                store
+                    .get_all(&dotted)
+                    .await
+                    .expect("legacy Config::get_all: redb store query failed")
+                    .into_iter()
+                    .map(|e| e.value)
+                    .collect()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_all_with_conn(&db, configuration, name, key).await
+            }
+        }
     }
 
     /// Get literally all the entries in database without any filtering.
     pub async fn list_all() -> Vec<(String, String)> {
-        let db = get_db_conn_instance().await;
-        Self::list_all_with_conn(&db).await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .expect("legacy Config::list_all: failed to open redb config store");
+                store
+                    .list_all()
+                    .await
+                    .expect("legacy Config::list_all: redb store query failed")
+                    .into_iter()
+                    .map(|e| (e.key, e.value))
+                    .collect()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::list_all_with_conn(&db).await
+            }
+        }
     }
 
     /// Delete one or all configuration entries using given key and value pattern.
@@ -3946,16 +4290,53 @@ impl Config {
         valuepattern: Option<&str>,
         delete_all: bool,
     ) -> Result<(), sea_orm::DbErr> {
-        let db = get_db_conn_instance().await;
-        Self::remove_config_with_conn(
-            db.as_db_conn_ref(),
-            configuration,
-            name,
-            key,
-            valuepattern,
-            delete_all,
-        )
-        .await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+                let dotted = Self::legacy_dotted_key(configuration, name, key);
+                let entries = store
+                    .get_all(&dotted)
+                    .await
+                    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+                let mut kept = Vec::with_capacity(entries.len());
+                let mut removed_any = false;
+                for entry in entries {
+                    let matches = valuepattern.is_none_or(|vp| entry.value.contains(vp));
+                    if matches && (delete_all || !removed_any) {
+                        removed_any = true;
+                    } else {
+                        kept.push(entry);
+                    }
+                }
+                if removed_any {
+                    store
+                        .unset_all(&dotted)
+                        .await
+                        .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+                    for entry in kept {
+                        store
+                            .add(&dotted, &entry.value, entry.encrypted)
+                            .await
+                            .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+                    }
+                }
+                Ok(())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::remove_config_with_conn(
+                    db.as_db_conn_ref(),
+                    configuration,
+                    name,
+                    key,
+                    valuepattern,
+                    delete_all,
+                )
+                .await
+            }
+        }
     }
 
     /// Remove every row matching the given `(configuration, name, key)` triple.
@@ -3973,8 +4354,32 @@ impl Config {
 
     /// Pool-acquiring counterpart of [`Self::remove_remote_with_conn`].
     pub async fn remove_remote(name: &str) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        Self::remove_remote_with_conn(&db, name).await
+        match Self::detect_current_backend() {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let prefix = format!("remote.{name}.");
+                let entries = store
+                    .get_by_prefix(&prefix)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if entries.is_empty() {
+                    return Err(format!("fatal: No such remote: {name}"));
+                }
+                let mut keys: Vec<String> = entries.into_iter().map(|e| e.key).collect();
+                keys.sort();
+                keys.dedup();
+                for k in keys {
+                    store.unset_all(&k).await.map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::remove_remote_with_conn(&db, name).await
+            }
+        }
     }
 }
 

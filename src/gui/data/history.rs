@@ -1,6 +1,8 @@
 //! History projection for the window: real commits with capture attribution.
 
 use std::collections::HashMap;
+#[cfg(feature = "storage-redb")]
+use std::collections::HashSet;
 
 /// Maximum History rows kept for the window.
 pub const HISTORY_ROW_CAP: usize = 200;
@@ -11,6 +13,12 @@ use super::{
     snapshot::DataError,
     state::{self, SourceState},
 };
+#[cfg(feature = "storage-redb")]
+use crate::internal::db::DatabaseRole;
+use crate::storage::StorageBackendKind;
+#[cfg(feature = "storage-redb")]
+use crate::storage::{CaptureStore, RedbCaptureStore, RedbConfigStore, RedbGitStateStore};
+#[cfg(feature = "storage-sqlite")]
 use crate::{internal::db, utils::util};
 
 /// One commit row shown by the History surface.
@@ -68,22 +76,13 @@ pub async fn read_history(
     let Some(head_oid) = head_oid else {
         return Ok(Vec::new());
     };
-    let db_path = scope.storage.join(util::DATABASE);
-    let db_path_str = db_path.to_str().ok_or_else(|| {
-        DataError::new(
-            SourceState::Corrupt,
-            "the repository database path is not UTF-8",
-        )
-    })?;
-    let conn =
-        db::open_connection_without_schema_management(db_path_str, super::repo::READ_BUSY_TIMEOUT)
-            .await
-            .map_err(|error| {
-                DataError::new(
-                    state::classify_open_error(&error),
-                    "the repository database is unusable",
-                )
-            })?;
+    let backend =
+        crate::storage::runtime::detect_repo_backend(&scope.storage).map_err(|error| {
+            super::context::map_storage_error(
+                &error,
+                "the repository backend could not be detected",
+            )
+        })?;
 
     let head_oid = crate::internal::object_format::parse_repo_oid(&head_oid)
         .map_err(|_| DataError::new(SourceState::Corrupt, "HEAD is not a valid object id"))?;
@@ -101,7 +100,77 @@ pub async fn read_history(
     commits.truncate(HISTORY_ROW_CAP);
 
     let ids: Vec<String> = commits.iter().map(|commit| commit.id.to_string()).collect();
-    let attribution = read_attribution(scope, &conn, &ids).await;
+    let attribution = match backend {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                read_attribution_redb(scope, &ids).await?
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = &ids;
+                return Err(DataError::new(
+                    SourceState::Corrupt,
+                    "this Libra binary was compiled without `storage-redb`",
+                ));
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let db_path = scope.storage.join(util::DATABASE);
+                let db_path_str = db_path.to_str().ok_or_else(|| {
+                    DataError::new(
+                        SourceState::Corrupt,
+                        "the repository database path is not UTF-8",
+                    )
+                })?;
+                let conn = db::open_connection_without_schema_management(
+                    db_path_str,
+                    super::repo::READ_BUSY_TIMEOUT,
+                )
+                .await
+                .map_err(|error| {
+                    DataError::new(
+                        state::classify_open_error(&error),
+                        "the repository database is unusable",
+                    )
+                })?;
+                let capture_path =
+                    crate::internal::ai::capture::store::capture_database_path(&scope.storage);
+                let attribution = match state::probe_path(&capture_path) {
+                    state::ProbeOutcome::Present => {
+                        match crate::internal::ai::capture::store::open_readonly(
+                            &scope.storage,
+                            super::repo::READ_BUSY_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(capture_conn) => {
+                                let map =
+                                    read_attribution_sqlite(scope, &conn, &capture_conn, &ids)
+                                        .await;
+                                capture_conn.close().await.ok();
+                                map
+                            }
+                            Err(_) => HashMap::new(),
+                        }
+                    }
+                    _ => HashMap::new(),
+                };
+                conn.close().await.ok();
+                attribution
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = &ids;
+                return Err(DataError::new(
+                    SourceState::Corrupt,
+                    "this Libra binary was compiled without `storage-sqlite`",
+                ));
+            }
+        }
+    };
 
     let mut rows = Vec::with_capacity(commits.len());
     for commit in commits {
@@ -130,24 +199,13 @@ pub async fn read_history(
 
 /// Attribution is best-effort: a missing, unreadable or busy capture catalog
 /// leaves every commit Human instead of hiding the commit list.
-async fn read_attribution(
+#[cfg(feature = "storage-sqlite")]
+async fn read_attribution_sqlite(
     scope: &crate::internal::worktree_scope::RequestScope,
     repo_conn: &sea_orm::DatabaseConnection,
+    capture_conn: &sea_orm::DatabaseConnection,
     commit_ids: &[String],
 ) -> HashMap<String, crate::command::agent::CommitAttribution> {
-    let capture_path = crate::internal::ai::capture::store::capture_database_path(&scope.storage);
-    match state::probe_path(&capture_path) {
-        state::ProbeOutcome::Present => {}
-        _ => return HashMap::new(),
-    }
-    let Ok(capture_conn) = crate::internal::ai::capture::store::open_readonly(
-        &scope.storage,
-        super::repo::READ_BUSY_TIMEOUT,
-    )
-    .await
-    else {
-        return HashMap::new();
-    };
     // Resolve the scope with the injected repository connection (no hidden
     // second connection) and verify the workspace fence with a SELECT-only
     // check.
@@ -164,9 +222,148 @@ async fn read_attribution(
     {
         return HashMap::new();
     }
-    crate::command::agent::commit_attribution_batch(&capture_conn, &capture_scope, commit_ids)
+    crate::command::agent::commit_attribution_batch(capture_conn, &capture_scope, commit_ids)
         .await
         .unwrap_or_default()
+}
+
+/// Strictly read-only `redb` counterpart to [`read_attribution_sqlite`].
+///
+/// Validates the repository database handle first (matching SQLite error
+/// propagation), then computes capture attribution on a best-effort basis so a
+/// missing, unreadable, or busy capture catalog leaves commits Human.
+#[cfg(feature = "storage-redb")]
+async fn read_attribution_redb(
+    scope: &crate::internal::worktree_scope::RequestScope,
+    commit_ids: &[String],
+) -> Result<HashMap<String, crate::command::agent::CommitAttribution>, DataError> {
+    let git_db_path =
+        crate::storage::runtime::resolve_repo_git_redb_path(&scope.storage).map_err(|error| {
+            super::context::map_storage_error(&error, "the repository database is unusable")
+        })?;
+    let cfg_path = git_db_path.clone();
+    let config_store = tokio::task::spawn_blocking(move || {
+        RedbConfigStore::open_read_only(&cfg_path, DatabaseRole::Repository)
+    })
+    .await
+    .map_err(|_| {
+        DataError::new(
+            SourceState::Corrupt,
+            "the repository configuration store open task failed",
+        )
+    })?
+    .map_err(|error| {
+        super::context::map_storage_error(&error, "the repository database is unusable")
+    })?;
+
+    if commit_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let Ok(capture_path) = crate::storage::runtime::resolve_repo_capture_redb_path(&scope.storage)
+    else {
+        return Ok(HashMap::new());
+    };
+    match state::probe_path(&capture_path) {
+        state::ProbeOutcome::Present => {}
+        _ => return Ok(HashMap::new()),
+    }
+    let Ok(capture_store) = RedbCaptureStore::open_read_only(&capture_path).await else {
+        return Ok(HashMap::new());
+    };
+    let state_path = git_db_path;
+    let Ok(Ok(state_store)) =
+        tokio::task::spawn_blocking(move || RedbGitStateStore::open_read_only(&state_path)).await
+    else {
+        return Ok(HashMap::new());
+    };
+    let Ok(capture_scope) = crate::internal::ai::capture_scope::CaptureScope::resolve_with_stores(
+        &config_store,
+        &state_store,
+        &scope.worktree_root,
+    )
+    .await
+    else {
+        return Ok(HashMap::new());
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    if capture_scope
+        .assert_workspace_fence_live_with_state(&state_store, now_ms)
+        .await
+        .is_err()
+    {
+        return Ok(HashMap::new());
+    }
+    let Ok(tombstones) = capture_store.list_import_tombstones().await else {
+        return Ok(HashMap::new());
+    };
+    let erased_session_ids: HashSet<String> = tombstones
+        .into_iter()
+        .map(|record| record.erased_session_id)
+        .collect();
+    let Ok(sessions) = capture_store.list_sessions_by_started_desc().await else {
+        return Ok(HashMap::new());
+    };
+    let wanted: HashSet<&str> = commit_ids.iter().map(String::as_str).collect();
+    let mut per_commit: HashMap<String, (HashSet<String>, HashSet<String>)> = HashMap::new();
+    for session in sessions {
+        if erased_session_ids.contains(&session.session_id) {
+            continue;
+        }
+        if !capture_scope.matches_scope_fields(
+            session.scope_state,
+            session.repo_id.as_deref(),
+            session.worktree_id.as_deref(),
+            session.workspace_id.as_deref(),
+            session.workspace_fence,
+        ) {
+            continue;
+        }
+        let Ok(commit_links) = capture_store
+            .list_session_commits(&session.session_id)
+            .await
+        else {
+            return Ok(HashMap::new());
+        };
+        let matched_oids: Vec<String> = commit_links
+            .into_iter()
+            .filter(|link| wanted.contains(link.commit_oid.as_str()))
+            .map(|link| link.commit_oid)
+            .collect();
+        if matched_oids.is_empty() {
+            continue;
+        }
+        let Ok(checkpoints) = capture_store
+            .list_checkpoints_by_session(&session.session_id)
+            .await
+        else {
+            return Ok(HashMap::new());
+        };
+        for oid in matched_oids {
+            let entry = per_commit.entry(oid).or_default();
+            entry.0.insert(session.session_id.clone());
+            for checkpoint in &checkpoints {
+                entry.1.insert(checkpoint.checkpoint_id.clone());
+            }
+        }
+    }
+    let out = per_commit
+        .into_iter()
+        .map(|(oid, (sessions_set, checkpoints_set))| {
+            (
+                oid,
+                crate::command::agent::CommitAttribution {
+                    sessions: i64::try_from(sessions_set.len()).unwrap_or(i64::MAX),
+                    checkpoints: i64::try_from(checkpoints_set.len()).unwrap_or(i64::MAX),
+                },
+            )
+        })
+        .collect();
+    Ok(out)
 }
 
 fn subject_line(message: &str) -> String {

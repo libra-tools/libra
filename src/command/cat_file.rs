@@ -239,7 +239,7 @@ fn split_typed_ai_selector(selector: &str) -> Option<(&str, &str)> {
 }
 
 async fn resolve_ai_object_with_history(
-    hm: &HistoryManager,
+    hm: &AiHistoryReader,
     selector: &str,
 ) -> CliResult<(ObjectHash, String)> {
     if let Some((type_name, object_id)) = split_typed_ai_selector(selector) {
@@ -298,7 +298,7 @@ async fn resolve_ai_object(selector: &str) -> CliResult<(ObjectHash, String)> {
     resolve_ai_object_with_history(&hm, selector).await
 }
 
-async fn ensure_ai_listable_type(hm: &HistoryManager, type_name: &str) -> CliResult<()> {
+async fn ensure_ai_listable_type(hm: &AiHistoryReader, type_name: &str) -> CliResult<()> {
     if is_known_ai_object_type(type_name) {
         return Ok(());
     }
@@ -1500,8 +1500,97 @@ fn print_tag(hash: &ObjectHash) {
 
 // ── AI object helpers ───────────────────────────────────────────────────
 
-/// Build a `HistoryManager` from the current repo context.
-async fn build_history_manager() -> CliResult<HistoryManager> {
+enum AiHistoryReader {
+    Redb {
+        repo_path: std::path::PathBuf,
+        git_store: Arc<dyn crate::storage::git_store::GitStore>,
+    },
+    Sqlite(HistoryManager),
+}
+
+impl AiHistoryReader {
+    async fn get_object_hash(
+        &self,
+        object_type: &str,
+        object_id: &str,
+    ) -> anyhow::Result<Option<ObjectHash>> {
+        match self {
+            Self::Redb {
+                repo_path,
+                git_store,
+            } => {
+                crate::internal::ai::history::get_object_hash_with_git_store(
+                    repo_path,
+                    git_store.as_ref(),
+                    crate::internal::ai::history::ai_ref_name(),
+                    object_type,
+                    object_id,
+                )
+                .await
+            }
+            Self::Sqlite(hm) => hm.get_object_hash(object_type, object_id).await,
+        }
+    }
+
+    async fn find_object_hashes(
+        &self,
+        object_id: &str,
+    ) -> anyhow::Result<Vec<(ObjectHash, String)>> {
+        match self {
+            Self::Redb {
+                repo_path,
+                git_store,
+            } => {
+                crate::internal::ai::history::find_object_hashes_with_git_store(
+                    repo_path,
+                    git_store.as_ref(),
+                    crate::internal::ai::history::ai_ref_name(),
+                    object_id,
+                )
+                .await
+            }
+            Self::Sqlite(hm) => hm.find_object_hashes(object_id).await,
+        }
+    }
+
+    async fn list_objects(&self, object_type: &str) -> anyhow::Result<Vec<(String, ObjectHash)>> {
+        match self {
+            Self::Redb {
+                repo_path,
+                git_store,
+            } => {
+                crate::internal::ai::history::list_objects_with_git_store(
+                    repo_path,
+                    git_store.as_ref(),
+                    crate::internal::ai::history::ai_ref_name(),
+                    object_type,
+                )
+                .await
+            }
+            Self::Sqlite(hm) => hm.list_objects(object_type).await,
+        }
+    }
+
+    async fn list_object_types(&self) -> anyhow::Result<Vec<String>> {
+        match self {
+            Self::Redb {
+                repo_path,
+                git_store,
+            } => {
+                crate::internal::ai::history::list_object_types_with_git_store(
+                    repo_path,
+                    git_store.as_ref(),
+                    crate::internal::ai::history::ai_ref_name(),
+                )
+                .await
+            }
+            Self::Sqlite(hm) => hm.list_object_types().await,
+        }
+    }
+}
+
+/// Build an AI history reader from the current repo context.
+async fn build_history_manager() -> CliResult<AiHistoryReader> {
     let repo_path = util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
     let objects_dir = repo_path.join("objects");
     match crate::storage::runtime::detect_repo_backend(&repo_path).map_err(|e| {
@@ -1511,7 +1600,7 @@ async fn build_history_manager() -> CliResult<HistoryManager> {
         crate::storage::StorageBackendKind::Redb => {
             // Strictly read-only handle (`ADR-RB-03`): fails closed on
             // `RepairAborted` / `RepairRequired` without upgrading to writable.
-            let _ro = crate::storage::runtime::open_git_store_read_only(&repo_path)
+            let git_store = crate::storage::runtime::open_git_store_read_only(&repo_path)
                 .await
                 .map_err(|e| {
                     CliError::fatal(format!(
@@ -1520,10 +1609,10 @@ async fn build_history_manager() -> CliResult<HistoryManager> {
                     ))
                     .with_stable_code(StableErrorCode::IoReadFailed)
                 })?;
-            Err(CliError::fatal(
-                "AI history inspection on redb storage requires CaptureStore history wiring",
-            )
-            .with_stable_code(StableErrorCode::Unsupported))
+            Ok(AiHistoryReader::Redb {
+                repo_path,
+                git_store,
+            })
         }
         crate::storage::StorageBackendKind::Sqlite => {
             let db_path = repo_path.join(util::DATABASE);
@@ -1538,7 +1627,11 @@ async fn build_history_manager() -> CliResult<HistoryManager> {
                     .with_stable_code(StableErrorCode::RepoCorrupt)
                 })?;
             let storage = Arc::new(LocalStorage::try_new(objects_dir)?);
-            Ok(HistoryManager::new(storage, repo_path, Arc::new(db_conn)))
+            Ok(AiHistoryReader::Sqlite(HistoryManager::new(
+                storage,
+                repo_path,
+                Arc::new(db_conn),
+            )))
         }
     }
 }

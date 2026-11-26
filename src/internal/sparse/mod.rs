@@ -215,30 +215,50 @@ impl SparseViewStore {
     }
 
     async fn rewrite(scope: &WorktreeScope, patterns: &[String]) -> Result<(), String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let txn = db.begin().await.map_err(|e| e.to_string())?;
-        txn.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM sparse_view WHERE worktree_id = ?",
-            [scope.storage_key().into()],
-        ))
-        .await
-        .map_err(|e| format!("failed to clear the sparse view: {e}"))?;
-        for (ordinal, pattern) in patterns.iter().enumerate() {
-            txn.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
-                [
-                    scope.storage_key().into(),
-                    pattern.as_str().into(),
-                    (ordinal as i64).into(),
-                ],
-            ))
-            .await
-            .map_err(|e| format!("failed to record a sparse pattern: {e}"))?;
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to save the sparse view: {e}"))?;
+                let enabled = store
+                    .get_sparse_view(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to read the sparse view: {e}"))?
+                    .is_some_and(|snap| snap.enabled);
+                store
+                    .replace_sparse_view(scope.storage_key(), enabled, patterns)
+                    .await
+                    .map_err(|e| format!("failed to save the sparse view: {e}"))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let txn = db.begin().await.map_err(|e| e.to_string())?;
+                txn.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM sparse_view WHERE worktree_id = ?",
+                    [scope.storage_key().into()],
+                ))
+                .await
+                .map_err(|e| format!("failed to clear the sparse view: {e}"))?;
+                for (ordinal, pattern) in patterns.iter().enumerate() {
+                    txn.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
+                        [
+                            scope.storage_key().into(),
+                            pattern.as_str().into(),
+                            (ordinal as i64).into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(|e| format!("failed to record a sparse pattern: {e}"))?;
+                }
+                txn.commit().await.map_err(|e| e.to_string())?;
+                Ok(())
+            }
         }
-        txn.commit().await.map_err(|e| e.to_string())?;
-        Ok(())
     }
 }
 

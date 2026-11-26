@@ -1123,7 +1123,11 @@ async fn run_init_internal(
                 // INVARIANT: the database must exist before refs, config, conversion, or
                 // vault setup run; those later stages persist their durable state through
                 // this connection/path and assume schema bootstrap has completed.
-                let conn = create_database_connection(&database_path).await?;
+                let conn = create_database_connection(
+                    &database_path,
+                    crate::storage::StorageBackendKind::Sqlite,
+                )
+                .await?;
                 #[cfg(windows)]
                 if is_git_conversion {
                     conversion_db_for_rollback = Some(conn.clone());
@@ -2426,26 +2430,36 @@ fn validate_filesystem_branch_name(branch_name: &str) -> Result<(), InitError> {
     Ok(())
 }
 
-async fn create_database_connection(database: &Path) -> Result<DbConn, InitError> {
-    #[cfg(target_os = "windows")]
-    {
-        let database = database
-            .to_str()
-            .ok_or_else(|| InitError::InvalidUtf8Path {
-                path: database.to_path_buf(),
-            })?
-            .replace('\\', "/");
-        db::create_database(&database).await.map_err(InitError::Io)
-    }
+async fn create_database_connection(
+    database: &Path,
+    backend: crate::storage::StorageBackendKind,
+) -> Result<DbConn, InitError> {
+    match backend {
+        crate::storage::StorageBackendKind::Redb => Err(InitError::Io(io::Error::other(
+            "SQLite database creation is not valid for a redb repository",
+        ))),
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(target_os = "windows")]
+            {
+                let database = database
+                    .to_str()
+                    .ok_or_else(|| InitError::InvalidUtf8Path {
+                        path: database.to_path_buf(),
+                    })?
+                    .replace('\\', "/");
+                db::create_database(&database).await.map_err(InitError::Io)
+            }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let database = database
-            .to_str()
-            .ok_or_else(|| InitError::InvalidUtf8Path {
-                path: database.to_path_buf(),
-            })?;
-        db::create_database(database).await.map_err(InitError::Io)
+            #[cfg(not(target_os = "windows"))]
+            {
+                let database = database
+                    .to_str()
+                    .ok_or_else(|| InitError::InvalidUtf8Path {
+                        path: database.to_path_buf(),
+                    })?;
+                db::create_database(database).await.map_err(InitError::Io)
+            }
+        }
     }
 }
 

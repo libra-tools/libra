@@ -163,10 +163,7 @@ async fn repo_scoped_credential(attrs: &CredentialAttrs) -> Option<StoredCredent
 /// record is vault-encrypted (global unseal key) and stored in the global
 /// config store; a miss/decrypt-failure returns `None` (not an error).
 async fn user_scoped_credential(attrs: &CredentialAttrs) -> Option<StoredCredential> {
-    let db = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .ok()?;
-    let entry = ConfigKv::get_with_conn(&db, &credential_key(attrs))
+    let entry = ScopedConfig::get(ConfigScope::Global, &credential_key(attrs))
         .await
         .ok()
         .flatten()?;
@@ -187,7 +184,8 @@ async fn user_scoped_credential(attrs: &CredentialAttrs) -> Option<StoredCredent
 
 /// Encrypt and persist a credential to the user-level (global) store (HP-14).
 async fn user_store_encrypted(attrs: &CredentialAttrs, plaintext: &[u8]) -> CliResult<()> {
-    let db = ScopedConfig::get_connection(ConfigScope::Global)
+    ConfigScope::Global
+        .ensure_config_exists()
         .await
         .map_err(|e| {
             CliError::fatal(format!("failed to open the global config store: {e}"))
@@ -207,24 +205,30 @@ async fn user_store_encrypted(attrs: &CredentialAttrs, plaintext: &[u8]) -> CliR
             .with_exit_code(128)
             .with_stable_code(StableErrorCode::InternalInvariant)
     })?;
-    ConfigKv::set_with_conn(&db, &credential_key(attrs), &hex::encode(encrypted), false)
-        .await
-        .map_err(|_| {
-            CliError::fatal("failed to persist the user-level credential")
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
+    ScopedConfig::set(
+        ConfigScope::Global,
+        &credential_key(attrs),
+        &hex::encode(encrypted),
+        false,
+    )
+    .await
+    .map_err(|_| {
+        CliError::fatal("failed to persist the user-level credential")
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+    })?;
     Ok(())
 }
 
 /// Erase a credential from the user-level (global) store, idempotently (HP-14).
 async fn user_erase(attrs: &CredentialAttrs) -> CliResult<()> {
-    let db = match ScopedConfig::get_connection(ConfigScope::Global).await {
-        Ok(db) => db,
-        // No global config: nothing to erase.
-        Err(_) => return Ok(()),
-    };
-    ConfigKv::unset_with_conn(&db, &credential_key(attrs))
+    let key = credential_key(attrs);
+    match ScopedConfig::get(ConfigScope::Global, &key).await {
+        Ok(Some(_)) => {}
+        // No global config or entry absent: nothing to erase.
+        Ok(None) | Err(_) => return Ok(()),
+    }
+    ScopedConfig::unset(ConfigScope::Global, &key)
         .await
         .map_err(|_| {
             CliError::fatal("failed to erase the user-level credential")

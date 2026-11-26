@@ -4,10 +4,12 @@
 //! (fail-closed) with a rebuild hint, matching `libra memory`.
 
 use super::{
-    repo,
     snapshot::DataError,
     state::{self, SourceState},
 };
+#[cfg(feature = "storage-redb")]
+use crate::storage::ConfigStore;
+use crate::storage::StorageBackendKind;
 
 /// One projected episode shown by the Memory surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,109 +43,163 @@ pub const MEMORY_ROW_CAP: usize = 200;
 pub async fn read_memory(
     scope: &crate::internal::worktree_scope::RequestScope,
 ) -> Result<MemoryRead, DataError> {
-    let db_path = scope.storage.join(crate::utils::util::DATABASE);
-    match state::probe_path(&db_path) {
-        state::ProbeOutcome::Absent => {
-            return Ok(MemoryRead {
-                state: SourceState::Absent,
-                rows: Vec::new(),
-            });
-        }
-        state::ProbeOutcome::Unreadable { kind } => {
-            return Err(DataError::new(
-                SourceState::Unreadable { kind },
-                "the repository database cannot be opened for reading",
-            ));
-        }
-        state::ProbeOutcome::Present => {}
-    }
-    let db_str = db_path.to_str().ok_or_else(|| {
-        DataError::new(
-            SourceState::Corrupt,
-            "the repository database path is not UTF-8",
-        )
-    })?;
-    let conn = crate::internal::db::open_connection_without_schema_management(
-        db_str,
-        repo::READ_BUSY_TIMEOUT,
-    )
-    .await
-    .map_err(|error| {
-        DataError::new(
-            state::classify_open_error(&error),
-            "the repository database is unusable",
-        )
-    })?;
-    let compatibility = crate::internal::db::schema::inspect_schema_for_connection(
-        &conn,
-        crate::internal::db::schema::DatabaseRole::Repository,
-    )
-    .await
-    .map_err(|error| {
-        DataError::new(
-            state::classify_store_message(&error.to_string()),
-            "the repository schema ledger could not be read",
-        )
-    })?;
-    match state::classify_schema(&compatibility) {
-        SourceState::Available => {}
-        other => {
-            return Err(DataError::new(
-                other,
-                "the repository schema does not match this binary",
-            ));
-        }
-    }
-    let repo_id = crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
-        .await
-        .map_err(|error| {
-            DataError::new(
-                state::classify_store_message(&error.to_string()),
-                "the repository identity could not be read",
-            )
-        })?
-        .map(|entry| entry.value)
-        .ok_or_else(|| {
-            DataError::new(
-                SourceState::Corrupt,
-                "the repository has no recorded identity",
+    let backend =
+        crate::storage::runtime::detect_repo_backend(&scope.storage).map_err(|error| {
+            super::context::map_storage_error(
+                &error,
+                "the repository backend could not be detected",
             )
         })?;
-    let stale = crate::internal::ai::memory::reader::projection_is_stale(&conn, &repo_id)
-        .await
-        .map_err(|error| {
-            DataError::new(
-                state::classify_store_message(&error.to_string()),
-                "the memory projection state could not be read",
-            )
-        })?;
-    match stale {
-        None => {
-            conn.close().await.ok();
-            return Ok(MemoryRead {
-                state: SourceState::Absent,
-                rows: Vec::new(),
-            });
+    let episodes = match backend {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                match read_memory_episodes_redb(scope).await? {
+                    RedbMemoryEpisodes::Absent => {
+                        return Ok(MemoryRead {
+                            state: SourceState::Absent,
+                            rows: Vec::new(),
+                        });
+                    }
+                    RedbMemoryEpisodes::Stale => {
+                        return Ok(MemoryRead {
+                            state: SourceState::Stale,
+                            rows: Vec::new(),
+                        });
+                    }
+                    RedbMemoryEpisodes::Ready(episodes) => episodes,
+                }
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                return Err(DataError::new(
+                    SourceState::Corrupt,
+                    "this Libra binary was compiled without `storage-redb`",
+                ));
+            }
         }
-        Some(true) => {
-            conn.close().await.ok();
-            return Ok(MemoryRead {
-                state: SourceState::Stale,
-                rows: Vec::new(),
-            });
-        }
-        Some(false) => {}
-    }
-    let episodes =
-        crate::internal::ai::memory::reader::list_episodes_bounded(&conn, &repo_id, MEMORY_ROW_CAP)
-            .await
-            .map_err(|error| {
-                DataError::new(
-                    state::classify_store_message(&error.to_string()),
-                    "memory episodes could not be read",
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let db_path = scope.storage.join(crate::utils::util::DATABASE);
+                match state::probe_path(&db_path) {
+                    state::ProbeOutcome::Absent => {
+                        return Ok(MemoryRead {
+                            state: SourceState::Absent,
+                            rows: Vec::new(),
+                        });
+                    }
+                    state::ProbeOutcome::Unreadable { kind } => {
+                        return Err(DataError::new(
+                            SourceState::Unreadable { kind },
+                            "the repository database cannot be opened for reading",
+                        ));
+                    }
+                    state::ProbeOutcome::Present => {}
+                }
+                let db_str = db_path.to_str().ok_or_else(|| {
+                    DataError::new(
+                        SourceState::Corrupt,
+                        "the repository database path is not UTF-8",
+                    )
+                })?;
+                let conn = crate::internal::db::open_connection_without_schema_management(
+                    db_str,
+                    super::repo::READ_BUSY_TIMEOUT,
                 )
-            })?;
-    conn.close().await.ok();
+                .await
+                .map_err(|error| {
+                    DataError::new(
+                        state::classify_open_error(&error),
+                        "the repository database is unusable",
+                    )
+                })?;
+                let compatibility = crate::internal::db::schema::inspect_schema_for_connection(
+                    &conn,
+                    crate::internal::db::schema::DatabaseRole::Repository,
+                )
+                .await
+                .map_err(|error| {
+                    DataError::new(
+                        state::classify_store_message(&error.to_string()),
+                        "the repository schema ledger could not be read",
+                    )
+                })?;
+                match state::classify_schema(&compatibility) {
+                    SourceState::Available => {}
+                    other => {
+                        return Err(DataError::new(
+                            other,
+                            "the repository schema does not match this binary",
+                        ));
+                    }
+                }
+                let repo_id =
+                    crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
+                        .await
+                        .map_err(|error| {
+                            DataError::new(
+                                state::classify_store_message(&error.to_string()),
+                                "the repository identity could not be read",
+                            )
+                        })?
+                        .map(|entry| entry.value)
+                        .ok_or_else(|| {
+                            DataError::new(
+                                SourceState::Corrupt,
+                                "the repository has no recorded identity",
+                            )
+                        })?;
+                let stale =
+                    crate::internal::ai::memory::reader::projection_is_stale(&conn, &repo_id)
+                        .await
+                        .map_err(|error| {
+                            DataError::new(
+                                state::classify_store_message(&error.to_string()),
+                                "the memory projection state could not be read",
+                            )
+                        })?;
+                match stale {
+                    None => {
+                        conn.close().await.ok();
+                        return Ok(MemoryRead {
+                            state: SourceState::Absent,
+                            rows: Vec::new(),
+                        });
+                    }
+                    Some(true) => {
+                        conn.close().await.ok();
+                        return Ok(MemoryRead {
+                            state: SourceState::Stale,
+                            rows: Vec::new(),
+                        });
+                    }
+                    Some(false) => {}
+                }
+                let episodes = crate::internal::ai::memory::reader::list_episodes_bounded(
+                    &conn,
+                    &repo_id,
+                    MEMORY_ROW_CAP,
+                )
+                .await
+                .map_err(|error| {
+                    DataError::new(
+                        state::classify_store_message(&error.to_string()),
+                        "memory episodes could not be read",
+                    )
+                })?;
+                conn.close().await.ok();
+                episodes
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                return Err(DataError::new(
+                    SourceState::Corrupt,
+                    "this Libra binary was compiled without `storage-sqlite`",
+                ));
+            }
+        }
+    };
     let redactor = crate::internal::ai::observed_agents::redaction::Redactor::new_default();
     let rows: Vec<MemoryRow> = episodes
         .into_iter()
@@ -168,6 +224,89 @@ pub async fn read_memory(
         SourceState::Available
     };
     Ok(MemoryRead { state, rows })
+}
+
+#[cfg(feature = "storage-redb")]
+enum RedbMemoryEpisodes {
+    Absent,
+    Stale,
+    Ready(Vec<crate::internal::ai::memory::Episode>),
+}
+
+#[cfg(feature = "storage-redb")]
+async fn read_memory_episodes_redb(
+    scope: &crate::internal::worktree_scope::RequestScope,
+) -> Result<RedbMemoryEpisodes, DataError> {
+    let Some((git_db_path, config_store)) =
+        super::context::open_redb_repo_config_checked(&scope.storage).await?
+    else {
+        return Ok(RedbMemoryEpisodes::Absent);
+    };
+    let repo_id = config_store
+        .get("libra.repoid")
+        .await
+        .map_err(|error| {
+            super::context::map_storage_error(&error, "the repository identity could not be read")
+        })?
+        .map(|entry| entry.value)
+        .ok_or_else(|| {
+            DataError::new(
+                SourceState::Corrupt,
+                "the repository has no recorded identity",
+            )
+        })?;
+    drop(config_store);
+
+    let state_store = tokio::task::spawn_blocking(move || {
+        crate::storage::RedbGitStateStore::open_read_only(&git_db_path)
+    })
+    .await
+    .map_err(|_| {
+        DataError::new(
+            SourceState::Corrupt,
+            "the repository state store open task failed",
+        )
+    })?
+    .map_err(|error| {
+        super::context::map_storage_error(&error, "the repository database is unusable")
+    })?;
+
+    let stale =
+        crate::internal::ai::memory::reader::projection_is_stale_with_store(&state_store, &repo_id)
+            .await
+            .map_err(|error| {
+                map_memory_error(&error, "the memory projection state could not be read")
+            })?;
+    match stale {
+        None => return Ok(RedbMemoryEpisodes::Absent),
+        Some(true) => return Ok(RedbMemoryEpisodes::Stale),
+        Some(false) => {}
+    }
+
+    let episodes = crate::internal::ai::memory::reader::list_episodes_bounded_with_store(
+        &state_store,
+        &repo_id,
+        MEMORY_ROW_CAP,
+    )
+    .await
+    .map_err(|error| map_memory_error(&error, "memory episodes could not be read"))?;
+    Ok(RedbMemoryEpisodes::Ready(episodes))
+}
+
+#[cfg(feature = "storage-redb")]
+fn map_memory_error(
+    error: &crate::internal::ai::memory::MemoryError,
+    default_message: &str,
+) -> DataError {
+    match error {
+        crate::internal::ai::memory::MemoryError::Storage(storage_err) => {
+            super::context::map_storage_error(storage_err, default_message)
+        }
+        other => DataError::new(
+            state::classify_store_message(&other.to_string()),
+            default_message,
+        ),
+    }
 }
 
 /// Filter predicate over real rows (source kind and free-text search).

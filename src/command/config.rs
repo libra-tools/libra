@@ -163,6 +163,11 @@ fn config_kv_entry_from_storage(entry: crate::storage::ConfigEntry) -> ConfigKvE
     }
 }
 
+enum ScopedConfigBackend {
+    Redb(std::sync::Arc<dyn crate::storage::ConfigStore>),
+    Sqlite(Option<std::sync::Arc<dyn crate::storage::ConfigStore>>),
+}
+
 /// Scoped config access layer — resolves the correct database for each scope.
 pub struct ScopedConfig;
 
@@ -187,14 +192,24 @@ impl ScopedConfig {
                     "fatal: not a libra repository (or any of the parent directories): .libra"
                         .to_string()
                 })?;
-                let db_path = storage.join(DATABASE);
-                if !db_path.exists() {
-                    return Err(format!(
-                        "fatal: libra database not found at '{}'",
-                        db_path.display()
-                    ));
+                match crate::storage::runtime::detect_repo_backend(&storage)
+                    .map_err(|err| err.to_string())?
+                {
+                    crate::storage::StorageBackendKind::Redb => Err(
+                        "fatal: local repository uses redb storage; SQLite connection is unavailable"
+                            .to_string(),
+                    ),
+                    crate::storage::StorageBackendKind::Sqlite => {
+                        let db_path = storage.join(DATABASE);
+                        if !db_path.exists() {
+                            return Err(format!(
+                                "fatal: libra database not found at '{}'",
+                                db_path.display()
+                            ));
+                        }
+                        Ok(get_db_conn_instance().await.clone())
+                    }
                 }
-                Ok(get_db_conn_instance().await.clone())
             }
             ConfigScope::Global => {
                 Self::get_or_create_cached_connection(
@@ -502,50 +517,100 @@ impl ScopedConfig {
         Ok(txn)
     }
 
+    async fn resolve_read_backend(scope: ConfigScope) -> Result<ScopedConfigBackend, String> {
+        match Self::open_storage_for_read(scope).await? {
+            Some(store) => match store.backend() {
+                crate::storage::StorageBackendKind::Redb => Ok(ScopedConfigBackend::Redb(store)),
+                crate::storage::StorageBackendKind::Sqlite => {
+                    Ok(ScopedConfigBackend::Sqlite(Some(store)))
+                }
+            },
+            None => Ok(ScopedConfigBackend::Sqlite(None)),
+        }
+    }
+
+    async fn resolve_write_backend(scope: ConfigScope) -> Result<ScopedConfigBackend, String> {
+        match Self::open_storage_for_write(scope).await? {
+            Some(store) => match store.backend() {
+                crate::storage::StorageBackendKind::Redb => Ok(ScopedConfigBackend::Redb(store)),
+                crate::storage::StorageBackendKind::Sqlite => {
+                    Ok(ScopedConfigBackend::Sqlite(Some(store)))
+                }
+            },
+            None => Ok(ScopedConfigBackend::Sqlite(None)),
+        }
+    }
+
     pub async fn get(scope: ConfigScope, key: &str) -> Result<Option<ConfigKvEntry>, String> {
-        if let Some(store) = Self::open_storage_for_read(scope).await? {
-            return store
+        match Self::resolve_read_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => store
                 .get(key)
                 .await
                 .map(|opt| opt.map(config_kv_entry_from_storage))
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string()),
+            ScopedConfigBackend::Sqlite(None) => {
+                let conn = Self::get_connection_for_read(scope).await?;
+                ConfigKv::get_with_conn(&conn, key)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         }
-        let conn = Self::get_connection_for_read(scope).await?;
-        ConfigKv::get_with_conn(&conn, key)
-            .await
-            .map_err(|e| e.to_string())
+    }
+
+    pub async fn get_var_case_insensitive(
+        scope: ConfigScope,
+        prefix: &str,
+        variable: &str,
+    ) -> Result<Option<ConfigKvEntry>, String> {
+        match Self::resolve_read_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => {
+                ConfigKv::get_var_case_insensitive_with_store(store.as_ref(), prefix, variable)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            ScopedConfigBackend::Sqlite(None) => {
+                let conn = Self::get_connection_for_read(scope).await?;
+                ConfigKv::get_var_case_insensitive_with_conn(&conn, prefix, variable)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
     }
 
     pub async fn get_all(scope: ConfigScope, key: &str) -> Result<Vec<ConfigKvEntry>, String> {
-        if let Some(store) = Self::open_storage_for_read(scope).await? {
-            return store
+        match Self::resolve_read_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => store
                 .get_all(key)
                 .await
                 .map(|rows| rows.into_iter().map(config_kv_entry_from_storage).collect())
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string()),
+            ScopedConfigBackend::Sqlite(None) => {
+                let conn = Self::get_connection_for_read(scope).await?;
+                ConfigKv::get_all_with_conn(&conn, key)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         }
-        let conn = Self::get_connection_for_read(scope).await?;
-        ConfigKv::get_all_with_conn(&conn, key)
-            .await
-            .map_err(|e| e.to_string())
     }
 
     async fn get_set_replacement_entries(
         scope: ConfigScope,
         key: &str,
     ) -> Result<Vec<ConfigKvEntry>, String> {
-        if let Some(store) = Self::open_storage_for_write(scope).await? {
-            return store
+        match Self::resolve_write_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => store
                 .get_all(key)
                 .await
                 .map(|rows| rows.into_iter().map(config_kv_entry_from_storage).collect())
-                .map_err(|error| error.to_string());
+                .map_err(|error| error.to_string()),
+            ScopedConfigBackend::Sqlite(None) => {
+                let conn = Self::get_connection(scope).await?;
+                ConfigKv::select_set_replacement_with_conn(&conn, key)
+                    .await
+                    .map(|replacement| replacement.entries())
+                    .map_err(|error| error.to_string())
+            }
         }
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::select_set_replacement_with_conn(&conn, key)
-            .await
-            .map(|replacement| replacement.entries())
-            .map_err(|error| error.to_string())
     }
 
     pub async fn set(
@@ -560,33 +625,41 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
-        if let Some(store) = Self::open_storage_for_write(scope).await? {
-            if !encrypted {
-                let existing = store
-                    .get_all(key)
-                    .await
-                    .map_err(|e| format!("failed to set config '{key}': {e}"))?;
-                if existing.iter().any(|entry| entry.encrypted) {
-                    return Err(format!(
-                        "failed to set config '{key}': {PLAINTEXT_ENCRYPTED_REPLACEMENT}"
-                    ));
+        match Self::resolve_write_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => {
+                if !encrypted {
+                    let existing = store
+                        .get_all(key)
+                        .await
+                        .map_err(|e| format!("failed to set config '{key}': {e}"))?;
+                    if existing.iter().any(|entry| entry.encrypted) {
+                        return Err(format!(
+                            "failed to set config '{key}': {PLAINTEXT_ENCRYPTED_REPLACEMENT}"
+                        ));
+                    }
                 }
+                store
+                    .set(key, value, encrypted)
+                    .await
+                    .map_err(|e| format!("failed to set config '{key}': {e}"))
             }
-            return store
-                .set(key, value, encrypted)
-                .await
-                .map_err(|e| format!("failed to set config '{key}': {e}"));
+            ScopedConfigBackend::Sqlite(None) => {
+                let txn = Self::begin_mutation(scope).await?;
+                if let Err(error) =
+                    ConfigKv::set_prepared_with_conn(&txn, key, value, encrypted).await
+                {
+                    txn.rollback().await.map_err(|rollback| {
+                        format!(
+                            "failed to roll back rejected configuration update ({error}): {rollback}"
+                        )
+                    })?;
+                    return Err(format!("failed to set config '{key}': {error}"));
+                }
+                txn.commit()
+                    .await
+                    .map_err(|e| format!("failed to commit config update: {e}"))
+            }
         }
-        let txn = Self::begin_mutation(scope).await?;
-        if let Err(error) = ConfigKv::set_prepared_with_conn(&txn, key, value, encrypted).await {
-            txn.rollback().await.map_err(|rollback| {
-                format!("failed to roll back rejected configuration update ({error}): {rollback}")
-            })?;
-            return Err(format!("failed to set config '{key}': {error}"));
-        }
-        txn.commit()
-            .await
-            .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
     pub async fn add(
@@ -601,19 +674,21 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
-        if let Some(store) = Self::open_storage_for_write(scope).await? {
-            return store
+        match Self::resolve_write_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => store
                 .add(key, value, encrypted)
                 .await
-                .map_err(|e| format!("failed to add config '{key}': {e}"));
+                .map_err(|e| format!("failed to add config '{key}': {e}")),
+            ScopedConfigBackend::Sqlite(None) => {
+                let txn = Self::begin_mutation(scope).await?;
+                ConfigKv::add_with_conn(&txn, key, value, encrypted)
+                    .await
+                    .map_err(|e| format!("failed to add config '{key}': {e}"))?;
+                txn.commit()
+                    .await
+                    .map_err(|e| format!("failed to commit config update: {e}"))
+            }
         }
-        let txn = Self::begin_mutation(scope).await?;
-        ConfigKv::add_with_conn(&txn, key, value, encrypted)
-            .await
-            .map_err(|e| format!("failed to add config '{key}': {e}"))?;
-        txn.commit()
-            .await
-            .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
     pub async fn unset(scope: ConfigScope, key: &str) -> Result<usize, String> {
@@ -623,20 +698,22 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
-        if let Some(store) = Self::open_storage_for_write(scope).await? {
-            return store
+        match Self::resolve_write_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => store
                 .unset(key)
                 .await
-                .map_err(|e| format!("failed to unset config '{key}': {e}"));
+                .map_err(|e| format!("failed to unset config '{key}': {e}")),
+            ScopedConfigBackend::Sqlite(None) => {
+                let txn = Self::begin_mutation(scope).await?;
+                let removed = ConfigKv::unset_with_conn(&txn, key)
+                    .await
+                    .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+                txn.commit()
+                    .await
+                    .map_err(|e| format!("failed to commit config update: {e}"))?;
+                Ok(removed)
+            }
         }
-        let txn = Self::begin_mutation(scope).await?;
-        let removed = ConfigKv::unset_with_conn(&txn, key)
-            .await
-            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
-        txn.commit()
-            .await
-            .map_err(|e| format!("failed to commit config update: {e}"))?;
-        Ok(removed)
     }
 
     /// Remove only the values matching `matcher` (Git `--unset <key> <pattern>`).
@@ -651,42 +728,46 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
-        if let Some(store) = Self::open_storage_for_write(scope).await? {
-            let entries = store
-                .get_all(key)
-                .await
-                .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
-            let mut kept = Vec::with_capacity(entries.len());
-            let mut removed = 0usize;
-            for entry in entries {
-                if matcher(&entry.value) {
-                    removed += 1;
-                } else {
-                    kept.push(entry);
-                }
-            }
-            if removed > 0 {
-                store
-                    .unset_all(key)
+        match Self::resolve_write_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => {
+                let entries = store
+                    .get_all(key)
                     .await
                     .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
-                for entry in kept {
+                let mut kept = Vec::with_capacity(entries.len());
+                let mut removed = 0usize;
+                for entry in entries {
+                    if matcher(&entry.value) {
+                        removed += 1;
+                    } else {
+                        kept.push(entry);
+                    }
+                }
+                if removed > 0 {
                     store
-                        .add(key, &entry.value, entry.encrypted)
+                        .unset_all(key)
                         .await
                         .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+                    for entry in kept {
+                        store
+                            .add(key, &entry.value, entry.encrypted)
+                            .await
+                            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+                    }
                 }
+                Ok(removed)
             }
-            return Ok(removed);
+            ScopedConfigBackend::Sqlite(None) => {
+                let txn = Self::begin_mutation(scope).await?;
+                let removed = ConfigKv::unset_matching_with_conn(&txn, key, matcher)
+                    .await
+                    .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+                txn.commit()
+                    .await
+                    .map_err(|e| format!("failed to commit config update: {e}"))?;
+                Ok(removed)
+            }
         }
-        let txn = Self::begin_mutation(scope).await?;
-        let removed = ConfigKv::unset_matching_with_conn(&txn, key, matcher)
-            .await
-            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
-        txn.commit()
-            .await
-            .map_err(|e| format!("failed to commit config update: {e}"))?;
-        Ok(removed)
     }
 
     /// Git `--replace-all`: drop every existing value for `key`, then store one.
@@ -697,26 +778,30 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
-        if let Some(store) = Self::open_storage_for_write(scope).await? {
-            store
-                .unset_all(key)
-                .await
-                .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
-            return store
-                .set(key, value, false)
-                .await
-                .map_err(|e| format!("failed to replace config '{key}': {e}"));
+        match Self::resolve_write_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => {
+                store
+                    .unset_all(key)
+                    .await
+                    .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                store
+                    .set(key, value, false)
+                    .await
+                    .map_err(|e| format!("failed to replace config '{key}': {e}"))
+            }
+            ScopedConfigBackend::Sqlite(None) => {
+                let txn = Self::begin_mutation(scope).await?;
+                ConfigKv::unset_all_with_conn(&txn, key)
+                    .await
+                    .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                ConfigKv::set_with_conn(&txn, key, value, false)
+                    .await
+                    .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                txn.commit()
+                    .await
+                    .map_err(|e| format!("failed to commit config update: {e}"))
+            }
         }
-        let txn = Self::begin_mutation(scope).await?;
-        ConfigKv::unset_all_with_conn(&txn, key)
-            .await
-            .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
-        ConfigKv::set_with_conn(&txn, key, value, false)
-            .await
-            .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
-        txn.commit()
-            .await
-            .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
     /// Git `--replace-all <key> <value> <pattern>`: replace the first matching
@@ -747,64 +832,68 @@ impl ScopedConfig {
             };
             matched_entries.push((entry, matches));
         }
-        if let Some(store) = Self::open_storage_for_write(scope).await? {
-            store
-                .unset_all(key)
-                .await
-                .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
-            let mut replaced = 0usize;
-            for (entry, matches) in matched_entries {
-                if matches {
-                    if replaced == 0 {
+        match Self::resolve_write_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => {
+                store
+                    .unset_all(key)
+                    .await
+                    .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                let mut replaced = 0usize;
+                for (entry, matches) in matched_entries {
+                    if matches {
+                        if replaced == 0 {
+                            store
+                                .add(key, value, encrypted)
+                                .await
+                                .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                        }
+                        replaced += 1;
+                    } else {
                         store
-                            .add(key, value, encrypted)
+                            .add(key, &entry.value, entry.encrypted)
                             .await
                             .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
                     }
-                    replaced += 1;
-                } else {
+                }
+                if replaced == 0 {
                     store
-                        .add(key, &entry.value, entry.encrypted)
+                        .add(key, value, encrypted)
                         .await
                         .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
                 }
+                Ok(replaced)
             }
-            if replaced == 0 {
-                store
-                    .add(key, value, encrypted)
+            ScopedConfigBackend::Sqlite(None) => {
+                let txn = Self::begin_mutation(scope).await?;
+                ConfigKv::unset_all_with_conn(&txn, key)
                     .await
                     .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
-            }
-            return Ok(replaced);
-        }
-        let txn = Self::begin_mutation(scope).await?;
-        ConfigKv::unset_all_with_conn(&txn, key)
-            .await
-            .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
-        let mut replaced = 0;
-        for (entry, matches) in matched_entries {
-            if matches {
+                let mut replaced = 0;
+                for (entry, matches) in matched_entries {
+                    if matches {
+                        if replaced == 0 {
+                            ConfigKv::add_with_conn(&txn, key, value, encrypted)
+                                .await
+                                .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                        }
+                        replaced += 1;
+                    } else {
+                        ConfigKv::add_with_conn(&txn, key, &entry.value, entry.encrypted)
+                            .await
+                            .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                    }
+                }
                 if replaced == 0 {
                     ConfigKv::add_with_conn(&txn, key, value, encrypted)
                         .await
                         .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
                 }
-                replaced += 1;
-            } else {
-                ConfigKv::add_with_conn(&txn, key, &entry.value, entry.encrypted)
+                txn.commit()
                     .await
-                    .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                    .map_err(|e| format!("failed to commit config update: {e}"))?;
+                Ok(replaced)
             }
         }
-        if replaced == 0 {
-            ConfigKv::add_with_conn(&txn, key, value, encrypted)
-                .await
-                .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
-        }
-        txn.commit()
-            .await
-            .map_err(|e| format!("failed to commit config update: {e}"))?;
-        Ok(replaced)
     }
 
     pub async fn unset_all(scope: ConfigScope, key: &str) -> Result<usize, String> {
@@ -814,71 +903,81 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
-        if let Some(store) = Self::open_storage_for_write(scope).await? {
-            return store
+        match Self::resolve_write_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => store
                 .unset_all(key)
                 .await
-                .map_err(|e| format!("failed to unset config '{key}': {e}"));
+                .map_err(|e| format!("failed to unset config '{key}': {e}")),
+            ScopedConfigBackend::Sqlite(None) => {
+                let txn = Self::begin_mutation(scope).await?;
+                let removed = ConfigKv::unset_all_with_conn(&txn, key)
+                    .await
+                    .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+                txn.commit()
+                    .await
+                    .map_err(|e| format!("failed to commit config update: {e}"))?;
+                Ok(removed)
+            }
         }
-        let txn = Self::begin_mutation(scope).await?;
-        let removed = ConfigKv::unset_all_with_conn(&txn, key)
-            .await
-            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
-        txn.commit()
-            .await
-            .map_err(|e| format!("failed to commit config update: {e}"))?;
-        Ok(removed)
     }
 
     pub async fn list_all(scope: ConfigScope) -> Result<Vec<ConfigKvEntry>, String> {
-        if let Some(store) = Self::open_storage_for_read(scope).await? {
-            return store
+        match Self::resolve_read_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => store
                 .list_all()
                 .await
                 .map(|rows| rows.into_iter().map(config_kv_entry_from_storage).collect())
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string()),
+            ScopedConfigBackend::Sqlite(None) => {
+                let conn = Self::get_connection_for_read(scope).await?;
+                ConfigKv::list_all_with_conn(&conn)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         }
-        let conn = Self::get_connection_for_read(scope).await?;
-        ConfigKv::list_all_with_conn(&conn)
-            .await
-            .map_err(|e| e.to_string())
     }
 
     pub async fn get_by_prefix(
         scope: ConfigScope,
         prefix: &str,
     ) -> Result<Vec<ConfigKvEntry>, String> {
-        if let Some(store) = Self::open_storage_for_read(scope).await? {
-            return store
+        match Self::resolve_read_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => store
                 .get_by_prefix(prefix)
                 .await
                 .map(|rows| rows.into_iter().map(config_kv_entry_from_storage).collect())
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string()),
+            ScopedConfigBackend::Sqlite(None) => {
+                let conn = Self::get_connection_for_read(scope).await?;
+                ConfigKv::get_by_prefix_with_conn(&conn, prefix)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         }
-        let conn = Self::get_connection_for_read(scope).await?;
-        ConfigKv::get_by_prefix_with_conn(&conn, prefix)
-            .await
-            .map_err(|e| e.to_string())
     }
 
     pub async fn get_regexp(
         scope: ConfigScope,
         pattern: &str,
     ) -> Result<Vec<ConfigKvEntry>, String> {
-        if let Some(store) = Self::open_storage_for_read(scope).await? {
-            let re = regex::Regex::new(pattern)
-                .map_err(|e| format!("invalid regex pattern '{pattern}': {e}"))?;
-            let rows = store.list_all().await.map_err(|e| e.to_string())?;
-            return Ok(rows
-                .into_iter()
-                .filter(|r| re.is_match(&r.key))
-                .map(config_kv_entry_from_storage)
-                .collect());
+        match Self::resolve_read_backend(scope).await? {
+            ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => {
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| format!("invalid regex pattern '{pattern}': {e}"))?;
+                let rows = store.list_all().await.map_err(|e| e.to_string())?;
+                Ok(rows
+                    .into_iter()
+                    .filter(|r| re.is_match(&r.key))
+                    .map(config_kv_entry_from_storage)
+                    .collect())
+            }
+            ScopedConfigBackend::Sqlite(None) => {
+                let conn = Self::get_connection_for_read(scope).await?;
+                ConfigKv::get_regexp_with_conn(&conn, pattern)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         }
-        let conn = Self::get_connection_for_read(scope).await?;
-        ConfigKv::get_regexp_with_conn(&conn, pattern)
-            .await
-            .map_err(|e| e.to_string())
     }
 }
 
@@ -4866,60 +4965,64 @@ async fn handle_remove_section(
     if scope == ConfigScope::Local && is_exact_core_section(name) {
         return Err(core_objectformat_mutation_error("config --remove-section"));
     }
-    let removed = if let Some(store) = ScopedConfig::open_storage_for_write(scope)
+    let removed = match ScopedConfig::resolve_write_backend(scope)
         .await
         .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?
     {
-        let prefix = format!("{name}.");
-        let entries = store
-            .get_by_prefix(&prefix)
-            .await
-            .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?;
-        let mut keys: Vec<String> = entries
-            .into_iter()
-            .filter(|e| key_in_section(&e.key, name))
-            .map(|e| e.key)
-            .collect();
-        keys.sort();
-        keys.dedup();
-        if keys.is_empty() {
-            return Err(
-                CliError::from_legacy_string(format!("error: No such section: {name}"))
-                    .with_exit_code(128),
-            );
-        }
-        let mut removed = 0usize;
-        for key in &keys {
-            removed += store
-                .unset_all(key)
+        ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => {
+            let prefix = format!("{name}.");
+            let entries = store
+                .get_by_prefix(&prefix)
                 .await
-                .map_err(|e| config_write_cli_error(format!("failed to remove '{key}': {e}")))?;
+                .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?;
+            let mut keys: Vec<String> = entries
+                .into_iter()
+                .filter(|e| key_in_section(&e.key, name))
+                .map(|e| e.key)
+                .collect();
+            keys.sort();
+            keys.dedup();
+            if keys.is_empty() {
+                return Err(CliError::from_legacy_string(format!(
+                    "error: No such section: {name}"
+                ))
+                .with_exit_code(128));
+            }
+            let mut removed = 0usize;
+            for key in &keys {
+                removed += store.unset_all(key).await.map_err(|e| {
+                    config_write_cli_error(format!("failed to remove '{key}': {e}"))
+                })?;
+            }
+            removed
         }
-        removed
-    } else {
-        // Lock before reading; the compatibility marker rolls back with deletes.
-        let txn = ScopedConfig::begin_mutation(scope).await.map_err(|e| {
-            config_write_cli_error(format!("failed to start config transaction: {e}"))
-        })?;
+        ScopedConfigBackend::Sqlite(None) => {
+            // Lock before reading; the compatibility marker rolls back with deletes.
+            let txn = ScopedConfig::begin_mutation(scope).await.map_err(|e| {
+                config_write_cli_error(format!("failed to start config transaction: {e}"))
+            })?;
 
-        let keys = section_member_keys(&txn, name).await?;
-        if keys.is_empty() {
-            return Err(
-                CliError::from_legacy_string(format!("error: No such section: {name}"))
-                    .with_exit_code(128),
-            );
-        }
+            let keys = section_member_keys(&txn, name).await?;
+            if keys.is_empty() {
+                return Err(CliError::from_legacy_string(format!(
+                    "error: No such section: {name}"
+                ))
+                .with_exit_code(128));
+            }
 
-        let mut removed = 0usize;
-        for key in &keys {
-            removed += ConfigKv::unset_all_with_conn(&txn, key)
-                .await
-                .map_err(|e| config_write_cli_error(format!("failed to remove '{key}': {e}")))?;
+            let mut removed = 0usize;
+            for key in &keys {
+                removed += ConfigKv::unset_all_with_conn(&txn, key)
+                    .await
+                    .map_err(|e| {
+                        config_write_cli_error(format!("failed to remove '{key}': {e}"))
+                    })?;
+            }
+            txn.commit().await.map_err(|e| {
+                config_write_cli_error(format!("failed to commit config transaction: {e}"))
+            })?;
+            removed
         }
-        txn.commit().await.map_err(|e| {
-            config_write_cli_error(format!("failed to commit config transaction: {e}"))
-        })?;
-        removed
     };
 
     if output.is_json() {
@@ -4961,151 +5064,154 @@ async fn handle_rename_section(
         .with_exit_code(2));
     }
 
-    let old_keys: Vec<String> = if let Some(store) = ScopedConfig::open_storage_for_write(scope)
+    let old_keys: Vec<String> = match ScopedConfig::resolve_write_backend(scope)
         .await
         .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?
     {
-        let old_prefix = format!("{old}.");
-        let source: Vec<ConfigKvEntry> = store
-            .get_by_prefix(&old_prefix)
-            .await
-            .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
-            .into_iter()
-            .map(config_kv_entry_from_storage)
-            .filter(|e| key_in_section(&e.key, old))
-            .collect();
-        if source.is_empty() {
-            return Err(
-                CliError::from_legacy_string(format!("error: No such section: {old}"))
-                    .with_exit_code(128),
-            );
-        }
-        let new_prefix = format!("{new}.");
-        let dest_exists = store
-            .get_by_prefix(&new_prefix)
-            .await
-            .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
-            .into_iter()
-            .any(|e| key_in_section(&e.key, new));
-        if dest_exists {
-            return Err(CliError::from_legacy_string(format!(
-                "error: destination section already exists: {new}"
-            ))
-            .with_exit_code(128));
-        }
-        if scope == ConfigScope::System {
+        ScopedConfigBackend::Redb(store) | ScopedConfigBackend::Sqlite(Some(store)) => {
+            let old_prefix = format!("{old}.");
+            let source: Vec<ConfigKvEntry> = store
+                .get_by_prefix(&old_prefix)
+                .await
+                .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
+                .into_iter()
+                .map(config_kv_entry_from_storage)
+                .filter(|e| key_in_section(&e.key, old))
+                .collect();
+            if source.is_empty() {
+                return Err(
+                    CliError::from_legacy_string(format!("error: No such section: {old}"))
+                        .with_exit_code(128),
+                );
+            }
+            let new_prefix = format!("{new}.");
+            let dest_exists = store
+                .get_by_prefix(&new_prefix)
+                .await
+                .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
+                .into_iter()
+                .any(|e| key_in_section(&e.key, new));
+            if dest_exists {
+                return Err(CliError::from_legacy_string(format!(
+                    "error: destination section already exists: {new}"
+                ))
+                .with_exit_code(128));
+            }
+            if scope == ConfigScope::System {
+                for e in &source {
+                    let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
+                    let new_key = format!("{new}.{name}");
+                    if e.encrypted
+                        || new_key.to_ascii_lowercase().starts_with("vault.")
+                        || is_sensitive_key(&new_key)
+                    {
+                        return Err(CliError::command_usage(
+                            "vault-encrypted secrets are not supported in --system scope",
+                        )
+                        .with_hint(
+                            "rename into a vault/secret namespace is rejected in --system; use --global or --local",
+                        ));
+                    }
+                }
+            }
             for e in &source {
                 let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
                 let new_key = format!("{new}.{name}");
-                if e.encrypted
-                    || new_key.to_ascii_lowercase().starts_with("vault.")
-                    || is_sensitive_key(&new_key)
-                {
-                    return Err(CliError::command_usage(
-                        "vault-encrypted secrets are not supported in --system scope",
-                    )
-                    .with_hint(
-                        "rename into a vault/secret namespace is rejected in --system; use --global or --local",
-                    ));
-                }
+                store
+                    .add(&new_key, &e.value, e.encrypted)
+                    .await
+                    .map_err(|err| {
+                        config_write_cli_error(format!("failed to write '{new_key}': {err}"))
+                    })?;
             }
-        }
-        for e in &source {
-            let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
-            let new_key = format!("{new}.{name}");
-            store
-                .add(&new_key, &e.value, e.encrypted)
-                .await
-                .map_err(|err| {
-                    config_write_cli_error(format!("failed to write '{new_key}': {err}"))
-                })?;
-        }
-        let mut old_keys: Vec<String> = source.iter().map(|e| e.key.clone()).collect();
-        old_keys.sort();
-        old_keys.dedup();
-        for key in &old_keys {
-            store.unset_all(key).await.map_err(|err| {
-                config_write_cli_error(format!("failed to remove '{key}': {err}"))
-            })?;
-        }
-        old_keys
-    } else {
-        let txn = ScopedConfig::begin_mutation(scope).await.map_err(|e| {
-            config_write_cli_error(format!("failed to start config transaction: {e}"))
-        })?;
-
-        // Read source members transactionally (exact section semantics). Use the
-        // full entries (value + encrypted) in insertion order for the re-add.
-        let old_prefix = format!("{old}.");
-        let source: Vec<ConfigKvEntry> = ConfigKv::get_by_prefix_with_conn(&txn, &old_prefix)
-            .await
-            .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
-            .into_iter()
-            .filter(|e| key_in_section(&e.key, old))
-            .collect();
-        if source.is_empty() {
-            return Err(
-                CliError::from_legacy_string(format!("error: No such section: {old}"))
-                    .with_exit_code(128),
-            );
-        }
-
-        // Refuse to write into a destination section that already exists, so every
-        // re-added key is fresh (preserving the source's exact value + encrypted
-        // flag, and avoiding silent multi-value merges).
-        if !section_member_keys(&txn, new).await?.is_empty() {
-            return Err(CliError::from_legacy_string(format!(
-                "error: destination section already exists: {new}"
-            ))
-            .with_exit_code(128));
-        }
-
-        // System scope holds no vault: refuse a rename that would either carry an
-        // encrypted source row into it or land a key under a vault/secret namespace
-        // (which direct `set --system` also rejects).
-        if scope == ConfigScope::System {
-            for e in &source {
-                let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
-                let new_key = format!("{new}.{name}");
-                if e.encrypted
-                    || new_key.to_ascii_lowercase().starts_with("vault.")
-                    || is_sensitive_key(&new_key)
-                {
-                    return Err(CliError::command_usage(
-                        "vault-encrypted secrets are not supported in --system scope",
-                    )
-                    .with_hint(
-                        "rename into a vault/secret namespace is rejected in --system; use --global or --local",
-                    ));
-                }
-            }
-        }
-
-        for e in &source {
-            // Exact members all begin with `{old}.`; the remainder is the key name
-            // under the section (which itself may contain dots for nested names).
-            let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
-            let new_key = format!("{new}.{name}");
-            ConfigKv::add_with_conn(&txn, &new_key, &e.value, e.encrypted)
-                .await
-                .map_err(|err| {
-                    config_write_cli_error(format!("failed to write '{new_key}': {err}"))
-                })?;
-        }
-        let mut old_keys: Vec<String> = source.iter().map(|e| e.key.clone()).collect();
-        old_keys.sort();
-        old_keys.dedup();
-        for key in &old_keys {
-            ConfigKv::unset_all_with_conn(&txn, key)
-                .await
-                .map_err(|err| {
+            let mut old_keys: Vec<String> = source.iter().map(|e| e.key.clone()).collect();
+            old_keys.sort();
+            old_keys.dedup();
+            for key in &old_keys {
+                store.unset_all(key).await.map_err(|err| {
                     config_write_cli_error(format!("failed to remove '{key}': {err}"))
                 })?;
+            }
+            old_keys
         }
-        txn.commit().await.map_err(|e| {
-            config_write_cli_error(format!("failed to commit config transaction: {e}"))
-        })?;
-        old_keys
+        ScopedConfigBackend::Sqlite(None) => {
+            let txn = ScopedConfig::begin_mutation(scope).await.map_err(|e| {
+                config_write_cli_error(format!("failed to start config transaction: {e}"))
+            })?;
+
+            // Read source members transactionally (exact section semantics). Use the
+            // full entries (value + encrypted) in insertion order for the re-add.
+            let old_prefix = format!("{old}.");
+            let source: Vec<ConfigKvEntry> = ConfigKv::get_by_prefix_with_conn(&txn, &old_prefix)
+                .await
+                .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
+                .into_iter()
+                .filter(|e| key_in_section(&e.key, old))
+                .collect();
+            if source.is_empty() {
+                return Err(
+                    CliError::from_legacy_string(format!("error: No such section: {old}"))
+                        .with_exit_code(128),
+                );
+            }
+
+            // Refuse to write into a destination section that already exists, so every
+            // re-added key is fresh (preserving the source's exact value + encrypted
+            // flag, and avoiding silent multi-value merges).
+            if !section_member_keys(&txn, new).await?.is_empty() {
+                return Err(CliError::from_legacy_string(format!(
+                    "error: destination section already exists: {new}"
+                ))
+                .with_exit_code(128));
+            }
+
+            // System scope holds no vault: refuse a rename that would either carry an
+            // encrypted source row into it or land a key under a vault/secret namespace
+            // (which direct `set --system` also rejects).
+            if scope == ConfigScope::System {
+                for e in &source {
+                    let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
+                    let new_key = format!("{new}.{name}");
+                    if e.encrypted
+                        || new_key.to_ascii_lowercase().starts_with("vault.")
+                        || is_sensitive_key(&new_key)
+                    {
+                        return Err(CliError::command_usage(
+                            "vault-encrypted secrets are not supported in --system scope",
+                        )
+                        .with_hint(
+                            "rename into a vault/secret namespace is rejected in --system; use --global or --local",
+                        ));
+                    }
+                }
+            }
+
+            for e in &source {
+                // Exact members all begin with `{old}.`; the remainder is the key name
+                // under the section (which itself may contain dots for nested names).
+                let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
+                let new_key = format!("{new}.{name}");
+                ConfigKv::add_with_conn(&txn, &new_key, &e.value, e.encrypted)
+                    .await
+                    .map_err(|err| {
+                        config_write_cli_error(format!("failed to write '{new_key}': {err}"))
+                    })?;
+            }
+            let mut old_keys: Vec<String> = source.iter().map(|e| e.key.clone()).collect();
+            old_keys.sort();
+            old_keys.dedup();
+            for key in &old_keys {
+                ConfigKv::unset_all_with_conn(&txn, key)
+                    .await
+                    .map_err(|err| {
+                        config_write_cli_error(format!("failed to remove '{key}': {err}"))
+                    })?;
+            }
+            txn.commit().await.map_err(|e| {
+                config_write_cli_error(format!("failed to commit config transaction: {e}"))
+            })?;
+            old_keys
+        }
     };
 
     if output.is_json() {

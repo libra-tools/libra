@@ -270,142 +270,301 @@ pub async fn commit_merge() -> Result<CommitMergeResult, NotesError> {
     }
 
     let marker = dir.join(NOTES_MERGE_COMMITTING);
-    let db = get_db_conn_instance().await;
-
-    // A pre-existing marker means the previous commit crashed before or after
-    // its transaction. We cannot distinguish those cases, so retry CONFIRMS
-    // only (never replays): every row must already hold its target value, in
-    // which case the three state paths are cleaned up; otherwise fail closed
-    // and keep everything so the user can `--abort` and merge again.
-    if marker.exists() {
-        for (object, before, target) in &targets {
-            let current = note_blob_with_conn(&db, &state.target_ref, object).await?;
-            let _ = before;
-            if current.as_deref() != Some(target.as_str()) {
-                return Err(NotesError::MergeRaced {
-                    object: object.clone(),
-                });
-            }
-        }
-        for copy in &state.to_copy {
-            let current = note_blob_with_conn(&db, &state.target_ref, &copy.object).await?;
-            if current.as_deref() != Some(copy.source.as_str()) {
-                return Err(NotesError::MergeRaced {
-                    object: copy.object.clone(),
-                });
-            }
-        }
-        let skipped = targets.len() + state.to_copy.len();
-        let _ = std::fs::remove_file(&state_path);
-        let _ = std::fs::remove_dir_all(&worktree);
-        let _ = std::fs::remove_file(&marker);
-        return Ok(CommitMergeResult {
-            notes_ref: state.target_ref,
-            source_ref: state.source_ref,
-            applied: 0,
-            skipped,
-        });
-    }
-
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
     {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(NotesError::MergeInProgress);
-        }
-        Err(error) => {
-            return Err(NotesError::MergeStateIo {
-                path: marker.display().to_string(),
-                detail: error.to_string(),
-            });
-        }
-    }
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
 
-    let txn = crate::internal::db::begin_write_transaction(&db).await?;
-    let verify = async {
-        for (object, before, target) in &targets {
-            let current = note_blob_with_conn(&txn, &state.target_ref, object).await?;
-            if current.as_deref() != Some(before.as_str())
-                && current.as_deref() != Some(target.as_str())
-            {
-                return Err(NotesError::MergeRaced {
-                    object: object.clone(),
+            if marker.exists() {
+                for (object, _before, target) in &targets {
+                    let current = store
+                        .get_note(&state.target_ref, object)
+                        .await
+                        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+                        .map(|r| r.blob);
+                    if current.as_deref() != Some(target.as_str()) {
+                        return Err(NotesError::MergeRaced {
+                            object: object.clone(),
+                        });
+                    }
+                }
+                for copy in &state.to_copy {
+                    let current = store
+                        .get_note(&state.target_ref, &copy.object)
+                        .await
+                        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+                        .map(|r| r.blob);
+                    if current.as_deref() != Some(copy.source.as_str()) {
+                        return Err(NotesError::MergeRaced {
+                            object: copy.object.clone(),
+                        });
+                    }
+                }
+                let skipped = targets.len() + state.to_copy.len();
+                let _ = std::fs::remove_file(&state_path);
+                let _ = std::fs::remove_dir_all(&worktree);
+                let _ = std::fs::remove_file(&marker);
+                return Ok(CommitMergeResult {
+                    notes_ref: state.target_ref,
+                    source_ref: state.source_ref,
+                    applied: 0,
+                    skipped,
                 });
             }
-        }
-        for copy in &state.to_copy {
-            let current = note_blob_with_conn(&txn, &state.target_ref, &copy.object).await?;
-            if let Some(current) = current
-                && current != copy.source
+
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
             {
-                return Err(NotesError::MergeRaced {
-                    object: copy.object.clone(),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(NotesError::MergeInProgress);
+                }
+                Err(error) => {
+                    return Err(NotesError::MergeStateIo {
+                        path: marker.display().to_string(),
+                        detail: error.to_string(),
+                    });
+                }
+            }
+
+            let mut ops: Vec<crate::storage::NoteCasOp> = Vec::new();
+            let mut skipped = 0usize;
+            let mut verify_err: Option<NotesError> = None;
+            for (object, before, target) in &targets {
+                let current = match store.get_note(&state.target_ref, object).await {
+                    Ok(rec) => rec.map(|r| r.blob),
+                    Err(err) => {
+                        verify_err = Some(NotesError::from(DbErr::Custom(err.to_string())));
+                        break;
+                    }
+                };
+                if current.as_deref() == Some(target.as_str()) {
+                    skipped += 1;
+                } else if current.as_deref() == Some(before.as_str()) {
+                    if before == target {
+                        skipped += 1;
+                    } else {
+                        ops.push(crate::storage::NoteCasOp::UpdateIfMatches {
+                            object: object.clone(),
+                            expected_blob: before.clone(),
+                            new_blob: target.clone(),
+                        });
+                    }
+                } else {
+                    verify_err = Some(NotesError::MergeRaced {
+                        object: object.clone(),
+                    });
+                    break;
+                }
+            }
+            if verify_err.is_none() {
+                for copy in &state.to_copy {
+                    let current = match store.get_note(&state.target_ref, &copy.object).await {
+                        Ok(rec) => rec.map(|r| r.blob),
+                        Err(err) => {
+                            verify_err = Some(NotesError::from(DbErr::Custom(err.to_string())));
+                            break;
+                        }
+                    };
+                    match current {
+                        None => {
+                            ops.push(crate::storage::NoteCasOp::InsertIfAbsent {
+                                object: copy.object.clone(),
+                                blob: copy.source.clone(),
+                            });
+                        }
+                        Some(cur) if cur == copy.source => {
+                            skipped += 1;
+                        }
+                        Some(_) => {
+                            verify_err = Some(NotesError::MergeRaced {
+                                object: copy.object.clone(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(error) = verify_err {
+                let _ = std::fs::remove_file(&marker);
+                return Err(error);
+            }
+
+            let applied = if ops.is_empty() {
+                0
+            } else {
+                match store
+                    .apply_notes_cas_batch(&state.target_ref, &ops)
+                    .await
+                    .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+                {
+                    crate::storage::NoteBatchOutcome::Applied {
+                        inserted, updated, ..
+                    } => inserted + updated,
+                    crate::storage::NoteBatchOutcome::CasConflict { object, .. } => {
+                        let _ = std::fs::remove_file(&marker);
+                        return Err(NotesError::MergeRaced { object });
+                    }
+                }
+            };
+
+            // Cleanup order from ADR-PM-02: state, worktree, marker.
+            let _ = std::fs::remove_file(&state_path);
+            let _ = std::fs::remove_dir_all(&worktree);
+            let _ = std::fs::remove_file(&marker);
+
+            Ok(CommitMergeResult {
+                notes_ref: state.target_ref,
+                source_ref: state.source_ref,
+                applied,
+                skipped,
+            })
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+
+            // A pre-existing marker means the previous commit crashed before or after
+            // its transaction. We cannot distinguish those cases, so retry CONFIRMS
+            // only (never replays): every row must already hold its target value, in
+            // which case the three state paths are cleaned up; otherwise fail closed
+            // and keep everything so the user can `--abort` and merge again.
+            if marker.exists() {
+                for (object, before, target) in &targets {
+                    let current = note_blob_with_conn(&db, &state.target_ref, object).await?;
+                    let _ = before;
+                    if current.as_deref() != Some(target.as_str()) {
+                        return Err(NotesError::MergeRaced {
+                            object: object.clone(),
+                        });
+                    }
+                }
+                for copy in &state.to_copy {
+                    let current = note_blob_with_conn(&db, &state.target_ref, &copy.object).await?;
+                    if current.as_deref() != Some(copy.source.as_str()) {
+                        return Err(NotesError::MergeRaced {
+                            object: copy.object.clone(),
+                        });
+                    }
+                }
+                let skipped = targets.len() + state.to_copy.len();
+                let _ = std::fs::remove_file(&state_path);
+                let _ = std::fs::remove_dir_all(&worktree);
+                let _ = std::fs::remove_file(&marker);
+                return Ok(CommitMergeResult {
+                    notes_ref: state.target_ref,
+                    source_ref: state.source_ref,
+                    applied: 0,
+                    skipped,
                 });
             }
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(error) = verify {
-        txn.rollback().await?;
-        let _ = std::fs::remove_file(&marker);
-        return Err(error);
-    }
 
-    let mut applied = 0usize;
-    let mut skipped = 0usize;
-    for (object, before, target) in &targets {
-        if before == target {
-            skipped += 1;
-            continue;
-        }
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "UPDATE notes SET blob = ? WHERE notes_ref = ? AND object = ? AND blob = ?",
-            [
-                target.clone().into(),
-                state.target_ref.clone().into(),
-                object.clone().into(),
-                before.clone().into(),
-            ],
-        ))
-        .await?;
-        applied += 1;
-    }
-    for copy in &state.to_copy {
-        let current = note_blob_with_conn(&txn, &state.target_ref, &copy.object).await?;
-        if current.is_some() {
-            skipped += 1;
-            continue;
-        }
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)",
-            [
-                state.target_ref.clone().into(),
-                copy.object.clone().into(),
-                copy.source.clone().into(),
-            ],
-        ))
-        .await?;
-        applied += 1;
-    }
-    txn.commit().await?;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+            {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(NotesError::MergeInProgress);
+                }
+                Err(error) => {
+                    return Err(NotesError::MergeStateIo {
+                        path: marker.display().to_string(),
+                        detail: error.to_string(),
+                    });
+                }
+            }
 
-    // Cleanup order from ADR-PM-02: state, worktree, marker.
-    let _ = std::fs::remove_file(&state_path);
-    let _ = std::fs::remove_dir_all(&worktree);
-    let _ = std::fs::remove_file(&marker);
+            let txn = crate::internal::db::begin_write_transaction(&db).await?;
+            let verify = async {
+                for (object, before, target) in &targets {
+                    let current = note_blob_with_conn(&txn, &state.target_ref, object).await?;
+                    if current.as_deref() != Some(before.as_str())
+                        && current.as_deref() != Some(target.as_str())
+                    {
+                        return Err(NotesError::MergeRaced {
+                            object: object.clone(),
+                        });
+                    }
+                }
+                for copy in &state.to_copy {
+                    let current =
+                        note_blob_with_conn(&txn, &state.target_ref, &copy.object).await?;
+                    if let Some(current) = current
+                        && current != copy.source
+                    {
+                        return Err(NotesError::MergeRaced {
+                            object: copy.object.clone(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = verify {
+                txn.rollback().await?;
+                let _ = std::fs::remove_file(&marker);
+                return Err(error);
+            }
 
-    Ok(CommitMergeResult {
-        notes_ref: state.target_ref,
-        source_ref: state.source_ref,
-        applied,
-        skipped,
-    })
+            let mut applied = 0usize;
+            let mut skipped = 0usize;
+            for (object, before, target) in &targets {
+                if before == target {
+                    skipped += 1;
+                    continue;
+                }
+                txn.execute_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "UPDATE notes SET blob = ? WHERE notes_ref = ? AND object = ? AND blob = ?",
+                    [
+                        target.clone().into(),
+                        state.target_ref.clone().into(),
+                        object.clone().into(),
+                        before.clone().into(),
+                    ],
+                ))
+                .await?;
+                applied += 1;
+            }
+            for copy in &state.to_copy {
+                let current = note_blob_with_conn(&txn, &state.target_ref, &copy.object).await?;
+                if current.is_some() {
+                    skipped += 1;
+                    continue;
+                }
+                txn.execute_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)",
+                    [
+                        state.target_ref.clone().into(),
+                        copy.object.clone().into(),
+                        copy.source.clone().into(),
+                    ],
+                ))
+                .await?;
+                applied += 1;
+            }
+            txn.commit().await?;
+
+            // Cleanup order from ADR-PM-02: state, worktree, marker.
+            let _ = std::fs::remove_file(&state_path);
+            let _ = std::fs::remove_dir_all(&worktree);
+            let _ = std::fs::remove_file(&marker);
+
+            Ok(CommitMergeResult {
+                notes_ref: state.target_ref,
+                source_ref: state.source_ref,
+                applied,
+                skipped,
+            })
+        }
+    }
 }
 
 async fn note_blob_with_conn<C>(
@@ -903,51 +1062,108 @@ pub async fn remove(
     objects: &[String],
 ) -> Result<Vec<(String, String)>, NotesError> {
     validate_notes_ref(notes_ref)?;
-    let db = get_db_conn_instance().await;
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
 
-    // Phase 1: resolve and verify every target first.
-    let mut to_delete: Vec<(String, String)> = Vec::new();
-    for obj in objects {
-        let resolved = resolve_object(Some(obj)).await?;
-        let obj_str = resolved.to_string();
-        let blob_hash = find_note_blob(&db, notes_ref, &obj_str)
-            .await?
-            .ok_or_else(|| NotesError::NotFound {
-                notes_ref: notes_ref.to_string(),
-                object: obj_str.clone(),
-            })?;
-        to_delete.push((obj_str, blob_hash));
-    }
+            // Phase 1: resolve and verify every target first.
+            let mut to_delete: Vec<(String, String)> = Vec::new();
+            for obj in objects {
+                let resolved = resolve_object(Some(obj)).await?;
+                let obj_str = resolved.to_string();
+                let blob_hash = store
+                    .get_note(notes_ref, &obj_str)
+                    .await
+                    .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+                    .map(|rec| rec.blob)
+                    .ok_or_else(|| NotesError::NotFound {
+                        notes_ref: notes_ref.to_string(),
+                        object: obj_str.clone(),
+                    })?;
+                to_delete.push((obj_str, blob_hash));
+            }
 
-    // Phase 2: delete all verified rows inside a single transaction.
-    // Include `blob = ?` so that a concurrent `add -f` cannot overwrite
-    // the blob between Phase 1 and Phase 2 — if the blob hash changed,
-    // rows_affected() is 0 and we roll back the whole transaction.
-    let txn = crate::internal::db::begin_write_transaction(&db).await?;
-    for (obj_str, blob_hash) in &to_delete {
-        let result = txn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "DELETE FROM notes WHERE notes_ref = ? AND object = ? AND blob = ?",
-                [
-                    notes_ref.into(),
-                    obj_str.clone().into(),
-                    blob_hash.clone().into(),
-                ],
-            ))
-            .await?;
+            // Phase 2: atomically delete all verified rows via CAS batch.
+            let ops: Vec<crate::storage::NoteCasOp> = to_delete
+                .iter()
+                .map(
+                    |(obj_str, blob_hash)| crate::storage::NoteCasOp::DeleteIfMatches {
+                        object: obj_str.clone(),
+                        expected_blob: blob_hash.clone(),
+                    },
+                )
+                .collect();
+            if !ops.is_empty() {
+                match store
+                    .apply_notes_cas_batch(notes_ref, &ops)
+                    .await
+                    .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+                {
+                    crate::storage::NoteBatchOutcome::Applied { .. } => {}
+                    crate::storage::NoteBatchOutcome::CasConflict { object, .. } => {
+                        return Err(NotesError::NotFound {
+                            notes_ref: notes_ref.to_string(),
+                            object,
+                        });
+                    }
+                }
+            }
 
-        if result.rows_affected() == 0 {
-            txn.rollback().await?;
-            return Err(NotesError::NotFound {
-                notes_ref: notes_ref.to_string(),
-                object: obj_str.clone(),
-            });
+            Ok(to_delete)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+
+            // Phase 1: resolve and verify every target first.
+            let mut to_delete: Vec<(String, String)> = Vec::new();
+            for obj in objects {
+                let resolved = resolve_object(Some(obj)).await?;
+                let obj_str = resolved.to_string();
+                let blob_hash =
+                    find_note_blob(&db, notes_ref, &obj_str)
+                        .await?
+                        .ok_or_else(|| NotesError::NotFound {
+                            notes_ref: notes_ref.to_string(),
+                            object: obj_str.clone(),
+                        })?;
+                to_delete.push((obj_str, blob_hash));
+            }
+
+            // Phase 2: delete all verified rows inside a single transaction.
+            // Include `blob = ?` so that a concurrent `add -f` cannot overwrite
+            // the blob between Phase 1 and Phase 2 — if the blob hash changed,
+            // rows_affected() is 0 and we roll back the whole transaction.
+            let txn = crate::internal::db::begin_write_transaction(&db).await?;
+            for (obj_str, blob_hash) in &to_delete {
+                let result = txn
+                    .execute_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "DELETE FROM notes WHERE notes_ref = ? AND object = ? AND blob = ?",
+                        [
+                            notes_ref.into(),
+                            obj_str.clone().into(),
+                            blob_hash.clone().into(),
+                        ],
+                    ))
+                    .await?;
+
+                if result.rows_affected() == 0 {
+                    txn.rollback().await?;
+                    return Err(NotesError::NotFound {
+                        notes_ref: notes_ref.to_string(),
+                        object: obj_str.clone(),
+                    });
+                }
+            }
+            txn.commit().await?;
+
+            Ok(to_delete)
         }
     }
-    txn.commit().await?;
-
-    Ok(to_delete)
 }
 
 /// Remove notes whose annotated object no longer exists in the object store
@@ -1001,37 +1217,59 @@ pub async fn prune(notes_ref: &str, dry_run: bool) -> Result<Vec<String>, NotesE
         return Ok(stale.into_iter().map(|(object, _)| object).collect());
     }
 
-    let db = get_db_conn_instance().await;
-    let txn = crate::internal::db::begin_write_transaction(&db).await?;
-    let mut pruned = Vec::new();
-    for (object, blob) in stale {
-        let result = match &blob {
-            Some(blob) => {
-                txn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Sqlite,
-                    "DELETE FROM notes WHERE notes_ref = ? AND object = ? AND blob = ?",
-                    [notes_ref.into(), object.clone().into(), blob.clone().into()],
-                ))
-                .await?
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+            let mut pruned = Vec::new();
+            for (object, blob) in stale {
+                let removed = store
+                    .remove_note_cas(notes_ref, &object, blob.as_deref())
+                    .await
+                    .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+                if removed {
+                    pruned.push(object);
+                }
             }
-            None => {
-                txn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Sqlite,
-                    "DELETE FROM notes WHERE notes_ref = ? AND object = ?",
-                    [notes_ref.into(), object.clone().into()],
-                ))
-                .await?
+            Ok(pruned)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let txn = crate::internal::db::begin_write_transaction(&db).await?;
+            let mut pruned = Vec::new();
+            for (object, blob) in stale {
+                let result = match &blob {
+                    Some(blob) => {
+                        txn.execute_raw(Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Sqlite,
+                            "DELETE FROM notes WHERE notes_ref = ? AND object = ? AND blob = ?",
+                            [notes_ref.into(), object.clone().into(), blob.clone().into()],
+                        ))
+                        .await?
+                    }
+                    None => {
+                        txn.execute_raw(Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Sqlite,
+                            "DELETE FROM notes WHERE notes_ref = ? AND object = ?",
+                            [notes_ref.into(), object.clone().into()],
+                        ))
+                        .await?
+                    }
+                };
+                // Only report rows actually removed: a 0-row delete means the note
+                // changed concurrently and is no longer the stale row we inspected.
+                if result.rows_affected() > 0 {
+                    pruned.push(object);
+                }
             }
-        };
-        // Only report rows actually removed: a 0-row delete means the note
-        // changed concurrently and is no longer the stale row we inspected.
-        if result.rows_affected() > 0 {
-            pruned.push(object);
+            txn.commit().await?;
+
+            Ok(pruned)
         }
     }
-    txn.commit().await?;
-
-    Ok(pruned)
 }
 
 /// Merge the notes of `other_ref` into `notes_ref` (`notes merge <other-ref>`).
@@ -1053,27 +1291,53 @@ pub async fn merge(
     // All merge forms take the same worktree-scoped lock before touching state.
     let _lock = NotesMergeLock::acquire()?;
     ensure_no_merge_in_progress()?;
-    let db = get_db_conn_instance().await;
-
-    let other_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "SELECT object, blob FROM notes WHERE notes_ref = ?",
-            [other_ref.into()],
-        ))
-        .await?;
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
 
     // Classify every object annotated in `other_ref` against the current ref.
     let mut to_copy: Vec<(String, String)> = Vec::new(); // (object, other_blob)
     let mut conflicts: Vec<(String, String, String)> = Vec::new(); // (object, current_blob, other_blob)
     let mut skipped = 0usize;
-    for row in &other_rows {
-        let object = row.try_get::<String>("", "object")?;
-        let other_blob = row.try_get::<String>("", "blob")?;
-        match find_note_blob(&db, notes_ref, &object).await? {
-            None => to_copy.push((object, other_blob)),
-            Some(current) if current == other_blob => skipped += 1,
-            Some(current) => conflicts.push((object, current, other_blob)),
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+            let other_rows = store
+                .list_notes(other_ref)
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+            for rec in other_rows {
+                let current = store
+                    .get_note(notes_ref, &rec.object)
+                    .await
+                    .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+                    .map(|r| r.blob);
+                match current {
+                    None => to_copy.push((rec.object, rec.blob)),
+                    Some(current) if current == rec.blob => skipped += 1,
+                    Some(current) => conflicts.push((rec.object, current, rec.blob)),
+                }
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let other_rows = db
+                .query_all_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "SELECT object, blob FROM notes WHERE notes_ref = ?",
+                    [other_ref.into()],
+                ))
+                .await?;
+            for row in &other_rows {
+                let object = row.try_get::<String>("", "object")?;
+                let other_blob = row.try_get::<String>("", "blob")?;
+                match find_note_blob(&db, notes_ref, &object).await? {
+                    None => to_copy.push((object, other_blob)),
+                    Some(current) if current == other_blob => skipped += 1,
+                    Some(current) => conflicts.push((object, current, other_blob)),
+                }
+            }
         }
     }
 
@@ -1126,46 +1390,84 @@ pub async fn merge(
     // current blob (`AND blob = <expected>`). Any mismatch means another writer
     // changed the notes between classification and apply, so the whole merge
     // rolls back rather than clobbering concurrent work or applying partially.
-    let txn = crate::internal::db::begin_write_transaction(&db).await?;
-    for (object, blob) in &to_copy {
-        let result = txn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?) \
-                 ON CONFLICT(notes_ref, object) DO NOTHING",
-                [notes_ref.into(), object.clone().into(), blob.clone().into()],
-            ))
-            .await?;
-        if result.rows_affected() == 0 {
-            txn.rollback().await?;
-            return Err(NotesError::MergeRaced {
-                object: object.clone(),
-            });
-        }
-    }
-    for (object, new_blob, expected_current) in &conflict_updates {
-        if let Some(blob) = new_blob {
-            let result = txn
-                .execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Sqlite,
-                    "UPDATE notes SET blob = ? WHERE notes_ref = ? AND object = ? AND blob = ?",
-                    [
-                        blob.clone().into(),
-                        notes_ref.into(),
-                        (*object).into(),
-                        (*expected_current).into(),
-                    ],
-                ))
-                .await?;
-            if result.rows_affected() == 0 {
-                txn.rollback().await?;
-                return Err(NotesError::MergeRaced {
-                    object: (*object).to_string(),
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+            let mut ops: Vec<crate::storage::NoteCasOp> = Vec::new();
+            for (object, blob) in &to_copy {
+                ops.push(crate::storage::NoteCasOp::InsertIfAbsent {
+                    object: object.clone(),
+                    blob: blob.clone(),
                 });
             }
+            for (object, new_blob, expected_current) in &conflict_updates {
+                if let Some(blob) = new_blob {
+                    ops.push(crate::storage::NoteCasOp::UpdateIfMatches {
+                        object: (*object).to_string(),
+                        expected_blob: (*expected_current).to_string(),
+                        new_blob: blob.clone(),
+                    });
+                }
+            }
+            if !ops.is_empty() {
+                match store
+                    .apply_notes_cas_batch(notes_ref, &ops)
+                    .await
+                    .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+                {
+                    crate::storage::NoteBatchOutcome::Applied { .. } => {}
+                    crate::storage::NoteBatchOutcome::CasConflict { object, .. } => {
+                        return Err(NotesError::MergeRaced { object });
+                    }
+                }
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let txn = crate::internal::db::begin_write_transaction(&db).await?;
+            for (object, blob) in &to_copy {
+                let result = txn
+                    .execute_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?) \
+                         ON CONFLICT(notes_ref, object) DO NOTHING",
+                        [notes_ref.into(), object.clone().into(), blob.clone().into()],
+                    ))
+                    .await?;
+                if result.rows_affected() == 0 {
+                    txn.rollback().await?;
+                    return Err(NotesError::MergeRaced {
+                        object: object.clone(),
+                    });
+                }
+            }
+            for (object, new_blob, expected_current) in &conflict_updates {
+                if let Some(blob) = new_blob {
+                    let result = txn
+                        .execute_raw(Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Sqlite,
+                            "UPDATE notes SET blob = ? WHERE notes_ref = ? AND object = ? AND blob = ?",
+                            [
+                                blob.clone().into(),
+                                notes_ref.into(),
+                                (*object).into(),
+                                (*expected_current).into(),
+                            ],
+                        ))
+                        .await?;
+                    if result.rows_affected() == 0 {
+                        txn.rollback().await?;
+                        return Err(NotesError::MergeRaced {
+                            object: (*object).to_string(),
+                        });
+                    }
+                }
+            }
+            txn.commit().await?;
         }
     }
-    txn.commit().await?;
 
     let merged = to_copy.len() + conflicts.len();
     let resolved_conflicts: Vec<String> =

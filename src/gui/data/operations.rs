@@ -1,11 +1,12 @@
 //! Operations projection for the window: real Operation v2 rows through the
 //! shared snapshot reader. Read-only: no operation rows are written.
 
-use super::{
-    repo,
-    snapshot::DataError,
-    state::{self, SourceState},
-};
+#[cfg(feature = "storage-sqlite")]
+use super::state;
+use super::{snapshot::DataError, state::SourceState};
+use crate::storage::StorageBackendKind;
+#[cfg(feature = "storage-redb")]
+use crate::storage::{ConfigStore, GitStateStore};
 
 /// One Operation v2 row shown by the Operations surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,85 +37,142 @@ pub const OPERATIONS_PAGE_SIZE: usize = 200;
 pub async fn read_operations(
     scope: &crate::internal::worktree_scope::RequestScope,
 ) -> Result<OperationsRead, DataError> {
-    let db_path = scope.storage.join(crate::utils::util::DATABASE);
-    match state::probe_path(&db_path) {
-        state::ProbeOutcome::Absent => {
-            return Ok(OperationsRead {
-                state: SourceState::Absent,
-                rows: Vec::new(),
-                truncated: false,
-            });
-        }
-        state::ProbeOutcome::Unreadable { kind } => {
-            return Err(DataError::new(
-                SourceState::Unreadable { kind },
-                "the repository database cannot be opened for reading",
-            ));
-        }
-        state::ProbeOutcome::Present => {}
-    }
-    let db_str = db_path.to_str().ok_or_else(|| {
-        DataError::new(
-            SourceState::Corrupt,
-            "the repository database path is not UTF-8",
-        )
-    })?;
-    let conn = crate::internal::db::open_connection_without_schema_management(
-        db_str,
-        repo::READ_BUSY_TIMEOUT,
-    )
-    .await
-    .map_err(|error| {
-        DataError::new(
-            state::classify_open_error(&error),
-            "the repository database is unusable",
-        )
-    })?;
-    // Validate schema compatibility on THIS connection, before reading rows.
-    let compatibility = crate::internal::db::schema::inspect_schema_for_connection(
-        &conn,
-        crate::internal::db::schema::DatabaseRole::Repository,
-    )
-    .await
-    .map_err(|error| {
-        DataError::new(
-            state::classify_store_message(&error.to_string()),
-            "the repository schema ledger could not be read",
-        )
-    })?;
-    match state::classify_schema(&compatibility) {
-        SourceState::Available => {}
-        other => {
-            return Err(DataError::new(
-                other,
-                "the repository schema does not match this binary",
-            ));
-        }
-    }
-    let repo_id = crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
-        .await
-        .map_err(|error| {
-            DataError::new(
-                state::classify_store_message(&error.to_string()),
-                "the repository identity could not be read",
-            )
-        })?
-        .map(|entry| entry.value)
-        .ok_or_else(|| {
-            DataError::new(
-                SourceState::Corrupt,
-                "the repository has no recorded identity",
+    let backend =
+        crate::storage::runtime::detect_repo_backend(&scope.storage).map_err(|error| {
+            super::context::map_storage_error(
+                &error,
+                "the repository backend could not be detected",
             )
         })?;
-    let (entries, truncated) = crate::command::op::operation_snapshot_rows(&conn, &repo_id)
-        .await
-        .map_err(|error| {
-            DataError::new(
-                state::classify_store_message(&error.to_string()),
-                "operation history could not be read",
-            )
-        })?;
-    conn.close().await.ok();
+    let (entries, truncated) = match backend {
+        StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let Some(snapshot) = read_operations_redb(scope).await? else {
+                    return Ok(OperationsRead {
+                        state: SourceState::Absent,
+                        rows: Vec::new(),
+                        truncated: false,
+                    });
+                };
+                snapshot
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                return Err(DataError::new(
+                    SourceState::Corrupt,
+                    "this Libra binary was compiled without `storage-redb`",
+                ));
+            }
+        }
+        StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let db_path = scope.storage.join(crate::utils::util::DATABASE);
+                match state::probe_path(&db_path) {
+                    state::ProbeOutcome::Absent => {
+                        return Ok(OperationsRead {
+                            state: SourceState::Absent,
+                            rows: Vec::new(),
+                            truncated: false,
+                        });
+                    }
+                    state::ProbeOutcome::Unreadable { kind } => {
+                        return Err(DataError::new(
+                            SourceState::Unreadable { kind },
+                            "the repository database cannot be opened for reading",
+                        ));
+                    }
+                    state::ProbeOutcome::Present => {}
+                }
+                let db_str = db_path.to_str().ok_or_else(|| {
+                    DataError::new(
+                        SourceState::Corrupt,
+                        "the repository database path is not UTF-8",
+                    )
+                })?;
+                let conn = crate::internal::db::open_connection_without_schema_management(
+                    db_str,
+                    super::repo::READ_BUSY_TIMEOUT,
+                )
+                .await
+                .map_err(|error| {
+                    DataError::new(
+                        state::classify_open_error(&error),
+                        "the repository database is unusable",
+                    )
+                })?;
+                // Validate schema compatibility on THIS connection, before reading rows.
+                let compatibility = crate::internal::db::schema::inspect_schema_for_connection(
+                    &conn,
+                    crate::internal::db::schema::DatabaseRole::Repository,
+                )
+                .await
+                .map_err(|error| {
+                    DataError::new(
+                        state::classify_store_message(&error.to_string()),
+                        "the repository schema ledger could not be read",
+                    )
+                })?;
+                match state::classify_schema(&compatibility) {
+                    SourceState::Available => {}
+                    other => {
+                        return Err(DataError::new(
+                            other,
+                            "the repository schema does not match this binary",
+                        ));
+                    }
+                }
+                let repo_id =
+                    crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
+                        .await
+                        .map_err(|error| {
+                            DataError::new(
+                                state::classify_store_message(&error.to_string()),
+                                "the repository identity could not be read",
+                            )
+                        })?
+                        .map(|entry| entry.value)
+                        .ok_or_else(|| {
+                            DataError::new(
+                                SourceState::Corrupt,
+                                "the repository has no recorded identity",
+                            )
+                        })?;
+                let (raw_entries, truncated) =
+                    crate::command::op::operation_snapshot_rows(&conn, &repo_id)
+                        .await
+                        .map_err(|error| {
+                            DataError::new(
+                                state::classify_store_message(&error.to_string()),
+                                "operation history could not be read",
+                            )
+                        })?;
+                conn.close().await.ok();
+                let entries: Vec<RawOperationEntry> = raw_entries
+                    .into_iter()
+                    .map(|entry| RawOperationEntry {
+                        op_id: entry.op_id,
+                        command_name: entry.command_name,
+                        description: entry.description,
+                        actor: entry.actor,
+                        status: entry.status,
+                        start_ts: entry.start_ts,
+                        end_ts: entry.end_ts,
+                        view_id: entry.view_id,
+                    })
+                    .collect();
+                (entries, truncated)
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                return Err(DataError::new(
+                    SourceState::Corrupt,
+                    "this Libra binary was compiled without `storage-sqlite`",
+                ));
+            }
+        }
+    };
     let redactor = crate::internal::ai::observed_agents::redaction::Redactor::new_default();
     let rows: Vec<OperationRow> = entries
         .into_iter()
@@ -146,6 +204,93 @@ pub async fn read_operations(
         rows,
         truncated,
     })
+}
+
+struct RawOperationEntry {
+    op_id: String,
+    command_name: String,
+    description: String,
+    actor: String,
+    status: String,
+    start_ts: i64,
+    end_ts: Option<i64>,
+    view_id: String,
+}
+
+#[cfg(feature = "storage-redb")]
+async fn read_operations_redb(
+    scope: &crate::internal::worktree_scope::RequestScope,
+) -> Result<Option<(Vec<RawOperationEntry>, bool)>, DataError> {
+    let Some((git_db_path, config_store)) =
+        super::context::open_redb_repo_config_checked(&scope.storage).await?
+    else {
+        return Ok(None);
+    };
+    let repo_id = config_store
+        .get("libra.repoid")
+        .await
+        .map_err(|error| {
+            super::context::map_storage_error(&error, "the repository identity could not be read")
+        })?
+        .map(|entry| entry.value)
+        .ok_or_else(|| {
+            DataError::new(
+                SourceState::Corrupt,
+                "the repository has no recorded identity",
+            )
+        })?;
+    drop(config_store);
+
+    let state_store = tokio::task::spawn_blocking(move || {
+        crate::storage::RedbGitStateStore::open_read_only(&git_db_path)
+    })
+    .await
+    .map_err(|_| {
+        DataError::new(
+            SourceState::Corrupt,
+            "the repository state store open task failed",
+        )
+    })?
+    .map_err(|error| {
+        super::context::map_storage_error(&error, "the repository database is unusable")
+    })?;
+
+    let mut records = state_store
+        .list_operations(&repo_id)
+        .await
+        .map_err(|error| {
+            super::context::map_storage_error(&error, "operation history could not be read")
+        })?;
+    records.sort_by(|(a, _), (b, _)| {
+        b.end_ts
+            .cmp(&a.end_ts)
+            .then_with(|| b.start_ts.cmp(&a.start_ts))
+            .then_with(|| b.op_id.cmp(&a.op_id))
+    });
+    let cap = crate::command::op::OPERATION_SNAPSHOT_CAP;
+    let truncated = records.len() > cap;
+    let entries = records
+        .into_iter()
+        .take(cap)
+        .map(|(rec, _)| {
+            let status = match rec.status.as_str() {
+                "success" => "succeeded".to_string(),
+                "aborted" => "canceled".to_string(),
+                other => other.to_string(),
+            };
+            RawOperationEntry {
+                op_id: rec.op_id,
+                command_name: rec.command_name.unwrap_or_else(|| rec.kind.clone()),
+                description: rec.description.unwrap_or(rec.kind),
+                actor: rec.actor.unwrap_or_default(),
+                status,
+                start_ts: rec.start_ts.div_euclid(1000),
+                end_ts: rec.end_ts.map(|ts| ts.div_euclid(1000)),
+                view_id: rec.post_view_oid,
+            }
+        })
+        .collect();
+    Ok(Some((entries, truncated)))
 }
 
 /// Byte/row bounds for one page of a fixed snapshot.

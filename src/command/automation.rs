@@ -307,18 +307,27 @@ fn parse_now(now: Option<String>) -> CliResult<DateTime<Utc>> {
 }
 
 async fn open_repo_db() -> CliResult<sea_orm::DatabaseConnection> {
-    let db_path = try_get_storage_path(None)
-        .map(|storage| storage.join(DATABASE))
-        .map_err(|error| {
-            CliError::repo_not_found()
-                .with_hint(format!("failed to resolve repository storage: {error}"))
-        })?;
-    get_db_conn_instance_for_path(&db_path)
-        .await
-        .map_err(|error| {
-            CliError::failure(format!(
-                "failed to open repository database {}: {error}",
-                db_path.display()
-            ))
-        })
+    let storage = try_get_storage_path(None).map_err(|error| {
+        CliError::repo_not_found()
+            .with_hint(format!("failed to resolve repository storage: {error}"))
+    })?;
+    match crate::storage::runtime::detect_repo_backend(&storage) {
+        Ok(crate::storage::StorageBackendKind::Redb) => Err(CliError::failure(
+            "SQLite repository database is unavailable on a redb repository; use GitStateStore helpers",
+        )),
+        Ok(crate::storage::StorageBackendKind::Sqlite) => {
+            let db_path = storage.join(DATABASE);
+            get_db_conn_instance_for_path(&db_path)
+                .await
+                .map_err(|error| {
+                    CliError::failure(format!(
+                        "failed to open repository database {}: {error}",
+                        db_path.display()
+                    ))
+                })
+        }
+        Err(error) => Err(CliError::failure(format!(
+            "failed to detect repository backend: {error}"
+        ))),
+    }
 }

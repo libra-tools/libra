@@ -3936,24 +3936,40 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
         // A database that is not a repository's `libra.db` (an in-memory or
         // fixture file) has no paired capture catalog.
         let storage_root = crate::internal::db::connection_storage_root(db).await.ok();
-        if let Some(storage_root) = storage_root.filter(|storage_root| {
-            crate::internal::ai::capture::store::capture_database_path(storage_root).is_file()
-        }) {
-            let capture = crate::internal::ai::capture::store::open_readonly(
-                &storage_root,
-                crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
-            )
-            .await
-            .map_err(|err| {
-                CliError::fatal(format!(
-                    "failed to open the capture catalog for GC roots: {err}"
-                ))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-            })?;
-            Box::pin(collect_registered_store_roots(
-                &capture, storage, boundaries, reachable,
-            ))
-            .await?;
+        if let Some(storage_root) = storage_root {
+            match crate::storage::runtime::detect_repo_backend(&storage_root) {
+                Ok(crate::storage::StorageBackendKind::Redb) => {
+                    // Redb capture roots are collected through `CaptureStore` on the
+                    // Redb GC path; never open `.libra/private/capture.db` via SQLite.
+                }
+                Ok(crate::storage::StorageBackendKind::Sqlite) => {
+                    if crate::internal::ai::capture::store::capture_database_path(&storage_root)
+                        .is_file()
+                    {
+                        let capture = crate::internal::ai::capture::store::open_readonly(
+                            &storage_root,
+                            crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|err| {
+                            CliError::fatal(format!(
+                                "failed to open the capture catalog for GC roots: {err}"
+                            ))
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                        })?;
+                        Box::pin(collect_registered_store_roots(
+                            &capture, storage, boundaries, reachable,
+                        ))
+                        .await?;
+                    }
+                }
+                Err(err) => {
+                    return Err(CliError::fatal(format!(
+                        "failed to detect repository backend while computing GC roots: {err}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed));
+                }
+            }
         }
     }
 

@@ -2717,6 +2717,7 @@ mod live_pipeline_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "storage-redb")]
     use super::*;
 
     #[cfg(feature = "storage-redb")]

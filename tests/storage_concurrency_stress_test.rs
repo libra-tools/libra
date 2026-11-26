@@ -975,3 +975,2044 @@ async fn dual_feature_migration_and_stress_roundtrip() {
 fn post_unlock_libra_migrate_binary_bidirectional_roundtrip() {
     dual_feature_stress::post_unlock_libra_migrate_binary_bidirectional_roundtrip_impl();
 }
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+mod rb29b_ast_audit {
+    use std::{
+        collections::{BTreeMap, BTreeSet, HashMap},
+        fmt, fs,
+        path::{Path, PathBuf},
+    };
+
+    use syn::{parse::Parse, spanned::Spanned, visit::Visit};
+
+    /// Explicitly exempt files per Requirement #5 / RB-29b:
+    /// 3 external read-only SQLite parsers + 3 forbidden-to-modify files.
+    const EXEMPT_FILES: &[&str] = &[
+        "src/internal/ai/capture/store.rs",
+        "src/internal/ai/capture/detach.rs",
+        "src/internal/ai/provider_index_io.rs",
+        "src/internal/ai/observed_agents/codex_index.rs",
+        "src/internal/ai/observed_agents/builtin/hermes.rs",
+        "src/utils/shared_perm.rs",
+    ];
+
+    /// Direct SQLite/SeaORM database opener function names (unqualified or final segment).
+    const DIRECT_OPENER_FNS: &[&str] = &[
+        "get_db_conn_instance",
+        "get_db_conn_instance_for_path",
+        "open_cached_repository",
+        "open_database_without_migrations",
+        "open_connection_without_schema_management",
+        "open_repository_with_busy_timeout",
+        "open_readonly_connection_for_role",
+        "establish_connection",
+        "establish_connection_for_role",
+        "establish_connection_with_lock_timeout",
+        "establish_connection_with_lock_timeout_for_role",
+        "create_database",
+        "create_database_for_role",
+        "request_db",
+        "request_db_checked",
+    ];
+
+    /// Connection-derived SQLite peer helpers defined in `src/internal/db.rs` that take an
+    /// already-open `&DatabaseConnection` / `&impl ConnectionTrait`. They cannot open a DB
+    /// cold; they are allowed inside connection-passing SQLite functions or paired
+    /// `StorageBackendKind::Sqlite`/`Redb` dispatch, and rejected from unwired callers.
+    const CONN_DERIVED_PEER_FNS: &[&str] = &["open_paired_repository", "repository_peer"];
+
+    /// Capture store SQLite opener functions (`capture::store::open*`).
+    const CAPTURE_STORE_OPENERS: &[&str] = &[
+        "open",
+        "open_readonly",
+        "open_current",
+        "open_existing_writer",
+    ];
+
+    /// Concrete SQLite store wrappers whose `open*` / `create` constructors open SQLite.
+    const SQLITE_STORE_TYPES: &[&str] = &[
+        "SqliteGitStore",
+        "SqliteGitStateStore",
+        "SqliteCaptureStore",
+        "SqliteConfigStore",
+    ];
+
+    /// SeaORM / SQLite connection type identifiers in function signatures.
+    const CONN_TYPE_IDENTS: &[&str] = &[
+        "DatabaseConnection",
+        "DatabaseTransaction",
+        "DbConn",
+        "ConnectionTrait",
+    ];
+
+    /// Direct SeaORM raw query / SQLite write-tx helpers that must never run outside
+    /// a connection-passing function or paired `StorageBackendKind::Sqlite`/`Redb` dispatch.
+    const DIRECT_SQLITE_QUERY_METHODS: &[&str] = &[
+        "execute_raw",
+        "execute_unprepared",
+        "query_one_raw",
+        "query_all_raw",
+    ];
+
+    #[derive(Debug, Clone)]
+    pub(super) struct SourceUnit {
+        pub(super) path: String,
+        pub(super) source: String,
+    }
+
+    #[derive(Debug, Clone)]
+    pub(super) struct AuditParseError {
+        pub(super) path: String,
+        pub(super) line: usize,
+        pub(super) message: String,
+    }
+
+    impl fmt::Display for AuditParseError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "fail-closed syn parse error in {}:{}: {}",
+                self.path, self.line, self.message
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    pub(super) struct AuditViolation {
+        pub(super) path: String,
+        pub(super) line: usize,
+        pub(super) function: String,
+        pub(super) kind: &'static str,
+        pub(super) detail: String,
+    }
+
+    impl fmt::Display for AuditViolation {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "{}:{}:{} [{}] {}",
+                self.path, self.line, self.function, self.kind, self.detail
+            )
+        }
+    }
+
+    fn normalize_rel(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    fn is_statically_excluded_path(rel: &str) -> bool {
+        if rel.starts_with("src/storage/")
+            || rel == "src/internal/db.rs"
+            || rel.starts_with("src/internal/db/")
+            || rel.starts_with("src/internal/model/")
+            || rel.starts_with("src/bin/")
+        {
+            return true;
+        }
+        if EXEMPT_FILES.contains(&rel) {
+            return true;
+        }
+        if rel.contains("/tests/") {
+            return true;
+        }
+        let path = Path::new(rel);
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && (matches!(stem, "test" | "tests")
+                || stem.ends_with("_test")
+                || stem.ends_with("_tests"))
+        {
+            return true;
+        }
+        false
+    }
+
+    fn collect_src_files(repo_root: &Path) -> Vec<SourceUnit> {
+        let src_dir = repo_root.join("src");
+        let mut paths = Vec::new();
+        let mut stack = vec![src_dir];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir)
+                .unwrap_or_else(|err| panic!("failed to read '{}': {err}", dir.display()))
+            {
+                let entry = entry.unwrap_or_else(|err| {
+                    panic!("failed to read entry in '{}': {err}", dir.display())
+                });
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+
+        let mut units = Vec::new();
+        for path in paths {
+            let rel = path
+                .strip_prefix(repo_root)
+                .map(normalize_rel)
+                .unwrap_or_else(|_| normalize_rel(&path));
+            if is_statically_excluded_path(&rel) {
+                continue;
+            }
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read '{}': {err}", path.display()));
+            units.push(SourceUnit { path: rel, source });
+        }
+        units
+    }
+
+    /// True ONLY for exact `#[cfg(test)]` or `#[cfg(all(test, ...))]` attributes.
+    /// `#[cfg(any(test, ...))]`, `#[cfg(not(test))]`, and `#[cfg(feature = "storage-sqlite")]`
+    /// all compile in production and MUST return `false`.
+    fn is_cfg_test_meta(meta: &syn::Meta) -> bool {
+        match meta {
+            syn::Meta::Path(path) => path.is_ident("test"),
+            syn::Meta::List(list) if list.path.is_ident("all") => {
+                let mut found_test = false;
+                let _ = list.parse_nested_meta(|nested| {
+                    if nested.path.is_ident("test") {
+                        found_test = true;
+                        Ok(())
+                    } else if nested.path.is_ident("all") {
+                        let content;
+                        syn::parenthesized!(content in nested.input);
+                        let nested_metas: syn::punctuated::Punctuated<syn::Meta, syn::Token![,]> =
+                            content.parse_terminated(syn::Meta::parse, syn::Token![,])?;
+                        if nested_metas.iter().any(is_cfg_test_meta) {
+                            found_test = true;
+                        }
+                        Ok(())
+                    } else {
+                        if nested.input.peek(syn::Token![=]) {
+                            let _eq: syn::Token![=] = nested.input.parse()?;
+                            let _val: syn::Expr = nested.input.parse()?;
+                        } else if nested.input.peek(syn::token::Paren) {
+                            let content;
+                            syn::parenthesized!(content in nested.input);
+                            let _: proc_macro2::TokenStream = content.parse()?;
+                        }
+                        Ok(())
+                    }
+                });
+                found_test
+            }
+            _ => false,
+        }
+    }
+
+    fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            if !attr.path().is_ident("cfg") {
+                return false;
+            }
+            attr.parse_args::<syn::Meta>()
+                .map(|meta| is_cfg_test_meta(&meta))
+                .unwrap_or(false)
+        })
+    }
+
+    fn extract_path_attr(attrs: &[syn::Attribute]) -> Option<String> {
+        for attr in attrs {
+            if !attr.path().is_ident("path") {
+                continue;
+            }
+            if let syn::Meta::NameValue(nv) = &attr.meta
+                && let syn::Expr::Lit(expr_lit) = &nv.value
+                && let syn::Lit::Str(lit_str) = &expr_lit.lit
+            {
+                return Some(lit_str.value());
+            }
+        }
+        None
+    }
+
+    fn syn_item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+        match item {
+            syn::Item::Const(i) => &i.attrs,
+            syn::Item::Enum(i) => &i.attrs,
+            syn::Item::ExternCrate(i) => &i.attrs,
+            syn::Item::Fn(i) => &i.attrs,
+            syn::Item::ForeignMod(i) => &i.attrs,
+            syn::Item::Impl(i) => &i.attrs,
+            syn::Item::Macro(i) => &i.attrs,
+            syn::Item::Mod(i) => &i.attrs,
+            syn::Item::Static(i) => &i.attrs,
+            syn::Item::Struct(i) => &i.attrs,
+            syn::Item::Trait(i) => &i.attrs,
+            syn::Item::TraitAlias(i) => &i.attrs,
+            syn::Item::Type(i) => &i.attrs,
+            syn::Item::Union(i) => &i.attrs,
+            syn::Item::Use(i) => &i.attrs,
+            _ => &[],
+        }
+    }
+
+    fn syn_impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+        match item {
+            syn::ImplItem::Const(i) => &i.attrs,
+            syn::ImplItem::Fn(i) => &i.attrs,
+            syn::ImplItem::Type(i) => &i.attrs,
+            syn::ImplItem::Macro(i) => &i.attrs,
+            _ => &[],
+        }
+    }
+
+    fn syn_trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+        match item {
+            syn::TraitItem::Const(i) => &i.attrs,
+            syn::TraitItem::Fn(i) => &i.attrs,
+            syn::TraitItem::Type(i) => &i.attrs,
+            syn::TraitItem::Macro(i) => &i.attrs,
+            _ => &[],
+        }
+    }
+
+    fn syn_stmt_attrs(stmt: &syn::Stmt) -> &[syn::Attribute] {
+        match stmt {
+            syn::Stmt::Local(l) => &l.attrs,
+            syn::Stmt::Item(i) => syn_item_attrs(i),
+            syn::Stmt::Expr(e, _) => syn_expr_attrs(e),
+            syn::Stmt::Macro(m) => &m.attrs,
+        }
+    }
+
+    fn syn_expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+        match expr {
+            syn::Expr::Array(e) => &e.attrs,
+            syn::Expr::Assign(e) => &e.attrs,
+            syn::Expr::Async(e) => &e.attrs,
+            syn::Expr::Await(e) => &e.attrs,
+            syn::Expr::Binary(e) => &e.attrs,
+            syn::Expr::Block(e) => &e.attrs,
+            syn::Expr::Break(e) => &e.attrs,
+            syn::Expr::Call(e) => &e.attrs,
+            syn::Expr::Cast(e) => &e.attrs,
+            syn::Expr::Closure(e) => &e.attrs,
+            syn::Expr::Const(e) => &e.attrs,
+            syn::Expr::Continue(e) => &e.attrs,
+            syn::Expr::Field(e) => &e.attrs,
+            syn::Expr::ForLoop(e) => &e.attrs,
+            syn::Expr::Group(e) => &e.attrs,
+            syn::Expr::If(e) => &e.attrs,
+            syn::Expr::Index(e) => &e.attrs,
+            syn::Expr::Infer(e) => &e.attrs,
+            syn::Expr::Let(e) => &e.attrs,
+            syn::Expr::Lit(e) => &e.attrs,
+            syn::Expr::Loop(e) => &e.attrs,
+            syn::Expr::Macro(e) => &e.attrs,
+            syn::Expr::Match(e) => &e.attrs,
+            syn::Expr::MethodCall(e) => &e.attrs,
+            syn::Expr::Paren(e) => &e.attrs,
+            syn::Expr::Path(e) => &e.attrs,
+            syn::Expr::Range(e) => &e.attrs,
+            syn::Expr::RawAddr(e) => &e.attrs,
+            syn::Expr::Reference(e) => &e.attrs,
+            syn::Expr::Repeat(e) => &e.attrs,
+            syn::Expr::Return(e) => &e.attrs,
+            syn::Expr::Struct(e) => &e.attrs,
+            syn::Expr::Try(e) => &e.attrs,
+            syn::Expr::TryBlock(e) => &e.attrs,
+            syn::Expr::Tuple(e) => &e.attrs,
+            syn::Expr::Unary(e) => &e.attrs,
+            syn::Expr::Unsafe(e) => &e.attrs,
+            syn::Expr::While(e) => &e.attrs,
+            syn::Expr::Yield(e) => &e.attrs,
+            _ => &[],
+        }
+    }
+
+    fn path_segments(path: &syn::Path) -> Vec<String> {
+        path.segments.iter().map(|s| s.ident.to_string()).collect()
+    }
+
+    fn path_to_string(path: &syn::Path) -> String {
+        path_segments(path).join("::")
+    }
+
+    fn self_type_name(ty: &syn::Type) -> Option<String> {
+        match ty {
+            syn::Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),
+            syn::Type::Reference(r) => self_type_name(&r.elem),
+            syn::Type::Paren(p) => self_type_name(&p.elem),
+            syn::Type::Group(g) => self_type_name(&g.elem),
+            _ => None,
+        }
+    }
+
+    /// Resolve out-of-line `#[cfg(test)] mod foo;` / `#[cfg(test)] #[path = "..."] mod foo;`
+    /// declarations across parsed files so test-only helper files (like `src/internal/source_scan.rs`)
+    /// are excluded without guessing.
+    fn collect_cfg_test_out_of_line_modules(parsed: &[(String, syn::File)]) -> BTreeSet<String> {
+        struct OutOfLineModFinder {
+            parent_rel: String,
+            cfg_test_targets: Vec<String>,
+            non_test_targets: Vec<String>,
+            in_cfg_test: bool,
+        }
+
+        impl OutOfLineModFinder {
+            fn resolve_mod_candidates(
+                &self,
+                mod_ident: &str,
+                path_attr: Option<&str>,
+            ) -> Vec<String> {
+                let parent = Path::new(&self.parent_rel);
+                let parent_dir = parent.parent().unwrap_or_else(|| Path::new(""));
+                let file_name = parent.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                let file_stem = parent.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let is_mod_root = matches!(file_name, "mod.rs" | "lib.rs" | "main.rs");
+
+                if let Some(explicit) = path_attr {
+                    let base = if is_mod_root {
+                        parent_dir.to_path_buf()
+                    } else {
+                        // Rust resolves `#[path]` on a non-mod.rs file relative to parent_dir first
+                        // (or subdir for inline mods); record both to be safe.
+                        parent_dir.to_path_buf()
+                    };
+                    let mut out = vec![normalize_rel(&base.join(explicit))];
+                    if !is_mod_root {
+                        out.push(normalize_rel(&parent_dir.join(file_stem).join(explicit)));
+                    }
+                    return out;
+                }
+
+                let base = if is_mod_root {
+                    parent_dir.to_path_buf()
+                } else {
+                    parent_dir.join(file_stem)
+                };
+                vec![
+                    normalize_rel(&base.join(format!("{mod_ident}.rs"))),
+                    normalize_rel(&base.join(mod_ident).join("mod.rs")),
+                ]
+            }
+        }
+
+        impl<'ast> Visit<'ast> for OutOfLineModFinder {
+            fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                let is_test = self.in_cfg_test || has_cfg_test(&item.attrs);
+                if item.content.is_none() {
+                    let ident = item.ident.to_string();
+                    let path_attr = extract_path_attr(&item.attrs);
+                    let candidates = self.resolve_mod_candidates(&ident, path_attr.as_deref());
+                    if is_test {
+                        self.cfg_test_targets.extend(candidates);
+                    } else {
+                        self.non_test_targets.extend(candidates);
+                    }
+                    return;
+                }
+                let prev = self.in_cfg_test;
+                self.in_cfg_test = is_test;
+                syn::visit::visit_item_mod(self, item);
+                self.in_cfg_test = prev;
+            }
+        }
+
+        let mut test_only = BTreeSet::new();
+        let mut non_test = BTreeSet::new();
+        for (rel, file) in parsed {
+            let mut finder = OutOfLineModFinder {
+                parent_rel: rel.clone(),
+                cfg_test_targets: Vec::new(),
+                non_test_targets: Vec::new(),
+                in_cfg_test: false,
+            };
+            finder.visit_file(file);
+            test_only.extend(finder.cfg_test_targets);
+            non_test.extend(finder.non_test_targets);
+        }
+        // Only treat a file as test-only if it is NEVER included as a non-test module.
+        for prod in non_test {
+            test_only.remove(&prod);
+        }
+        test_only
+    }
+
+    /// Collect `use` aliases and glob imports in a scope so renamed imports
+    /// (e.g. `use crate::internal::db::get_db_conn_instance as open_it;`) cannot evade detection.
+    fn collect_use_tree(
+        tree: &syn::UseTree,
+        prefix: &str,
+        aliases: &mut HashMap<String, String>,
+        has_storage_backend_glob: &mut bool,
+        has_rusqlite_import: &mut bool,
+    ) {
+        let join = |p: &str, seg: &str| {
+            if p.is_empty() {
+                seg.to_string()
+            } else {
+                format!("{p}::{seg}")
+            }
+        };
+        match tree {
+            syn::UseTree::Path(p) => {
+                let next = join(prefix, &p.ident.to_string());
+                if p.ident == "rusqlite" {
+                    *has_rusqlite_import = true;
+                }
+                collect_use_tree(
+                    &p.tree,
+                    &next,
+                    aliases,
+                    has_storage_backend_glob,
+                    has_rusqlite_import,
+                );
+            }
+            syn::UseTree::Name(n) => {
+                let ident = n.ident.to_string();
+                if ident == "self" {
+                    if let Some(last) = prefix.rsplit("::").next() {
+                        aliases.insert(last.to_string(), prefix.to_string());
+                    }
+                } else {
+                    let full = join(prefix, &ident);
+                    if full.contains("rusqlite") {
+                        *has_rusqlite_import = true;
+                    }
+                    aliases.insert(ident, full);
+                }
+            }
+            syn::UseTree::Rename(r) => {
+                let orig = r.ident.to_string();
+                let alias = r.rename.to_string();
+                let full = if orig == "self" {
+                    prefix.to_string()
+                } else {
+                    join(prefix, &orig)
+                };
+                if full.contains("rusqlite") {
+                    *has_rusqlite_import = true;
+                }
+                aliases.insert(alias, full);
+            }
+            syn::UseTree::Glob(_) => {
+                if prefix.ends_with("StorageBackendKind") {
+                    *has_storage_backend_glob = true;
+                }
+                if prefix.contains("rusqlite") {
+                    *has_rusqlite_import = true;
+                }
+            }
+            syn::UseTree::Group(g) => {
+                for item in &g.items {
+                    collect_use_tree(
+                        item,
+                        prefix,
+                        aliases,
+                        has_storage_backend_glob,
+                        has_rusqlite_import,
+                    );
+                }
+            }
+        }
+    }
+
+    fn expand_path_with_aliases(path: &str, aliases: &HashMap<String, String>) -> String {
+        let mut parts = path.splitn(2, "::");
+        let Some(first) = parts.next() else {
+            return path.to_string();
+        };
+        if let Some(target) = aliases.get(first) {
+            if let Some(rest) = parts.next() {
+                format!("{target}::{rest}")
+            } else {
+                target.clone()
+            }
+        } else {
+            path.to_string()
+        }
+    }
+
+    /// Inspect generics + where clause for type parameters bounded by `ConnectionTrait`.
+    fn collect_conn_trait_generics(generics: &syn::Generics) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for param in &generics.params {
+            if let syn::GenericParam::Type(tp) = param
+                && bounds_mention_connection_trait(&tp.bounds)
+            {
+                out.insert(tp.ident.to_string());
+            }
+        }
+        if let Some(wc) = &generics.where_clause {
+            for pred in &wc.predicates {
+                if let syn::WherePredicate::Type(pt) = pred
+                    && bounds_mention_connection_trait(&pt.bounds)
+                    && let Some(name) = self_type_name(&pt.bounded_ty)
+                {
+                    out.insert(name);
+                }
+            }
+        }
+        out
+    }
+
+    fn bounds_mention_connection_trait(
+        bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    ) -> bool {
+        bounds.iter().any(|b| match b {
+            syn::TypeParamBound::Trait(tb) => tb
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "ConnectionTrait"),
+            _ => false,
+        })
+    }
+
+    /// True if a struct field or function parameter MANDATORILY (non-`Option`) holds a SeaORM/SQLite connection
+    /// (e.g. `DatabaseConnection`, `&'a DatabaseConnection`, `DbConn`, `&'a C` where `C: ConnectionTrait`).
+    /// Deliberately returns `false` for `Option<DatabaseConnection>` or enums so dual-backend
+    /// context structs cannot be confused with SQLite-only connection bundles.
+    fn field_mandatorily_holds_conn(
+        ty: &syn::Type,
+        conn_generics: &BTreeSet<String>,
+        conn_holding_structs: &BTreeSet<String>,
+    ) -> bool {
+        match ty {
+            syn::Type::Reference(r) => {
+                field_mandatorily_holds_conn(&r.elem, conn_generics, conn_holding_structs)
+            }
+            syn::Type::Paren(p) => {
+                field_mandatorily_holds_conn(&p.elem, conn_generics, conn_holding_structs)
+            }
+            syn::Type::Group(g) => {
+                field_mandatorily_holds_conn(&g.elem, conn_generics, conn_holding_structs)
+            }
+            syn::Type::Path(tp) => {
+                let Some(last) = tp.path.segments.last() else {
+                    return false;
+                };
+                let ident = last.ident.to_string();
+                if ident == "Option" || ident == "Vec" || ident == "Result" {
+                    return false;
+                }
+                if CONN_TYPE_IDENTS.contains(&ident.as_str())
+                    || conn_holding_structs.contains(&ident)
+                    || (tp.path.segments.len() == 1 && conn_generics.contains(&ident))
+                {
+                    return true;
+                }
+                // Check single-wrapper smart pointers like `Arc<DatabaseConnection>`, `Box<...>`.
+                if matches!(ident.as_str(), "Arc" | "Rc" | "Box" | "Mutex" | "RwLock")
+                    && let syn::PathArguments::AngleBracketed(ab) = &last.arguments
+                {
+                    return ab.args.iter().any(|arg| {
+                        matches!(arg, syn::GenericArgument::Type(inner) if field_mandatorily_holds_conn(inner, conn_generics, conn_holding_structs))
+                    });
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn type_mentions_conn_or_bundle(
+        ty: &syn::Type,
+        conn_generics: &BTreeSet<String>,
+        conn_holding_structs: &BTreeSet<String>,
+    ) -> bool {
+        // Only mandatory (non-`Option`, non-`Vec`, non-`Result`) connection parameters
+        // or mandatory-conn struct bundles make a function a SQLite connection-passing function.
+        // Dual-backend helpers taking `Option<&DatabaseConnection>` alongside a `GitStore` are
+        // audited directly on their bodies instead.
+        if field_mandatorily_holds_conn(ty, conn_generics, conn_holding_structs) {
+            return true;
+        }
+        // Also recognize `impl ConnectionTrait` and `dyn ConnectionTrait` parameter types.
+        match ty {
+            syn::Type::Reference(r) => {
+                type_mentions_conn_or_bundle(&r.elem, conn_generics, conn_holding_structs)
+            }
+            syn::Type::ImplTrait(it) => bounds_mention_connection_trait(&it.bounds),
+            syn::Type::TraitObject(to) => bounds_mention_connection_trait(&to.bounds),
+            syn::Type::Paren(p) => {
+                type_mentions_conn_or_bundle(&p.elem, conn_generics, conn_holding_structs)
+            }
+            syn::Type::Group(g) => {
+                type_mentions_conn_or_bundle(&g.elem, conn_generics, conn_holding_structs)
+            }
+            _ => false,
+        }
+    }
+
+    fn signature_accepts_conn(
+        sig: &syn::Signature,
+        impl_conn_generics: &BTreeSet<String>,
+        impl_type_holds_conn: bool,
+        conn_holding_structs: &BTreeSet<String>,
+    ) -> bool {
+        let name = sig.ident.to_string();
+        if name.ends_with("_with_conn") {
+            return true;
+        }
+        let mut conn_generics = impl_conn_generics.clone();
+        conn_generics.extend(collect_conn_trait_generics(&sig.generics));
+
+        for input in &sig.inputs {
+            match input {
+                syn::FnArg::Receiver(_) => {
+                    if !impl_conn_generics.is_empty() || impl_type_holds_conn {
+                        return true;
+                    }
+                }
+                syn::FnArg::Typed(pt) => {
+                    if type_mentions_conn_or_bundle(&pt.ty, &conn_generics, conn_holding_structs) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn canonical_module_path_from_file(rel: &str) -> String {
+        let trimmed = rel.strip_prefix("src/").unwrap_or(rel);
+        let without_ext = trimmed.strip_suffix(".rs").unwrap_or(trimmed);
+        if without_ext == "lib" || without_ext == "main" {
+            return "crate".to_string();
+        }
+        let mod_part = without_ext.strip_suffix("/mod").unwrap_or(without_ext);
+        format!("crate::{}", mod_part.replace('/', "::"))
+    }
+
+    fn stmt_has_cfg_attr(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|a| a.path().is_ident("cfg"))
+    }
+
+    fn expr_unconditionally_diverges(expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Return(_) | syn::Expr::Break(_) | syn::Expr::Continue(_) => true,
+            syn::Expr::Macro(em) => em.mac.path.segments.last().is_some_and(|s| {
+                matches!(
+                    s.ident.to_string().as_str(),
+                    "panic" | "unreachable" | "todo" | "unimplemented"
+                )
+            }),
+            syn::Expr::Block(eb) => block_unconditionally_diverges(&eb.block),
+            syn::Expr::Group(g) => expr_unconditionally_diverges(&g.expr),
+            syn::Expr::Paren(p) => expr_unconditionally_diverges(&p.expr),
+            syn::Expr::If(ei) => {
+                block_unconditionally_diverges(&ei.then_branch)
+                    && ei
+                        .else_branch
+                        .as_ref()
+                        .is_some_and(|(_, eb)| expr_unconditionally_diverges(eb))
+            }
+            syn::Expr::Match(em) => {
+                let active: Vec<&syn::Arm> =
+                    em.arms.iter().filter(|a| !has_cfg_test(&a.attrs)).collect();
+                !active.is_empty()
+                    && active
+                        .iter()
+                        .all(|a| expr_unconditionally_diverges(&a.body))
+            }
+            _ => false,
+        }
+    }
+
+    fn stmt_unconditionally_diverges(stmt: &syn::Stmt) -> bool {
+        match stmt {
+            syn::Stmt::Expr(e, _) => expr_unconditionally_diverges(e),
+            syn::Stmt::Macro(m) => m.mac.path.segments.last().is_some_and(|s| {
+                matches!(
+                    s.ident.to_string().as_str(),
+                    "panic" | "unreachable" | "todo" | "unimplemented"
+                )
+            }),
+            _ => false,
+        }
+    }
+
+    fn block_unconditionally_diverges(block: &syn::Block) -> bool {
+        let active: Vec<&syn::Stmt> = block
+            .stmts
+            .iter()
+            .filter(|s| !has_cfg_test(syn_stmt_attrs(s)))
+            .collect();
+        if active.is_empty() {
+            return false;
+        }
+        // Any unguarded statement that unconditionally diverges makes the whole block diverge.
+        for stmt in &active {
+            if !stmt_has_cfg_attr(syn_stmt_attrs(stmt)) && stmt_unconditionally_diverges(stmt) {
+                return true;
+            }
+        }
+        // If the block consists solely of mutually-gated `#[cfg(...)]` statements/blocks
+        // (e.g., `#[cfg(feature = "storage-redb")] { return ...; } #[cfg(not(feature = "storage-redb"))] { return Err(...); }`)
+        // and EVERY one of them unconditionally diverges, then the block unconditionally diverges.
+        active
+            .iter()
+            .all(|s| stmt_has_cfg_attr(syn_stmt_attrs(s)) && stmt_unconditionally_diverges(s))
+    }
+
+    /// Returns true if `expr` is a paired `StorageBackendKind` `match` where EVERY non-`Sqlite`
+    /// arm (including `StorageBackendKind::Redb`) unconditionally diverges, so statements
+    /// following this `match` in the same enclosing block can ONLY execute on `Sqlite`.
+    fn match_dominates_remainder_as_sqlite(
+        expr: &syn::ExprMatch,
+        allow_bare_variant: bool,
+    ) -> bool {
+        let active_arms: Vec<&syn::Arm> = expr
+            .arms
+            .iter()
+            .filter(|arm| !has_cfg_test(&arm.attrs))
+            .collect();
+        let has_sbk_sqlite = active_arms.iter().any(|arm| {
+            pat_matches_variant(
+                &arm.pat,
+                Some("StorageBackendKind"),
+                "Sqlite",
+                allow_bare_variant,
+            )
+        });
+        let has_sbk_redb = active_arms.iter().any(|arm| {
+            pat_matches_variant(
+                &arm.pat,
+                Some("StorageBackendKind"),
+                "Redb",
+                allow_bare_variant,
+            )
+        });
+        if !(has_sbk_sqlite && has_sbk_redb) {
+            return false;
+        }
+        active_arms.iter().all(|arm| {
+            let is_sqlite = pat_matches_variant(
+                &arm.pat,
+                Some("StorageBackendKind"),
+                "Sqlite",
+                allow_bare_variant,
+            );
+            let is_redb = pat_matches_variant(
+                &arm.pat,
+                Some("StorageBackendKind"),
+                "Redb",
+                allow_bare_variant,
+            );
+            if is_sqlite && !is_redb {
+                true
+            } else {
+                expr_unconditionally_diverges(&arm.body)
+            }
+        })
+    }
+
+    fn stmt_dominates_remainder_as_sqlite(stmt: &syn::Stmt, allow_bare_variant: bool) -> bool {
+        fn extract_match(e: &syn::Expr) -> Option<&syn::ExprMatch> {
+            match e {
+                syn::Expr::Match(m) => Some(m),
+                syn::Expr::Try(t) => match t.expr.as_ref() {
+                    syn::Expr::Match(m) => Some(m),
+                    _ => None,
+                },
+                syn::Expr::Await(a) => match a.base.as_ref() {
+                    syn::Expr::Match(m) => Some(m),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        match stmt {
+            syn::Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .and_then(|init| extract_match(&init.expr))
+                .is_some_and(|m| match_dominates_remainder_as_sqlite(m, allow_bare_variant)),
+            syn::Stmt::Expr(expr, _) => extract_match(expr)
+                .is_some_and(|m| match_dominates_remainder_as_sqlite(m, allow_bare_variant)),
+            _ => false,
+        }
+    }
+
+    /// Whole-tree Pass 1 catalog:
+    /// - All `*_with_conn` functions and connection-passing functions/methods.
+    /// - All dual-backend enums (having both `Sqlite` and `Redb` variants).
+    /// - All structs whose fields hold a `DatabaseConnection`/`DbConn`/`ConnectionTrait`.
+    #[derive(Default)]
+    struct WholeTreeCatalog {
+        /// Registered `*_with_conn` function/method names.
+        with_conn_fn_names: BTreeSet<String>,
+        /// Registered non-`*_with_conn` connection-passing methods `(TypeName, method_name)`.
+        conn_passing_methods: BTreeSet<(String, String)>,
+        /// Registered non-`*_with_conn` connection-passing free functions:
+        /// `fn_name -> set of (file_path, canonical_module_path)`.
+        conn_passing_free_fns: BTreeMap<String, BTreeSet<(String, String)>>,
+        /// Enums declaring BOTH a `Sqlite` and a `Redb` variant (e.g. `WorktreeDb`, `IntentRepoBackend`).
+        dual_backend_enums: BTreeSet<String>,
+        /// Structs whose fields hold a SeaORM/SQLite connection (so `&self` methods on them are connection-passing).
+        conn_holding_structs: BTreeSet<String>,
+    }
+
+    struct Pass1TypeCollector<'a> {
+        catalog: &'a mut WholeTreeCatalog,
+    }
+
+    impl<'ast> Visit<'ast> for Pass1TypeCollector<'_> {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if has_cfg_test(syn_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            let mut has_sqlite = false;
+            let mut has_redb = false;
+            for v in &item.variants {
+                if has_cfg_test(&v.attrs) {
+                    continue;
+                }
+                if v.ident == "Sqlite" {
+                    has_sqlite = true;
+                } else if v.ident == "Redb" {
+                    has_redb = true;
+                }
+            }
+            if has_sqlite && has_redb {
+                self.catalog
+                    .dual_backend_enums
+                    .insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            let conn_generics = collect_conn_trait_generics(&item.generics);
+            let holds_conn = !conn_generics.is_empty()
+                || item.fields.iter().any(|f| {
+                    !has_cfg_test(&f.attrs)
+                        && field_mandatorily_holds_conn(
+                            &f.ty,
+                            &conn_generics,
+                            &self.catalog.conn_holding_structs,
+                        )
+                });
+            if holds_conn {
+                self.catalog
+                    .conn_holding_structs
+                    .insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+    }
+
+    struct Pass1FnCollector<'a> {
+        file_path: &'a str,
+        catalog: &'a mut WholeTreeCatalog,
+        current_impl_type: Option<String>,
+        current_impl_conn_generics: BTreeSet<String>,
+    }
+
+    impl<'ast> Visit<'ast> for Pass1FnCollector<'_> {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if has_cfg_test(syn_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let prev_type = self.current_impl_type.take();
+            let prev_generics = std::mem::take(&mut self.current_impl_conn_generics);
+            self.current_impl_type = self_type_name(&item.self_ty);
+            self.current_impl_conn_generics = collect_conn_trait_generics(&item.generics);
+            syn::visit::visit_item_impl(self, item);
+            self.current_impl_type = prev_type;
+            self.current_impl_conn_generics = prev_generics;
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let name = item.sig.ident.to_string();
+            let empty = BTreeSet::new();
+            if name.ends_with("_with_conn") {
+                self.catalog.with_conn_fn_names.insert(name);
+            } else if signature_accepts_conn(
+                &item.sig,
+                &empty,
+                false,
+                &self.catalog.conn_holding_structs,
+            ) {
+                let mod_path = canonical_module_path_from_file(self.file_path);
+                self.catalog
+                    .conn_passing_free_fns
+                    .entry(name)
+                    .or_default()
+                    .insert((self.file_path.to_string(), mod_path));
+            }
+            syn::visit::visit_item_fn(self, item);
+        }
+
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if has_cfg_test(syn_impl_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, item);
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            let name = item.sig.ident.to_string();
+            let holds_conn = self
+                .current_impl_type
+                .as_deref()
+                .is_some_and(|t| self.catalog.conn_holding_structs.contains(t));
+            if name.ends_with("_with_conn") {
+                self.catalog.with_conn_fn_names.insert(name);
+            } else if signature_accepts_conn(
+                &item.sig,
+                &self.current_impl_conn_generics,
+                holds_conn,
+                &self.catalog.conn_holding_structs,
+            ) && let Some(ty) = &self.current_impl_type
+            {
+                self.catalog.conn_passing_methods.insert((ty.clone(), name));
+            }
+            syn::visit::visit_impl_item_fn(self, item);
+        }
+
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            if has_cfg_test(syn_trait_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_trait_item(self, item);
+        }
+
+        fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+            let name = item.sig.ident.to_string();
+            if name.ends_with("_with_conn") {
+                self.catalog.with_conn_fn_names.insert(name);
+            }
+            syn::visit::visit_trait_item_fn(self, item);
+        }
+    }
+
+    fn pat_matches_variant(
+        pat: &syn::Pat,
+        enum_name: Option<&str>,
+        variant: &str,
+        allow_bare_variant: bool,
+    ) -> bool {
+        let path_matches = |path: &syn::Path| -> bool {
+            let segs = path_segments(path);
+            match segs.as_slice() {
+                [.., ty, var] if var == variant => enum_name.is_none_or(|expected| ty == expected),
+                [var] if allow_bare_variant && var == variant => true,
+                _ => false,
+            }
+        };
+        match pat {
+            syn::Pat::Path(p) => path_matches(&p.path),
+            syn::Pat::TupleStruct(ts) => {
+                path_matches(&ts.path)
+                    || ts
+                        .elems
+                        .iter()
+                        .any(|e| pat_matches_variant(e, enum_name, variant, allow_bare_variant))
+            }
+            syn::Pat::Struct(ps) => {
+                path_matches(&ps.path)
+                    || ps.fields.iter().any(|f| {
+                        pat_matches_variant(&f.pat, enum_name, variant, allow_bare_variant)
+                    })
+            }
+            syn::Pat::Or(or) => or
+                .cases
+                .iter()
+                .any(|c| pat_matches_variant(c, enum_name, variant, allow_bare_variant)),
+            syn::Pat::Tuple(t) => t
+                .elems
+                .iter()
+                .any(|e| pat_matches_variant(e, enum_name, variant, allow_bare_variant)),
+            syn::Pat::Reference(r) => {
+                pat_matches_variant(&r.pat, enum_name, variant, allow_bare_variant)
+            }
+            syn::Pat::Paren(p) => {
+                pat_matches_variant(&p.pat, enum_name, variant, allow_bare_variant)
+            }
+            syn::Pat::Ident(id) => {
+                (allow_bare_variant && id.ident == variant && id.subpat.is_none())
+                    || id.subpat.as_ref().is_some_and(|(_, sub)| {
+                        pat_matches_variant(sub, enum_name, variant, allow_bare_variant)
+                    })
+            }
+            syn::Pat::Slice(s) => s
+                .elems
+                .iter()
+                .any(|e| pat_matches_variant(e, enum_name, variant, allow_bare_variant)),
+            _ => false,
+        }
+    }
+
+    fn expr_tests_storage_backend_variant(
+        expr: &syn::Expr,
+        variant: &str,
+        allow_bare_variant: bool,
+    ) -> bool {
+        let is_backend_path = |e: &syn::Expr| -> bool {
+            if let syn::Expr::Path(ep) = e {
+                let segs = path_segments(&ep.path);
+                matches!(segs.as_slice(), [.., ty, var] if ty == "StorageBackendKind" && var == variant)
+                    || (allow_bare_variant && matches!(segs.as_slice(), [var] if var == variant))
+            } else {
+                false
+            }
+        };
+        match expr {
+            syn::Expr::Binary(bin) if matches!(bin.op, syn::BinOp::Eq(_)) => {
+                is_backend_path(&bin.left) || is_backend_path(&bin.right)
+            }
+            syn::Expr::Let(expr_let) => pat_matches_variant(
+                &expr_let.pat,
+                Some("StorageBackendKind"),
+                variant,
+                allow_bare_variant,
+            ),
+            syn::Expr::Macro(em) if em.mac.path.is_ident("matches") => {
+                let s = em.mac.tokens.to_string();
+                s.contains(&format!("StorageBackendKind :: {variant}"))
+            }
+            syn::Expr::Paren(p) => {
+                expr_tests_storage_backend_variant(&p.expr, variant, allow_bare_variant)
+            }
+            syn::Expr::Group(g) => {
+                expr_tests_storage_backend_variant(&g.expr, variant, allow_bare_variant)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_direct_sqlite_opener_path(
+        raw_path: &str,
+        expanded_path: &str,
+        has_rusqlite_import: bool,
+    ) -> Option<&'static str> {
+        let check_one = |p: &str| -> Option<&'static str> {
+            let segs: Vec<&str> = p.split("::").collect();
+            let last = *segs.last()?;
+            if DIRECT_OPENER_FNS.contains(&last) {
+                return Some("direct-sqlite-opener");
+            }
+            if CAPTURE_STORE_OPENERS.contains(&last) {
+                let len = segs.len();
+                if (len >= 3 && segs[len - 3] == "capture" && segs[len - 2] == "store")
+                    || p.contains("capture::store::")
+                {
+                    return Some("direct-capture-sqlite-opener");
+                }
+            }
+            if segs.len() >= 2 {
+                let prev = segs[segs.len() - 2];
+                if prev == "Database" && last == "connect" {
+                    return Some("direct-seaorm-database-connect");
+                }
+                if prev == "SqlitePool" && last.starts_with("connect") {
+                    return Some("direct-sqlx-sqlite-connect");
+                }
+                if prev == "SqliteConnection" && last.starts_with("connect") {
+                    return Some("direct-sqlx-sqlite-connect");
+                }
+                if SQLITE_STORE_TYPES.contains(&prev)
+                    && (last.starts_with("open") || last == "create")
+                {
+                    return Some("direct-sqlite-store-open");
+                }
+                if prev == "Connection"
+                    && last.starts_with("open")
+                    && (p.contains("rusqlite") || has_rusqlite_import)
+                {
+                    return Some("direct-rusqlite-open");
+                }
+            }
+            None
+        };
+        check_one(expanded_path).or_else(|| check_one(raw_path))
+    }
+
+    struct Pass2Auditor<'a> {
+        file_path: &'a str,
+        catalog: &'a WholeTreeCatalog,
+        aliases: HashMap<String, String>,
+        has_storage_backend_glob: bool,
+        has_rusqlite_import: bool,
+        current_impl_type: Option<String>,
+        current_impl_conn_generics: BTreeSet<String>,
+        fn_stack: Vec<FnContext>,
+        storage_backend_sqlite_depth: usize,
+        paired_enum_sqlite_depth: usize,
+        violations: Vec<AuditViolation>,
+    }
+
+    #[derive(Clone)]
+    struct FnContext {
+        name: String,
+        is_conn_passing: bool,
+    }
+
+    impl<'a> Pass2Auditor<'a> {
+        fn current_fn_name(&self) -> String {
+            self.fn_stack
+                .last()
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "<module>".to_string())
+        }
+
+        fn current_fn_is_conn_passing(&self) -> bool {
+            self.fn_stack.last().is_some_and(|c| c.is_conn_passing)
+        }
+
+        fn record_violation(&mut self, line: usize, kind: &'static str, detail: String) {
+            self.violations.push(AuditViolation {
+                path: self.file_path.to_string(),
+                line,
+                function: self.current_fn_name(),
+                kind,
+                detail,
+            });
+        }
+
+        fn check_call_path(&mut self, raw_path: &str, line: usize) {
+            let expanded = expand_path_with_aliases(raw_path, &self.aliases);
+
+            // 1. Direct SQLite/SeaORM openers ALWAYS require lexical nesting in a paired
+            //    StorageBackendKind::Sqlite / StorageBackendKind::Redb dispatch.
+            if let Some(opener_kind) =
+                is_direct_sqlite_opener_path(raw_path, &expanded, self.has_rusqlite_import)
+            {
+                if self.storage_backend_sqlite_depth == 0 {
+                    let kind = if self.current_fn_is_conn_passing() {
+                        "with-conn-opens-db"
+                    } else {
+                        opener_kind
+                    };
+                    self.record_violation(
+                        line,
+                        kind,
+                        format!(
+                            "calls direct SQLite opener `{raw_path}` (resolved `{expanded}`) \
+                             without lexical nesting inside a paired StorageBackendKind::Sqlite/Redb dispatch"
+                        ),
+                    );
+                }
+                return;
+            }
+
+            // 2. Calls to registered `*_with_conn` or connection-passing functions/methods.
+            let segs: Vec<&str> = expanded.split("::").collect();
+            let raw_segs: Vec<&str> = raw_path.split("::").collect();
+            let last = segs.last().copied().unwrap_or("");
+            let raw_last = raw_segs.last().copied().unwrap_or("");
+
+            let is_with_conn_call = last.ends_with("_with_conn")
+                || raw_last.ends_with("_with_conn")
+                || self.catalog.with_conn_fn_names.contains(last)
+                || CONN_DERIVED_PEER_FNS.contains(&last)
+                || CONN_DERIVED_PEER_FNS.contains(&raw_last);
+
+            let is_conn_passing_method_call = segs.len() >= 2 && {
+                let ty = segs[segs.len() - 2];
+                let effective_ty = if ty == "Self" {
+                    self.current_impl_type.as_deref().unwrap_or(ty)
+                } else {
+                    ty
+                };
+                self.catalog
+                    .conn_passing_methods
+                    .contains(&(effective_ty.to_string(), last.to_string()))
+            };
+
+            let is_conn_passing_free_fn_call =
+                if let Some(defs) = self.catalog.conn_passing_free_fns.get(last) {
+                    let is_same_file_unqualified = !raw_path.contains("::")
+                        && !self.aliases.contains_key(raw_path)
+                        && defs.iter().any(|(def_file, _)| def_file == self.file_path);
+                    let matches_canonical_mod = defs.iter().any(|(_, mod_path)| {
+                        let full = format!("{mod_path}::{last}");
+                        if expanded == full {
+                            return true;
+                        }
+                        // Also match module-relative paths like `super::foo::fn_name` or `foo::fn_name`
+                        // when the immediate parent module matches the defining module's last segment.
+                        let mod_last = mod_path.rsplit("::").next().unwrap_or("");
+                        segs.len() >= 2
+                            && segs[segs.len() - 2] == mod_last
+                            && !mod_last.is_empty()
+                            && mod_last != "crate"
+                    });
+                    is_same_file_unqualified || matches_canonical_mod
+                } else {
+                    false
+                };
+
+            if is_with_conn_call || is_conn_passing_method_call || is_conn_passing_free_fn_call {
+                let allowed = self.current_fn_is_conn_passing()
+                    || self.storage_backend_sqlite_depth > 0
+                    || self.paired_enum_sqlite_depth > 0;
+                if !allowed {
+                    self.record_violation(
+                        line,
+                        "unwired-with-conn-caller",
+                        format!(
+                            "calls connection-passing `{raw_path}` outside a connection-passing \
+                             function or paired StorageBackendKind::Sqlite/Redb dispatch"
+                        ),
+                    );
+                }
+            }
+        }
+
+        fn check_method_call(&mut self, method_name: &str, line: usize) {
+            if method_name.ends_with("_with_conn")
+                || self.catalog.with_conn_fn_names.contains(method_name)
+            {
+                let allowed = self.current_fn_is_conn_passing()
+                    || self.storage_backend_sqlite_depth > 0
+                    || self.paired_enum_sqlite_depth > 0;
+                if !allowed {
+                    self.record_violation(
+                        line,
+                        "unwired-with-conn-caller",
+                        format!(
+                            "calls connection-passing method `.{method_name}(...)` outside a \
+                             connection-passing function or paired StorageBackendKind::Sqlite/Redb dispatch"
+                        ),
+                    );
+                }
+                return;
+            }
+            if DIRECT_SQLITE_QUERY_METHODS.contains(&method_name) {
+                let allowed = self.current_fn_is_conn_passing()
+                    || self.storage_backend_sqlite_depth > 0
+                    || self.paired_enum_sqlite_depth > 0;
+                if !allowed {
+                    self.record_violation(
+                        line,
+                        "direct-sqlite-query",
+                        format!(
+                            "calls SeaORM raw SQL method `.{method_name}(...)` outside a \
+                             connection-passing function or paired StorageBackendKind::Sqlite/Redb dispatch"
+                        ),
+                    );
+                }
+            }
+        }
+
+        fn scan_macro_tokens(&mut self, tokens: proc_macro2::TokenStream) {
+            let trees: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+            let mut idx = 0;
+            while idx < trees.len() {
+                match &trees[idx] {
+                    proc_macro2::TokenTree::Group(group) => {
+                        self.scan_macro_tokens(group.stream());
+                        idx += 1;
+                    }
+                    proc_macro2::TokenTree::Ident(ident) => {
+                        let start_line = ident.span().start().line;
+                        let mut segs = vec![ident.to_string()];
+                        let mut cursor = idx + 1;
+                        while cursor + 2 < trees.len() {
+                            if let (
+                                proc_macro2::TokenTree::Punct(p1),
+                                proc_macro2::TokenTree::Punct(p2),
+                                proc_macro2::TokenTree::Ident(next_id),
+                            ) = (&trees[cursor], &trees[cursor + 1], &trees[cursor + 2])
+                                && p1.as_char() == ':'
+                                && p2.as_char() == ':'
+                            {
+                                segs.push(next_id.to_string());
+                                cursor += 3;
+                                continue;
+                            }
+                            break;
+                        }
+                        let is_call = matches!(
+                            trees.get(cursor),
+                            Some(proc_macro2::TokenTree::Group(g))
+                                if g.delimiter() == proc_macro2::Delimiter::Parenthesis
+                        );
+                        if is_call {
+                            let full = segs.join("::");
+                            self.check_call_path(&full, start_line);
+                        }
+                        idx = cursor;
+                    }
+                    _ => {
+                        idx += 1;
+                    }
+                }
+            }
+        }
+
+        /// Check if a `match` expression pairs `StorageBackendKind::Sqlite` with
+        /// `StorageBackendKind::Redb`, or pairs a known dual-backend enum's `Sqlite` + `Redb` arms.
+        fn visit_paired_match(&mut self, expr: &syn::ExprMatch) {
+            self.visit_expr(&expr.expr);
+
+            let active_arms: Vec<&syn::Arm> = expr
+                .arms
+                .iter()
+                .filter(|arm| !has_cfg_test(&arm.attrs))
+                .collect();
+
+            let has_sbk_sqlite = active_arms.iter().any(|arm| {
+                pat_matches_variant(
+                    &arm.pat,
+                    Some("StorageBackendKind"),
+                    "Sqlite",
+                    self.has_storage_backend_glob,
+                )
+            });
+            let has_sbk_redb = active_arms.iter().any(|arm| {
+                pat_matches_variant(
+                    &arm.pat,
+                    Some("StorageBackendKind"),
+                    "Redb",
+                    self.has_storage_backend_glob,
+                )
+            });
+            let is_paired_sbk = has_sbk_sqlite && has_sbk_redb;
+
+            // Check for paired dual-backend enums (e.g. WorktreeDb::{Sqlite, Redb} or Self::{Sqlite, Redb}).
+            let mut matched_dual_enum: Option<String> = None;
+            if !is_paired_sbk {
+                let mut candidates: Vec<String> =
+                    self.catalog.dual_backend_enums.iter().cloned().collect();
+                if self
+                    .current_impl_type
+                    .as_deref()
+                    .is_some_and(|t| self.catalog.dual_backend_enums.contains(t))
+                {
+                    candidates.push("Self".to_string());
+                }
+                for enum_name in candidates {
+                    let has_sq = active_arms.iter().any(|arm| {
+                        pat_matches_variant(&arm.pat, Some(&enum_name), "Sqlite", false)
+                    });
+                    let has_rb = active_arms
+                        .iter()
+                        .any(|arm| pat_matches_variant(&arm.pat, Some(&enum_name), "Redb", false));
+                    if has_sq && has_rb {
+                        matched_dual_enum = Some(enum_name);
+                        break;
+                    }
+                }
+            }
+
+            for arm in active_arms {
+                let arm_is_sbk_sqlite = is_paired_sbk
+                    && pat_matches_variant(
+                        &arm.pat,
+                        Some("StorageBackendKind"),
+                        "Sqlite",
+                        self.has_storage_backend_glob,
+                    )
+                    && !pat_matches_variant(
+                        &arm.pat,
+                        Some("StorageBackendKind"),
+                        "Redb",
+                        self.has_storage_backend_glob,
+                    );
+                let arm_is_dual_enum_sqlite = matched_dual_enum.as_deref().is_some_and(|en| {
+                    pat_matches_variant(&arm.pat, Some(en), "Sqlite", false)
+                        && !pat_matches_variant(&arm.pat, Some(en), "Redb", false)
+                });
+
+                if arm_is_sbk_sqlite {
+                    self.storage_backend_sqlite_depth += 1;
+                }
+                if arm_is_dual_enum_sqlite {
+                    self.paired_enum_sqlite_depth += 1;
+                }
+                syn::visit::visit_arm(self, arm);
+                if arm_is_dual_enum_sqlite {
+                    self.paired_enum_sqlite_depth -= 1;
+                }
+                if arm_is_sbk_sqlite {
+                    self.storage_backend_sqlite_depth -= 1;
+                }
+            }
+        }
+
+        /// Check an `if / else if / else` chain for explicit paired `StorageBackendKind::Sqlite`
+        /// and `StorageBackendKind::Redb` branches.
+        fn visit_paired_if(&mut self, expr: &syn::ExprIf) {
+            let mut branches: Vec<(Option<&syn::Expr>, &syn::Block)> = Vec::new();
+            let mut tail_else_expr: Option<&syn::Expr> = None;
+            let mut cursor: &syn::ExprIf = expr;
+            loop {
+                branches.push((Some(&cursor.cond), &cursor.then_branch));
+                match &cursor.else_branch {
+                    Some((_, else_expr)) => match else_expr.as_ref() {
+                        syn::Expr::If(next_if) => {
+                            cursor = next_if;
+                        }
+                        syn::Expr::Block(else_block) => {
+                            branches.push((None, &else_block.block));
+                            break;
+                        }
+                        other => {
+                            tail_else_expr = Some(other);
+                            break;
+                        }
+                    },
+                    None => break,
+                }
+            }
+
+            let has_explicit_sqlite = branches.iter().any(|(cond, _)| {
+                cond.is_some_and(|c| {
+                    expr_tests_storage_backend_variant(c, "Sqlite", self.has_storage_backend_glob)
+                })
+            });
+            let has_explicit_redb = branches.iter().any(|(cond, _)| {
+                cond.is_some_and(|c| {
+                    expr_tests_storage_backend_variant(c, "Redb", self.has_storage_backend_glob)
+                })
+            });
+            let is_paired_if = has_explicit_sqlite && has_explicit_redb;
+
+            for (cond, block) in branches {
+                if let Some(c) = cond {
+                    self.visit_expr(c);
+                }
+                let is_sqlite_branch = is_paired_if
+                    && cond.is_some_and(|c| {
+                        expr_tests_storage_backend_variant(
+                            c,
+                            "Sqlite",
+                            self.has_storage_backend_glob,
+                        )
+                    });
+                if is_sqlite_branch {
+                    self.storage_backend_sqlite_depth += 1;
+                }
+                self.visit_block(block);
+                if is_sqlite_branch {
+                    self.storage_backend_sqlite_depth -= 1;
+                }
+            }
+            if let Some(other) = tail_else_expr {
+                self.visit_expr(other);
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Pass2Auditor<'_> {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if has_cfg_test(syn_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            collect_use_tree(
+                &item.tree,
+                "",
+                &mut self.aliases,
+                &mut self.has_storage_backend_glob,
+                &mut self.has_rusqlite_import,
+            );
+            syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let prev_type = self.current_impl_type.take();
+            let prev_generics = std::mem::take(&mut self.current_impl_conn_generics);
+            self.current_impl_type = self_type_name(&item.self_ty);
+            self.current_impl_conn_generics = collect_conn_trait_generics(&item.generics);
+            syn::visit::visit_item_impl(self, item);
+            self.current_impl_type = prev_type;
+            self.current_impl_conn_generics = prev_generics;
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let empty = BTreeSet::new();
+            let is_conn_passing = signature_accepts_conn(
+                &item.sig,
+                &empty,
+                false,
+                &self.catalog.conn_holding_structs,
+            );
+            let saved_aliases = self.aliases.clone();
+            let saved_glob = self.has_storage_backend_glob;
+            let saved_rusqlite = self.has_rusqlite_import;
+            self.fn_stack.push(FnContext {
+                name: item.sig.ident.to_string(),
+                is_conn_passing,
+            });
+            syn::visit::visit_item_fn(self, item);
+            self.fn_stack.pop();
+            self.aliases = saved_aliases;
+            self.has_storage_backend_glob = saved_glob;
+            self.has_rusqlite_import = saved_rusqlite;
+        }
+
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if has_cfg_test(syn_impl_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, item);
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            let holds_conn = self
+                .current_impl_type
+                .as_deref()
+                .is_some_and(|t| self.catalog.conn_holding_structs.contains(t));
+            let is_conn_passing = signature_accepts_conn(
+                &item.sig,
+                &self.current_impl_conn_generics,
+                holds_conn,
+                &self.catalog.conn_holding_structs,
+            );
+            let fn_name = match &self.current_impl_type {
+                Some(ty) => format!("{ty}::{}", item.sig.ident),
+                None => item.sig.ident.to_string(),
+            };
+            let saved_aliases = self.aliases.clone();
+            let saved_glob = self.has_storage_backend_glob;
+            let saved_rusqlite = self.has_rusqlite_import;
+            self.fn_stack.push(FnContext {
+                name: fn_name,
+                is_conn_passing,
+            });
+            syn::visit::visit_impl_item_fn(self, item);
+            self.fn_stack.pop();
+            self.aliases = saved_aliases;
+            self.has_storage_backend_glob = saved_glob;
+            self.has_rusqlite_import = saved_rusqlite;
+        }
+
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            if has_cfg_test(syn_trait_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_trait_item(self, item);
+        }
+
+        fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+            let empty = BTreeSet::new();
+            let is_conn_passing = signature_accepts_conn(
+                &item.sig,
+                &empty,
+                false,
+                &self.catalog.conn_holding_structs,
+            );
+            self.fn_stack.push(FnContext {
+                name: item.sig.ident.to_string(),
+                is_conn_passing,
+            });
+            syn::visit::visit_trait_item_fn(self, item);
+            self.fn_stack.pop();
+        }
+
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            let mut dominated_added = 0usize;
+            for stmt in &block.stmts {
+                if has_cfg_test(syn_stmt_attrs(stmt)) {
+                    continue;
+                }
+                self.visit_stmt(stmt);
+                if stmt_dominates_remainder_as_sqlite(stmt, self.has_storage_backend_glob) {
+                    self.storage_backend_sqlite_depth += 1;
+                    dominated_added += 1;
+                }
+            }
+            self.storage_backend_sqlite_depth -= dominated_added;
+        }
+
+        fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+            if has_cfg_test(syn_stmt_attrs(stmt)) {
+                return;
+            }
+            syn::visit::visit_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+            if has_cfg_test(syn_expr_attrs(expr)) {
+                return;
+            }
+            match expr {
+                syn::Expr::Match(m) => self.visit_paired_match(m),
+                syn::Expr::If(i) => self.visit_paired_if(i),
+                _ => syn::visit::visit_expr(self, expr),
+            }
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(ep) = call.func.as_ref() {
+                let raw = path_to_string(&ep.path);
+                let line = ep.span().start().line;
+                self.check_call_path(&raw, line);
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let method = call.method.to_string();
+            let line = call.method.span().start().line;
+            self.check_method_call(&method, line);
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            self.scan_macro_tokens(mac.tokens.clone());
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+
+    pub(super) fn audit_sources(
+        units: &[SourceUnit],
+    ) -> Result<Vec<AuditViolation>, AuditParseError> {
+        let mut parsed = Vec::with_capacity(units.len());
+        for unit in units {
+            let file = syn::parse_file(&unit.source).map_err(|err| AuditParseError {
+                path: unit.path.clone(),
+                line: err.span().start().line,
+                message: err.to_string(),
+            })?;
+            parsed.push((unit.path.clone(), file));
+        }
+
+        // Exclude files that are ONLY included via `#[cfg(test)] mod ...;` in the parsed tree.
+        let cfg_test_files = collect_cfg_test_out_of_line_modules(&parsed);
+
+        // Pass 1a: Collect dual-backend enums and mandatory-connection struct bundles (to fixed point).
+        let mut catalog = WholeTreeCatalog::default();
+        loop {
+            let before = catalog.conn_holding_structs.len() + catalog.dual_backend_enums.len();
+            for (path, file) in &parsed {
+                if cfg_test_files.contains(path) {
+                    continue;
+                }
+                let mut collector = Pass1TypeCollector {
+                    catalog: &mut catalog,
+                };
+                collector.visit_file(file);
+            }
+            let after = catalog.conn_holding_structs.len() + catalog.dual_backend_enums.len();
+            if after == before {
+                break;
+            }
+        }
+
+        // Pass 1b: Build whole-tree `*_with_conn` and connection-passing function catalog.
+        for (path, file) in &parsed {
+            if cfg_test_files.contains(path) {
+                continue;
+            }
+            let mut collector = Pass1FnCollector {
+                file_path: path,
+                catalog: &mut catalog,
+                current_impl_type: None,
+                current_impl_conn_generics: BTreeSet::new(),
+            };
+            collector.visit_file(file);
+        }
+
+        // Pass 2: Audit every callsite and caller reachability across all non-test files.
+        let mut violations = Vec::new();
+        for (path, file) in &parsed {
+            if cfg_test_files.contains(path) {
+                continue;
+            }
+            let mut auditor = Pass2Auditor {
+                file_path: path,
+                catalog: &catalog,
+                aliases: HashMap::new(),
+                has_storage_backend_glob: false,
+                has_rusqlite_import: false,
+                current_impl_type: None,
+                current_impl_conn_generics: BTreeSet::new(),
+                fn_stack: Vec::new(),
+                storage_backend_sqlite_depth: 0,
+                paired_enum_sqlite_depth: 0,
+                violations: Vec::new(),
+            };
+            auditor.visit_file(file);
+            violations.extend(auditor.violations);
+        }
+
+        violations.sort();
+        Ok(violations)
+    }
+
+    pub(super) fn audit_workspace_src(
+        repo_root: &Path,
+    ) -> Result<Vec<AuditViolation>, AuditParseError> {
+        let units = collect_src_files(repo_root);
+        assert!(
+            !units.is_empty(),
+            "RB-29b AST audit must discover production Rust files under src/"
+        );
+        audit_sources(&units)
+    }
+
+    pub(super) fn rejects_partially_wired_caller_impl() {
+        let source = r##"
+use crate::storage::{GitStore, StorageBackendKind};
+use crate::internal::db::get_db_conn_instance;
+
+pub async fn wired_caller(backend: StorageBackendKind) {
+    match backend {
+        StorageBackendKind::Redb => {
+            let _marker = "redb";
+        }
+        StorageBackendKind::Sqlite => {
+            let _db = get_db_conn_instance().await;
+        }
+    }
+}
+
+pub fn fake_cfg_test_in_string() -> &'static str {
+    "#[cfg(test)] mod tests {"
+}
+
+pub async fn unwired_helper() {
+    let _db = get_db_conn_instance().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    async fn ok_in_cfg_test() {
+        let _db = get_db_conn_instance().await;
+    }
+}
+"##;
+        let units = vec![SourceUnit {
+            path: "src/command/synthetic_partial.rs".to_string(),
+            source: source.to_string(),
+        }];
+        let violations = audit_sources(&units).expect("valid Rust fixture must parse");
+        let rendered = violations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !violations.is_empty(),
+            "partially wired file must be rejected by syn AST guard"
+        );
+        assert!(
+            violations.iter().any(|v| v.function == "unwired_helper"),
+            "expected violation naming exact function `unwired_helper`, got:\n{rendered}"
+        );
+        assert!(
+            !violations.iter().any(|v| v.function == "wired_caller"),
+            "properly wired `wired_caller` must NOT be flagged:\n{rendered}"
+        );
+        assert!(
+            !violations.iter().any(|v| v.function == "ok_in_cfg_test"),
+            "exact `#[cfg(test)]` module must NOT be flagged:\n{rendered}"
+        );
+    }
+
+    pub(super) fn rejects_cfg_sqlite_without_runtime_dispatch_impl() {
+        let source = r#"
+use crate::internal::db::{get_db_conn_instance, open_database_without_migrations};
+use crate::storage::StorageBackendKind;
+
+#[cfg(feature = "storage-sqlite")]
+pub async fn cfg_only_opener() {
+    let _db = get_db_conn_instance().await;
+}
+
+pub async fn inline_cfg_sqlite_opener() {
+    #[cfg(feature = "storage-sqlite")]
+    {
+        let _db = open_database_without_migrations("repo.db").await;
+    }
+}
+
+pub async fn unpaired_sqlite_match_arm(backend: StorageBackendKind) {
+    match backend {
+        StorageBackendKind::Sqlite => {
+            let _db = get_db_conn_instance().await;
+        }
+        _ => {}
+    }
+}
+"#;
+        let units = vec![SourceUnit {
+            path: "src/command/synthetic_cfg_only.rs".to_string(),
+            source: source.to_string(),
+        }];
+        let violations = audit_sources(&units).expect("valid Rust fixture must parse");
+        let rendered = violations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected_fn in [
+            "cfg_only_opener",
+            "inline_cfg_sqlite_opener",
+            "unpaired_sqlite_match_arm",
+        ] {
+            assert!(
+                violations.iter().any(|v| v.function == expected_fn),
+                "expected violation for `{expected_fn}`, got:\n{rendered}"
+            );
+        }
+    }
+
+    pub(super) fn rejects_unwired_caller_of_allowlisted_with_conn_impl() {
+        let store_module = r#"
+use sea_orm::DatabaseConnection;
+use crate::storage::GitStore;
+use crate::internal::db::get_db_conn_instance;
+
+pub async fn foo_with_conn(_conn: &DatabaseConnection) -> Result<(), String> {
+    Ok(())
+}
+
+pub async fn foo_with_store(_store: &dyn GitStore) -> Result<(), String> {
+    Ok(())
+}
+
+pub async fn transitive_with_conn(conn: &DatabaseConnection) -> Result<(), String> {
+    foo_with_conn(conn).await
+}
+
+pub async fn bad_self_opening_with_conn(_conn: &DatabaseConnection) -> Result<(), String> {
+    let _leaked = get_db_conn_instance().await;
+    Ok(())
+}
+"#;
+        let cmd_module = r#"
+use crate::storage::{GitStore, StorageBackendKind};
+
+pub async fn wired_cmd_entry(
+    backend: StorageBackendKind,
+    conn: &sea_orm::DatabaseConnection,
+    store: &dyn GitStore,
+) -> Result<(), String> {
+    match backend {
+        StorageBackendKind::Redb => foo_with_store(store).await,
+        StorageBackendKind::Sqlite => foo_with_conn(conn).await,
+    }
+}
+
+pub async fn unwired_cmd_entry(handle: &OpaqueConn) -> Result<(), String> {
+    foo_with_conn(handle).await
+}
+"#;
+        let units = vec![
+            SourceUnit {
+                path: "src/internal/synthetic_store.rs".to_string(),
+                source: store_module.to_string(),
+            },
+            SourceUnit {
+                path: "src/command/synthetic_cmd.rs".to_string(),
+                source: cmd_module.to_string(),
+            },
+        ];
+        let violations = audit_sources(&units).expect("valid Rust fixture must parse");
+        let rendered = violations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.function == "bad_self_opening_with_conn"
+                    && v.kind == "with-conn-opens-db"),
+            "AC3: `*_with_conn` opening DB directly must be rejected:\n{rendered}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.function == "unwired_cmd_entry" && v.kind == "unwired-with-conn-caller"),
+            "AC4/AC7: unwired caller of `foo_with_conn` must be rejected:\n{rendered}"
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.function == "transitive_with_conn"),
+            "transitive `*_with_conn` caller must NOT be flagged:\n{rendered}"
+        );
+        assert!(
+            !violations.iter().any(|v| v.function == "wired_cmd_entry"),
+            "wired `StorageBackendKind::Sqlite/Redb` caller must NOT be flagged:\n{rendered}"
+        );
+    }
+
+    pub(super) fn fails_closed_on_malformed_rust_input_impl() {
+        let syntax_error_unit = SourceUnit {
+            path: "src/command/malformed_syntax.rs".to_string(),
+            source: "pub fn broken( { let x = 1; }".to_string(),
+        };
+        let err1 = audit_sources(&[syntax_error_unit])
+            .expect_err("malformed Rust syntax MUST fail closed");
+        assert_eq!(err1.path, "src/command/malformed_syntax.rs");
+
+        let unclosed_cfg_test_unit = SourceUnit {
+            path: "src/command/unclosed_cfg_test.rs".to_string(),
+            source: r#"
+pub fn valid_prod_fn() {}
+
+#[cfg(test)]
+mod tests {
+    fn x() {}
+"#
+            .to_string(),
+        };
+        let err2 = audit_sources(&[unclosed_cfg_test_unit])
+            .expect_err("unclosed `#[cfg(test)] mod tests {` MUST fail closed");
+        assert_eq!(err2.path, "src/command/unclosed_cfg_test.rs");
+    }
+
+    pub(super) fn per_callsite_storage_wiring_completeness_guard_impl() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let violations = audit_workspace_src(&repo_root)
+            .unwrap_or_else(|err| panic!("RB-29b AST audit failed closed on parse error: {err}"));
+        if !violations.is_empty() {
+            let report = violations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "RB-29b syn 2.0 AST audit found {} unprotected SQLite / `*_with_conn` callsite(s) \
+                 in production `src/`:\n{report}",
+                violations.len()
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[test]
+fn syn_guard_rejects_partially_wired_caller() {
+    rb29b_ast_audit::rejects_partially_wired_caller_impl();
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[test]
+fn syn_guard_rejects_cfg_sqlite_without_runtime_dispatch() {
+    rb29b_ast_audit::rejects_cfg_sqlite_without_runtime_dispatch_impl();
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[test]
+fn syn_guard_rejects_unwired_caller_of_allowlisted_with_conn() {
+    rb29b_ast_audit::rejects_unwired_caller_of_allowlisted_with_conn_impl();
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[test]
+fn syn_guard_fails_closed_on_malformed_rust_input() {
+    rb29b_ast_audit::fails_closed_on_malformed_rust_input_impl();
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[test]
+fn syn_ast_per_callsite_storage_wiring_completeness_guard() {
+    rb29b_ast_audit::per_callsite_storage_wiring_completeness_guard_impl();
+}

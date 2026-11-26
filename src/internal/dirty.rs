@@ -381,10 +381,28 @@ impl DirtyCache {
     pub async fn mark_paths(
         workdir_relative: &[std::path::PathBuf],
     ) -> std::result::Result<Vec<String>, MarkError> {
-        let db = crate::internal::sequencer::request_db_checked()
-            .await
-            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
-        Self::mark_paths_with_conn(&db, workdir_relative).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked()
+                    .await
+                    .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+                Self::mark_paths_with_conn(&db, workdir_relative).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let stored_paths =
+                    validate_mark_paths(workdir_relative).map_err(MarkError::Escaping)?;
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+                let scope = Self::scope_key();
+                Self::mark_stored_paths_in_scope_with_store(store.as_ref(), &scope, &stored_paths)
+                    .await
+                    .map_err(MarkError::Store)?;
+                Ok(stored_paths)
+            }
+        }
     }
 
     /// Mark paths in an EXPLICIT scope, for a caller acting on behalf of
@@ -398,26 +416,70 @@ impl DirtyCache {
         scope_key: &str,
         workdir_relative: &[std::path::PathBuf],
     ) -> std::result::Result<Vec<String>, MarkError> {
-        use sea_orm::TransactionTrait;
-
-        let db = crate::internal::sequencer::request_db_checked()
-            .await
-            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
         let stored_paths = validate_mark_paths(workdir_relative).map_err(MarkError::Escaping)?;
-        // ONE transaction for the whole batch. The caller holds the registry
-        // lock across this call to fence the scope, so the work under that
-        // lock has to be bounded — a per-path awaited upsert is not.
-        let txn = db
-            .begin()
-            .await
-            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
-        Self::mark_stored_paths_in_scope_with_conn(&txn, scope_key, &stored_paths)
-            .await
-            .map_err(MarkError::Store)?;
-        txn.commit()
-            .await
-            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
-        Ok(stored_paths)
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                use sea_orm::TransactionTrait;
+
+                let db = crate::internal::sequencer::request_db_checked()
+                    .await
+                    .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+                // ONE transaction for the whole batch. The caller holds the registry
+                // lock across this call to fence the scope, so the work under that
+                // lock has to be bounded — a per-path awaited upsert is not.
+                let txn = db
+                    .begin()
+                    .await
+                    .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+                Self::mark_stored_paths_in_scope_with_conn(&txn, scope_key, &stored_paths)
+                    .await
+                    .map_err(MarkError::Store)?;
+                txn.commit()
+                    .await
+                    .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+                Ok(stored_paths)
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+                Self::mark_stored_paths_in_scope_with_store(
+                    store.as_ref(),
+                    scope_key,
+                    &stored_paths,
+                )
+                .await
+                .map_err(MarkError::Store)?;
+                Ok(stored_paths)
+            }
+        }
+    }
+
+    async fn mark_stored_paths_in_scope_with_store(
+        store: &dyn crate::storage::git_state_store::GitStateStore,
+        scope: &str,
+        stored_paths: &[String],
+    ) -> Result<()> {
+        let now = now_timestamp();
+        for path in stored_paths {
+            let record = crate::storage::git_state_store::WorkingDirtyEntryRecord {
+                worktree_id: scope.to_string(),
+                path: path.clone(),
+                kind: KIND_UNKNOWN.to_string(),
+                source: SOURCE_MANUAL.to_string(),
+                marked_at: now.clone(),
+                verified_at: None,
+            };
+            store
+                .upsert_working_dirty_entry(&record)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to upsert a manual dirty mark: {error}")
+                })?;
+        }
+        Ok(())
     }
 
     /// Raw insertion for PRE-VALIDATED stored paths (private: every public

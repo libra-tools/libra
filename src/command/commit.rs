@@ -1571,30 +1571,34 @@ async fn run_commit_with_index(
         .await?;
         drop(bridge_publish_lock);
         sequence_warnings.extend(agent_config_warning);
-        if let Some(snapshot) = &agent_snapshot
-            && let Some(conn) = snapshot.conn.as_ref()
-            && let Err(error) =
-                crate::internal::ai::history::link_authorized_agent_sessions_to_commit(
-                    conn,
-                    &snapshot.session_ids,
-                    commit.id,
-                    &snapshot.scope,
-                )
-                .await
-        {
-            tracing::warn!(
-                reason = agent_link_failure_reason(&error),
-                "commit completed without local agent association"
-            );
-            sequence_warnings.push("commit completed, but local agent session association failed; inspect it with 'libra agent doctor'".to_string());
-        } else if let Some(snapshot) = journal_snapshot
-            && let Err(error) = mark_agent_journal_linked(snapshot, commit.id).await
-        {
-            tracing::warn!(
-                reason = agent_link_failure_reason(&error),
-                "commit completed but agent journal stage update failed"
-            );
-            sequence_warnings.push("commit completed and local agent sessions were linked, but journal stage update failed; inspect it with 'libra agent doctor'".to_string());
+        if let Some(snapshot) = &agent_snapshot {
+            let link_result = match &snapshot.backend {
+                AgentCommitSnapshotBackend::Redb => Ok(()),
+                AgentCommitSnapshotBackend::Sqlite(conn) => {
+                    crate::internal::ai::history::link_authorized_agent_sessions_to_commit(
+                        conn,
+                        &snapshot.session_ids,
+                        commit.id,
+                        &snapshot.scope,
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = link_result {
+                tracing::warn!(
+                    reason = agent_link_failure_reason(&error),
+                    "commit completed without local agent association"
+                );
+                sequence_warnings.push("commit completed, but local agent session association failed; inspect it with 'libra agent doctor'".to_string());
+            } else if let Some(snapshot) = journal_snapshot
+                && let Err(error) = mark_agent_journal_linked(snapshot, commit.id).await
+            {
+                tracing::warn!(
+                    reason = agent_link_failure_reason(&error),
+                    "commit completed but agent journal stage update failed"
+                );
+                sequence_warnings.push("commit completed and local agent sessions were linked, but journal stage update failed; inspect it with 'libra agent doctor'".to_string());
+            }
         }
         // Record the change revision only after HEAD has advanced; a failed ref
         // update must not leave a projection for an unreachable commit (the
@@ -1765,29 +1769,34 @@ async fn run_commit_with_index(
     .await?;
     drop(bridge_publish_lock);
     sequence_warnings.extend(agent_config_warning);
-    if let Some(snapshot) = &agent_snapshot
-        && let Some(conn) = snapshot.conn.as_ref()
-        && let Err(error) = crate::internal::ai::history::link_authorized_agent_sessions_to_commit(
-            conn,
-            &snapshot.session_ids,
-            commit.id,
-            &snapshot.scope,
-        )
-        .await
-    {
-        tracing::warn!(
-            reason = agent_link_failure_reason(&error),
-            "commit completed without local agent association"
-        );
-        sequence_warnings.push("commit completed, but local agent session association failed; inspect it with 'libra agent doctor'".to_string());
-    } else if let Some(snapshot) = journal_snapshot
-        && let Err(error) = mark_agent_journal_linked(snapshot, commit.id).await
-    {
-        tracing::warn!(
-            reason = agent_link_failure_reason(&error),
-            "commit completed but agent journal stage update failed"
-        );
-        sequence_warnings.push("commit completed and local agent sessions were linked, but journal stage update failed; inspect it with 'libra agent doctor'".to_string());
+    if let Some(snapshot) = &agent_snapshot {
+        let link_result = match &snapshot.backend {
+            AgentCommitSnapshotBackend::Redb => Ok(()),
+            AgentCommitSnapshotBackend::Sqlite(conn) => {
+                crate::internal::ai::history::link_authorized_agent_sessions_to_commit(
+                    conn,
+                    &snapshot.session_ids,
+                    commit.id,
+                    &snapshot.scope,
+                )
+                .await
+            }
+        };
+        if let Err(error) = link_result {
+            tracing::warn!(
+                reason = agent_link_failure_reason(&error),
+                "commit completed without local agent association"
+            );
+            sequence_warnings.push("commit completed, but local agent session association failed; inspect it with 'libra agent doctor'".to_string());
+        } else if let Some(snapshot) = journal_snapshot
+            && let Err(error) = mark_agent_journal_linked(snapshot, commit.id).await
+        {
+            tracing::warn!(
+                reason = agent_link_failure_reason(&error),
+                "commit completed but agent journal stage update failed"
+            );
+            sequence_warnings.push("commit completed and local agent sessions were linked, but journal stage update failed; inspect it with 'libra agent doctor'".to_string());
+        }
     }
     // Record the change revision only after HEAD has advanced; a failed ref
     // update must not leave a projection for an unreachable commit (the
@@ -2343,8 +2352,13 @@ pub(crate) fn append_trailers(message: &str, trailers: &[String]) -> String {
     }
 }
 
+enum AgentCommitSnapshotBackend {
+    Redb,
+    Sqlite(DbConn),
+}
+
 struct AgentCommitSnapshot {
-    conn: Option<DbConn>,
+    backend: AgentCommitSnapshotBackend,
     storage_root: PathBuf,
     scope: crate::internal::ai::capture_scope::CaptureScope,
     session_ids: Vec<String>,
@@ -2413,122 +2427,131 @@ async fn snapshot_agent_sessions_for_commit(
     let backend = crate::storage::runtime::detect_repo_backend(&storage_root).map_err(|error| {
         CommitError::AgentAssociation(format!("detect repository backend: {error}"))
     })?;
-    if matches!(backend, crate::storage::StorageBackendKind::Redb) {
-        // Under Redb, capture sessions live in CaptureStore (wired in RB-21/RB-22);
-        // until an active capture session is linked, return an empty snapshot without
-        // touching `libra.db`.
-        let config_store = crate::storage::runtime::open_repo_config_store_read_only(&storage_root)
-            .await
-            .map_err(|error| {
-                CommitError::AgentAssociation(format!("open repository config store: {error}"))
-            })?;
-        let repo_id =
-            crate::internal::config::ConfigKv::get_with_store(&*config_store, "libra.repoid")
-                .await
-                .ok()
-                .flatten()
-                .map(|e| e.value)
-                .unwrap_or_default();
-        let wt_id = crate::utils::util::current_worktree_id().unwrap_or_default();
-        let scope = crate::internal::ai::capture_scope::CaptureScope {
-            repo_id,
-            worktree_id: wt_id.clone(),
-            workspace_id: Some(wt_id),
-            workspace_fence: Some(0),
-        };
-        return Ok(AgentCommitSnapshot {
-            conn: None,
-            storage_root,
-            scope,
-            session_ids: Vec::new(),
-        });
-    }
-    let conn =
-        crate::internal::db::get_db_conn_instance_for_path(&storage_root.join(util::DATABASE))
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            // Under Redb, capture sessions live in CaptureStore (wired in RB-21/RB-22);
+            // until an active capture session is linked, return an empty snapshot without
+            // touching `libra.db`.
+            let config_store =
+                crate::storage::runtime::open_repo_config_store_read_only(&storage_root)
+                    .await
+                    .map_err(|error| {
+                        CommitError::AgentAssociation(format!(
+                            "open repository config store: {error}"
+                        ))
+                    })?;
+            let repo_id =
+                crate::internal::config::ConfigKv::get_with_store(&*config_store, "libra.repoid")
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|e| e.value)
+                    .unwrap_or_default();
+            let wt_id = crate::utils::util::current_worktree_id().unwrap_or_default();
+            let scope = crate::internal::ai::capture_scope::CaptureScope {
+                repo_id,
+                worktree_id: wt_id.clone(),
+                workspace_id: Some(wt_id),
+                workspace_fence: Some(0),
+            };
+            Ok(AgentCommitSnapshot {
+                backend: AgentCommitSnapshotBackend::Redb,
+                storage_root,
+                scope,
+                session_ids: Vec::new(),
+            })
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let conn = crate::internal::db::get_db_conn_instance_for_path(
+                &storage_root.join(util::DATABASE),
+            )
             .await
             .map_err(|error| {
                 CommitError::AgentAssociation(format!("open repository database: {error}"))
             })?;
-    let scope = crate::internal::ai::capture_scope::CaptureScope::resolve(&conn, &worktree_root)
-        .await
-        .map_err(|error| {
-            CommitError::AgentAssociation(format!("resolve capture scope: {error:#}"))
-        })?;
-    scope
-        .assert_workspace_fence_live(&conn)
-        .await
-        .map_err(|error| {
-            CommitError::AgentAssociation(format!("verify workspace lease: {error:#}"))
-        })?;
-    let parent_oid = parent.map(ToString::to_string);
-    let parent_kind = parent.map(|oid| match oid.kind() {
-        git_internal::hash::HashKind::Sha1 => "sha1",
-        git_internal::hash::HashKind::Sha256 => "sha256",
-        git_internal::hash::HashKind::Blake3 => "blake3",
-    });
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            conn.get_database_backend(),
-            format!(
-                "SELECT s.session_id FROM agent_session s
-                 WHERE {} AND s.state IN ('active', 'condensed', 'stopped')
-                   AND (s.parent_commit IS ? OR
-                        EXISTS (
-                            SELECT 1 FROM agent_session_commit l
-                             WHERE l.session_id = s.session_id
-                               AND l.hash_kind = ? AND l.commit_oid = ?
-                               AND (s.state = 'active' OR ?)))
-                   AND EXISTS (SELECT 1 FROM agent_checkpoint c
-                               WHERE c.session_id = s.session_id AND c.scope = 'committed')
-                 ORDER BY s.session_id LIMIT 65",
-                crate::internal::ai::capture_scope::CaptureScope::matches_existing_sql("s")
-            ),
-            [
-                scope.repo_id.clone().into(),
-                scope.worktree_id.clone().into(),
-                scope.workspace_id.clone().into(),
-                scope.workspace_fence.into(),
-                parent_oid.clone().into(),
-                parent_kind.into(),
-                parent_oid.into(),
-                is_amend.into(),
-            ],
-        ))
-        .await
-        .map_err(|error| {
-            CommitError::AgentAssociation(format!("read scoped agent sessions: {error}"))
-        })?;
-    if rows.len() > 64 {
-        return Err(CommitError::AgentAssociation(
-            "more than 64 eligible sessions; close or inspect old sessions before committing"
-                .to_string(),
-        ));
-    }
-    let session_ids = rows
-        .into_iter()
-        .map(|row| {
-            let session_id: String = row.try_get_by_index(0).map_err(|error| {
-                CommitError::AgentAssociation(format!("decode session ID: {error}"))
-            })?;
-            if session_id.len() > 256
-                || session_id.is_empty()
-                || !session_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(&byte))
-            {
+            let scope =
+                crate::internal::ai::capture_scope::CaptureScope::resolve(&conn, &worktree_root)
+                    .await
+                    .map_err(|error| {
+                        CommitError::AgentAssociation(format!("resolve capture scope: {error:#}"))
+                    })?;
+            scope
+                .assert_workspace_fence_live(&conn)
+                .await
+                .map_err(|error| {
+                    CommitError::AgentAssociation(format!("verify workspace lease: {error:#}"))
+                })?;
+            let parent_oid = parent.map(ToString::to_string);
+            let parent_kind = parent.map(|oid| match oid.kind() {
+                git_internal::hash::HashKind::Sha1 => "sha1",
+                git_internal::hash::HashKind::Sha256 => "sha256",
+                git_internal::hash::HashKind::Blake3 => "blake3",
+            });
+            let rows = conn
+                .query_all_raw(Statement::from_sql_and_values(
+                    conn.get_database_backend(),
+                    format!(
+                        "SELECT s.session_id FROM agent_session s
+                         WHERE {} AND s.state IN ('active', 'condensed', 'stopped')
+                           AND (s.parent_commit IS ? OR
+                                EXISTS (
+                                    SELECT 1 FROM agent_session_commit l
+                                     WHERE l.session_id = s.session_id
+                                       AND l.hash_kind = ? AND l.commit_oid = ?
+                                       AND (s.state = 'active' OR ?)))
+                           AND EXISTS (SELECT 1 FROM agent_checkpoint c
+                                       WHERE c.session_id = s.session_id AND c.scope = 'committed')
+                         ORDER BY s.session_id LIMIT 65",
+                        crate::internal::ai::capture_scope::CaptureScope::matches_existing_sql("s")
+                    ),
+                    [
+                        scope.repo_id.clone().into(),
+                        scope.worktree_id.clone().into(),
+                        scope.workspace_id.clone().into(),
+                        scope.workspace_fence.into(),
+                        parent_oid.clone().into(),
+                        parent_kind.into(),
+                        parent_oid.into(),
+                        is_amend.into(),
+                    ],
+                ))
+                .await
+                .map_err(|error| {
+                    CommitError::AgentAssociation(format!("read scoped agent sessions: {error}"))
+                })?;
+            if rows.len() > 64 {
                 return Err(CommitError::AgentAssociation(
-                    "a scoped session ID is not safe for a commit trailer".to_string(),
+                    "more than 64 eligible sessions; close or inspect old sessions before committing"
+                        .to_string(),
                 ));
             }
-            Ok(session_id)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(AgentCommitSnapshot {
-        conn: Some(conn),
-        storage_root,
-        scope,
-        session_ids,
-    })
+            let session_ids = rows
+                .into_iter()
+                .map(|row| {
+                    let session_id: String = row.try_get_by_index(0).map_err(|error| {
+                        CommitError::AgentAssociation(format!("decode session ID: {error}"))
+                    })?;
+                    if session_id.len() > 256
+                        || session_id.is_empty()
+                        || !session_id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(&byte))
+                    {
+                        return Err(CommitError::AgentAssociation(
+                            "a scoped session ID is not safe for a commit trailer".to_string(),
+                        ));
+                    }
+                    Ok(session_id)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(AgentCommitSnapshot {
+                backend: AgentCommitSnapshotBackend::Sqlite(conn),
+                storage_root,
+                scope,
+                session_ids,
+            })
+        }
+    }
 }
 
 fn append_agent_session_trailers(message: &str, session_ids: &[String]) -> String {
@@ -4091,26 +4114,28 @@ async fn mark_agent_journal_linked(
     if snapshot.session_ids.is_empty() {
         return Ok(());
     }
-    let Some(conn) = snapshot.conn.as_ref() else {
-        return Ok(());
-    };
-    let txn = crate::internal::db::begin_write_transaction(conn).await?;
-    crate::internal::ai::history::authorize_agent_commit_links_in_txn(
-        &txn,
-        &snapshot.session_ids,
-        &snapshot.scope,
-    )
-    .await?;
-    let mut record = crate::internal::ai::commit_journal::CommitJournalRecord::prepared(
-        snapshot.scope.clone(),
-        commit_hash_kind(oid),
-        &oid.to_string(),
-        &snapshot.session_ids,
-    );
-    record.stage = crate::internal::ai::commit_journal::CommitJournalStage::Linked;
-    crate::internal::ai::commit_journal::append(&snapshot.storage_root, &record)?;
-    txn.commit().await?;
-    Ok(())
+    match &snapshot.backend {
+        AgentCommitSnapshotBackend::Redb => Ok(()),
+        AgentCommitSnapshotBackend::Sqlite(conn) => {
+            let txn = crate::internal::db::begin_write_transaction(conn).await?;
+            crate::internal::ai::history::authorize_agent_commit_links_in_txn(
+                &txn,
+                &snapshot.session_ids,
+                &snapshot.scope,
+            )
+            .await?;
+            let mut record = crate::internal::ai::commit_journal::CommitJournalRecord::prepared(
+                snapshot.scope.clone(),
+                commit_hash_kind(oid),
+                &oid.to_string(),
+                &snapshot.session_ids,
+            );
+            record.stage = crate::internal::ai::commit_journal::CommitJournalStage::Linked;
+            crate::internal::ai::commit_journal::append(&snapshot.storage_root, &record)?;
+            txn.commit().await?;
+            Ok(())
+        }
+    }
 }
 
 /// Refuse prepared-commit recovery when completing the ref update could also

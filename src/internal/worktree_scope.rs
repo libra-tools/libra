@@ -126,9 +126,34 @@ pub async fn request_db() -> std::io::Result<sea_orm::DatabaseConnection> {
         context::with_current(|pinned| pinned.as_ref().map(|pinned| pinned.storage.clone()));
     match storage {
         Some(storage) => {
-            crate::internal::db::get_db_conn_instance_for_path(&storage.join(util::DATABASE)).await
+            let backend = crate::storage::runtime::detect_repo_backend(&storage)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            match backend {
+                crate::storage::StorageBackendKind::Redb => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "cannot open SQLite repository database: active repository backend is redb",
+                )),
+                crate::storage::StorageBackendKind::Sqlite => {
+                    crate::internal::db::get_db_conn_instance_for_path(
+                        &storage.join(util::DATABASE),
+                    )
+                    .await
+                }
+            }
         }
-        None => Ok(crate::internal::db::get_db_conn_instance().await),
+        None => {
+            let backend = crate::storage::runtime::detect_current_repo_backend()
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            match backend {
+                crate::storage::StorageBackendKind::Redb => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "cannot open SQLite repository database: active repository backend is redb",
+                )),
+                crate::storage::StorageBackendKind::Sqlite => {
+                    Ok(crate::internal::db::get_db_conn_instance().await)
+                }
+            }
+        }
     }
 }
 

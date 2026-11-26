@@ -57,10 +57,23 @@ impl DoctorEngine {
 
     pub async fn inspect(&self, dry_run: bool, fix: bool) -> Result<DoctorReport, DoctorError> {
         let _repo_lease = if fix && !dry_run {
-            let shared_repository =
-                ConfigKv::get_with_conn(self.store.db(), "core.sharedRepository")
+            let shared_repository = match self.store.backend_kind() {
+                crate::storage::StorageBackendKind::Redb => {
+                    let config_store = crate::storage::runtime::open_repo_config_store_read_only(
+                        &self.scope.storage,
+                    )
                     .await
                     .map_err(|error| DoctorError::Storage(error.to_string()))?;
+                    ConfigKv::get_with_store(config_store.as_ref(), "core.sharedRepository")
+                        .await
+                        .map_err(|error| DoctorError::Storage(error.to_string()))?
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    ConfigKv::get_with_conn(self.store.db(), "core.sharedRepository")
+                        .await
+                        .map_err(|error| DoctorError::Storage(error.to_string()))?
+                }
+            };
             if shared_repository
                 .as_ref()
                 .is_some_and(|entry| entry.encrypted)
@@ -249,12 +262,27 @@ impl DoctorEngine {
         }
 
         if fix && !dry_run {
-            let engine = super::RestoreEngine::new(
-                self.scope.clone(),
-                self.repo_id.clone(),
-                self.store.db().clone(),
-                self.store.storage(),
-            );
+            let engine = match self.store.backend_kind() {
+                crate::storage::StorageBackendKind::Redb => {
+                    let state_store = self.store.state_store().cloned().ok_or_else(|| {
+                        DoctorError::Storage(
+                            "redb operation store is missing its GitStateStore handle".to_string(),
+                        )
+                    })?;
+                    super::RestoreEngine::new_with_store(
+                        self.scope.clone(),
+                        self.repo_id.clone(),
+                        state_store,
+                        self.store.storage(),
+                    )
+                }
+                crate::storage::StorageBackendKind::Sqlite => super::RestoreEngine::new(
+                    self.scope.clone(),
+                    self.repo_id.clone(),
+                    self.store.db().clone(),
+                    self.store.storage(),
+                ),
+            };
             let restore_recovered = if latest_journals
                 .values()
                 .any(|journal| operation_is_running(journal) && journal_belongs_to_scope(journal))

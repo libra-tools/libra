@@ -3683,7 +3683,8 @@ async fn resolve_env_for_storage_init_typed(
     let vault_key = format!("vault.env.{name}");
 
     if let Some(global_db_path) = storage_global_config_path()
-        && global_db_path.exists()
+        && (global_db_path.exists()
+            || config_path_uses_redb_backend(&global_db_path, DatabaseRole::GlobalConfig))
     {
         if let Some(future) = inspect_global_config_schema_future_at_path(&global_db_path).await {
             return Err(StorageConfigResolutionError::GlobalSchemaFuture(future));
@@ -3724,7 +3725,8 @@ async fn resolve_env_for_storage_init_without_global(
 
     if let Ok(storage_path) = try_get_storage_path(None) {
         let local_db_path = storage_path.join(DATABASE);
-        if local_db_path.exists()
+        if (local_db_path.exists()
+            || crate::storage::runtime::has_redb_storage_markers(&storage_path))
             && let Some(value) =
                 read_config_env_value(name, &vault_key, &local_db_path, DatabaseRole::Repository)
                     .await
@@ -3754,24 +3756,81 @@ pub(crate) async fn inspect_global_config_schema_future_at_path(
     inspect_configuration_schema_issue_at_path(global_db_path, DatabaseRole::GlobalConfig).await
 }
 
+fn detect_config_backend_for_path(
+    db_path: &Path,
+    role: DatabaseRole,
+) -> crate::storage::StorageBackendKind {
+    use crate::storage::{
+        StorageBackendKind,
+        config_store::{
+            CONFIG_REDB_FILE_NAME, ConfigScopeAuthority, inspect_config_scope_authority,
+        },
+    };
+    if db_path
+        .file_name()
+        .is_some_and(|name| name == CONFIG_REDB_FILE_NAME)
+        || db_path.extension().is_some_and(|ext| ext == "redb")
+    {
+        return StorageBackendKind::Redb;
+    }
+    let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return StorageBackendKind::Sqlite;
+    };
+    match role {
+        DatabaseRole::Repository => {
+            if crate::storage::runtime::has_redb_storage_markers(parent)
+                && matches!(
+                    crate::storage::runtime::detect_repo_backend(parent),
+                    Ok(StorageBackendKind::Redb)
+                )
+            {
+                StorageBackendKind::Redb
+            } else {
+                StorageBackendKind::Sqlite
+            }
+        }
+        DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => {
+            match inspect_config_scope_authority(parent, role) {
+                Ok(ConfigScopeAuthority::Manifest { manifest, .. }) => manifest.backend,
+                Ok(ConfigScopeAuthority::UnmanifestedRedb { .. }) => StorageBackendKind::Redb,
+                _ => StorageBackendKind::Sqlite,
+            }
+        }
+        _ => StorageBackendKind::Sqlite,
+    }
+}
+
+fn config_path_uses_redb_backend(db_path: &Path, role: DatabaseRole) -> bool {
+    detect_config_backend_for_path(db_path, role) == crate::storage::StorageBackendKind::Redb
+}
+
 async fn inspect_configuration_schema_issue_at_path(
     db_path: &Path,
     role: DatabaseRole,
 ) -> Option<GlobalConfigSchemaFuture> {
-    // Physically read-only, literal path, no creation or migration. Malformed
-    // and unreadable databases retain the normal resolver's error policy.
-    let conn = schema::open_readonly_connection_for_role(db_path, Duration::from_millis(200), role)
-        .await
-        .ok()?;
-    let inspection = schema::inspect_configuration_schema(&conn, role).await;
-    let _ = conn.close().await;
-    let issue = inspection.ok()?.issue?;
-    Some(GlobalConfigSchemaFuture {
-        db_path: db_path.to_path_buf(),
-        current_version: issue.current_version,
-        latest_version: issue.latest_version,
-        issue,
-    })
+    match detect_config_backend_for_path(db_path, role) {
+        crate::storage::StorageBackendKind::Redb => None,
+        crate::storage::StorageBackendKind::Sqlite => {
+            // Physically read-only, literal path, no creation or migration. Malformed
+            // and unreadable databases retain the normal resolver's error policy.
+            let conn = schema::open_readonly_connection_for_role(
+                db_path,
+                Duration::from_millis(200),
+                role,
+            )
+            .await
+            .ok()?;
+            let inspection = schema::inspect_configuration_schema(&conn, role).await;
+            let _ = conn.close().await;
+            let issue = inspection.ok()?.issue?;
+            Some(GlobalConfigSchemaFuture {
+                db_path: db_path.to_path_buf(),
+                current_version: issue.current_version,
+                latest_version: issue.latest_version,
+                issue,
+            })
+        }
+    }
 }
 
 /// Inspect both scopes before dispatch makes any global-credential bypass
@@ -3891,53 +3950,9 @@ async fn read_config_env_value_once(
     db_path: &Path,
     role: DatabaseRole,
 ) -> Result<Option<String>, ConfigReadFailure> {
-    let (conn, scope) = match role {
-        DatabaseRole::GlobalConfig => {
-            let conn = schema::open_readonly_connection_for_role(
-                db_path,
-                Duration::from_millis(200),
-                role,
-            )
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to connect to global config '{}': {error}",
-                    db_path.display()
-                )
-            })?;
-            schema::check_configuration_schema(&conn, role)
-                .await
-                .map_err(|error| error.to_string())?;
-            if !schema::configuration_has_kv(&conn, role)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                return Ok(None);
-            }
-            (conn, "global")
-        }
-        DatabaseRole::Repository => {
-            let path = db_path.to_str().ok_or_else(|| {
-                format!(
-                    "database path is not valid UTF-8 for local config: {}",
-                    db_path.display()
-                )
-            })?;
-            let conn = schema::establish_connection_with_lock_timeout_for_role(
-                path,
-                Duration::from_millis(200),
-                role,
-            )
-            .await
-            .map_err(|error| ConfigReadFailure {
-                busy: is_sqlite_busy_message(&error.to_string()),
-                message: format!(
-                    "failed to connect to local config '{}': {error}",
-                    db_path.display()
-                ),
-            })?;
-            (conn, "local")
-        }
+    let scope = match role {
+        DatabaseRole::GlobalConfig => "global",
+        DatabaseRole::Repository => "local",
         DatabaseRole::SystemConfig | DatabaseRole::Derived | DatabaseRole::Capture => {
             return Err(format!(
                 "{role} cannot supply storage credentials; use local or global configuration"
@@ -3946,12 +3961,116 @@ async fn read_config_env_value_once(
         }
     };
 
-    let entry = ConfigKv::get_with_conn(&conn, vault_key)
-        .await
-        .map_err(|err| ConfigReadFailure {
-            busy: role == DatabaseRole::Repository && is_sqlite_busy_error(&err),
-            message: format!("failed to read '{env_name}' from {scope} config: {err}"),
-        })?;
+    let entry = match detect_config_backend_for_path(db_path, role) {
+        crate::storage::StorageBackendKind::Redb => {
+            let parent = db_path.parent().ok_or_else(|| {
+                format!(
+                    "failed to resolve parent directory for {scope} config '{}'",
+                    db_path.display()
+                )
+            })?;
+            let store = match role {
+                DatabaseRole::Repository => {
+                    crate::storage::runtime::open_repo_config_store_read_only(parent)
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "failed to connect to local config '{}': {error}",
+                                db_path.display()
+                            )
+                        })?
+                }
+                DatabaseRole::GlobalConfig => {
+                    crate::storage::config_store::open_config_scope_for_read(
+                        parent,
+                        role,
+                        crate::storage::StorageBackendKind::Redb,
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to connect to global config '{}': {error}",
+                            db_path.display()
+                        )
+                    })?
+                }
+                _ => {
+                    return Err(format!(
+                        "{role} cannot supply storage credentials; use local or global configuration"
+                    )
+                    .into());
+                }
+            };
+            ConfigKv::get_with_store(store.as_ref(), vault_key)
+                .await
+                .map_err(|err| {
+                    ConfigReadFailure::from(format!(
+                        "failed to read '{env_name}' from {scope} config: {err}"
+                    ))
+                })?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let conn = match role {
+                DatabaseRole::GlobalConfig => {
+                    let conn = schema::open_readonly_connection_for_role(
+                        db_path,
+                        Duration::from_millis(200),
+                        role,
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to connect to global config '{}': {error}",
+                            db_path.display()
+                        )
+                    })?;
+                    schema::check_configuration_schema(&conn, role)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if !schema::configuration_has_kv(&conn, role)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        return Ok(None);
+                    }
+                    conn
+                }
+                DatabaseRole::Repository => {
+                    let path = db_path.to_str().ok_or_else(|| {
+                        format!(
+                            "database path is not valid UTF-8 for local config: {}",
+                            db_path.display()
+                        )
+                    })?;
+                    schema::establish_connection_with_lock_timeout_for_role(
+                        path,
+                        Duration::from_millis(200),
+                        role,
+                    )
+                    .await
+                    .map_err(|error| ConfigReadFailure {
+                        busy: is_sqlite_busy_message(&error.to_string()),
+                        message: format!(
+                            "failed to connect to local config '{}': {error}",
+                            db_path.display()
+                        ),
+                    })?
+                }
+                _ => {
+                    return Err(format!(
+                        "{role} cannot supply storage credentials; use local or global configuration"
+                    )
+                    .into());
+                }
+            };
+            ConfigKv::get_with_conn(&conn, vault_key)
+                .await
+                .map_err(|err| ConfigReadFailure {
+                    busy: role == DatabaseRole::Repository && is_sqlite_busy_error(&err),
+                    message: format!("failed to read '{env_name}' from {scope} config: {err}"),
+                })?
+        }
+    };
 
     let value = match entry {
         Some(entry) if entry.encrypted => decrypt_value(&entry.value, scope)
@@ -3991,19 +4110,21 @@ fn repo_id_prefix_for_configured_remote() -> Result<Option<String>, StorageConfi
         variable: "libra.repoid",
     })?;
     let db_path = storage_path.join(DATABASE);
-    match fs::symlink_metadata(&db_path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(StorageConfigFailure {
-                variable: "libra.repoid",
-            });
+    if !crate::storage::runtime::has_redb_storage_markers(&storage_path) {
+        match fs::symlink_metadata(&db_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(StorageConfigFailure {
+                    variable: "libra.repoid",
+                });
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(StorageConfigFailure {
+                    variable: "libra.repoid",
+                });
+            }
+            Ok(_) => {}
         }
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(StorageConfigFailure {
-                variable: "libra.repoid",
-            });
-        }
-        Ok(_) => {}
     }
 
     let (tx, rx) = mpsc::channel();
@@ -4019,31 +4140,81 @@ fn repo_id_prefix_for_configured_remote() -> Result<Option<String>, StorageConfi
 async fn read_or_create_configured_repo_id(
     db_path: PathBuf,
 ) -> Result<Option<String>, StorageConfigFailure> {
-    let db = db::get_db_conn_instance_for_path(&db_path)
-        .await
-        .map_err(|_| StorageConfigFailure {
-            variable: "libra.repoid",
-        })?;
-    let current = ConfigKv::get_with_conn(&db, "libra.repoid")
-        .await
-        .map_err(|_| StorageConfigFailure {
-            variable: "libra.repoid",
-        })?
-        .map(|entry| entry.value);
-    let needs_init = current
-        .as_deref()
-        .map(|value| value.is_empty() || value == "unknown-repo")
-        .unwrap_or(true);
-    if !needs_init {
-        return Ok(current);
+    let backend = match db_path.parent() {
+        Some(storage_dir) if crate::storage::runtime::has_redb_storage_markers(storage_dir) => {
+            crate::storage::runtime::detect_repo_backend(storage_dir).map_err(|_| {
+                StorageConfigFailure {
+                    variable: "libra.repoid",
+                }
+            })?
+        }
+        _ => crate::storage::StorageBackendKind::Sqlite,
+    };
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let storage_dir = db_path.parent().ok_or(StorageConfigFailure {
+                variable: "libra.repoid",
+            })?;
+            let store = crate::storage::runtime::open_repo_config_store_read_only(storage_dir)
+                .await
+                .map_err(|_| StorageConfigFailure {
+                    variable: "libra.repoid",
+                })?;
+            let current = ConfigKv::get_with_store(store.as_ref(), "libra.repoid")
+                .await
+                .map_err(|_| StorageConfigFailure {
+                    variable: "libra.repoid",
+                })?
+                .map(|entry| entry.value);
+            let needs_init = current
+                .as_deref()
+                .map(|value| value.is_empty() || value == "unknown-repo")
+                .unwrap_or(true);
+            if !needs_init {
+                return Ok(current);
+            }
+            drop(store);
+            let rw_store = crate::storage::runtime::open_repo_config_store_read_write(storage_dir)
+                .await
+                .map_err(|_| StorageConfigFailure {
+                    variable: "libra.repoid",
+                })?;
+            let new_id = Uuid::new_v4().to_string();
+            ConfigKv::set_with_store(rw_store.as_ref(), "libra.repoid", &new_id, false)
+                .await
+                .map_err(|_| StorageConfigFailure {
+                    variable: "libra.repoid",
+                })?;
+            Ok(Some(new_id))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = db::get_db_conn_instance_for_path(&db_path)
+                .await
+                .map_err(|_| StorageConfigFailure {
+                    variable: "libra.repoid",
+                })?;
+            let current = ConfigKv::get_with_conn(&db, "libra.repoid")
+                .await
+                .map_err(|_| StorageConfigFailure {
+                    variable: "libra.repoid",
+                })?
+                .map(|entry| entry.value);
+            let needs_init = current
+                .as_deref()
+                .map(|value| value.is_empty() || value == "unknown-repo")
+                .unwrap_or(true);
+            if !needs_init {
+                return Ok(current);
+            }
+            let new_id = Uuid::new_v4().to_string();
+            ConfigKv::set_with_conn(&db, "libra.repoid", &new_id, false)
+                .await
+                .map_err(|_| StorageConfigFailure {
+                    variable: "libra.repoid",
+                })?;
+            Ok(Some(new_id))
+        }
     }
-    let new_id = Uuid::new_v4().to_string();
-    ConfigKv::set_with_conn(&db, "libra.repoid", &new_id, false)
-        .await
-        .map_err(|_| StorageConfigFailure {
-            variable: "libra.repoid",
-        })?;
-    Ok(Some(new_id))
 }
 
 async fn expected_index_repair_oid_len(db_conn: &DatabaseConnection) -> Result<usize, String> {
@@ -4548,12 +4719,21 @@ async fn update_object_index_once(
     o_type: &str,
     o_size: i64,
 ) -> Result<(), String> {
-    if let Some(storage_dir) = db_path.parent()
-        && crate::storage::runtime::has_redb_storage_markers(storage_dir)
-    {
-        let backend = crate::storage::runtime::detect_repo_backend(storage_dir)
-            .map_err(|err| format!("failed to detect backend for object index update: {err}"))?;
-        if backend == crate::storage::StorageBackendKind::Redb {
+    let backend = match db_path.parent() {
+        Some(storage_dir) if crate::storage::runtime::has_redb_storage_markers(storage_dir) => {
+            crate::storage::runtime::detect_repo_backend(storage_dir)
+                .map_err(|err| format!("failed to detect backend for object index update: {err}"))?
+        }
+        _ => crate::storage::StorageBackendKind::Sqlite,
+    };
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let storage_dir = db_path.parent().ok_or_else(|| {
+                format!(
+                    "cannot resolve repository storage directory for '{}'",
+                    db_path.display()
+                )
+            })?;
             let config_store =
                 crate::storage::runtime::open_repo_config_store_read_only(storage_dir)
                     .await
@@ -4591,6 +4771,7 @@ async fn update_object_index_once(
                 .map_err(|err| format!("failed to upsert redb object_index row: {err}"))?;
             return Ok(());
         }
+        crate::storage::StorageBackendKind::Sqlite => {}
     }
     if !db_path.exists() {
         return Err(format!(

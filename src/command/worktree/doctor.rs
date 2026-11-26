@@ -768,88 +768,89 @@ pub(crate) async fn adopt_or_clear_legacy_approved_project(
     };
     require_repair_confirmation(confirm, action)?;
 
-    if matches!(
-        crate::storage::runtime::detect_current_repo_backend(),
-        Ok(crate::storage::StorageBackendKind::Redb)
-    ) {
-        let state = crate::storage::runtime::open_current_git_state_store_read_write()
-            .await
-            .map_err(|error| {
-                CliError::fatal(format!(
-                    "cannot open the redb state store for approved_permission recovery: {error}"
-                ))
-            })?;
-        let config = crate::storage::runtime::open_current_repo_config_store_read_write()
-            .await
-            .map_err(|error| {
-                CliError::fatal(format!(
-                    "cannot open the redb config store for approved_permission recovery: {error}"
-                ))
-            })?;
-        let repo_id =
-            crate::internal::workspace::RepoIdentity::resolve_or_init_with_store(config.as_ref())
+    match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let state = crate::storage::runtime::open_current_git_state_store_read_write()
                 .await
                 .map_err(|error| {
                     CliError::fatal(format!(
-                        "cannot resolve libra.repoid for approved_permission recovery: {error}"
-                    ))
-                })?
-                .as_str()
-                .to_string();
-        let rows = state
-            .list_approved_permissions(legacy_project_id)
-            .await
-            .map_err(|error| {
-                CliError::fatal(format!(
-                    "cannot list approved_permission rows for '{legacy_project_id}': {error}"
-                ))
-            })?;
-        let mut affected = 0usize;
-        for mut row in rows {
-            let _ = state
-                .delete_approved_permission(&row.project_id, &row.permission, &row.pattern)
-                .await
-                .map_err(|error| {
-                    CliError::fatal(format!(
-                        "cannot update approved_permission '{legacy_project_id}': {error}"
+                        "cannot open the redb state store for approved_permission recovery: {error}"
                     ))
                 })?;
-            if !clear {
-                row.project_id = repo_id.clone();
-                state
-                    .upsert_approved_permission(&row)
+            let config = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "cannot open the redb config store for approved_permission recovery: {error}"
+                    ))
+                })?;
+            let repo_id = crate::internal::workspace::RepoIdentity::resolve_or_init_with_store(
+                config.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "cannot resolve libra.repoid for approved_permission recovery: {error}"
+                ))
+            })?
+            .as_str()
+            .to_string();
+            let rows = state
+                .list_approved_permissions(legacy_project_id)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "cannot list approved_permission rows for '{legacy_project_id}': {error}"
+                    ))
+                })?;
+            let mut affected = 0usize;
+            for mut row in rows {
+                let _ = state
+                    .delete_approved_permission(&row.project_id, &row.permission, &row.pattern)
                     .await
                     .map_err(|error| {
                         CliError::fatal(format!(
-                            "cannot adopt approved_permission '{legacy_project_id}': {error}"
+                            "cannot update approved_permission '{legacy_project_id}': {error}"
                         ))
                     })?;
+                if !clear {
+                    row.project_id = repo_id.clone();
+                    state
+                        .upsert_approved_permission(&row)
+                        .await
+                        .map_err(|error| {
+                            CliError::fatal(format!(
+                                "cannot adopt approved_permission '{legacy_project_id}': {error}"
+                            ))
+                        })?;
+                }
+                affected += 1;
             }
-            affected += 1;
-        }
-        let payload = serde_json::json!({
-            "action": if clear { "clear" } else { "adopt" },
-            "legacy_project_id": legacy_project_id,
-            "rows_affected": affected,
-        });
-        if output.is_json() {
-            let command = if clear {
-                "worktree.doctor.clear_approved_project"
+            let payload = serde_json::json!({
+                "action": if clear { "clear" } else { "adopt" },
+                "legacy_project_id": legacy_project_id,
+                "rows_affected": affected,
+            });
+            if output.is_json() {
+                let command = if clear {
+                    "worktree.doctor.clear_approved_project"
+                } else {
+                    "worktree.doctor.adopt_approved_project"
+                };
+                return emit_json_data(command, &payload, output);
+            }
+            if clear {
+                println!(
+                    "cleared {affected} approved_permission row(s) under legacy project_id '{legacy_project_id}'"
+                );
             } else {
-                "worktree.doctor.adopt_approved_project"
-            };
-            return emit_json_data(command, &payload, output);
+                println!(
+                    "adopted {affected} approved_permission row(s) from legacy project_id '{legacy_project_id}' onto libra.repoid"
+                );
+            }
+            return Ok(());
         }
-        if clear {
-            println!(
-                "cleared {affected} approved_permission row(s) under legacy project_id '{legacy_project_id}'"
-            );
-        } else {
-            println!(
-                "adopted {affected} approved_permission row(s) from legacy project_id '{legacy_project_id}' onto libra.repoid"
-            );
-        }
-        return Ok(());
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {}
     }
 
     let db_path = crate::utils::path::database();
@@ -953,37 +954,41 @@ pub(crate) async fn adopt_legacy_capture_scope(
               verifying the workspace and session",
         ));
     }
-    if matches!(
-        crate::storage::runtime::detect_current_repo_backend(),
-        Ok(crate::storage::StorageBackendKind::Redb)
-    ) {
-        let storage = crate::storage::runtime::current_repo_storage_dir().map_err(|error| {
-            CliError::fatal(format!("cannot resolve repository storage: {error}"))
-        })?;
-        let state = crate::storage::runtime::open_git_state_store_read_only(&storage)
-            .await
-            .map_err(|error| CliError::fatal(format!("cannot open redb state store: {error}")))?;
-        let record = WorkspaceStore::get_with_store(state.as_ref(), workspace_id)
-            .await
-            .map_err(|error| {
-                CliError::fatal(format!("cannot read workspace '{workspace_id}': {error}"))
-            })?
-            .ok_or_else(|| {
-                CliError::fatal(format!(
-                    "no workspace matches id '{workspace_id}'; list them with `libra worktree doctor`"
-                ))
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
+    match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let storage = crate::storage::runtime::current_repo_storage_dir().map_err(|error| {
+                CliError::fatal(format!("cannot resolve repository storage: {error}"))
             })?;
-        if !record.state.holds_identity() || record.lease_owner.is_none() || record.lease_fence <= 0
-        {
+            let state = crate::storage::runtime::open_git_state_store_read_only(&storage)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("cannot open redb state store: {error}"))
+                })?;
+            let record = WorkspaceStore::get_with_store(state.as_ref(), workspace_id)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("cannot read workspace '{workspace_id}': {error}"))
+                })?
+                .ok_or_else(|| {
+                    CliError::fatal(format!(
+                        "no workspace matches id '{workspace_id}'; list them with `libra worktree doctor`"
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidTarget)
+                })?;
+            if !record.state.holds_identity()
+                || record.lease_owner.is_none()
+                || record.lease_fence <= 0
+            {
+                return Err(CliError::fatal(format!(
+                    "workspace '{workspace_id}' has no live lease fence; refuse to attribute capture \
+                      state to a released, orphaned, or unleased scope"
+                )));
+            }
             return Err(CliError::fatal(format!(
-                "workspace '{workspace_id}' has no live lease fence; refuse to attribute capture \
-                  state to a released, orphaned, or unleased scope"
+                "capture session identifier '{session_id}' has no legacy unscoped capture row"
             )));
         }
-        return Err(CliError::fatal(format!(
-            "capture session identifier '{session_id}' has no legacy unscoped capture row"
-        )));
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {}
     }
     let db_path = crate::utils::path::database();
     let conn = crate::internal::db::get_db_conn_instance_for_path(&db_path)

@@ -1095,18 +1095,36 @@ where
 /// corrupt, which is a repairable user-facing condition rather than a bug, so
 /// the message names the worktree and the command that fixes it.
 pub(crate) async fn request_db_checked() -> Result<sea_orm::DatabaseConnection, String> {
-    crate::internal::worktree_scope::request_db()
-        .await
-        .map_err(|error| {
+    match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => Err(
+            "cannot open SQLite repository database: active repository backend is redb".to_string(),
+        ),
+        Ok(crate::storage::StorageBackendKind::Sqlite) => {
+            crate::internal::worktree_scope::request_db()
+                .await
+                .map_err(|error| {
+                    let workdir =
+                        crate::internal::worktree_scope::WorktreeScope::request_scope()
+                            .map(|pinned| pinned.workdir.display().to_string())
+                            .unwrap_or_else(|| "this worktree".to_string());
+                    format!(
+                        "cannot open the repository database for '{workdir}': {error}. If this is a \
+                         linked worktree, its `.libra/commondir` may be missing or corrupt — run \
+                         `libra worktree repair --confirm --path <worktree-path>` from the main worktree"
+                    )
+                })
+        }
+        Err(error) => {
             let workdir = crate::internal::worktree_scope::WorktreeScope::request_scope()
                 .map(|pinned| pinned.workdir.display().to_string())
                 .unwrap_or_else(|| "this worktree".to_string());
-            format!(
+            Err(format!(
                 "cannot open the repository database for '{workdir}': {error}. If this is a \
                  linked worktree, its `.libra/commondir` may be missing or corrupt — run \
                  `libra worktree repair --confirm --path <worktree-path>` from the main worktree"
-            )
-        })
+            ))
+        }
+    }
 }
 
 /// This INVOCATION's scope key (§C.4.2 resolve-once): the pinned request scope
@@ -1540,9 +1558,16 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
         }
         return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Rebase)));
     }
-    if let Some(db) = db_opt.as_ref()
-        && legacy_table_active(db, "cherry_pick_state").await?
-    {
+    let legacy_cp_active = match backend {
+        crate::storage::StorageBackendKind::Redb => false,
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = db_opt
+                .as_ref()
+                .ok_or_else(|| "missing sqlite database".to_string())?;
+            legacy_table_active(db, "cherry_pick_state").await?
+        }
+    };
+    if legacy_cp_active {
         if !scope.is_linked() && crate::command::maintenance::repository_had_linked_worktrees() {
             return Ok(Some(ActiveSequenceKind::AmbiguousLegacy(
                 AmbiguousLegacyState::Table("cherry_pick_state"),

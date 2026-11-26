@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     command::config::{ConfigScope, ScopedConfig},
-    internal::{config::ConfigKv, vault},
+    internal::vault,
 };
 
 const ACCOUNT_SESSION_PREFIX: &str = "account.host.";
@@ -41,11 +41,8 @@ pub async fn store_session(session: &AccountSession) -> Result<()> {
         serde_json::to_vec(session).context("failed to serialize the account session")?;
     let encrypted = vault::encrypt_token(&unseal_key, &plaintext)
         .map_err(|_| anyhow!("failed to encrypt the account session"))?;
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-    ConfigKv::set_with_conn(
-        &conn,
+    ScopedConfig::set(
+        ConfigScope::Global,
         &storage_key(&session.host),
         &hex::encode(encrypted),
         false,
@@ -57,38 +54,34 @@ pub async fn store_session(session: &AccountSession) -> Result<()> {
 }
 
 pub async fn load_session(host: &str) -> Result<Option<AccountSession>> {
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-    let Some(entry) = ConfigKv::get_with_conn(&conn, &storage_key(host))
-        .await
-        .map_err(|error| anyhow!("failed to read the account session: {error}"))?
-    else {
+    let entry = match ScopedConfig::get(ConfigScope::Global, &storage_key(host)).await {
+        Ok(entry) => entry,
+        Err(error) if error.starts_with("NOT_FOUND:") => return Ok(None),
+        Err(error) => return Err(anyhow!("failed to read the account session: {error}")),
+    };
+    let Some(entry) = entry else {
         return Ok(None);
     };
     decrypt_session(&entry.value).await.map(Some)
 }
 
 pub async fn remove_session(host: &str) -> Result<bool> {
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-    let removed = ConfigKv::unset_all_with_conn(&conn, &storage_key(host))
+    let removed = ScopedConfig::unset_all(ConfigScope::Global, &storage_key(host))
         .await
         .map_err(|error| anyhow!("failed to remove the account session: {error}"))?;
     Ok(removed > 0)
 }
 
 pub async fn remove_all_sessions() -> Result<usize> {
-    let conn = ScopedConfig::get_connection(ConfigScope::Global)
-        .await
-        .map_err(|error| anyhow!("failed to open the global config store: {error}"))?;
-    let entries = ConfigKv::get_by_prefix_with_conn(&conn, ACCOUNT_SESSION_PREFIX)
-        .await
-        .map_err(|error| anyhow!("failed to list account sessions: {error}"))?;
+    let entries =
+        match ScopedConfig::get_by_prefix(ConfigScope::Global, ACCOUNT_SESSION_PREFIX).await {
+            Ok(entries) => entries,
+            Err(error) if error.starts_with("NOT_FOUND:") => return Ok(0),
+            Err(error) => return Err(anyhow!("failed to list account sessions: {error}")),
+        };
     let mut removed = 0;
     for entry in entries {
-        removed += ConfigKv::unset_all_with_conn(&conn, &entry.key)
+        removed += ScopedConfig::unset_all(ConfigScope::Global, &entry.key)
             .await
             .map_err(|error| anyhow!("failed to remove account session: {error}"))?;
     }

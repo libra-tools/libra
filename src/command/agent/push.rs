@@ -139,6 +139,182 @@ pub async fn execute_safe(args: PushArgs, output: &OutputConfig) -> CliResult<()
     }
 }
 
+enum Mega2StreamHandle {
+    Redb(std::sync::Arc<dyn crate::storage::ConfigStore>),
+    Sqlite(sea_orm::DatabaseConnection),
+}
+
+async fn config_value_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    key: &str,
+) -> Result<Option<String>, super::mega2_stream::Mega2StreamError> {
+    let entry = crate::internal::config::ConfigKv::get_with_store(config, key)
+        .await
+        .map_err(|error| {
+            super::mega2_stream::Mega2StreamError::Store(format!(
+                "cannot read repository config `{key}`: {error}"
+            ))
+        })?;
+    Ok(entry.map(|entry| entry.value))
+}
+
+async fn reusable_scope_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    target: &str,
+    epoch: &str,
+) -> Result<Option<super::mega2_stream::ReusableScope>, super::mega2_stream::Mega2StreamError> {
+    use super::mega2_stream::{
+        RECEIPT_EPOCH_KEY, RECEIPT_SCOPE_KEY, RECEIPT_STATE_KEY, RECEIPT_TARGET_KEY, ReusableScope,
+        STATE_CONFIRMED,
+    };
+
+    let state = config_value_with_store(config, RECEIPT_STATE_KEY).await?;
+    let scope = config_value_with_store(config, RECEIPT_SCOPE_KEY).await?;
+    let recorded_target = config_value_with_store(config, RECEIPT_TARGET_KEY).await?;
+    let recorded_epoch = config_value_with_store(config, RECEIPT_EPOCH_KEY).await?;
+    match (state.as_deref(), scope) {
+        (Some(STATE_CONFIRMED), Some(scope))
+            if recorded_target.as_deref() == Some(target)
+                && recorded_epoch.as_deref() == Some(epoch)
+                && uuid::Uuid::parse_str(&scope).is_ok() =>
+        {
+            Ok(Some(ReusableScope { scope }))
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn begin_push_attempt_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    intent: super::mega2_stream::EpochIntent,
+    tip: &str,
+) -> Result<super::mega2_stream::PushReceipt, super::mega2_stream::Mega2StreamError> {
+    use super::mega2_stream::{
+        EPOCH_KEY, Mega2StreamError, PushReceipt, RECEIPT_STATE_KEY, RECEIPT_TIP_KEY,
+        STATE_PENDING, bind_source_epoch_with_store,
+    };
+    use crate::internal::config::ConfigKv;
+
+    if tip.is_empty() {
+        return Err(Mega2StreamError::Epoch(
+            "the local traces tip is empty; create a checkpoint before pushing".to_string(),
+        ));
+    }
+    let before = config_value_with_store(config, EPOCH_KEY).await?;
+    let binding = bind_source_epoch_with_store(config, intent).await?;
+    let created_epoch = before.as_deref() != Some(binding.epoch.as_str());
+    ConfigKv::set_with_store(config, RECEIPT_TIP_KEY, tip, false)
+        .await
+        .map_err(|error| Mega2StreamError::Store(format!("cannot record the push tip: {error}")))?;
+    ConfigKv::set_with_store(config, RECEIPT_STATE_KEY, STATE_PENDING, false)
+        .await
+        .map_err(|error| {
+            Mega2StreamError::Store(format!("cannot record the pending push receipt: {error}"))
+        })?;
+    Ok(PushReceipt {
+        epoch: binding.epoch,
+        tip: tip.to_string(),
+        state: STATE_PENDING.to_string(),
+        scope: None,
+        created_epoch,
+    })
+}
+
+async fn confirm_push_attempt_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    tip: &str,
+    discovered_scope: Option<&str>,
+) -> Result<super::mega2_stream::PushReceipt, super::mega2_stream::Mega2StreamError> {
+    use super::mega2_stream::{
+        EPOCH_KEY, Mega2StreamError, PushReceipt, RECEIPT_SCOPE_KEY, RECEIPT_STATE_KEY,
+        RECEIPT_TIP_KEY, STATE_CONFIRMED, STATE_SCOPE_PENDING,
+    };
+    use crate::internal::config::ConfigKv;
+
+    let epoch = config_value_with_store(config, EPOCH_KEY)
+        .await?
+        .ok_or_else(|| {
+            Mega2StreamError::Epoch(
+                "cannot confirm a traces push because no epoch is stored".to_string(),
+            )
+        })?;
+    let stored_tip = config_value_with_store(config, RECEIPT_TIP_KEY).await?;
+    let stored_state = config_value_with_store(config, RECEIPT_STATE_KEY).await?;
+    let stored_scope = config_value_with_store(config, RECEIPT_SCOPE_KEY).await?;
+    if stored_tip.as_deref() == Some(tip)
+        && stored_state.as_deref() == Some(STATE_CONFIRMED)
+        && discovered_scope.is_none()
+    {
+        return Ok(PushReceipt {
+            epoch,
+            tip: tip.to_string(),
+            state: STATE_CONFIRMED.to_string(),
+            scope: stored_scope,
+            created_epoch: false,
+        });
+    }
+    let (state, scope) = match discovered_scope {
+        Some(scope) if !scope.is_empty() => (STATE_CONFIRMED, Some(scope.to_string())),
+        _ => (STATE_SCOPE_PENDING, None),
+    };
+    ConfigKv::set_with_store(config, RECEIPT_TIP_KEY, tip, false)
+        .await
+        .map_err(|error| {
+            Mega2StreamError::Store(format!("cannot record the confirmed tip: {error}"))
+        })?;
+    ConfigKv::set_with_store(config, RECEIPT_STATE_KEY, state, false)
+        .await
+        .map_err(|error| {
+            Mega2StreamError::Store(format!("cannot record the push receipt state: {error}"))
+        })?;
+    if let Some(scope) = scope.as_deref() {
+        ConfigKv::set_with_store(config, RECEIPT_SCOPE_KEY, scope, false)
+            .await
+            .map_err(|error| {
+                Mega2StreamError::Store(format!("cannot record the traces scope: {error}"))
+            })?;
+    }
+    let epoch_after = config_value_with_store(config, EPOCH_KEY).await?;
+    if epoch_after.as_deref() != Some(epoch.as_str()) {
+        return Err(Mega2StreamError::Epoch(
+            "confirmation changed the stored epoch; refusing to publish that receipt".to_string(),
+        ));
+    }
+    Ok(PushReceipt {
+        epoch,
+        tip: tip.to_string(),
+        state: state.to_string(),
+        scope,
+        created_epoch: false,
+    })
+}
+
+async fn record_receipt_binding_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    target: &str,
+    epoch: &str,
+    scope: Option<&str>,
+) -> Result<(), super::mega2_stream::Mega2StreamError> {
+    use super::mega2_stream::{
+        Mega2StreamError, RECEIPT_EPOCH_KEY, RECEIPT_SCOPE_KEY, RECEIPT_TARGET_KEY,
+    };
+    use crate::internal::config::ConfigKv;
+
+    for (key, value) in [(RECEIPT_TARGET_KEY, target), (RECEIPT_EPOCH_KEY, epoch)] {
+        ConfigKv::set_with_store(config, key, value, false)
+            .await
+            .map_err(|error| Mega2StreamError::Store(format!("cannot record `{key}`: {error}")))?;
+    }
+    if scope.is_none() {
+        ConfigKv::unset_with_store(config, RECEIPT_SCOPE_KEY)
+            .await
+            .map_err(|error| {
+                Mega2StreamError::Store(format!("cannot clear `{RECEIPT_SCOPE_KEY}`: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
 async fn execute_mega2(args: PushArgs, output: &OutputConfig) -> CliResult<()> {
     use super::mega2_stream::{self, EpochIntent};
     use crate::internal::protocol::mega2_traces::{self, Admission, ByPathLocator};
@@ -237,17 +413,59 @@ async fn execute_mega2(args: PushArgs, output: &OutputConfig) -> CliResult<()> {
         })?)
     };
 
-    let connection = mega2_stream::open_repository_at(&workdir)
-        .await
-        .map_err(|error| CliError::fatal(error.to_string()))?;
-    let reuse = mega2_stream::reusable_scope(&connection, &target, &binding.epoch)
-        .await
-        .map_err(|error| CliError::fatal(error.to_string()))?;
-    mega2_stream::begin_push_attempt(&connection, EpochIntent::Current, &tip_hex)
-        .await
-        .map_err(|error| {
-            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
+    let storage_dir =
+        crate::utils::util::try_get_storage_path(Some(workdir.clone())).map_err(|error| {
+            CliError::fatal(format!(
+                "cannot find the repository storage for {}: {error}",
+                workdir.display()
+            ))
         })?;
+    let stream_handle = match crate::storage::runtime::detect_repo_backend(&storage_dir)
+        .map_err(|error| CliError::fatal(error.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let config = crate::storage::runtime::open_repo_config_store_read_write(&storage_dir)
+                .await
+                .map_err(|error| CliError::fatal(error.to_string()))?;
+            Mega2StreamHandle::Redb(config)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let connection = mega2_stream::open_repository_at(&workdir)
+                .await
+                .map_err(|error| CliError::fatal(error.to_string()))?;
+            Mega2StreamHandle::Sqlite(connection)
+        }
+    };
+    let reuse = match &stream_handle {
+        Mega2StreamHandle::Redb(config) => {
+            reusable_scope_with_store(config.as_ref(), &target, &binding.epoch)
+                .await
+                .map_err(|error| CliError::fatal(error.to_string()))?
+        }
+        Mega2StreamHandle::Sqlite(connection) => {
+            mega2_stream::reusable_scope(connection, &target, &binding.epoch)
+                .await
+                .map_err(|error| CliError::fatal(error.to_string()))?
+        }
+    };
+    match &stream_handle {
+        Mega2StreamHandle::Redb(config) => {
+            begin_push_attempt_with_store(config.as_ref(), EpochIntent::Current, &tip_hex)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::RepoStateInvalid)
+                })?;
+        }
+        Mega2StreamHandle::Sqlite(connection) => {
+            mega2_stream::begin_push_attempt(connection, EpochIntent::Current, &tip_hex)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::RepoStateInvalid)
+                })?;
+        }
+    }
     let locator_path = match &reuse {
         Some(reuse) => mega2_traces::by_scope_git_path(&reuse.scope),
         None => mega2_traces::by_path_git_path(&ByPathLocator {
@@ -351,17 +569,40 @@ async fn execute_mega2(args: PushArgs, output: &OutputConfig) -> CliResult<()> {
             }
         },
     };
-    let receipt = mega2_stream::confirm_push_attempt(&connection, &tip_hex, scope.as_deref())
-        .await
-        .map_err(|error| CliError::fatal(error.to_string()))?;
-    mega2_stream::record_receipt_binding(
-        &connection,
-        &target,
-        &binding.epoch,
-        receipt.scope.as_deref(),
-    )
-    .await
-    .map_err(|error| CliError::fatal(error.to_string()))?;
+    let receipt = match &stream_handle {
+        Mega2StreamHandle::Redb(config) => {
+            confirm_push_attempt_with_store(config.as_ref(), &tip_hex, scope.as_deref())
+                .await
+                .map_err(|error| CliError::fatal(error.to_string()))?
+        }
+        Mega2StreamHandle::Sqlite(connection) => {
+            mega2_stream::confirm_push_attempt(connection, &tip_hex, scope.as_deref())
+                .await
+                .map_err(|error| CliError::fatal(error.to_string()))?
+        }
+    };
+    match &stream_handle {
+        Mega2StreamHandle::Redb(config) => {
+            record_receipt_binding_with_store(
+                config.as_ref(),
+                &target,
+                &binding.epoch,
+                receipt.scope.as_deref(),
+            )
+            .await
+            .map_err(|error| CliError::fatal(error.to_string()))?;
+        }
+        Mega2StreamHandle::Sqlite(connection) => {
+            mega2_stream::record_receipt_binding(
+                connection,
+                &target,
+                &binding.epoch,
+                receipt.scope.as_deref(),
+            )
+            .await
+            .map_err(|error| CliError::fatal(error.to_string()))?;
+        }
+    }
 
     let report = Mega2PushReport {
         remote,

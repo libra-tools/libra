@@ -582,27 +582,123 @@ async fn commit_current(state: &mut AmState, mail: MailPatch) -> CliResult<Appli
             message: mail.message.clone(),
         },
     };
-    with_reflog(
-        context,
-        move |txn| {
-            Box::pin(async move {
-                Branch::update_branch_with_conn(txn, &branch, &transaction_id, None).await?;
-                match next_sequence {
-                    Some(sequence) => sequencer::save_am_with_conn(txn, &sequence).await?,
-                    None => sequencer::clear_am_with_conn(txn).await?,
-                }
-                Ok(())
-            })
-        },
-        true,
-    )
-    .await
-    .map_err(|error| {
-        am_state_error(format!(
-            "failed to update the branch, reflog, and am state for '{}': {error}",
-            mail.source
-        ))
-    })?;
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| am_state_error(format!("failed to detect storage backend: {error}")))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| {
+                    am_state_error(format!(
+                        "failed to open git store for '{}': {error}",
+                        mail.source
+                    ))
+                })?;
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|error| {
+                    am_state_error(format!(
+                        "failed to open config store for '{}': {error}",
+                        mail.source
+                    ))
+                })?;
+            let scope = crate::internal::worktree_scope::WorktreeScope::current();
+            if let Some(other) = Head::branch_checked_out_elsewhere_for_scope_result_with_store(
+                git_store.as_ref(),
+                &branch,
+                &scope,
+            )
+            .await
+            .map_err(|error| {
+                am_state_error(format!(
+                    "failed to check branch checkout state for '{}': {error}",
+                    mail.source
+                ))
+            })? {
+                return Err(am_state_error(format!(
+                    "branch '{branch}' is checked out at worktree '{other}'"
+                )));
+            }
+            let head_reflog = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                config_store.as_ref(),
+                &context,
+                crate::internal::reflog::HEAD,
+            )
+            .await;
+            let branch_reflog = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                config_store.as_ref(),
+                &context,
+                &format!("refs/heads/{branch}"),
+            )
+            .await;
+            let key = crate::storage::git_store::RefKey::LocalBranch {
+                name: branch.clone(),
+            };
+            let expected = crate::storage::git_store::RefTarget::Direct(parent.to_string());
+            let new_target = crate::storage::git_store::RefTarget::Direct(transaction_id.clone());
+            let outcome = git_store
+                .update_ref_cas(
+                    &key,
+                    Some(&expected),
+                    Some(&new_target),
+                    &[head_reflog, branch_reflog],
+                )
+                .await
+                .map_err(|error| {
+                    am_state_error(format!(
+                        "failed to update the branch and reflog for '{}': {error}",
+                        mail.source
+                    ))
+                })?;
+            if !matches!(
+                outcome,
+                crate::storage::git_store::RefCasOutcome::Applied { .. }
+            ) {
+                return Err(am_state_error(format!(
+                    "concurrent ref update while applying '{}'",
+                    mail.source
+                )));
+            }
+            match next_sequence {
+                Some(sequence) => sequencer::save_am(&sequence).await.map_err(|error| {
+                    am_state_error(format!(
+                        "failed to save am state for '{}': {error}",
+                        mail.source
+                    ))
+                })?,
+                None => sequencer::clear_am().await.map_err(|error| {
+                    am_state_error(format!(
+                        "failed to clear am state for '{}': {error}",
+                        mail.source
+                    ))
+                })?,
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            with_reflog(
+                context,
+                move |txn| {
+                    Box::pin(async move {
+                        Branch::update_branch_with_conn(txn, &branch, &transaction_id, None)
+                            .await?;
+                        match next_sequence {
+                            Some(sequence) => sequencer::save_am_with_conn(txn, &sequence).await?,
+                            None => sequencer::clear_am_with_conn(txn).await?,
+                        }
+                        Ok(())
+                    })
+                },
+                true,
+            )
+            .await
+            .map_err(|error| {
+                am_state_error(format!(
+                    "failed to update the branch, reflog, and am state for '{}': {error}",
+                    mail.source
+                ))
+            })?;
+        }
+    }
     *state = next;
 
     Ok(AppliedMail {

@@ -347,9 +347,12 @@ impl Head {
                     .await
                     .expect("HEAD row in redb store is corrupt")
             }
-            _ => {
+            Ok(crate::storage::StorageBackendKind::Sqlite) => {
                 let db_conn = get_db_conn_instance().await;
                 Self::current_with_conn(&db_conn).await
+            }
+            Err(err) => {
+                panic!("failed to detect repository storage backend for HEAD: {err}");
             }
         }
     }
@@ -801,9 +804,17 @@ impl Head {
                     .await
                     .expect("remote HEAD row in redb store is corrupt")
             }
-            _ => {
+            Ok(crate::storage::StorageBackendKind::Sqlite) => {
                 let db_conn = get_db_conn_instance().await;
                 Self::remote_current_with_conn(&db_conn, remote).await
+            }
+            Err(err) => {
+                tracing::error!(
+                    remote,
+                    error = %err,
+                    "failed to detect repository storage backend for remote HEAD"
+                );
+                None
             }
         }
     }

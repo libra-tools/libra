@@ -529,37 +529,46 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), DbErr>> + Send + 'b>>,
     F: Send + 'static,
 {
-    // §C.4.2: the reflog entry and the ref move it describes must land in the
-    // database of the worktree this INVOCATION is acting on — the ambient
-    // connection follows the cwd, so a moved cwd would record the move in
-    // another repository's log (or fail to find the row it just wrote).
-    let db = crate::internal::worktree_scope::request_db()
-        .await
-        .map_err(|error| {
-            ReflogError::Storage(format!(
-                "cannot open the repository database for this reflog write: {error}"
-            ))
-        })?;
-    // The caller's `operation` almost always READS before it writes (resolve
-    // the branch, read HEAD, then move them), and a deferred transaction that
-    // upgrades read→write gets `SQLITE_BUSY` immediately, without the busy
-    // timeout — so a second worktree writing its own refs at the same moment
-    // failed this one outright instead of queueing. Take the write lock up
-    // front; see `db::begin_write_transaction`.
-    let txn = crate::internal::db::begin_write_transaction(&db)
-        .await
-        .map_err(ReflogError::from)?;
-    let result = async {
-        operation(&txn).await.map_err(ReflogError::from)?;
-        Reflog::insert(&txn, context, insert_ref).await?;
-        Ok::<_, ReflogError>(())
-    }
-    .await;
-    match result {
-        Ok(()) => txn.commit().await.map_err(ReflogError::from),
-        Err(err) => {
-            let _ = txn.rollback().await;
-            Err(err)
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| ReflogError::Storage(error.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => Err(ReflogError::Storage(
+            "with_reflog requires a SQLite backend; use GitStore::update_ref_cas with ReflogWrite on redb repositories".to_string(),
+        )),
+        crate::storage::StorageBackendKind::Sqlite => {
+            // §C.4.2: the reflog entry and the ref move it describes must land in the
+            // database of the worktree this INVOCATION is acting on — the ambient
+            // connection follows the cwd, so a moved cwd would record the move in
+            // another repository's log (or fail to find the row it just wrote).
+            let db = crate::internal::worktree_scope::request_db()
+                .await
+                .map_err(|error| {
+                    ReflogError::Storage(format!(
+                        "cannot open the repository database for this reflog write: {error}"
+                    ))
+                })?;
+            // The caller's `operation` almost always READS before it writes (resolve
+            // the branch, read HEAD, then move them), and a deferred transaction that
+            // upgrades read→write gets `SQLITE_BUSY` immediately, without the busy
+            // timeout — so a second worktree writing its own refs at the same moment
+            // failed this one outright instead of queueing. Take the write lock up
+            // front; see `db::begin_write_transaction`.
+            let txn = crate::internal::db::begin_write_transaction(&db)
+                .await
+                .map_err(ReflogError::from)?;
+            let result = async {
+                operation(&txn).await.map_err(ReflogError::from)?;
+                Reflog::insert(&txn, context, insert_ref).await?;
+                Ok::<_, ReflogError>(())
+            }
+            .await;
+            match result {
+                Ok(()) => txn.commit().await.map_err(ReflogError::from),
+                Err(err) => {
+                    let _ = txn.rollback().await;
+                    Err(err)
+                }
+            }
         }
     }
 }
@@ -989,7 +998,7 @@ pub async fn expire_reflog<C, LP, LC>(
     is_commit: LC,
 ) -> Result<ExpireResult, ReflogError>
 where
-    C: TransactionTrait<Transaction = sea_orm::DatabaseTransaction>,
+    C: ConnectionTrait + TransactionTrait<Transaction = sea_orm::DatabaseTransaction>,
     LP: FnMut(&str) -> Option<Vec<String>> + Send + 'static,
     LC: Fn(&str) -> bool + Send + 'static,
 {

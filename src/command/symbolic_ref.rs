@@ -244,88 +244,122 @@ async fn run_local_symref(
         ))
         .with_stable_code(StableErrorCode::CliInvalidTarget));
     }
-    let db = crate::internal::db::get_db_conn_instance().await;
-    if args.delete {
-        let deleted = db
-            .execute_raw(Statement::from_sql_and_values(
-                db.get_database_backend(),
-                "DELETE FROM symbolic_ref WHERE name = ?",
-                [name.into()],
-            ))
-            .await
-            .map_err(|error| db_error("delete", name, error))?;
-        if deleted.rows_affected() == 0 {
-            // Keep Git's delete wording and exit code for a ref that exists as
-            // an entity branch (or not at all): `Cannot delete <name>, not a
-            // symbolic ref` (128).
-            return Err(
-                CliError::fatal(format!("Cannot delete {name}, not a symbolic ref"))
-                    .with_exit_code(128)
-                    .with_stable_code(StableErrorCode::CliInvalidTarget),
-            );
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(format!(
+            "failed to detect storage backend for symbolic ref '{name}': {error}"
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            if args.delete {
+                return Err(
+                    CliError::fatal(format!("Cannot delete {name}, not a symbolic ref"))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::CliInvalidTarget),
+                );
+            }
+            if let Some(target) = args.target.as_deref() {
+                validate_symref_target(target)?;
+                return Err(CliError::failure(format!(
+                    "cannot create symbolic ref '{name}': local branch symbolic refs are not supported on the redb storage backend"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidTarget));
+            }
+            Err(not_symbolic(name))
         }
-        return Ok(SymbolicRefOutput {
-            name: name.to_string(),
-            target: String::new(),
-            short: None,
-            action: "delete",
-        });
-    }
-    if let Some(target) = args.target.as_deref() {
-        validate_symref_target(target)?;
-        let txn = crate::internal::db::begin_write_transaction(&db)
-            .await
-            .map_err(|error| db_error("write", name, error))?;
-        let entity =
-            crate::internal::branch::Branch::find_branch_result_with_conn(&txn, branch, None)
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::db::get_db_conn_instance().await;
+            if args.delete {
+                let deleted = db
+                    .execute_raw(Statement::from_sql_and_values(
+                        db.get_database_backend(),
+                        "DELETE FROM symbolic_ref WHERE name = ?",
+                        [name.into()],
+                    ))
+                    .await
+                    .map_err(|error| db_error("delete", name, error))?;
+                if deleted.rows_affected() == 0 {
+                    // Keep Git's delete wording and exit code for a ref that exists as
+                    // an entity branch (or not at all): `Cannot delete <name>, not a
+                    // symbolic ref` (128).
+                    return Err(CliError::fatal(format!(
+                        "Cannot delete {name}, not a symbolic ref"
+                    ))
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::CliInvalidTarget));
+                }
+                return Ok(SymbolicRefOutput {
+                    name: name.to_string(),
+                    target: String::new(),
+                    short: None,
+                    action: "delete",
+                });
+            }
+            if let Some(target) = args.target.as_deref() {
+                validate_symref_target(target)?;
+                let txn = crate::internal::db::begin_write_transaction(&db)
+                    .await
+                    .map_err(|error| db_error("write", name, error))?;
+                let entity = crate::internal::branch::Branch::find_branch_result_with_conn(
+                    &txn, branch, None,
+                )
                 .await
                 .map_err(map_head_error)?;
-        if entity.is_some() {
-            return Err(CliError::failure(format!(
-                "cannot create symbolic ref '{name}': local branch '{branch}' already exists"
-            ))
-            .with_stable_code(StableErrorCode::CliInvalidTarget));
+                if entity.is_some() {
+                    return Err(CliError::failure(format!(
+                        "cannot create symbolic ref '{name}': local branch '{branch}' already exists"
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidTarget));
+                }
+                txn.execute_raw(Statement::from_sql_and_values(
+                    txn.get_database_backend(),
+                    "INSERT INTO symbolic_ref (name, target) VALUES (?, ?) \
+                     ON CONFLICT(name) DO UPDATE SET target = excluded.target",
+                    [name.into(), target.into()],
+                ))
+                .await
+                .map_err(|error| db_error("write", name, error))?;
+                txn.commit()
+                    .await
+                    .map_err(|error| db_error("write", name, error))?;
+                return Ok(SymbolicRefOutput {
+                    name: name.to_string(),
+                    target: target.to_string(),
+                    short: Some(branch.to_string()),
+                    action: "set",
+                });
+            }
+            let target = query_symref_target(name)
+                .await
+                .map_err(|error| db_error("read", name, error))?
+                .ok_or_else(|| not_symbolic(name))?;
+            Ok(SymbolicRefOutput {
+                name: name.to_string(),
+                target,
+                short: Some(branch.to_string()),
+                action: "read",
+            })
         }
-        txn.execute_raw(Statement::from_sql_and_values(
-            txn.get_database_backend(),
-            "INSERT INTO symbolic_ref (name, target) VALUES (?, ?) \
-             ON CONFLICT(name) DO UPDATE SET target = excluded.target",
-            [name.into(), target.into()],
-        ))
-        .await
-        .map_err(|error| db_error("write", name, error))?;
-        txn.commit()
-            .await
-            .map_err(|error| db_error("write", name, error))?;
-        return Ok(SymbolicRefOutput {
-            name: name.to_string(),
-            target: target.to_string(),
-            short: Some(branch.to_string()),
-            action: "set",
-        });
     }
-    let target = query_symref_target(name)
-        .await
-        .map_err(|error| db_error("read", name, error))?
-        .ok_or_else(|| not_symbolic(name))?;
-    Ok(SymbolicRefOutput {
-        name: name.to_string(),
-        target,
-        short: Some(branch.to_string()),
-        action: "read",
-    })
 }
 
 async fn query_symref_target(name: &str) -> Result<Option<String>, sea_orm::DbErr> {
-    let db = crate::internal::db::get_db_conn_instance().await;
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            "SELECT target FROM symbolic_ref WHERE name = ? LIMIT 1",
-            [name.into()],
-        ))
-        .await?;
-    Ok(row.and_then(|row| row.try_get::<String>("", "target").ok()))
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => Ok(None),
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::db::get_db_conn_instance().await;
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    db.get_database_backend(),
+                    "SELECT target FROM symbolic_ref WHERE name = ? LIMIT 1",
+                    [name.into()],
+                ))
+                .await?;
+            Ok(row.and_then(|row| row.try_get::<String>("", "target").ok()))
+        }
+    }
 }
 
 fn validate_symref_target(target: &str) -> CliResult<()> {

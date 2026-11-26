@@ -1166,18 +1166,23 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
 /// just-renamed remote that no longer exists. The global value is left
 /// unchanged; only the message is emitted, matching Git `handle_push_default`.
 async fn warn_if_global_push_default_dangles(old: &str) -> Result<(), RemoteError> {
-    let global_db = match ScopedConfig::get_connection(ConfigScope::Global).await {
-        Ok(db) => db,
-        // No global configuration database (or it is unreadable): nothing
-        // to warn about.
-        Err(_) => return Ok(()),
-    };
     let global_pd =
-        ConfigKv::get_var_case_insensitive_with_conn(&global_db, "remote.", "pushDefault")
+        match ScopedConfig::get_var_case_insensitive(ConfigScope::Global, "remote.", "pushDefault")
             .await
-            .map_err(|e| RemoteError::ConfigRead {
-                detail: e.to_string(),
-            })?;
+        {
+            Ok(entry) => entry,
+            // No global configuration database (or it is unreadable): nothing
+            // to warn about.
+            Err(err)
+                if err.starts_with("NOT_FOUND:")
+                    || err.starts_with("UNREADABLE:")
+                    || err.starts_with("Could not determine config path")
+                    || err.starts_with("Failed to connect") =>
+            {
+                return Ok(());
+            }
+            Err(detail) => return Err(RemoteError::ConfigRead { detail }),
+        };
     if global_pd.as_ref().map(|e| e.value.as_str()) == Some(old) {
         emit_warning(format!(
             "the global configuration remote.pushDefault now names the non-existent remote '{old}'"

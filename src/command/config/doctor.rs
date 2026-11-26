@@ -264,26 +264,52 @@ fn safe_to_open(path: &Path, wal: &Option<FileStamp>) -> io::Result<bool> {
 }
 
 async fn inspect_snapshot(path: &Path, report: &mut Report) -> io::Result<()> {
-    let connection =
-        schema::open_readonly_connection_for_role(path, Duration::from_millis(200), ROLE).await?;
-    let result: io::Result<_> = async {
-        let transaction = connection.begin().await.map_err(io::Error::other)?;
-        let inspection = schema::inspect_configuration_schema(&transaction, ROLE).await?;
-        let legacy =
-            schema::current_schema_version_for_role(&transaction, DatabaseRole::Repository).await;
-        // A proven configuration future must not be hidden by a malformed
-        // legacy ledger. The report marks that auxiliary metadata unavailable.
-        let legacy_readable = legacy.is_ok();
-        let legacy = legacy.ok().flatten();
-        transaction.rollback().await.map_err(io::Error::other)?;
-        Ok((inspection, legacy, legacy_readable))
+    use crate::storage::{
+        StorageBackendKind,
+        config_store::{ConfigScopeAuthority, inspect_config_scope_authority},
+    };
+
+    let backend = match path
+        .parent()
+        .and_then(|dir| inspect_config_scope_authority(dir, ROLE).ok())
+    {
+        Some(ConfigScopeAuthority::Manifest { manifest, .. }) => manifest.backend,
+        Some(ConfigScopeAuthority::UnmanifestedRedb { .. }) => StorageBackendKind::Redb,
+        _ => StorageBackendKind::Sqlite,
+    };
+
+    match backend {
+        StorageBackendKind::Redb => {
+            if let Some(scope_dir) = path.parent() {
+                let _ = inspect_redb_scope(scope_dir, report).await?;
+            }
+            Ok(())
+        }
+        StorageBackendKind::Sqlite => {
+            let connection =
+                schema::open_readonly_connection_for_role(path, Duration::from_millis(200), ROLE)
+                    .await?;
+            let result: io::Result<_> = async {
+                let transaction = connection.begin().await.map_err(io::Error::other)?;
+                let inspection = schema::inspect_configuration_schema(&transaction, ROLE).await?;
+                let legacy =
+                    schema::current_schema_version_for_role(&transaction, DatabaseRole::Repository)
+                        .await;
+                // A proven configuration future must not be hidden by a malformed
+                // legacy ledger. The report marks that auxiliary metadata unavailable.
+                let legacy_readable = legacy.is_ok();
+                let legacy = legacy.ok().flatten();
+                transaction.rollback().await.map_err(io::Error::other)?;
+                Ok((inspection, legacy, legacy_readable))
+            }
+            .await;
+            let closed = connection.close().await.map_err(io::Error::other);
+            let (inspection, legacy, legacy_readable) = result?;
+            closed?;
+            report.record_inspection(inspection, legacy, legacy_readable);
+            Ok(())
+        }
     }
-    .await;
-    let closed = connection.close().await.map_err(io::Error::other);
-    let (inspection, legacy, legacy_readable) = result?;
-    closed?;
-    report.record_inspection(inspection, legacy, legacy_readable);
-    Ok(())
 }
 
 async fn inspect_redb_scope(scope_dir: &Path, report: &mut Report) -> io::Result<bool> {

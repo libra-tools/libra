@@ -762,18 +762,210 @@ async fn resolve_expire_refs<C: ConnectionTrait>(
 }
 
 async fn handle_expire(options: ExpireCliOptions, output: &OutputConfig) -> CliResult<()> {
-    if matches!(
-        crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
-            CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
-        })?,
-        crate::storage::StorageBackendKind::Redb
-    ) {
-        let store = crate::storage::runtime::open_current_git_store_read_write()
-            .await
-            .map_err(|e| {
-                CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
-            })?;
-        let refs = if options.all {
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+            let refs = if options.all {
+                let all = store.list_refs(None).await.map_err(|e| {
+                    CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+                let mut names = vec![HEAD.to_string()];
+                for rec in all {
+                    if let crate::storage::git_store::RefKey::LocalBranch { name } = rec.key {
+                        names.push(format!("refs/heads/{name}"));
+                    }
+                }
+                names.sort();
+                names.dedup();
+                names
+            } else {
+                if options.refs.is_empty() {
+                    return Err(
+                        CliError::fatal("reflog expire: no reflog specified to delete")
+                            .with_stable_code(StableErrorCode::CliInvalidArguments)
+                            .with_exit_code(128)
+                            .with_hint("specify one or more refs, or use --all"),
+                    );
+                }
+                let mut out = Vec::new();
+                for raw in &options.refs {
+                    validate_expire_ref(raw)?;
+                    let normalized = parse_ref_name(raw).await;
+                    if Reflog::find_one_with_store(&*store, &normalized)
+                        .await
+                        .map_err(|e| {
+                            CliError::fatal(format!(
+                                "failed to read reflog for '{normalized}': {e}"
+                            ))
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                        })?
+                        .is_none()
+                    {
+                        return Err(CliError::failure(format!(
+                            "reflog for '{normalized}' not found"
+                        ))
+                        .with_stable_code(StableErrorCode::CliInvalidTarget));
+                    }
+                    out.push(normalized);
+                }
+                out.sort();
+                out.dedup();
+                out
+            };
+            let now_ts = chrono::Utc::now().timestamp();
+            let cutoff_ts = match &options.expire {
+                Some(raw) => match parse_cli_expire_cutoff(raw)? {
+                    ExpireCutoff::All => i64::MAX,
+                    ExpireCutoff::Never => i64::MIN,
+                    ExpireCutoff::Before(ts) => ts,
+                },
+                None => now_ts - 90 * 86_400,
+            };
+            let mut results = Vec::new();
+            for ref_name in refs {
+                let wt = if ref_name == HEAD {
+                    crate::utils::util::current_worktree_id()
+                } else {
+                    None
+                };
+                let existing = store
+                    .list_reflog(&ref_name, wt.as_deref(), None)
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(e.to_string())
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+                let scanned = existing.len();
+                let expired_ids: Vec<i64> = existing
+                    .iter()
+                    .filter(|e| e.timestamp < cutoff_ts)
+                    .map(|e| e.id)
+                    .collect();
+                let pruned = if options.dry_run {
+                    expired_ids.len()
+                } else {
+                    store
+                        .delete_reflog_entries(&ref_name, wt.as_deref(), &expired_ids)
+                        .await
+                        .map_err(|e| {
+                            CliError::fatal(e.to_string())
+                                .with_stable_code(StableErrorCode::IoWriteFailed)
+                        })?
+                };
+                results.push(ExpireResult {
+                    ref_name,
+                    scanned,
+                    pruned,
+                    rewritten: 0,
+                    pruned_entries: Vec::new(),
+                });
+            }
+            render_expire(&results, options.verbose, output)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+
+            let (default_expire, default_unreachable) = expire_defaults_with_conn(&db)
+                .await
+                .map_err(map_reflog_error)?;
+            let expire = match &options.expire {
+                Some(raw) => parse_cli_expire_cutoff(raw)?,
+                None => default_expire,
+            };
+            let expire_unreachable = match &options.expire_unreachable {
+                Some(raw) => parse_cli_expire_cutoff(raw)?,
+                None => default_unreachable,
+            };
+
+            let expire_options = ExpireOptions {
+                expire,
+                expire_unreachable,
+                rewrite: options.rewrite,
+                updateref: options.updateref,
+                stale_fix: options.stale_fix,
+                dry_run: options.dry_run,
+            };
+
+            // Phase A: resolve + validate (no writes).
+            let refs = resolve_expire_refs(&db, &options).await?;
+
+            // Part C W0 (§C.11): `--updateref` moves a local branch tip to its newest
+            // surviving reflog entry. Refuse before any write if a target branch is
+            // checked out in ANOTHER worktree — moving its tip would diverge that
+            // worktree's working tree from its branch. Non-`--updateref` expiry only
+            // trims reflog entries and is unaffected.
+            if options.updateref && !options.dry_run {
+                for ref_name in &refs {
+                    if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+                        let checked_out_elsewhere =
+                            crate::internal::head::Head::branch_checked_out_elsewhere_result(
+                                branch,
+                            )
+                            .await
+                            .map_err(|error| {
+                                CliError::fatal(format!(
+                                    "cannot verify whether '{branch}' is checked out in another \
+                                         worktree: {error}"
+                                ))
+                                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                                .with_hint("repair the repository database, then retry")
+                            })?;
+                        if let Some(other) = checked_out_elsewhere {
+                            return Err(CliError::fatal(format!(
+                                "cannot expire --updateref: branch '{branch}' is checked out at worktree '{other}'"
+                            ))
+                            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                            .with_hint(
+                                "switch that worktree to another branch first, or run the command there",
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Phase B: expire each ref in its own transaction.
+            let mut results = Vec::new();
+            for ref_name in &refs {
+                let result = expire_reflog(
+                    &db,
+                    ref_name,
+                    &expire_options,
+                    load_commit_parents,
+                    oid_is_commit,
+                )
+                .await
+                .map_err(map_reflog_error)?;
+                results.push(result);
+            }
+
+            render_expire(&results, options.verbose, output)
+        }
+    }
+}
+
+/// Expire every ref's reflog using the default `gc.reflogExpire` /
+/// `gc.reflogExpireUnreachable` policy (90/30-day defaults), without `--rewrite`,
+/// `--updateref`, or `--stale-fix` — the reflog step of `libra gc` (ADR-MX-07).
+///
+/// Returns the per-ref results and renders nothing; the caller owns the output
+/// contract (a `gc` JSON envelope or a human summary).
+pub(crate) async fn expire_all_reflogs() -> CliResult<Vec<ExpireResult>> {
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+            let cutoff_ts = chrono::Utc::now().timestamp() - 90 * 86_400;
             let all = store.list_refs(None).await.map_err(|e| {
                 CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             })?;
@@ -785,267 +977,84 @@ async fn handle_expire(options: ExpireCliOptions, output: &OutputConfig) -> CliR
             }
             names.sort();
             names.dedup();
-            names
-        } else {
-            if options.refs.is_empty() {
-                return Err(
-                    CliError::fatal("reflog expire: no reflog specified to delete")
-                        .with_stable_code(StableErrorCode::CliInvalidArguments)
-                        .with_exit_code(128)
-                        .with_hint("specify one or more refs, or use --all"),
-                );
-            }
-            let mut out = Vec::new();
-            for raw in &options.refs {
-                validate_expire_ref(raw)?;
-                let normalized = parse_ref_name(raw).await;
-                if Reflog::find_one_with_store(&*store, &normalized)
+            let mut results = Vec::new();
+            for ref_name in names {
+                let wt = if ref_name == HEAD {
+                    crate::utils::util::current_worktree_id()
+                } else {
+                    None
+                };
+                let existing = store
+                    .list_reflog(&ref_name, wt.as_deref(), None)
                     .await
                     .map_err(|e| {
-                        CliError::fatal(format!("failed to read reflog for '{normalized}': {e}"))
+                        CliError::fatal(e.to_string())
                             .with_stable_code(StableErrorCode::IoReadFailed)
-                    })?
-                    .is_none()
-                {
-                    return Err(
-                        CliError::failure(format!("reflog for '{normalized}' not found"))
-                            .with_stable_code(StableErrorCode::CliInvalidTarget),
-                    );
-                }
-                out.push(normalized);
-            }
-            out.sort();
-            out.dedup();
-            out
-        };
-        let now_ts = chrono::Utc::now().timestamp();
-        let cutoff_ts = match &options.expire {
-            Some(raw) => match parse_cli_expire_cutoff(raw)? {
-                ExpireCutoff::All => i64::MAX,
-                ExpireCutoff::Never => i64::MIN,
-                ExpireCutoff::Before(ts) => ts,
-            },
-            None => now_ts - 90 * 86_400,
-        };
-        let mut results = Vec::new();
-        for ref_name in refs {
-            let wt = if ref_name == HEAD {
-                crate::utils::util::current_worktree_id()
-            } else {
-                None
-            };
-            let existing = store
-                .list_reflog(&ref_name, wt.as_deref(), None)
-                .await
-                .map_err(|e| {
-                    CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
-                })?;
-            let scanned = existing.len();
-            let expired_ids: Vec<i64> = existing
-                .iter()
-                .filter(|e| e.timestamp < cutoff_ts)
-                .map(|e| e.id)
-                .collect();
-            let pruned = if options.dry_run {
-                expired_ids.len()
-            } else {
-                store
+                    })?;
+                let scanned = existing.len();
+                let expired_ids: Vec<i64> = existing
+                    .iter()
+                    .filter(|e| e.timestamp < cutoff_ts)
+                    .map(|e| e.id)
+                    .collect();
+                let pruned = store
                     .delete_reflog_entries(&ref_name, wt.as_deref(), &expired_ids)
                     .await
                     .map_err(|e| {
                         CliError::fatal(e.to_string())
                             .with_stable_code(StableErrorCode::IoWriteFailed)
-                    })?
-            };
-            results.push(ExpireResult {
-                ref_name,
-                scanned,
-                pruned,
-                rewritten: 0,
-                pruned_entries: Vec::new(),
-            });
-        }
-        return render_expire(&results, options.verbose, output);
-    }
-    let db = get_db_conn_instance().await;
-
-    let (default_expire, default_unreachable) = expire_defaults_with_conn(&db)
-        .await
-        .map_err(map_reflog_error)?;
-    let expire = match &options.expire {
-        Some(raw) => parse_cli_expire_cutoff(raw)?,
-        None => default_expire,
-    };
-    let expire_unreachable = match &options.expire_unreachable {
-        Some(raw) => parse_cli_expire_cutoff(raw)?,
-        None => default_unreachable,
-    };
-
-    let expire_options = ExpireOptions {
-        expire,
-        expire_unreachable,
-        rewrite: options.rewrite,
-        updateref: options.updateref,
-        stale_fix: options.stale_fix,
-        dry_run: options.dry_run,
-    };
-
-    // Phase A: resolve + validate (no writes).
-    let refs = resolve_expire_refs(&db, &options).await?;
-
-    // Part C W0 (§C.11): `--updateref` moves a local branch tip to its newest
-    // surviving reflog entry. Refuse before any write if a target branch is
-    // checked out in ANOTHER worktree — moving its tip would diverge that
-    // worktree's working tree from its branch. Non-`--updateref` expiry only
-    // trims reflog entries and is unaffected.
-    if options.updateref && !options.dry_run {
-        for ref_name in &refs {
-            if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
-                let checked_out_elsewhere =
-                    crate::internal::head::Head::branch_checked_out_elsewhere_result(branch)
-                        .await
-                        .map_err(|error| {
-                            CliError::fatal(format!(
-                                "cannot verify whether '{branch}' is checked out in another \
-                                 worktree: {error}"
-                            ))
-                            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-                            .with_hint("repair the repository database, then retry")
-                        })?;
-                if let Some(other) = checked_out_elsewhere {
-                    return Err(CliError::fatal(format!(
-                        "cannot expire --updateref: branch '{branch}' is checked out at worktree '{other}'"
-                    ))
-                    .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-                    .with_hint(
-                        "switch that worktree to another branch first, or run the command there",
-                    ));
-                }
+                    })?;
+                results.push(ExpireResult {
+                    ref_name,
+                    scanned,
+                    pruned,
+                    rewritten: 0,
+                    pruned_entries: Vec::new(),
+                });
             }
+            Ok(results)
         }
-    }
-
-    // Phase B: expire each ref in its own transaction.
-    let mut results = Vec::new();
-    for ref_name in &refs {
-        let result = expire_reflog(
-            &db,
-            ref_name,
-            &expire_options,
-            load_commit_parents,
-            oid_is_commit,
-        )
-        .await
-        .map_err(map_reflog_error)?;
-        results.push(result);
-    }
-
-    render_expire(&results, options.verbose, output)
-}
-
-/// Expire every ref's reflog using the default `gc.reflogExpire` /
-/// `gc.reflogExpireUnreachable` policy (90/30-day defaults), without `--rewrite`,
-/// `--updateref`, or `--stale-fix` — the reflog step of `libra gc` (ADR-MX-07).
-///
-/// Returns the per-ref results and renders nothing; the caller owns the output
-/// contract (a `gc` JSON envelope or a human summary).
-pub(crate) async fn expire_all_reflogs() -> CliResult<Vec<ExpireResult>> {
-    if matches!(
-        crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
-            CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
-        })?,
-        crate::storage::StorageBackendKind::Redb
-    ) {
-        let store = crate::storage::runtime::open_current_git_store_read_write()
-            .await
-            .map_err(|e| {
-                CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
-            })?;
-        let cutoff_ts = chrono::Utc::now().timestamp() - 90 * 86_400;
-        let all = store.list_refs(None).await.map_err(|e| {
-            CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
-        let mut names = vec![HEAD.to_string()];
-        for rec in all {
-            if let crate::storage::git_store::RefKey::LocalBranch { name } = rec.key {
-                names.push(format!("refs/heads/{name}"));
-            }
-        }
-        names.sort();
-        names.dedup();
-        let mut results = Vec::new();
-        for ref_name in names {
-            let wt = if ref_name == HEAD {
-                crate::utils::util::current_worktree_id()
-            } else {
-                None
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let (default_expire, default_unreachable) = expire_defaults_with_conn(&db)
+                .await
+                .map_err(map_reflog_error)?;
+            let expire_options = ExpireOptions {
+                expire: default_expire,
+                expire_unreachable: default_unreachable,
+                rewrite: false,
+                updateref: false,
+                stale_fix: false,
+                dry_run: false,
             };
-            let existing = store
-                .list_reflog(&ref_name, wt.as_deref(), None)
+            let cli_options = ExpireCliOptions {
+                all: true,
+                expire: None,
+                expire_unreachable: None,
+                rewrite: false,
+                updateref: false,
+                stale_fix: false,
+                dry_run: false,
+                verbose: false,
+                refs: Vec::new(),
+            };
+            let refs = resolve_expire_refs(&db, &cli_options).await?;
+            let mut results = Vec::new();
+            for ref_name in &refs {
+                let result = expire_reflog(
+                    &db,
+                    ref_name,
+                    &expire_options,
+                    load_commit_parents,
+                    oid_is_commit,
+                )
                 .await
-                .map_err(|e| {
-                    CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
-                })?;
-            let scanned = existing.len();
-            let expired_ids: Vec<i64> = existing
-                .iter()
-                .filter(|e| e.timestamp < cutoff_ts)
-                .map(|e| e.id)
-                .collect();
-            let pruned = store
-                .delete_reflog_entries(&ref_name, wt.as_deref(), &expired_ids)
-                .await
-                .map_err(|e| {
-                    CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
-                })?;
-            results.push(ExpireResult {
-                ref_name,
-                scanned,
-                pruned,
-                rewritten: 0,
-                pruned_entries: Vec::new(),
-            });
+                .map_err(map_reflog_error)?;
+                results.push(result);
+            }
+            Ok(results)
         }
-        return Ok(results);
     }
-    let db = get_db_conn_instance().await;
-    let (default_expire, default_unreachable) = expire_defaults_with_conn(&db)
-        .await
-        .map_err(map_reflog_error)?;
-    let expire_options = ExpireOptions {
-        expire: default_expire,
-        expire_unreachable: default_unreachable,
-        rewrite: false,
-        updateref: false,
-        stale_fix: false,
-        dry_run: false,
-    };
-    let cli_options = ExpireCliOptions {
-        all: true,
-        expire: None,
-        expire_unreachable: None,
-        rewrite: false,
-        updateref: false,
-        stale_fix: false,
-        dry_run: false,
-        verbose: false,
-        refs: Vec::new(),
-    };
-    let refs = resolve_expire_refs(&db, &cli_options).await?;
-    let mut results = Vec::new();
-    for ref_name in &refs {
-        let result = expire_reflog(
-            &db,
-            ref_name,
-            &expire_options,
-            load_commit_parents,
-            oid_is_commit,
-        )
-        .await
-        .map_err(map_reflog_error)?;
-        results.push(result);
-    }
-    Ok(results)
 }
 
 fn render_expire(results: &[ExpireResult], verbose: bool, output: &OutputConfig) -> CliResult<()> {
@@ -1117,83 +1126,84 @@ async fn handle_delete(selectors: &[String], output: &OutputConfig) -> CliResult
 }
 
 async fn delete_single_group(group: &[(String, usize)]) -> CliResult<usize> {
-    if matches!(
-        crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
-            CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
-        })?,
-        crate::storage::StorageBackendKind::Redb
-    ) {
-        let store = crate::storage::runtime::open_current_git_store_read_write()
-            .await
-            .map_err(|e| {
-                CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
-            })?;
-        let ref_name = &group[0].0;
-        let logs = Reflog::find_all_with_store(&*store, ref_name)
-            .await
-            .map_err(|e| {
-                CliError::fatal(format!("failed to read reflog entries: {e}"))
-                    .with_stable_code(StableErrorCode::IoReadFailed)
-            })?;
-        let wt = if ref_name == HEAD {
-            crate::utils::util::current_worktree_id()
-        } else {
-            None
-        };
-        let mut ids_to_delete = Vec::with_capacity(group.len());
-        for (_, index) in group {
-            if let Some(entry) = logs.get(*index) {
-                ids_to_delete.push(entry.id);
-            } else {
-                return Err(CliError::fatal(format!(
-                    "failed to delete reflog entries: reflog entry `{ref_name}@{{{index}}}` not found"
-                ))
-                .with_stable_code(StableErrorCode::CliInvalidTarget));
-            }
-        }
-        let deleted = store
-            .delete_reflog_entries(ref_name, wt.as_deref(), &ids_to_delete)
-            .await
-            .map_err(|e| {
-                CliError::fatal(format!("failed to delete reflog entries: {e}"))
-                    .with_stable_code(StableErrorCode::IoWriteFailed)
-            })?;
-        return Ok(deleted);
-    }
-    let db = get_db_conn_instance().await;
-    // clone this to move it into async block to make compiler happy :(
-    let group = group.to_vec();
-
-    crate::internal::db::write_transaction(&db, |txn| {
-        Box::pin(async move {
-            let ref_name = &group[0].0;
-            let logs = Reflog::find_all(txn, ref_name)
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
                 .await
-                .map_err(|err| DbErr::Custom(err.to_string()))?;
-
-            let mut deleted = 0;
-            for (_, index) in &group {
+                .map_err(|e| {
+                    CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+            let ref_name = &group[0].0;
+            let logs = Reflog::find_all_with_store(&*store, ref_name)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to read reflog entries: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let wt = if ref_name == HEAD {
+                crate::utils::util::current_worktree_id()
+            } else {
+                None
+            };
+            let mut ids_to_delete = Vec::with_capacity(group.len());
+            for (_, index) in group {
                 if let Some(entry) = logs.get(*index) {
-                    let id = entry.id;
-                    txn.execute_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        "DELETE FROM reflog WHERE id = ?;",
-                        [id.into()],
+                    ids_to_delete.push(entry.id);
+                } else {
+                    return Err(CliError::fatal(format!(
+                        "failed to delete reflog entries: reflog entry `{ref_name}@{{{index}}}` not found"
                     ))
-                    .await?;
-                    deleted += 1;
-                    continue;
+                    .with_stable_code(StableErrorCode::CliInvalidTarget));
                 }
-                return Err(DbErr::Custom(format!(
-                    "reflog entry `{ref_name}@{{{index}}}` not found"
-                )));
             }
+            let deleted = store
+                .delete_reflog_entries(ref_name, wt.as_deref(), &ids_to_delete)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to delete reflog entries: {e}"))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+            Ok(deleted)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            // clone this to move it into async block to make compiler happy :(
+            let group = group.to_vec();
 
-            Ok::<_, DbErr>(deleted)
-        })
-    })
-    .await
-    .map_err(map_reflog_delete_error)
+            crate::internal::db::write_transaction(&db, |txn| {
+                Box::pin(async move {
+                    let ref_name = &group[0].0;
+                    let logs = Reflog::find_all(txn, ref_name)
+                        .await
+                        .map_err(|err| DbErr::Custom(err.to_string()))?;
+
+                    let mut deleted = 0;
+                    for (_, index) in &group {
+                        if let Some(entry) = logs.get(*index) {
+                            let id = entry.id;
+                            txn.execute_raw(Statement::from_sql_and_values(
+                                DbBackend::Sqlite,
+                                "DELETE FROM reflog WHERE id = ?;",
+                                [id.into()],
+                            ))
+                            .await?;
+                            deleted += 1;
+                            continue;
+                        }
+                        return Err(DbErr::Custom(format!(
+                            "reflog entry `{ref_name}@{{{index}}}` not found"
+                        )));
+                    }
+
+                    Ok::<_, DbErr>(deleted)
+                })
+            })
+            .await
+            .map_err(map_reflog_delete_error)
+        }
+    }
 }
 
 fn map_reflog_delete_error(err: TransactionError<DbErr>) -> CliError {
