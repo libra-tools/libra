@@ -262,3 +262,21 @@ fn test_t1300_get_regexp_name_only() {
     assert_cli_success(&out_null_name, "--null --name-only --get-regexp");
     assert_eq!(out_null_name.stdout, b"section.val\0section.empty\0");
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_105_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for (key, value) in [("a.one", "1"), ("b.two", "2")] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", key, value], repo.path()),
+            "set",
+        );
+    }
+    let legacy = run_libra_command(&["config", "--local", "--list"], repo.path());
+    let sub = run_libra_command(&["config", "list", "--local"], repo.path());
+    assert_cli_success(&legacy, "--list");
+    assert_cli_success(&sub, "config list");
+    assert_eq!(legacy.stdout, sub.stdout, "same order and formatting");
+}
