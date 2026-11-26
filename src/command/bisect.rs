@@ -79,106 +79,242 @@ pub struct BisectState {
 }
 
 impl BisectState {
+    fn to_record(
+        &self,
+        worktree_id: String,
+    ) -> Result<crate::storage::git_state_store::BisectStateRecord, String> {
+        let good = serde_json::to_string(&self.good)
+            .map_err(|e| format!("failed to serialize good commits: {e}"))?;
+        let skipped = serde_json::to_string(&self.skipped)
+            .map_err(|e| format!("failed to serialize skipped commits: {e}"))?;
+        Ok(crate::storage::git_state_store::BisectStateRecord {
+            worktree_id,
+            orig_head: self.orig_head.to_string(),
+            orig_head_name: self.orig_head_name.clone(),
+            bad: self.bad.map(|h| h.to_string()),
+            good,
+            current: self.current.map(|h| h.to_string()),
+            skipped: Some(skipped),
+            steps: self.steps.map(|s| s as i64),
+            completed: self.completed,
+            first_parent: self.first_parent,
+        })
+    }
+
+    fn from_record(
+        rec: crate::storage::git_state_store::BisectStateRecord,
+    ) -> Result<Self, String> {
+        let orig_head = crate::internal::object_format::parse_repo_oid(&rec.orig_head)
+            .map_err(|e| format!("invalid orig_head hash: {e}"))?;
+        let bad = rec
+            .bad
+            .as_deref()
+            .map(crate::internal::object_format::parse_repo_oid)
+            .transpose()
+            .map_err(|e| format!("invalid bad hash: {e}"))?;
+        let good: Vec<ObjectHash> = serde_json::from_str(&rec.good)
+            .map_err(|e| format!("failed to deserialize good commits: {e}"))?;
+        let current = rec
+            .current
+            .as_deref()
+            .map(crate::internal::object_format::parse_repo_oid)
+            .transpose()
+            .map_err(|e| format!("invalid current hash: {e}"))?;
+        let skipped: Vec<ObjectHash> = match rec.skipped {
+            Some(ref raw) if !raw.is_empty() => serde_json::from_str(raw)
+                .map_err(|e| format!("failed to deserialize skipped commits: {e}"))?,
+            _ => Vec::new(),
+        };
+        Ok(Self {
+            orig_head,
+            orig_head_name: rec.orig_head_name,
+            bad,
+            good,
+            current,
+            skipped,
+            steps: rec.steps.and_then(|s| usize::try_from(s).ok()),
+            completed: rec.completed,
+            first_parent: rec.first_parent,
+        })
+    }
+
     /// Returns true when a non-completed bisect session row exists. Used by
     /// the bare-repo guard and by `start` to refuse re-entry.
     pub async fn is_in_progress() -> Result<bool, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::has_active_state_in_db(&db).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let row = store
+                    .get_bisect_state(&Self::scope_key())
+                    .await
+                    .map_err(|e| format!("failed to query bisect_state: {e}"))?;
+                Ok(row.is_some_and(|r| !r.completed))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::has_active_state_in_db(&db).await
+            }
+        }
     }
 
     /// Returns true when any row exists, including converged sessions whose
     /// state was preserved for `bisect reset`.
     pub async fn has_state() -> Result<bool, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::has_any_state_in_db(&db).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let row = store
+                    .get_bisect_state(&Self::scope_key())
+                    .await
+                    .map_err(|e| format!("failed to query bisect_state: {e}"))?;
+                Ok(row.is_some())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::has_any_state_in_db(&db).await
+            }
+        }
     }
 
     /// Persist `self` as THIS worktree's single row in `bisect_state`.
-    ///
-    /// Boundary conditions:
-    /// - Upserts on the `worktree_id` primary key in one statement, so
-    ///   concurrent writers in the same worktree get last-writer-wins
-    ///   semantics instead of one of them hitting a UNIQUE violation.
-    ///   Last-writer-wins is right for an OWNER advancing its own session; a
-    ///   STARTING session must use [`BisectState::claim_start`] instead.
     pub async fn save(&self) -> Result<(), String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::save_with_conn(&db, self).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let rec = self.to_record(Self::scope_key())?;
+                store
+                    .put_bisect_state(&rec)
+                    .await
+                    .map_err(|e| format!("failed to save bisect state: {e}"))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::save_with_conn(&db, self).await
+            }
+        }
     }
 
     /// Claim this worktree's bisect slot for a STARTING session (§C.4.4).
-    ///
-    /// `ensure_none_for_bisect` is a check, and a check followed by an upsert
-    /// is a TOCTOU window: two `bisect start` runs in one worktree both see no
-    /// row, both check out a candidate, and the loser's upsert overwrites the
-    /// winner's `orig_head` — so `bisect reset` afterwards returns HEAD to the
-    /// wrong place, which is the one thing a bisect must not get wrong. A bare
-    /// `INSERT` against `worktree_id PRIMARY KEY` lets exactly one starter
-    /// win; the loser gets the ordinary "already in progress" refusal.
     pub async fn claim_start(&self) -> Result<(), String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let good_json = serde_json::to_string(&self.good)
-            .map_err(|e| format!("failed to serialize good commits: {e}"))?;
-        let skipped_json = serde_json::to_string(&self.skipped)
-            .map_err(|e| format!("failed to serialize skipped commits: {e}"))?;
-        let scope_key = crate::internal::worktree_scope::WorktreeScope::for_request()
-            .storage_key()
-            .to_string();
-        let result = db
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO bisect_state (orig_head, orig_head_name, bad, good, current, \
-                 skipped, steps, completed, first_parent, worktree_id) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    self.orig_head.to_string().into(),
-                    self.orig_head_name
-                        .clone()
-                        .map(|name| name.into())
-                        .unwrap_or(Value::String(None)),
-                    self.bad
-                        .map(|h| h.to_string().into())
-                        .unwrap_or(Value::String(None)),
-                    good_json.into(),
-                    self.current
-                        .map(|h| h.to_string().into())
-                        .unwrap_or(Value::String(None)),
-                    skipped_json.into(),
-                    self.steps
-                        .map(|s| s as i64)
-                        .map(|v| v.into())
-                        .unwrap_or(Value::BigInt(None)),
-                    (self.completed as i64).into(),
-                    (self.first_parent as i64).into(),
-                    scope_key.into(),
-                ],
-            ))
-            .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(err) if crate::internal::sequencer::is_unique_violation(&err) => {
-                Err("a bisect is already in progress in this worktree".to_string())
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let scope_key = Self::scope_key();
+                if store
+                    .get_bisect_state(&scope_key)
+                    .await
+                    .map_err(|e| format!("failed to inspect bisect_state: {e}"))?
+                    .is_some()
+                {
+                    return Err("a bisect is already in progress in this worktree".to_string());
+                }
+                let rec = self.to_record(scope_key)?;
+                store
+                    .put_bisect_state(&rec)
+                    .await
+                    .map_err(|e| format!("failed to claim bisect_state: {e}"))
             }
-            Err(err) => Err(format!("failed to claim bisect_state: {err}")),
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let good_json = serde_json::to_string(&self.good)
+                    .map_err(|e| format!("failed to serialize good commits: {e}"))?;
+                let skipped_json = serde_json::to_string(&self.skipped)
+                    .map_err(|e| format!("failed to serialize skipped commits: {e}"))?;
+                let scope_key = crate::internal::worktree_scope::WorktreeScope::for_request()
+                    .storage_key()
+                    .to_string();
+                let result = db
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "INSERT INTO bisect_state (orig_head, orig_head_name, bad, good, current, \
+                         skipped, steps, completed, first_parent, worktree_id) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            self.orig_head.to_string().into(),
+                            self.orig_head_name
+                                .clone()
+                                .map(|name| name.into())
+                                .unwrap_or(Value::String(None)),
+                            self.bad
+                                .map(|h| h.to_string().into())
+                                .unwrap_or(Value::String(None)),
+                            good_json.into(),
+                            self.current
+                                .map(|h| h.to_string().into())
+                                .unwrap_or(Value::String(None)),
+                            skipped_json.into(),
+                            self.steps
+                                .map(|s| s as i64)
+                                .map(|v| v.into())
+                                .unwrap_or(Value::BigInt(None)),
+                            (self.completed as i64).into(),
+                            (self.first_parent as i64).into(),
+                            scope_key.into(),
+                        ],
+                    ))
+                    .await;
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(err) if crate::internal::sequencer::is_unique_violation(&err) => {
+                        Err("a bisect is already in progress in this worktree".to_string())
+                    }
+                    Err(err) => Err(format!("failed to claim bisect_state: {err}")),
+                }
+            }
         }
     }
 
     /// Load the persisted bisect state.
-    ///
-    /// Boundary conditions:
-    /// - Returns `Err("No bisect in progress")` if the row is missing — this
-    ///   propagates as a fatal CLI error in every caller.
     pub async fn load() -> Result<Self, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::load_from_db(&db)
-            .await?
-            .ok_or_else(|| "No bisect in progress".to_string())
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let Some(rec) = store
+                    .get_bisect_state(&Self::scope_key())
+                    .await
+                    .map_err(|e| format!("failed to load bisect state: {e}"))?
+                else {
+                    return Err("No bisect in progress".to_string());
+                };
+                Self::from_record(rec)
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::load_from_db(&db)
+                    .await?
+                    .ok_or_else(|| "No bisect in progress".to_string())
+            }
+        }
     }
 
     /// Drop the bisect state row. Idempotent on an empty table.
     pub async fn cleanup() -> Result<(), String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::clear_state_in_db(&db).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let _ = store
+                    .delete_bisect_state(&Self::scope_key())
+                    .await
+                    .map_err(|e| format!("failed to clear bisect state: {e}"))?;
+                Ok(())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::clear_state_in_db(&db).await
+            }
+        }
     }
 
     /// This worktree's scope key for `bisect_state` (`""` = main worktree).
@@ -299,8 +435,22 @@ impl BisectState {
     pub(crate) async fn load_for_scope(
         scope: &crate::internal::worktree_scope::WorktreeScope,
     ) -> Result<Option<BisectState>, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::load_from_db_in_scope(&db, scope.storage_key()).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let row = store
+                    .get_bisect_state(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to load bisect state: {e}"))?;
+                row.map(Self::from_record).transpose()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::load_from_db_in_scope(&db, scope.storage_key()).await
+            }
+        }
     }
 
     async fn load_from_db<C: ConnectionTrait>(db: &C) -> Result<Option<BisectState>, String> {
@@ -1804,25 +1954,44 @@ fn map_bisect_branch_store_error(branch_name: &str, error: BranchStoreError) -> 
 ///   return fatal `CliError`s with diagnostic messages.
 async fn restore_to_branch(branch_name: String, commit_hash: ObjectHash) -> CliResult<()> {
     restore::preflight_worktree_restore_to_commit(&commit_hash).await?;
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
-
-    let txn = crate::internal::db::begin_write_transaction(&db)
-        .await
-        .map_err(|e| CliError::fatal(format!("Failed to begin transaction: {e}")))?;
-
-    // Update HEAD to point to the branch
     let new_head = Head::Branch(branch_name.clone());
-    Head::update_result_with_conn(&txn, new_head.clone(), None)
-        .await
-        .map_err(|error| map_bisect_branch_store_error(&branch_name, error))?;
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+            Head::update_result_with_store(&*store, new_head, None)
+                .await
+                .map_err(|error| map_bisect_branch_store_error(&branch_name, error))?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
 
-    txn.commit()
-        .await
-        .map_err(|e| CliError::fatal(format!("Failed to commit transaction: {e}")))?;
+            let txn = crate::internal::db::begin_write_transaction(&db)
+                .await
+                .map_err(|e| CliError::fatal(format!("Failed to begin transaction: {e}")))?;
 
-    // Verify HEAD was updated correctly (update_with_conn logs errors but doesn't return Result)
+            // Update HEAD to point to the branch
+            Head::update_result_with_conn(&txn, new_head.clone(), None)
+                .await
+                .map_err(|error| map_bisect_branch_store_error(&branch_name, error))?;
+
+            txn.commit()
+                .await
+                .map_err(|e| CliError::fatal(format!("Failed to commit transaction: {e}")))?;
+        }
+    }
+
+    // Verify HEAD was updated correctly
     let actual_head = Head::current().await;
     if !matches!(actual_head, Head::Branch(ref name) if name == &branch_name) {
         return Err(CliError::fatal(format!(
@@ -2199,25 +2368,47 @@ async fn resolve_ref(ref_str: &str) -> CliResult<ObjectHash> {
 ///   worktree out of sync until `bisect reset`.
 async fn checkout_to_commit(commit_hash: ObjectHash) -> CliResult<()> {
     restore::preflight_worktree_restore_to_commit(&commit_hash).await?;
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
-
-    let txn = crate::internal::db::begin_write_transaction(&db)
-        .await
-        .map_err(|e| CliError::fatal(format!("Failed to begin transaction: {e}")))?;
-
     let new_head = Head::Detached(commit_hash);
-    Head::update_result_with_conn(&txn, new_head, None)
-        .await
-        .map_err(|error| {
-            CliError::fatal(format!("failed to move HEAD to {commit_hash}: {error}"))
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+            Head::update_result_with_store(&*store, new_head, None)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to move HEAD to {commit_hash}: {error}"))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
 
-    txn.commit()
-        .await
-        .map_err(|e| CliError::fatal(format!("Failed to commit transaction: {e}")))?;
+            let txn = crate::internal::db::begin_write_transaction(&db)
+                .await
+                .map_err(|e| CliError::fatal(format!("Failed to begin transaction: {e}")))?;
+
+            Head::update_result_with_conn(&txn, new_head, None)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to move HEAD to {commit_hash}: {error}"))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+
+            txn.commit()
+                .await
+                .map_err(|e| CliError::fatal(format!("Failed to commit transaction: {e}")))?;
+        }
+    }
 
     // Restore working directory
     restore_to_commit(commit_hash).await?;

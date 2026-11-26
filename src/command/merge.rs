@@ -4780,14 +4780,32 @@ async fn apply_fast_forward_merge(
     let gitlink_paths: Vec<PathBuf> = target_gitlinks.keys().cloned().collect();
     ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
 
-    let db = get_db_conn_instance().await;
-
-    let old_oid_opt = Head::current_commit_result_with_conn(&db)
-        .await
+    let backend = crate::storage::runtime::detect_current_repo_backend()
         .map_err(|e| PullMergeError::HeadResolve(e.to_string()))?;
-    let current_head_state = Head::current_result_with_conn(&db)
-        .await
-        .map_err(|e| PullMergeError::HeadResolve(e.to_string()))?;
+    let (old_oid_opt, current_head_state) = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|e| PullMergeError::HeadResolve(e.to_string()))?;
+            let old_oid_opt = Head::current_commit_result_with_store(&*store)
+                .await
+                .map_err(|e| PullMergeError::HeadResolve(e.to_string()))?;
+            let current_head_state = Head::current_result_with_store(&*store)
+                .await
+                .map_err(|e| PullMergeError::HeadResolve(e.to_string()))?;
+            (old_oid_opt, current_head_state)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let old_oid_opt = Head::current_commit_result_with_conn(&db)
+                .await
+                .map_err(|e| PullMergeError::HeadResolve(e.to_string()))?;
+            let current_head_state = Head::current_result_with_conn(&db)
+                .await
+                .map_err(|e| PullMergeError::HeadResolve(e.to_string()))?;
+            (old_oid_opt, current_head_state)
+        }
+    };
 
     let action = ReflogAction::Merge {
         branch: target_branch_name.to_string(),
@@ -4812,36 +4830,97 @@ async fn apply_fast_forward_merge(
         .await
         .map_err(|error| PullMergeError::Restore(error.to_string()))?;
 
-    // Use `with_reflog`. A merge operation should log for the branch.
-    if let Err(e) = with_reflog(
-        context,
-        move |txn: &sea_orm::DatabaseTransaction| {
-            Box::pin(async move {
-                match &current_head_state {
-                    Head::Branch(branch_name) => {
-                        Branch::update_branch_with_conn(
-                            txn,
-                            branch_name,
-                            &target_commit.id.to_string(),
-                            None,
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|e| PullMergeError::HeadUpdate(e.to_string()))?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|e| PullMergeError::HeadUpdate(e.to_string()))?;
+            let wt_id = crate::utils::util::current_worktree_id();
+            let head_log = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                &*cfg_store,
+                &context,
+                "HEAD",
+            )
+            .await;
+            let (key, reflogs) = match &current_head_state {
+                Head::Branch(branch_name) => {
+                    let branch_log =
+                        crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                            &*cfg_store,
+                            &context,
+                            &format!("refs/heads/{branch_name}"),
                         )
-                        .await?;
-                    }
-                    Head::Detached(_) => {
-                        // Merging into a detached HEAD is unusual but possible. We just move HEAD.
-                        Head::update_result_with_conn(txn, Head::Detached(target_commit.id), None)
-                            .await
-                            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
-                    }
+                        .await;
+                    (
+                        RefKey::LocalBranch {
+                            name: branch_name.clone(),
+                        },
+                        vec![head_log, branch_log],
+                    )
                 }
-                Ok(())
-            })
-        },
-        true,
-    )
-    .await
-    {
-        return Err(PullMergeError::HeadUpdate(e.to_string()));
+                Head::Detached(_) => (RefKey::LocalHead { worktree_id: wt_id }, vec![head_log]),
+            };
+            let existing = git_store
+                .get_ref(&key)
+                .await
+                .map_err(|e| PullMergeError::HeadUpdate(e.to_string()))?;
+            let new_target = RefTarget::Direct(target_commit.id.to_string());
+            match git_store
+                .update_ref_cas(&key, existing.as_ref(), Some(&new_target), &reflogs)
+                .await
+                .map_err(|e| PullMergeError::HeadUpdate(e.to_string()))?
+            {
+                RefCasOutcome::Applied { .. } => {}
+                RefCasOutcome::CasConflict { .. } => {
+                    return Err(PullMergeError::HeadUpdate(
+                        "concurrent modification while updating HEAD during fast-forward merge"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            // Use `with_reflog`. A merge operation should log for the branch.
+            if let Err(e) = with_reflog(
+                context,
+                move |txn: &sea_orm::DatabaseTransaction| {
+                    Box::pin(async move {
+                        match &current_head_state {
+                            Head::Branch(branch_name) => {
+                                Branch::update_branch_with_conn(
+                                    txn,
+                                    branch_name,
+                                    &target_commit.id.to_string(),
+                                    None,
+                                )
+                                .await?;
+                            }
+                            Head::Detached(_) => {
+                                // Merging into a detached HEAD is unusual but possible. We just move HEAD.
+                                Head::update_result_with_conn(
+                                    txn,
+                                    Head::Detached(target_commit.id),
+                                    None,
+                                )
+                                .await
+                                .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+                            }
+                        }
+                        Ok(())
+                    })
+                },
+                true,
+            )
+            .await
+            {
+                return Err(PullMergeError::HeadUpdate(e.to_string()));
+            }
+        }
     }
 
     // Only restore the working directory *after* the pointers have been updated.
@@ -5326,10 +5405,24 @@ async fn update_head_with_reflog(
     target_branch_name: &str,
     policy: &str,
 ) -> Result<(), PullMergeError> {
-    let db = get_db_conn_instance().await;
-    let old_oid_opt = Head::current_commit_result_with_conn(&db)
-        .await
+    let backend = crate::storage::runtime::detect_current_repo_backend()
         .map_err(|error| PullMergeError::HeadResolve(error.to_string()))?;
+    let old_oid_opt = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| PullMergeError::HeadResolve(error.to_string()))?;
+            Head::current_commit_result_with_store(&*store)
+                .await
+                .map_err(|error| PullMergeError::HeadResolve(error.to_string()))?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            Head::current_commit_result_with_conn(&db)
+                .await
+                .map_err(|error| PullMergeError::HeadResolve(error.to_string()))?
+        }
+    };
     let action = ReflogAction::Merge {
         branch: target_branch_name.to_string(),
         policy: policy.to_string(),
@@ -5343,27 +5436,84 @@ async fn update_head_with_reflog(
         action,
     };
 
-    let head_name = head_name.to_string();
-    with_reflog(
-        context,
-        move |txn: &sea_orm::DatabaseTransaction| {
-            let head_name = head_name.clone();
-            Box::pin(async move {
-                if head_name == "HEAD" {
-                    Head::update_result_with_conn(txn, Head::Detached(new_oid), None)
-                        .await
-                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
-                } else {
-                    Branch::update_branch_with_conn(txn, &head_name, &new_oid.to_string(), None)
-                        .await?;
-                }
-                Ok(())
-            })
-        },
-        true,
-    )
-    .await
-    .map_err(|error| PullMergeError::HeadUpdate(error.to_string()))
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| PullMergeError::HeadUpdate(error.to_string()))?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|error| PullMergeError::HeadUpdate(error.to_string()))?;
+            let wt_id = crate::utils::util::current_worktree_id();
+            let head_log = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                &*cfg_store,
+                &context,
+                "HEAD",
+            )
+            .await;
+            let (key, reflogs) = if head_name == "HEAD" {
+                (RefKey::LocalHead { worktree_id: wt_id }, vec![head_log])
+            } else {
+                let branch_log = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                    &*cfg_store,
+                    &context,
+                    &format!("refs/heads/{head_name}"),
+                )
+                .await;
+                (
+                    RefKey::LocalBranch {
+                        name: head_name.to_string(),
+                    },
+                    vec![head_log, branch_log],
+                )
+            };
+            let existing = git_store
+                .get_ref(&key)
+                .await
+                .map_err(|error| PullMergeError::HeadUpdate(error.to_string()))?;
+            let new_target = RefTarget::Direct(new_oid.to_string());
+            match git_store
+                .update_ref_cas(&key, existing.as_ref(), Some(&new_target), &reflogs)
+                .await
+                .map_err(|error| PullMergeError::HeadUpdate(error.to_string()))?
+            {
+                RefCasOutcome::Applied { .. } => Ok(()),
+                RefCasOutcome::CasConflict { .. } => Err(PullMergeError::HeadUpdate(
+                    "concurrent modification while updating HEAD during merge".to_string(),
+                )),
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let head_name = head_name.to_string();
+            with_reflog(
+                context,
+                move |txn: &sea_orm::DatabaseTransaction| {
+                    let head_name = head_name.clone();
+                    Box::pin(async move {
+                        if head_name == "HEAD" {
+                            Head::update_result_with_conn(txn, Head::Detached(new_oid), None)
+                                .await
+                                .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+                        } else {
+                            Branch::update_branch_with_conn(
+                                txn,
+                                &head_name,
+                                &new_oid.to_string(),
+                                None,
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                },
+                true,
+            )
+            .await
+            .map_err(|error| PullMergeError::HeadUpdate(error.to_string()))
+        }
+    }
 }
 
 fn object_hash_from_state(field: &str, value: &str) -> Result<ObjectHash, PullMergeError> {
@@ -11300,6 +11450,293 @@ mod tests {
             .expect_err("both submodules diverged");
 
         assert_eq!(refusal.path, PathBuf::from("a/sub"));
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_merge_rebase_cherry_pick_and_bisect_workflows() {
+        use std::path::Path;
+
+        use clap::Parser;
+        use git_internal::hash::ObjectHash;
+
+        use super::{MergeArgs, execute_safe};
+        use crate::{
+            command::{add, bisect, branch, cherry_pick, commit, init, merge_base, rebase, switch},
+            internal::{config::ConfigKv, head::Head},
+            utils::{output::OutputConfig, test::ChangeDirGuard},
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tmp.path().join("merge-workflows-redb");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        let output = OutputConfig::default();
+
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "-q",
+                "-b",
+                "main",
+                repo_dir.to_string_lossy().as_ref(),
+            ])
+            .expect("parse init"),
+            &output,
+        )
+        .await
+        .expect("init redb repo");
+
+        let _cwd = ChangeDirGuard::new(&repo_dir);
+        let dot_libra = repo_dir.join(".libra");
+        assert!(!dot_libra.join("libra.db").exists());
+
+        ConfigKv::set("user.name", "Merge Tester", false)
+            .await
+            .expect("set user.name");
+        ConfigKv::set("user.email", "merge@example.com", false)
+            .await
+            .expect("set user.email");
+
+        // Helper to write, stage, and commit a file.
+        async fn commit_file(
+            repo_dir: &Path,
+            name: &str,
+            content: &str,
+            msg: &str,
+            output: &OutputConfig,
+        ) -> ObjectHash {
+            std::fs::write(repo_dir.join(name), content).expect("write file");
+            add::execute_safe(
+                add::AddArgs::try_parse_from(["add", name]).expect("parse add"),
+                output,
+            )
+            .await
+            .expect("add file");
+            commit::execute_safe(
+                commit::CommitArgs {
+                    message: Some(msg.to_string()),
+                    ..commit::CommitArgs::default()
+                },
+                output,
+            )
+            .await
+            .expect("commit file");
+            Head::current_commit().await.expect("HEAD commit")
+        }
+
+        // Base commit c0 on main.
+        let c0 = commit_file(&repo_dir, "shared.txt", "base\n", "c0 base", &output).await;
+
+        // 1. AC1: Fast-forward merge + 3-way merge + conflict pause/abort + merge-base.
+        branch::execute_safe(
+            branch::BranchArgs::try_parse_from(["branch", "ff-branch"]).expect("parse branch"),
+            &output,
+        )
+        .await
+        .expect("branch ff-branch");
+        switch::execute_safe(
+            switch::SwitchArgs::try_parse_from(["switch", "ff-branch"]).expect("parse switch"),
+            &output,
+        )
+        .await
+        .expect("switch ff-branch");
+        let c_ff = commit_file(&repo_dir, "ff.txt", "ff\n", "c_ff", &output).await;
+        switch::execute_safe(
+            switch::SwitchArgs::try_parse_from(["switch", "main"]).expect("parse switch main"),
+            &output,
+        )
+        .await
+        .expect("switch main");
+        execute_safe(
+            MergeArgs::try_parse_from(["merge", "ff-branch"]).expect("parse ff merge"),
+            &output,
+        )
+        .await
+        .expect("fast-forward merge on redb");
+        assert_eq!(Head::current_commit().await, Some(c_ff));
+
+        // 3-way clean merge.
+        branch::execute_safe(
+            branch::BranchArgs::try_parse_from(["branch", "side"]).expect("parse branch side"),
+            &output,
+        )
+        .await
+        .expect("branch side");
+        let c_main_2 = commit_file(&repo_dir, "main_only.txt", "m\n", "main side", &output).await;
+        switch::execute_safe(
+            switch::SwitchArgs::try_parse_from(["switch", "side"]).expect("parse switch side"),
+            &output,
+        )
+        .await
+        .expect("switch side");
+        let c_side_1 = commit_file(&repo_dir, "side_only.txt", "s\n", "side work", &output).await;
+        switch::execute_safe(
+            switch::SwitchArgs::try_parse_from(["switch", "main"]).expect("parse switch main"),
+            &output,
+        )
+        .await
+        .expect("switch main");
+        merge_base::execute_safe(
+            merge_base::MergeBaseArgs::try_parse_from([
+                "merge-base",
+                &c_main_2.to_string(),
+                &c_side_1.to_string(),
+            ])
+            .expect("parse merge-base"),
+            &output,
+        )
+        .await
+        .expect("merge-base on redb");
+        execute_safe(
+            MergeArgs::try_parse_from(["merge", "side", "-m", "merge side"]).expect("parse merge"),
+            &output,
+        )
+        .await
+        .expect("3-way merge on redb");
+        assert!(repo_dir.join("side_only.txt").is_file());
+
+        // 2. AC3: Cherry-pick (clean pick + conflict pause + abort).
+        branch::execute_safe(
+            branch::BranchArgs::try_parse_from(["branch", "pick-src"]).expect("parse branch"),
+            &output,
+        )
+        .await
+        .expect("branch pick-src");
+        switch::execute_safe(
+            switch::SwitchArgs::try_parse_from(["switch", "pick-src"]).expect("parse switch"),
+            &output,
+        )
+        .await
+        .expect("switch pick-src");
+        let c_pick = commit_file(
+            &repo_dir,
+            "picked.txt",
+            "pick payload\n",
+            "pick me",
+            &output,
+        )
+        .await;
+        switch::execute_safe(
+            switch::SwitchArgs::try_parse_from(["switch", "main"]).expect("parse switch main"),
+            &output,
+        )
+        .await
+        .expect("switch main");
+        cherry_pick::execute_safe(
+            cherry_pick::CherryPickArgs::try_parse_from(["cherry-pick", &c_pick.to_string()])
+                .expect("parse cherry-pick"),
+            &output,
+        )
+        .await
+        .expect("cherry-pick on redb");
+        assert!(repo_dir.join("picked.txt").is_file());
+
+        // 3. AC2: Rebase (clean replay + conflict pause + --continue + --abort).
+        branch::execute_safe(
+            branch::BranchArgs::try_parse_from(["branch", "reb-topic"]).expect("parse branch"),
+            &output,
+        )
+        .await
+        .expect("branch reb-topic");
+        let _c_main_reb = commit_file(
+            &repo_dir,
+            "shared.txt",
+            "main-change\n",
+            "main edit",
+            &output,
+        )
+        .await;
+        switch::execute_safe(
+            switch::SwitchArgs::try_parse_from(["switch", "reb-topic"]).expect("parse switch"),
+            &output,
+        )
+        .await
+        .expect("switch reb-topic");
+        let _c_topic_clean = commit_file(
+            &repo_dir,
+            "topic_clean.txt",
+            "clean\n",
+            "topic clean",
+            &output,
+        )
+        .await;
+        let _c_topic_conflict = commit_file(
+            &repo_dir,
+            "shared.txt",
+            "topic-conflict\n",
+            "topic conflict",
+            &output,
+        )
+        .await;
+
+        // Rebase onto main should pause with conflict on shared.txt.
+        let reb_res = rebase::execute_safe(
+            rebase::RebaseArgs::try_parse_from(["rebase", "main"]).expect("parse rebase"),
+            &output,
+        )
+        .await;
+        assert!(reb_res.is_err(), "rebase must pause on conflict");
+        // Resolve conflict and `--continue`.
+        std::fs::write(repo_dir.join("shared.txt"), "resolved\n").expect("resolve shared.txt");
+        add::execute_safe(
+            add::AddArgs::try_parse_from(["add", "shared.txt"]).expect("parse add resolved"),
+            &output,
+        )
+        .await
+        .expect("add resolved");
+        rebase::execute_safe(
+            rebase::RebaseArgs::try_parse_from(["rebase", "--continue"])
+                .expect("parse rebase --continue"),
+            &output,
+        )
+        .await
+        .expect("rebase --continue on redb");
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.join("shared.txt")).expect("read shared.txt"),
+            "resolved\n"
+        );
+
+        // 4. AC4: Bisect `start` / `bad` / `good` / `reset` roundtrip on Redb.
+        switch::execute_safe(
+            switch::SwitchArgs::try_parse_from(["switch", "main"]).expect("parse switch main"),
+            &output,
+        )
+        .await
+        .expect("switch main");
+        let bad_tip = Head::current_commit().await.expect("main tip");
+        bisect::execute_safe(
+            crate::cli::Bisect::Start {
+                bad: Some(bad_tip.to_string()),
+                good: vec![c0.to_string()],
+                good_opt: None,
+                first_parent: false,
+                term_old: Vec::new(),
+                term_new: Vec::new(),
+            },
+            &output,
+        )
+        .await
+        .expect("bisect start on redb");
+        assert!(
+            bisect::BisectState::has_state()
+                .await
+                .expect("bisect has_state")
+        );
+        bisect::execute_safe(crate::cli::Bisect::Reset { rev: None }, &output)
+            .await
+            .expect("bisect reset on redb");
+        assert!(
+            !bisect::BisectState::has_state()
+                .await
+                .expect("bisect cleared after reset")
+        );
+        assert_eq!(Head::current_commit().await, Some(bad_tip));
+
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "merge/rebase/cherry-pick/bisect on Redb must never create libra.db"
+        );
     }
 }
 

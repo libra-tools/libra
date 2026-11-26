@@ -2021,6 +2021,87 @@ fn interactive_drive_output(
     }
 }
 
+async fn update_detached_head_auto(commit_id: ObjectHash) -> Result<(), RebaseError> {
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| RebaseError::HeadUpdate(e.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|e| RebaseError::HeadUpdate(e.to_string()))?;
+            Head::update_result_with_store(&*store, Head::Detached(commit_id), None)
+                .await
+                .map_err(|error| RebaseError::HeadUpdate(error.to_string()))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(RebaseError::StateSave)?;
+            Head::update_result_with_conn(&db, Head::Detached(commit_id), None)
+                .await
+                .map_err(|error| RebaseError::HeadUpdate(error.to_string()))
+        }
+    }
+}
+
+async fn start_rebase_detach_head_with_reflog(
+    newbase_id: ObjectHash,
+    start_context: ReflogContext,
+) -> Result<(), RebaseError> {
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| RebaseError::Finalize(format!("failed to start rebase: {e}")))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|e| RebaseError::Finalize(format!("failed to start rebase: {e}")))?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|e| RebaseError::Finalize(format!("failed to start rebase: {e}")))?;
+            let wt_id = crate::utils::util::current_worktree_id();
+            let key = RefKey::LocalHead { worktree_id: wt_id };
+            let existing = git_store
+                .get_ref(&key)
+                .await
+                .map_err(|e| RebaseError::Finalize(format!("failed to start rebase: {e}")))?;
+            let head_log =
+                reflog::Reflog::build_reflog_write_with_store(&*cfg_store, &start_context, "HEAD")
+                    .await;
+            let new_target = RefTarget::Direct(newbase_id.to_string());
+            match git_store
+                .update_ref_cas(&key, existing.as_ref(), Some(&new_target), &[head_log])
+                .await
+                .map_err(|e| RebaseError::Finalize(format!("failed to start rebase: {e}")))?
+            {
+                RefCasOutcome::Applied { .. } => Ok(()),
+                RefCasOutcome::CasConflict { .. } => Err(RebaseError::Finalize(
+                    "concurrent modification while detaching HEAD at rebase start".to_string(),
+                )),
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(RebaseError::StateSave)?;
+            crate::internal::db::write_transaction(&db, |txn| {
+                Box::pin(async move {
+                    reflog::Reflog::insert_single_entry(txn, &start_context, "HEAD").await?;
+                    Head::update_result_with_conn(txn, Head::Detached(newbase_id), None)
+                        .await
+                        .map_err(|error| {
+                            ReflogError::from(sea_orm::DbErr::Custom(error.to_string()))
+                        })?;
+                    Ok::<_, ReflogError>(())
+                })
+            })
+            .await
+            .map_err(|e| RebaseError::Finalize(format!("failed to start rebase: {e}")))
+        }
+    }
+}
+
 async fn amend_head_from_index_if_staged(state: &mut RebaseState) -> Result<(), RebaseError> {
     let index_file = path::index();
     let index = git_internal::internal::index::Index::load(&index_file)
@@ -2054,12 +2135,7 @@ async fn amend_head_from_index_if_staged(state: &mut RebaseState) -> Result<(), 
     );
     save_object(&new_commit, &new_commit.id)
         .map_err(|error| RebaseError::CommitSave(error.to_string()))?;
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(RebaseError::StateSave)?;
-    Head::update_result_with_conn(&db, Head::Detached(new_commit.id), None)
-        .await
-        .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
+    update_detached_head_auto(new_commit.id).await?;
     state.current_head = new_commit.id;
     state.save().await.map_err(RebaseError::StateSave)
 }
@@ -2139,10 +2215,6 @@ async fn claim_interactive_onto(
     spec: &RebaseStartSpec,
     items: Vec<(ObjectHash, RebaseTodoAction)>,
 ) -> Result<RebaseState, RebaseError> {
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(RebaseError::StateSave)?;
-
     let current_branch_name = match Head::current().await {
         Head::Branch(name) if !name.is_empty() => name,
         _ => return Err(RebaseError::NotOnBranch),
@@ -2178,17 +2250,7 @@ async fn claim_interactive_onto(
         new_oid: newbase_id.to_string(),
         action: start_action,
     };
-    crate::internal::db::write_transaction(&db, |txn| {
-        Box::pin(async move {
-            reflog::Reflog::insert_single_entry(txn, &start_context, "HEAD").await?;
-            Head::update_result_with_conn(txn, Head::Detached(newbase_id), None)
-                .await
-                .map_err(|error| ReflogError::from(sea_orm::DbErr::Custom(error.to_string())))?;
-            Ok::<_, ReflogError>(())
-        })
-    })
-    .await
-    .map_err(|e| RebaseError::Finalize(format!("failed to start rebase: {e}")))?;
+    start_rebase_detach_head_with_reflog(newbase_id, start_context).await?;
 
     let (commits, actions): (Vec<ObjectHash>, Vec<RebaseTodoAction>) = items.into_iter().unzip();
     let todo_actions = VecDeque::from(actions);
@@ -2205,9 +2267,7 @@ async fn claim_interactive_onto(
         empty_mode: RebaseEmptyMode::Keep,
     };
     state.claim_start().await.map_err(RebaseError::StateSave)?;
-    Head::update_result_with_conn(&db, Head::Detached(newbase_id), None)
-        .await
-        .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
+    update_detached_head_auto(newbase_id).await?;
     Ok(state)
 }
 
@@ -2972,20 +3032,47 @@ async fn resolve_rebase_autostash() -> Result<(), RebaseError> {
 }
 
 async fn checked_out_local_branches() -> Result<HashSet<String>, RebaseError> {
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(RebaseError::StateSave)?;
-    ref_model::Entity::find()
-        .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
-        .filter(ref_model::Column::Remote.is_null())
-        .all(&db)
-        .await
-        .map_err(|error| {
-            RebaseError::UpdateRefs(format!(
-                "failed to inspect branches checked out by repository worktrees: {error}"
-            ))
-        })
-        .map(|heads| heads.into_iter().filter_map(|head| head.name).collect())
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| RebaseError::StateSave(e.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| {
+                    RebaseError::UpdateRefs(format!(
+                        "failed to inspect branches checked out by repository worktrees: {error}"
+                    ))
+                })?;
+            let heads = store.list_all_local_heads().await.map_err(|error| {
+                RebaseError::UpdateRefs(format!(
+                    "failed to inspect branches checked out by repository worktrees: {error}"
+                ))
+            })?;
+            Ok(heads
+                .into_iter()
+                .filter_map(|rec| match rec.target {
+                    crate::storage::RefTarget::Symbolic(name) => Some(name),
+                    crate::storage::RefTarget::Direct(_) => None,
+                })
+                .collect())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(RebaseError::StateSave)?;
+            ref_model::Entity::find()
+                .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
+                .filter(ref_model::Column::Remote.is_null())
+                .all(&db)
+                .await
+                .map_err(|error| {
+                    RebaseError::UpdateRefs(format!(
+                        "failed to inspect branches checked out by repository worktrees: {error}"
+                    ))
+                })
+                .map(|heads| heads.into_iter().filter_map(|head| head.name).collect())
+        }
+    }
 }
 
 async fn capture_rebase_update_refs(
@@ -3281,23 +3368,51 @@ async fn reflog_fork_point(
     let Some(ref_name) = upstream_reflog_name(upstream).await? else {
         return Ok(None);
     };
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(RebaseError::StateSave)?;
-    let entries = reflog_model::Entity::find()
-        .filter(reflog_model::Column::RefName.eq(ref_name))
-        .order_by_desc(reflog_model::Column::Timestamp)
-        .order_by_desc(reflog_model::Column::Id)
-        .all(&db)
-        .await
-        .map_err(|error| {
-            RebaseError::StateLoad(format!(
-                "failed to read upstream reflog for --fork-point: {error}"
-            ))
-        })?;
+    let entries: Vec<(String, String)> =
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| RebaseError::StateSave(e.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|error| {
+                        RebaseError::StateLoad(format!(
+                            "failed to open store for --fork-point reflog: {error}"
+                        ))
+                    })?;
+                let mut logs = reflog::Reflog::find_all_with_store(&*store, &ref_name)
+                    .await
+                    .map_err(|error| {
+                        RebaseError::StateLoad(format!(
+                            "failed to read upstream reflog for --fork-point: {error}"
+                        ))
+                    })?;
+                logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
+                logs.into_iter().map(|e| (e.new_oid, e.old_oid)).collect()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked()
+                    .await
+                    .map_err(RebaseError::StateSave)?;
+                reflog_model::Entity::find()
+                    .filter(reflog_model::Column::RefName.eq(ref_name))
+                    .order_by_desc(reflog_model::Column::Timestamp)
+                    .order_by_desc(reflog_model::Column::Id)
+                    .all(&db)
+                    .await
+                    .map_err(|error| {
+                        RebaseError::StateLoad(format!(
+                            "failed to read upstream reflog for --fork-point: {error}"
+                        ))
+                    })?
+                    .into_iter()
+                    .map(|e| (e.new_oid, e.old_oid))
+                    .collect()
+            }
+        };
     let mut candidates = vec![upstream_id];
-    for entry in entries {
-        for value in [entry.new_oid, entry.old_oid] {
+    for (new_oid, old_oid) in entries {
+        for value in [new_oid, old_oid] {
             if let Ok(candidate) = crate::internal::object_format::parse_repo_oid(&value) {
                 candidates.push(candidate);
             }
@@ -3494,10 +3609,6 @@ async fn run_rebase_start(
     root: bool,
     output: &OutputConfig,
 ) -> Result<RebaseOutput, RebaseError> {
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(RebaseError::StateSave)?;
-
     let current_branch_name = match Head::current().await {
         Head::Branch(name) if !name.is_empty() => name,
         _ => return Err(RebaseError::NotOnBranch),
@@ -3641,27 +3752,90 @@ async fn run_rebase_start(
 
         let branch_name_cloned = current_branch_name.clone();
         let upstream_id_str = upstream_id.to_string();
-        with_reflog(
-            fast_forward_context,
-            move |txn: &sea_orm::DatabaseTransaction| {
-                Box::pin(async move {
-                    Branch::update_branch_with_conn(
-                        txn,
-                        &branch_name_cloned,
-                        &upstream_id_str,
-                        None,
-                    )
-                    .await?;
-                    Head::update_result_with_conn(txn, Head::Branch(branch_name_cloned), None)
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| RebaseError::Finalize(format!("failed to fast-forward: {e}")))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+                let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|e| RebaseError::Finalize(format!("failed to fast-forward: {e}")))?;
+                let cfg_store =
+                    crate::storage::runtime::open_current_repo_config_store_read_write()
                         .await
-                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
-                    Ok(())
-                })
-            },
-            true,
-        )
-        .await
-        .map_err(|e| RebaseError::Finalize(format!("failed to fast-forward: {e}")))?;
+                        .map_err(|e| {
+                            RebaseError::Finalize(format!("failed to fast-forward: {e}"))
+                        })?;
+                let branch_key = RefKey::LocalBranch {
+                    name: branch_name_cloned.clone(),
+                };
+                let existing = git_store
+                    .get_ref(&branch_key)
+                    .await
+                    .map_err(|e| RebaseError::Finalize(format!("failed to fast-forward: {e}")))?;
+                let head_log = reflog::Reflog::build_reflog_write_with_store(
+                    &*cfg_store,
+                    &fast_forward_context,
+                    "HEAD",
+                )
+                .await;
+                let branch_log = reflog::Reflog::build_reflog_write_with_store(
+                    &*cfg_store,
+                    &fast_forward_context,
+                    &format!("refs/heads/{branch_name_cloned}"),
+                )
+                .await;
+                let new_target = RefTarget::Direct(upstream_id_str);
+                match git_store
+                    .update_ref_cas(
+                        &branch_key,
+                        existing.as_ref(),
+                        Some(&new_target),
+                        &[head_log, branch_log],
+                    )
+                    .await
+                    .map_err(|e| RebaseError::Finalize(format!("failed to fast-forward: {e}")))?
+                {
+                    RefCasOutcome::Applied { .. } => {}
+                    RefCasOutcome::CasConflict { .. } => {
+                        return Err(RebaseError::Finalize(
+                            "concurrent modification during rebase fast-forward".to_string(),
+                        ));
+                    }
+                }
+                Head::update_result_with_store(&*git_store, Head::Branch(branch_name_cloned), None)
+                    .await
+                    .map_err(|e| RebaseError::Finalize(format!("failed to fast-forward: {e}")))?;
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                with_reflog(
+                    fast_forward_context,
+                    move |txn: &sea_orm::DatabaseTransaction| {
+                        Box::pin(async move {
+                            Branch::update_branch_with_conn(
+                                txn,
+                                &branch_name_cloned,
+                                &upstream_id_str,
+                                None,
+                            )
+                            .await?;
+                            Head::update_result_with_conn(
+                                txn,
+                                Head::Branch(branch_name_cloned),
+                                None,
+                            )
+                            .await
+                            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+                            Ok(())
+                        })
+                    },
+                    true,
+                )
+                .await
+                .map_err(|e| RebaseError::Finalize(format!("failed to fast-forward: {e}")))?;
+            }
+        }
 
         index
             .save(&index_file)
@@ -3813,21 +3987,7 @@ async fn run_rebase_start(
         new_oid: newbase_id.to_string(),
         action: start_action,
     };
-    // The reflog insert reads `user.name`/`user.email` before either write,
-    // so this transaction must take the write lock up front — otherwise a
-    // second worktree rebasing at the same moment makes it fail rather than
-    // wait (`db::begin_write_transaction`).
-    crate::internal::db::write_transaction(&db, |txn| {
-        Box::pin(async move {
-            reflog::Reflog::insert_single_entry(txn, &start_context, "HEAD").await?;
-            Head::update_result_with_conn(txn, Head::Detached(newbase_id), None)
-                .await
-                .map_err(|error| ReflogError::from(sea_orm::DbErr::Custom(error.to_string())))?;
-            Ok::<_, ReflogError>(())
-        })
-    })
-    .await
-    .map_err(|e| RebaseError::Finalize(format!("failed to start rebase: {e}")))?;
+    start_rebase_detach_head_with_reflog(newbase_id, start_context).await?;
 
     let replay_count = commits_to_replay.len();
     let mut state = RebaseState {
@@ -3845,9 +4005,7 @@ async fn run_rebase_start(
 
     // The first write of a STARTING rebase is a claim, not a replace (§C.4.4).
     state.claim_start().await.map_err(RebaseError::StateSave)?;
-    Head::update_result_with_conn(&db, Head::Detached(newbase_id), None)
-        .await
-        .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
+    update_detached_head_auto(newbase_id).await?;
 
     let replay = continue_replay(
         &mut state,
@@ -3950,9 +4108,6 @@ async fn continue_replay(
     emit_human: bool,
     output: &OutputConfig,
 ) -> Result<RebaseReplaySummary, RebaseError> {
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(RebaseError::StateSave)?;
     let rerere_autoupdate = persisted_rerere_autoupdate()?;
     let interactive = rebase_aux_is_interactive();
     let mut squash_needs_editor = false;
@@ -4047,9 +4202,7 @@ async fn continue_replay(
                 }
 
                 // Update HEAD
-                Head::update_result_with_conn(&db, Head::Detached(state.current_head), None)
-                    .await
-                    .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
+                update_detached_head_auto(state.current_head).await?;
 
                 if emit_human {
                     println!(
@@ -4168,9 +4321,6 @@ async fn finalize_rebase(
     emit_human: bool,
     output: &OutputConfig,
 ) -> anyhow::Result<()> {
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
     let final_commit_id = state.current_head;
     let aux = RebaseAuxState::load_optional().context("failed to load rebase auxiliary state")?;
     let mut ref_updates = Vec::new();
@@ -4228,108 +4378,235 @@ async fn finalize_rebase(
 
     let branch_name_cloned = state.head_name.clone();
     let expected_branch_tip = state.orig_head;
-    if let Err(e) = with_reflog(
-        finish_context,
-        move |txn: &sea_orm::DatabaseTransaction| {
-            let ref_updates = ref_updates.clone();
-            Box::pin(async move {
-                let live_branch = Branch::find_branch_result_with_conn(
-                    txn,
-                    &branch_name_cloned,
-                    None,
-                )
-                .await
-                .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
-                .ok_or_else(|| {
-                    sea_orm::DbErr::Custom(format!(
-                        "rebased branch '{}' disappeared before finalization",
-                        branch_name_cloned
-                    ))
-                })?;
-                if live_branch.commit != expected_branch_tip
-                    && live_branch.commit != final_commit_id
-                {
-                    return Err(sea_orm::DbErr::Custom(format!(
-                        "rebased branch '{}' moved from {} to {} while the rebase was running",
-                        branch_name_cloned, expected_branch_tip, live_branch.commit
-                    )));
-                }
+    let finish_result: anyhow::Result<()> = match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| anyhow::anyhow!(e))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
 
-                for (branch, old_oid, new_oid) in ref_updates {
-                    let live = Branch::find_branch_result_with_conn(txn, &branch, None)
-                        .await
-                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
-                        .ok_or_else(|| {
-                            sea_orm::DbErr::Custom(format!(
-                                "branch '{branch}' disappeared during rebase --update-refs"
-                            ))
-                        })?;
-                    if live.commit == new_oid {
-                        continue;
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            let main_key = RefKey::LocalBranch {
+                name: branch_name_cloned.clone(),
+            };
+            let live_branch = Branch::find_branch_result_with_store(
+                &*git_store,
+                &branch_name_cloned,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rebased branch '{}' disappeared before finalization",
+                    branch_name_cloned
+                )
+            })?;
+            if live_branch.commit != expected_branch_tip && live_branch.commit != final_commit_id {
+                anyhow::bail!(
+                    "rebased branch '{}' moved from {} to {} while the rebase was running",
+                    branch_name_cloned,
+                    expected_branch_tip,
+                    live_branch.commit
+                );
+            }
+
+            for (branch, old_oid, new_oid) in ref_updates {
+                let live = Branch::find_branch_result_with_store(&*git_store, &branch, None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "branch '{branch}' disappeared during rebase --update-refs"
+                        )
+                    })?;
+                if live.commit == new_oid {
+                    continue;
+                }
+                if live.commit != old_oid {
+                    anyhow::bail!(
+                        "branch '{branch}' moved from {old_oid} to {} during rebase --update-refs",
+                        live.commit
+                    );
+                }
+                let context = ReflogContext {
+                    old_oid: old_oid.to_string(),
+                    new_oid: new_oid.to_string(),
+                    action: ReflogAction::Rebase {
+                        state: "update-refs".to_string(),
+                        details: format!("updating refs/heads/{branch}"),
+                    },
+                };
+                let reflog_write = reflog::Reflog::build_reflog_write_with_store(
+                    &*cfg_store,
+                    &context,
+                    &format!("refs/heads/{branch}"),
+                )
+                .await;
+                let key = RefKey::LocalBranch {
+                    name: branch.clone(),
+                };
+                let expected = RefTarget::Direct(old_oid.to_string());
+                let next = RefTarget::Direct(new_oid.to_string());
+                match git_store
+                    .update_ref_cas(&key, Some(&expected), Some(&next), &[reflog_write])
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?
+                {
+                    RefCasOutcome::Applied { .. } => {}
+                    RefCasOutcome::CasConflict { .. } => {
+                        anyhow::bail!("concurrent modification during rebase --update-refs on '{branch}'");
                     }
-                    if live.commit != old_oid {
+                }
+            }
+
+            if live_branch.commit != final_commit_id {
+                let branch_log = reflog::Reflog::build_reflog_write_with_store(
+                    &*cfg_store,
+                    &finish_context,
+                    &format!("refs/heads/{branch_name_cloned}"),
+                )
+                .await;
+                let expected = RefTarget::Direct(live_branch.commit.to_string());
+                let next = RefTarget::Direct(final_commit_id.to_string());
+                match git_store
+                    .update_ref_cas(&main_key, Some(&expected), Some(&next), &[branch_log])
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?
+                {
+                    RefCasOutcome::Applied { .. } => {}
+                    RefCasOutcome::CasConflict { .. } => {
+                        anyhow::bail!(
+                            "concurrent modification updating rebased branch '{branch_name_cloned}'"
+                        );
+                    }
+                }
+            }
+
+            let wt_id = crate::utils::util::current_worktree_id();
+            let head_key = RefKey::LocalHead { worktree_id: wt_id };
+            let cur_head = git_store
+                .get_ref(&head_key)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let head_log = reflog::Reflog::build_reflog_write_with_store(
+                &*cfg_store,
+                &finish_context,
+                "HEAD",
+            )
+            .await;
+            let sym = RefTarget::Symbolic(branch_name_cloned.clone());
+            match git_store
+                .update_ref_cas(&head_key, cur_head.as_ref(), Some(&sym), &[head_log])
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+            {
+                RefCasOutcome::Applied { .. } => Ok(()),
+                RefCasOutcome::CasConflict { .. } => Err(anyhow::anyhow!(
+                    "concurrent modification re-attaching HEAD after rebase"
+                )),
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => with_reflog(
+            finish_context,
+            move |txn: &sea_orm::DatabaseTransaction| {
+                let ref_updates = ref_updates.clone();
+                Box::pin(async move {
+                    let live_branch =
+                        Branch::find_branch_result_with_conn(txn, &branch_name_cloned, None)
+                            .await
+                            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
+                            .ok_or_else(|| {
+                                sea_orm::DbErr::Custom(format!(
+                                    "rebased branch '{}' disappeared before finalization",
+                                    branch_name_cloned
+                                ))
+                            })?;
+                    if live_branch.commit != expected_branch_tip
+                        && live_branch.commit != final_commit_id
+                    {
                         return Err(sea_orm::DbErr::Custom(format!(
-                            "branch '{branch}' moved from {old_oid} to {} during rebase --update-refs",
-                            live.commit
+                            "rebased branch '{}' moved from {} to {} while the rebase was running",
+                            branch_name_cloned, expected_branch_tip, live_branch.commit
                         )));
                     }
-                    Branch::update_branch_with_conn(
+
+                    for (branch, old_oid, new_oid) in ref_updates {
+                        let live = Branch::find_branch_result_with_conn(txn, &branch, None)
+                            .await
+                            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
+                            .ok_or_else(|| {
+                                sea_orm::DbErr::Custom(format!(
+                                    "branch '{branch}' disappeared during rebase --update-refs"
+                                ))
+                            })?;
+                        if live.commit == new_oid {
+                            continue;
+                        }
+                        if live.commit != old_oid {
+                            return Err(sea_orm::DbErr::Custom(format!(
+                                "branch '{branch}' moved from {old_oid} to {} during rebase --update-refs",
+                                live.commit
+                            )));
+                        }
+                        Branch::update_branch_with_conn(txn, &branch, &new_oid.to_string(), None)
+                            .await?;
+                        let context = ReflogContext {
+                            old_oid: old_oid.to_string(),
+                            new_oid: new_oid.to_string(),
+                            action: ReflogAction::Rebase {
+                                state: "update-refs".to_string(),
+                                details: format!("updating refs/heads/{branch}"),
+                            },
+                        };
+                        reflog::Reflog::insert_single_entry(
+                            txn,
+                            &context,
+                            &format!("refs/heads/{branch}"),
+                        )
+                        .await
+                        .map_err(|error| {
+                            sea_orm::DbErr::Custom(format!(
+                                "failed to record update-refs reflog for '{branch}': {error}"
+                            ))
+                        })?;
+                    }
+
+                    // This is the crucial step: move the original branch from its old position
+                    // to the final replayed commit.
+                    if live_branch.commit != final_commit_id {
+                        Branch::update_branch_with_conn(
+                            txn,
+                            &branch_name_cloned,
+                            &final_commit_id.to_string(),
+                            None,
+                        )
+                        .await?;
+                    }
+
+                    // Also, re-attach HEAD to the newly moved branch.
+                    Head::update_result_with_conn(
                         txn,
-                        &branch,
-                        &new_oid.to_string(),
+                        Head::Branch(branch_name_cloned.clone()),
                         None,
                     )
-                    .await?;
-                    let context = ReflogContext {
-                        old_oid: old_oid.to_string(),
-                        new_oid: new_oid.to_string(),
-                        action: ReflogAction::Rebase {
-                            state: "update-refs".to_string(),
-                            details: format!("updating refs/heads/{branch}"),
-                        },
-                    };
-                    reflog::Reflog::insert_single_entry(
-                        txn,
-                        &context,
-                        &format!("refs/heads/{branch}"),
-                    )
-                    .await
-                    .map_err(|error| {
-                        sea_orm::DbErr::Custom(format!(
-                            "failed to record update-refs reflog for '{branch}': {error}"
-                        ))
-                    })?;
-                }
-
-                // This is the crucial step: move the original branch from its old position
-                // to the final replayed commit.
-                if live_branch.commit != final_commit_id {
-                    Branch::update_branch_with_conn(
-                        txn,
-                        &branch_name_cloned,
-                        &final_commit_id.to_string(),
-                        None,
-                    )
-                    .await?;
-                }
-
-                // Also, re-attach HEAD to the newly moved branch.
-                Head::update_result_with_conn(txn, Head::Branch(branch_name_cloned.clone()), None)
                     .await
                     .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
-                Ok(())
-            })
-        },
-        true,
-    )
-    .await
-    {
-        // Best-effort recovery path: the caller is already returning the
-        // original failure, so a second failure here is logged rather than
-        // replacing it — but it is no longer invisible.
-        if let Err(error) =
-            Head::update_result_with_conn(&db, Head::Detached(final_commit_id), None).await
-        {
+                    Ok(())
+                })
+            },
+            true,
+        )
+        .await
+        .map_err(anyhow::Error::from),
+    };
+    if let Err(e) = finish_result {
+        if let Err(error) = update_detached_head_auto(final_commit_id).await {
             tracing::error!(%error, "failed to restore HEAD after a rebase finish failure");
         }
         return Err(e).context("failed to record reflog for rebase finish");
@@ -4488,12 +4765,7 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
         state.done.push(stopped_sha);
         state.stopped_sha = None;
 
-        let db = crate::internal::sequencer::request_db_checked()
-            .await
-            .map_err(RebaseError::StateSave)?;
-        Head::update_result_with_conn(&db, Head::Detached(state.current_head), None)
-            .await
-            .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
+        update_detached_head_auto(state.current_head).await?;
 
         applied_commits.push(RebaseAppliedCommitOutput {
             original_commit: stopped_sha.to_string(),
@@ -4578,67 +4850,183 @@ async fn run_rebase_abort() -> Result<RebaseOutput, RebaseError> {
 
     let branch_name_cloned = state.head_name.clone();
     let replay_tip = state.current_head;
-    with_reflog(
-        abort_context,
-        move |txn: &sea_orm::DatabaseTransaction| {
-            Box::pin(async move {
-                let live = Branch::find_branch_result_with_conn(txn, &branch_name_cloned, None)
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        RebaseError::BranchRestore {
+            branch: state.head_name.clone(),
+            detail: error.to_string(),
+        }
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| RebaseError::BranchRestore {
+                    branch: state.head_name.clone(),
+                    detail: error.to_string(),
+                })?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|error| RebaseError::BranchRestore {
+                    branch: state.head_name.clone(),
+                    detail: error.to_string(),
+                })?;
+            let live =
+                Branch::find_branch_result_with_store(&*git_store, &branch_name_cloned, None)
                     .await
-                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
-                    .ok_or_else(|| {
-                        sea_orm::DbErr::Custom(format!(
-                            "branch '{}' disappeared during rebase abort",
-                            branch_name_cloned
-                        ))
+                    .map_err(|error| RebaseError::BranchRestore {
+                        branch: state.head_name.clone(),
+                        detail: error.to_string(),
+                    })?
+                    .ok_or_else(|| RebaseError::BranchRestore {
+                        branch: state.head_name.clone(),
+                        detail: format!(
+                            "branch '{branch_name_cloned}' disappeared during rebase abort"
+                        ),
                     })?;
-                if live.commit != orig_head && live.commit != replay_tip {
-                    return Err(sea_orm::DbErr::Custom(format!(
-                        "branch '{}' moved from {} to {} while the rebase was running",
-                        branch_name_cloned, orig_head, live.commit
-                    )));
-                }
-                if live.commit == replay_tip && replay_tip != orig_head {
-                    Branch::update_branch_with_conn(
-                        txn,
-                        &branch_name_cloned,
-                        &orig_head.to_string(),
-                        None,
-                    )
-                    .await?;
-                    let context = ReflogContext {
-                        old_oid: replay_tip.to_string(),
-                        new_oid: orig_head.to_string(),
-                        action: ReflogAction::Rebase {
-                            state: "abort".to_string(),
-                            details: format!("returning to refs/heads/{branch_name_cloned}"),
-                        },
-                    };
-                    reflog::Reflog::insert_single_entry(
-                        txn,
-                        &context,
-                        &format!("refs/heads/{branch_name_cloned}"),
-                    )
+            if live.commit != orig_head && live.commit != replay_tip {
+                return Err(RebaseError::BranchRestore {
+                    branch: state.head_name.clone(),
+                    detail: format!(
+                        "branch '{branch_name_cloned}' moved from {orig_head} to {} while the rebase was running",
+                        live.commit
+                    ),
+                });
+            }
+            if live.commit == replay_tip && replay_tip != orig_head {
+                let context = ReflogContext {
+                    old_oid: replay_tip.to_string(),
+                    new_oid: orig_head.to_string(),
+                    action: ReflogAction::Rebase {
+                        state: "abort".to_string(),
+                        details: format!("returning to refs/heads/{branch_name_cloned}"),
+                    },
+                };
+                let branch_log = reflog::Reflog::build_reflog_write_with_store(
+                    &*cfg_store,
+                    &context,
+                    &format!("refs/heads/{branch_name_cloned}"),
+                )
+                .await;
+                let branch_key = RefKey::LocalBranch {
+                    name: branch_name_cloned.clone(),
+                };
+                let expected = RefTarget::Direct(replay_tip.to_string());
+                let restored = RefTarget::Direct(orig_head.to_string());
+                match git_store
+                    .update_ref_cas(&branch_key, Some(&expected), Some(&restored), &[branch_log])
                     .await
-                    .map_err(|error| {
-                        sea_orm::DbErr::Custom(format!(
-                            "failed to record abort reflog for '{}': {error}",
-                            branch_name_cloned
-                        ))
+                    .map_err(|error| RebaseError::BranchRestore {
+                        branch: state.head_name.clone(),
+                        detail: error.to_string(),
+                    })? {
+                    RefCasOutcome::Applied { .. } => {}
+                    RefCasOutcome::CasConflict { .. } => {
+                        return Err(RebaseError::BranchRestore {
+                            branch: state.head_name.clone(),
+                            detail: "concurrent modification restoring branch during rebase abort"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            let wt_id = crate::utils::util::current_worktree_id();
+            let head_key = RefKey::LocalHead { worktree_id: wt_id };
+            let cur_head =
+                git_store
+                    .get_ref(&head_key)
+                    .await
+                    .map_err(|error| RebaseError::BranchRestore {
+                        branch: state.head_name.clone(),
+                        detail: error.to_string(),
                     })?;
+            let head_log =
+                reflog::Reflog::build_reflog_write_with_store(&*cfg_store, &abort_context, "HEAD")
+                    .await;
+            let sym = RefTarget::Symbolic(branch_name_cloned);
+            match git_store
+                .update_ref_cas(&head_key, cur_head.as_ref(), Some(&sym), &[head_log])
+                .await
+                .map_err(|error| RebaseError::BranchRestore {
+                    branch: state.head_name.clone(),
+                    detail: error.to_string(),
+                })? {
+                RefCasOutcome::Applied { .. } => {}
+                RefCasOutcome::CasConflict { .. } => {
+                    return Err(RebaseError::BranchRestore {
+                        branch: state.head_name.clone(),
+                        detail: "concurrent modification re-attaching HEAD during rebase abort"
+                            .to_string(),
+                    });
                 }
-                Head::update_result_with_conn(txn, Head::Branch(branch_name_cloned), None)
-                    .await
-                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
-                Ok(())
-            })
-        },
-        false,
-    )
-    .await
-    .map_err(|error| RebaseError::BranchRestore {
-        branch: state.head_name.clone(),
-        detail: error.to_string(),
-    })?;
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            with_reflog(
+                abort_context,
+                move |txn: &sea_orm::DatabaseTransaction| {
+                    Box::pin(async move {
+                        let live =
+                            Branch::find_branch_result_with_conn(txn, &branch_name_cloned, None)
+                                .await
+                                .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
+                                .ok_or_else(|| {
+                                    sea_orm::DbErr::Custom(format!(
+                                        "branch '{}' disappeared during rebase abort",
+                                        branch_name_cloned
+                                    ))
+                                })?;
+                        if live.commit != orig_head && live.commit != replay_tip {
+                            return Err(sea_orm::DbErr::Custom(format!(
+                                "branch '{}' moved from {} to {} while the rebase was running",
+                                branch_name_cloned, orig_head, live.commit
+                            )));
+                        }
+                        if live.commit == replay_tip && replay_tip != orig_head {
+                            Branch::update_branch_with_conn(
+                                txn,
+                                &branch_name_cloned,
+                                &orig_head.to_string(),
+                                None,
+                            )
+                            .await?;
+                            let context = ReflogContext {
+                                old_oid: replay_tip.to_string(),
+                                new_oid: orig_head.to_string(),
+                                action: ReflogAction::Rebase {
+                                    state: "abort".to_string(),
+                                    details: format!(
+                                        "returning to refs/heads/{branch_name_cloned}"
+                                    ),
+                                },
+                            };
+                            reflog::Reflog::insert_single_entry(
+                                txn,
+                                &context,
+                                &format!("refs/heads/{branch_name_cloned}"),
+                            )
+                            .await
+                            .map_err(|error| {
+                                sea_orm::DbErr::Custom(format!(
+                                    "failed to record abort reflog for '{branch_name_cloned}': {error}"
+                                ))
+                            })?;
+                        }
+                        Head::update_result_with_conn(txn, Head::Branch(branch_name_cloned), None)
+                            .await
+                            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+                        Ok(())
+                    })
+                },
+                false,
+            )
+            .await
+            .map_err(|error| RebaseError::BranchRestore {
+                branch: state.head_name.clone(),
+                detail: error.to_string(),
+            })?;
+        }
+    }
 
     RebaseState::cleanup()
         .await

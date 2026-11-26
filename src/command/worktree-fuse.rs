@@ -515,15 +515,30 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
         // any registry IO, and refuse a future-schema database gracefully.
         // The fuse-native list path reads the legacy registry directly, so
         // the guarantee must hold here too, not only via legacy delegation.
-        crate::internal::db::get_db_conn_instance_for_path(&crate::utils::path::database())
-            .await
-            .map_err(|source| {
-                CliError::fatal(format!(
-                    "cannot open the repository database before touching the worktree \
-                     registry: {source}"
-                ))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-            })?;
+        match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|source| {
+                        CliError::fatal(format!(
+                            "cannot open the repository database before touching the worktree \
+                             registry: {source}"
+                        ))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+                crate::internal::db::get_db_conn_instance_for_path(&crate::utils::path::database())
+                    .await
+                    .map_err(|source| {
+                        CliError::fatal(format!(
+                            "cannot open the repository database before touching the worktree \
+                             registry: {source}"
+                        ))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+            }
+        }
         // Bare boundary (config-first, same as legacy): refused before any
         // registry IO.
         legacy::reject_bare_repository().await?;

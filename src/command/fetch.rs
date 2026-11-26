@@ -4703,17 +4703,56 @@ async fn record_received_objects(received: &ReceivedObjects) -> Result<(), Fetch
     if rows.is_empty() {
         return Ok(());
     }
-    let index_error = |error| FetchError::LocalState {
-        message: format!("index received objects for cloud backup: {error}"),
-    };
-    let db = crate::internal::db::get_db_conn_instance().await;
-    let txn = crate::internal::db::begin_write_transaction(&db)
-        .await
-        .map_err(index_error)?;
-    crate::utils::client_storage::upsert_agent_object_index_rows_with_conn(&txn, &rows)
-        .await
-        .map_err(index_error)?;
-    txn.commit().await.map_err(index_error)
+    fn index_error(error: impl std::fmt::Display) -> FetchError {
+        FetchError::LocalState {
+            message: format!("index received objects for cloud backup: {error}"),
+        }
+    }
+    match crate::storage::runtime::detect_current_repo_backend().map_err(index_error)? {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(index_error)?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(index_error)?;
+            let Some(repo_id_entry) =
+                crate::internal::config::ConfigKv::get_with_store(&*cfg_store, "libra.repoid")
+                    .await
+                    .map_err(index_error)?
+            else {
+                return Ok(());
+            };
+            let now = chrono::Utc::now().timestamp();
+            let records: Vec<crate::storage::git_store::ObjectIndexRecord> = rows
+                .iter()
+                .map(
+                    |(o_id, o_type, o_size)| crate::storage::git_store::ObjectIndexRecord {
+                        repo_id: repo_id_entry.value.clone(),
+                        o_id: o_id.clone(),
+                        o_type: o_type.clone(),
+                        o_size: *o_size,
+                        created_at: now,
+                        is_synced: false,
+                    },
+                )
+                .collect();
+            git_store
+                .upsert_object_index_batch(&records)
+                .await
+                .map_err(index_error)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::db::get_db_conn_instance().await;
+            let txn = crate::internal::db::begin_write_transaction(&db)
+                .await
+                .map_err(index_error)?;
+            crate::utils::client_storage::upsert_agent_object_index_rows_with_conn(&txn, &rows)
+                .await
+                .map_err(index_error)?;
+            txn.commit().await.map_err(index_error)
+        }
+    }
 }
 
 fn index_received_pack(
@@ -5070,13 +5109,42 @@ async fn compute_fetch_ref_preview(
     update_head_ok: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     let mut updates = Vec::new();
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|message| FetchError::LocalState { message })?;
     let checked_out_branches = if repository_is_bare().await {
         HashSet::new()
     } else {
-        checked_out_local_branches_with_conn(&db).await?
+        match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|source| FetchError::LocalState {
+                        message: format!(
+                            "failed to open redb git store for checked-out branches: {source}"
+                        ),
+                    })?;
+                let heads = store.list_all_local_heads().await.map_err(|source| {
+                    FetchError::LocalState {
+                        message: format!("failed to list HEADs for fetch preview: {source}"),
+                    }
+                })?;
+                heads
+                    .into_iter()
+                    .filter_map(|record| match record.target {
+                        crate::storage::git_store::RefTarget::Symbolic(name)
+                            if !name.is_empty() =>
+                        {
+                            Some(name)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+                let db = crate::internal::sequencer::request_db_checked()
+                    .await
+                    .map_err(|message| FetchError::LocalState { message })?;
+                checked_out_local_branches_with_conn(&db).await?
+            }
+        }
     };
     for plan in plans {
         if !plan.update_tracking {
@@ -5450,53 +5518,125 @@ async fn prune_stale_remote_refs(
         return Ok(pruned);
     }
 
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|message| FetchError::LocalState { message })?;
     let remote_owned = remote_name.to_string();
     let to_delete = pruned.clone();
     let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
-    // Reads the refs it is about to move/delete before writing them, so the
-    // write lock is taken up front (`db::begin_write_transaction`).
-    crate::internal::db::write_transaction(&db, |txn| {
-        Box::pin(async move {
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        FetchError::LocalState {
+            message: format!("failed to detect repository backend: {error}"),
+        }
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| FetchError::LocalState {
+                    message: error.to_string(),
+                })?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|error| FetchError::LocalState {
+                    message: error.to_string(),
+                })?;
             for entry in &to_delete {
-                // Record a non-lossy audit entry before deleting the ref. The
-                // reflog table is keyed by ref name (no FK to the reference
-                // row), so the entry survives the ref's deletion and the prune
-                // audit chain is not lost.
+                let key = RefKey::RemoteBranch {
+                    remote: remote_owned.clone(),
+                    name: entry.remote_ref.clone(),
+                };
+                let existing =
+                    git_store
+                        .get_ref(&key)
+                        .await
+                        .map_err(|source| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to inspect stale remote-tracking ref '{}': {source}",
+                                entry.remote_ref
+                            ),
+                        })?;
+                if existing.is_none() {
+                    continue;
+                }
                 let context = ReflogContext {
                     old_oid: entry.old_oid.clone().unwrap_or_else(|| zero.clone()),
                     new_oid: zero.clone(),
                     action: ReflogAction::Fetch,
                 };
-                Reflog::insert_single_entry(txn, &context, &entry.remote_ref)
-                    .await
-                    .map_err(|source| FetchError::UpdateRefs {
-                        message: format!(
-                            "failed to record prune reflog for '{}': {source}",
-                            entry.remote_ref
-                        ),
-                    })?;
-                Branch::delete_branch_result_with_conn(txn, &entry.remote_ref, Some(&remote_owned))
+                let reflog_write =
+                    Reflog::build_reflog_write_with_store(&*cfg_store, &context, &entry.remote_ref)
+                        .await;
+                match git_store
+                    .update_ref_cas(&key, existing.as_ref(), None, &[reflog_write])
                     .await
                     .map_err(|source| FetchError::UpdateRefs {
                         message: format!(
                             "failed to prune stale remote-tracking ref '{}': {source}",
                             entry.remote_ref
                         ),
-                    })?;
+                    })? {
+                    RefCasOutcome::Applied { .. } => {}
+                    RefCasOutcome::CasConflict { .. } => {
+                        return Err(FetchError::UpdateRefs {
+                            message: format!(
+                                "concurrent modification while pruning '{}'",
+                                entry.remote_ref
+                            ),
+                        });
+                    }
+                }
             }
-            Ok::<_, FetchError>(())
-        })
-    })
-    .await
-    .map_err(|source| FetchError::UpdateRefs {
-        message: match source {
-            TransactionError::Connection(error) => error.to_string(),
-            TransactionError::Transaction(error) => error.to_string(),
-        },
-    })?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|message| FetchError::LocalState { message })?;
+            // Reads the refs it is about to move/delete before writing them, so the
+            // write lock is taken up front (`db::begin_write_transaction`).
+            crate::internal::db::write_transaction(&db, |txn| {
+                Box::pin(async move {
+                    for entry in &to_delete {
+                        // Record a non-lossy audit entry before deleting the ref. The
+                        // reflog table is keyed by ref name (no FK to the reference
+                        // row), so the entry survives the ref's deletion and the prune
+                        // audit chain is not lost.
+                        let context = ReflogContext {
+                            old_oid: entry.old_oid.clone().unwrap_or_else(|| zero.clone()),
+                            new_oid: zero.clone(),
+                            action: ReflogAction::Fetch,
+                        };
+                        Reflog::insert_single_entry(txn, &context, &entry.remote_ref)
+                            .await
+                            .map_err(|source| FetchError::UpdateRefs {
+                                message: format!(
+                                    "failed to record prune reflog for '{}': {source}",
+                                    entry.remote_ref
+                                ),
+                            })?;
+                        Branch::delete_branch_result_with_conn(
+                            txn,
+                            &entry.remote_ref,
+                            Some(&remote_owned),
+                        )
+                        .await
+                        .map_err(|source| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to prune stale remote-tracking ref '{}': {source}",
+                                entry.remote_ref
+                            ),
+                        })?;
+                    }
+                    Ok::<_, FetchError>(())
+                })
+            })
+            .await
+            .map_err(|source| FetchError::UpdateRefs {
+                message: match source {
+                    TransactionError::Connection(error) => error.to_string(),
+                    TransactionError::Transaction(error) => error.to_string(),
+                },
+            })?;
+        }
+    }
 
     Ok(pruned)
 }
@@ -5561,46 +5701,113 @@ async fn prune_stale_mirror_refs(
         return Ok(pruned);
     }
 
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|message| FetchError::LocalState { message })?;
     let to_delete = pruned.clone();
     let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
-    crate::internal::db::write_transaction(&db, |txn| {
-        Box::pin(async move {
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        FetchError::LocalState {
+            message: format!("failed to detect repository backend: {error}"),
+        }
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| FetchError::LocalState {
+                    message: error.to_string(),
+                })?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|error| FetchError::LocalState {
+                    message: error.to_string(),
+                })?;
             for entry in &to_delete {
+                let key = RefKey::LocalBranch {
+                    name: entry.branch.clone(),
+                };
+                let existing =
+                    git_store
+                        .get_ref(&key)
+                        .await
+                        .map_err(|source| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to inspect mirrored ref '{}': {source}",
+                                entry.remote_ref
+                            ),
+                        })?;
+                if existing.is_none() {
+                    continue;
+                }
                 let context = ReflogContext {
                     old_oid: entry.old_oid.clone().unwrap_or_else(|| zero.clone()),
                     new_oid: zero.clone(),
                     action: ReflogAction::Fetch,
                 };
-                Reflog::insert_single_entry(txn, &context, &entry.remote_ref)
-                    .await
-                    .map_err(|source| FetchError::UpdateRefs {
-                        message: format!(
-                            "failed to record prune reflog for '{}': {source}",
-                            entry.remote_ref
-                        ),
-                    })?;
-                Branch::delete_branch_result_with_conn(txn, &entry.branch, None)
+                let reflog_write =
+                    Reflog::build_reflog_write_with_store(&*cfg_store, &context, &entry.remote_ref)
+                        .await;
+                match git_store
+                    .update_ref_cas(&key, existing.as_ref(), None, &[reflog_write])
                     .await
                     .map_err(|source| FetchError::UpdateRefs {
                         message: format!(
                             "failed to prune mirrored ref '{}': {source}",
                             entry.remote_ref
                         ),
-                    })?;
+                    })? {
+                    RefCasOutcome::Applied { .. } => {}
+                    RefCasOutcome::CasConflict { .. } => {
+                        return Err(FetchError::UpdateRefs {
+                            message: format!(
+                                "concurrent modification while pruning mirrored ref '{}'",
+                                entry.remote_ref
+                            ),
+                        });
+                    }
+                }
             }
-            Ok::<_, FetchError>(())
-        })
-    })
-    .await
-    .map_err(|source| FetchError::UpdateRefs {
-        message: match source {
-            TransactionError::Connection(error) => error.to_string(),
-            TransactionError::Transaction(error) => error.to_string(),
-        },
-    })?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|message| FetchError::LocalState { message })?;
+            crate::internal::db::write_transaction(&db, |txn| {
+                Box::pin(async move {
+                    for entry in &to_delete {
+                        let context = ReflogContext {
+                            old_oid: entry.old_oid.clone().unwrap_or_else(|| zero.clone()),
+                            new_oid: zero.clone(),
+                            action: ReflogAction::Fetch,
+                        };
+                        Reflog::insert_single_entry(txn, &context, &entry.remote_ref)
+                            .await
+                            .map_err(|source| FetchError::UpdateRefs {
+                                message: format!(
+                                    "failed to record prune reflog for '{}': {source}",
+                                    entry.remote_ref
+                                ),
+                            })?;
+                        Branch::delete_branch_result_with_conn(txn, &entry.branch, None)
+                            .await
+                            .map_err(|source| FetchError::UpdateRefs {
+                                message: format!(
+                                    "failed to prune mirrored ref '{}': {source}",
+                                    entry.remote_ref
+                                ),
+                            })?;
+                    }
+                    Ok::<_, FetchError>(())
+                })
+            })
+            .await
+            .map_err(|source| FetchError::UpdateRefs {
+                message: match source {
+                    TransactionError::Connection(error) => error.to_string(),
+                    TransactionError::Transaction(error) => error.to_string(),
+                },
+            })?;
+        }
+    }
     Ok(pruned)
 }
 
@@ -5615,34 +5822,72 @@ async fn update_references(
     force_override: bool,
     update_head_ok: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|message| FetchError::LocalState { message })?;
-    let remote_config = remote_config.clone();
-    let plans = plans.to_vec();
-    let ref_heads = ref_heads.to_vec();
     let bare_repo = repository_is_bare().await;
-    crate::internal::db::write_transaction(&db, |txn| {
-        Box::pin(async move {
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        FetchError::LocalState {
+            message: format!("failed to detect repository backend: {error}"),
+        }
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| FetchError::LocalState {
+                    message: error.to_string(),
+                })?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|error| FetchError::LocalState {
+                    message: error.to_string(),
+                })?;
             let mut updates = Vec::new();
-            let checked_out_branches = if bare_repo {
-                HashSet::new()
-            } else {
-                checked_out_local_branches_with_conn(txn).await?
-            };
-            for plan in &plans {
+            let mut checked_out_branches = HashSet::new();
+            if !bare_repo {
+                for rec in git_store.list_all_local_heads().await.map_err(|error| {
+                    FetchError::UpdateRefs {
+                        message: format!("failed to list checked-out heads: {error}"),
+                    }
+                })? {
+                    if let RefTarget::Symbolic(branch_name) = rec.target {
+                        checked_out_branches.insert(branch_name);
+                    }
+                }
+            }
+
+            let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
+            for plan in plans {
                 if !plan.update_tracking {
                     continue;
                 }
                 let (storage_name, remote_scope) =
                     fetch_destination_storage(&plan.destination, &remote_config.name).await?;
                 let tag_destination = plan.destination.starts_with("refs/tags/");
-                if tag_destination {
-                    use sea_orm::{ColumnTrait as _, EntityTrait as _, QueryFilter as _};
-                    let existing = ref_model::Entity::find()
-                        .filter(ref_model::Column::Name.eq(Some(storage_name.clone())))
-                        .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Tag))
-                        .one(txn)
+                let key = if tag_destination {
+                    RefKey::Tag {
+                        name: storage_name.clone(),
+                    }
+                } else if let Some(remote) = remote_scope.as_deref() {
+                    RefKey::RemoteBranch {
+                        remote: remote.to_string(),
+                        name: storage_name.clone(),
+                    }
+                } else {
+                    RefKey::LocalBranch {
+                        name: storage_name.clone(),
+                    }
+                };
+                if !tag_destination {
+                    reject_checked_out_destination(
+                        plan,
+                        remote_scope.as_deref(),
+                        &checked_out_branches,
+                        update_head_ok,
+                    )?;
+                }
+                let existing =
+                    git_store
+                        .get_ref(&key)
                         .await
                         .map_err(|error| FetchError::UpdateRefs {
                             message: format!(
@@ -5650,143 +5895,59 @@ async fn update_references(
                                 plan.destination
                             ),
                         })?;
-                    let old_oid = existing.as_ref().and_then(|row| row.commit.clone());
-                    if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
-                        continue;
-                    }
-                    let forced =
-                        fetch_update_is_forced(old_oid.as_deref(), &plan.reference._hash);
-                    if forced && !force_override && !plan.force {
-                        return Err(FetchError::RefUpdateRejected {
-                            message: format!(
-                                "non-fast-forward update to '{}' requires '+' in the refspec or --force",
-                                plan.destination
-                            ),
-                        });
-                    }
-                    match existing {
-                        Some(row) => {
-                            let mut active: ref_model::ActiveModel = row.into();
-                            active.commit = Set(Some(plan.reference._hash.clone()));
-                            active.update(txn).await.map_err(|source| FetchError::UpdateRefs {
-                                message: format!(
-                                    "failed to persist fetch destination '{}': {source}",
-                                    plan.destination
-                                ),
-                            })?;
-                        }
-                        None => {
-                            let new_row = ref_model::ActiveModel {
-                                name: Set(Some(storage_name.clone())),
-                                kind: Set(ref_model::ConfigKind::Tag),
-                                commit: Set(Some(plan.reference._hash.clone())),
-                                ..Default::default()
-                            };
-                            new_row.insert(txn).await.map_err(|source| FetchError::UpdateRefs {
-                                message: format!(
-                                    "failed to persist fetch destination '{}': {source}",
-                                    plan.destination
-                                ),
-                            })?;
-                        }
-                    }
-                    let context = ReflogContext {
-                        old_oid: old_oid.clone().unwrap_or_else(|| {
-                            ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string()
-                        }),
-                        new_oid: plan.reference._hash.clone(),
-                        action: ReflogAction::Fetch,
-                    };
-                    Reflog::insert_single_entry(txn, &context, &plan.destination)
-                        .await
-                        .map_err(|source| FetchError::UpdateRefs {
-                            message: format!(
-                                "failed to record reflog for fetch destination '{}': {source}",
-                                plan.destination
-                            ),
-                        })?;
-                    updates.push(FetchRefUpdate {
-                        remote_ref: plan.destination.clone(),
-                        forced,
-                        old_oid,
-                        new_oid: plan.reference._hash.clone(),
-                    });
-                    continue;
-                }
-
-                let old_oid = Branch::find_branch_result_with_conn(
-                    txn,
-                    &storage_name,
-                    remote_scope.as_deref(),
-                )
-                .await
-                .map_err(|error| FetchError::UpdateRefs {
-                    message: format!(
-                        "failed to inspect fetch destination '{}': {error}",
-                        plan.destination
-                    )})?
-                .map(|branch| branch.commit.to_string());
-
-                reject_checked_out_destination(
-                    plan,
-                    remote_scope.as_deref(),
-                    &checked_out_branches,
-                    update_head_ok,
-                )?;
+                let old_oid = existing.as_ref().map(|t| match t {
+                    RefTarget::Direct(o) | RefTarget::Symbolic(o) => o.clone(),
+                });
                 if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
                     continue;
                 }
-
-                let forced =
-                    fetch_update_is_forced(old_oid.as_deref(), &plan.reference._hash);
+                let forced = fetch_update_is_forced(old_oid.as_deref(), &plan.reference._hash);
                 if forced && !force_override && !plan.force {
                     return Err(FetchError::RefUpdateRejected {
                         message: format!(
                             "non-fast-forward update to '{}' requires '+' in the refspec or --force",
                             plan.destination
-                        )});
+                        ),
+                    });
                 }
-
-                Branch::update_branch_with_conn(
-                    txn,
-                    &storage_name,
-                    &plan.reference._hash,
-                    remote_scope.as_deref(),
-                )
-                .await
-                .map_err(|source| FetchError::UpdateRefs {
-                    message: format!(
-                        "failed to persist fetch destination '{}': {source}",
-                        plan.destination
-                    )})?;
-
                 let context = ReflogContext {
-                    old_oid: old_oid
-                        .clone()
-                        .unwrap_or_else(|| ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string()),
+                    old_oid: old_oid.clone().unwrap_or_else(|| zero.clone()),
                     new_oid: plan.reference._hash.clone(),
-                    action: ReflogAction::Fetch};
-                Reflog::insert_single_entry(txn, &context, &plan.destination)
+                    action: ReflogAction::Fetch,
+                };
+                let reflog_write =
+                    Reflog::build_reflog_write_with_store(&*cfg_store, &context, &plan.destination)
+                        .await;
+                let new_target = RefTarget::Direct(plan.reference._hash.clone());
+                match git_store
+                    .update_ref_cas(&key, existing.as_ref(), Some(&new_target), &[reflog_write])
                     .await
                     .map_err(|source| FetchError::UpdateRefs {
                         message: format!(
-                            "failed to record reflog for fetch destination '{}': {source}",
+                            "failed to persist fetch destination '{}': {source}",
                             plan.destination
-                        )})?;
+                        ),
+                    })? {
+                    RefCasOutcome::Applied { .. } => {}
+                    RefCasOutcome::CasConflict { .. } => {
+                        return Err(FetchError::UpdateRefs {
+                            message: format!(
+                                "concurrent modification while persisting fetch destination '{}'",
+                                plan.destination
+                            ),
+                        });
+                    }
+                }
                 updates.push(FetchRefUpdate {
                     remote_ref: plan.destination.clone(),
                     forced,
                     old_oid,
-                    new_oid: plan.reference._hash.clone()});
+                    new_oid: plan.reference._hash.clone(),
+                });
             }
 
-            // Update the cached remote HEAD to the branch it points at, resolved
-            // via the shared helper (symref capability, else OID match, else
-            // main/master/first). The symbolic target must be the mapped local
-            // tracking destination, not blindly the remote source branch: an
-            // explicit/configured refspec may rename it or omit it entirely.
             let remote_default_branch =
-                resolve_remote_default_branch(&capabilities, &ref_heads, remote_head.as_ref());
+                resolve_remote_default_branch(&capabilities, ref_heads, remote_head.as_ref());
             let tracking_prefix = format!("refs/remotes/{}/", remote_config.name);
             let mapped_branch = remote_default_branch.as_ref().and_then(|branch_name| {
                 let source_ref = format!("refs/heads/{branch_name}");
@@ -5797,8 +5958,8 @@ async fn update_references(
                 })
             });
             if let Some(mapped_branch) = mapped_branch {
-                Head::update_result_with_conn(
-                    txn,
+                Head::update_result_with_store(
+                    &*git_store,
                     Head::Branch(mapped_branch.to_string()),
                     Some(&remote_config.name),
                 )
@@ -5807,31 +5968,265 @@ async fn update_references(
                     message: format!(
                         "failed to update refs/remotes/{}/HEAD: {error}",
                         remote_config.name
-                    )})?;
+                    ),
+                })?;
             } else if branch.is_none() {
-                ref_model::Entity::delete_many()
-                    .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
-                    .filter(ref_model::Column::Remote.eq(&remote_config.name))
-                    .exec(txn)
+                Head::delete_remote_head_with_store(&*git_store, &remote_config.name)
                     .await
                     .map_err(|error| FetchError::UpdateRefs {
                         message: format!(
                             "failed to remove stale refs/remotes/{}/HEAD: {error}",
                             remote_config.name
-                        )})?;
+                        ),
+                    })?;
             }
             if remote_default_branch.is_none() && branch.is_none() && remote_head.is_some() {
                 tracing::debug!("remote HEAD does not point to a branch ref");
             }
+            Ok(updates)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|message| FetchError::LocalState { message })?;
+            let remote_config = remote_config.clone();
+            let plans = plans.to_vec();
+            let ref_heads = ref_heads.to_vec();
+            crate::internal::db::write_transaction(&db, |txn| {
+                Box::pin(async move {
+                    let mut updates = Vec::new();
+                    let checked_out_branches = if bare_repo {
+                        HashSet::new()
+                    } else {
+                        checked_out_local_branches_with_conn(txn).await?
+                    };
+                    for plan in &plans {
+                        if !plan.update_tracking {
+                            continue;
+                        }
+                        let (storage_name, remote_scope) =
+                            fetch_destination_storage(&plan.destination, &remote_config.name)
+                                .await?;
+                        let tag_destination = plan.destination.starts_with("refs/tags/");
+                        if tag_destination {
+                            use sea_orm::{ColumnTrait as _, EntityTrait as _, QueryFilter as _};
+                            let existing = ref_model::Entity::find()
+                                .filter(ref_model::Column::Name.eq(Some(storage_name.clone())))
+                                .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Tag))
+                                .one(txn)
+                                .await
+                                .map_err(|error| FetchError::UpdateRefs {
+                                    message: format!(
+                                        "failed to inspect fetch destination '{}': {error}",
+                                        plan.destination
+                                    ),
+                                })?;
+                            let old_oid = existing.as_ref().and_then(|row| row.commit.clone());
+                            if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
+                                continue;
+                            }
+                            let forced = fetch_update_is_forced(
+                                old_oid.as_deref(),
+                                &plan.reference._hash,
+                            );
+                            if forced && !force_override && !plan.force {
+                                return Err(FetchError::RefUpdateRejected {
+                                    message: format!(
+                                        "non-fast-forward update to '{}' requires '+' in the refspec or --force",
+                                        plan.destination
+                                    ),
+                                });
+                            }
+                            match existing {
+                                Some(row) => {
+                                    let mut active: ref_model::ActiveModel = row.into();
+                                    active.commit = Set(Some(plan.reference._hash.clone()));
+                                    active.update(txn).await.map_err(|source| {
+                                        FetchError::UpdateRefs {
+                                            message: format!(
+                                                "failed to persist fetch destination '{}': {source}",
+                                                plan.destination
+                                            ),
+                                        }
+                                    })?;
+                                }
+                                None => {
+                                    let new_row = ref_model::ActiveModel {
+                                        name: Set(Some(storage_name.clone())),
+                                        kind: Set(ref_model::ConfigKind::Tag),
+                                        commit: Set(Some(plan.reference._hash.clone())),
+                                        ..Default::default()
+                                    };
+                                    new_row.insert(txn).await.map_err(|source| {
+                                        FetchError::UpdateRefs {
+                                            message: format!(
+                                                "failed to persist fetch destination '{}': {source}",
+                                                plan.destination
+                                            ),
+                                        }
+                                    })?;
+                                }
+                            }
+                            let context = ReflogContext {
+                                old_oid: old_oid.clone().unwrap_or_else(|| {
+                                    ObjectHash::zero_str(git_internal::hash::get_hash_kind())
+                                        .to_string()
+                                }),
+                                new_oid: plan.reference._hash.clone(),
+                                action: ReflogAction::Fetch,
+                            };
+                            Reflog::insert_single_entry(txn, &context, &plan.destination)
+                                .await
+                                .map_err(|source| FetchError::UpdateRefs {
+                                    message: format!(
+                                        "failed to record reflog for fetch destination '{}': {source}",
+                                        plan.destination
+                                    ),
+                                })?;
+                            updates.push(FetchRefUpdate {
+                                remote_ref: plan.destination.clone(),
+                                forced,
+                                old_oid,
+                                new_oid: plan.reference._hash.clone(),
+                            });
+                            continue;
+                        }
 
-            Ok::<_, FetchError>(updates)
-        })
-    })
-    .await
-    .map_err(|source| match source {
-        TransactionError::Connection(error) => FetchError::UpdateRefs {
-            message: error.to_string()},
-        TransactionError::Transaction(error) => error})
+                        let old_oid = Branch::find_branch_result_with_conn(
+                            txn,
+                            &storage_name,
+                            remote_scope.as_deref(),
+                        )
+                        .await
+                        .map_err(|error| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to inspect fetch destination '{}': {error}",
+                                plan.destination
+                            ),
+                        })?
+                        .map(|branch| branch.commit.to_string());
+
+                        reject_checked_out_destination(
+                            plan,
+                            remote_scope.as_deref(),
+                            &checked_out_branches,
+                            update_head_ok,
+                        )?;
+                        if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
+                            continue;
+                        }
+
+                        let forced =
+                            fetch_update_is_forced(old_oid.as_deref(), &plan.reference._hash);
+                        if forced && !force_override && !plan.force {
+                            return Err(FetchError::RefUpdateRejected {
+                                message: format!(
+                                    "non-fast-forward update to '{}' requires '+' in the refspec or --force",
+                                    plan.destination
+                                ),
+                            });
+                        }
+
+                        Branch::update_branch_with_conn(
+                            txn,
+                            &storage_name,
+                            &plan.reference._hash,
+                            remote_scope.as_deref(),
+                        )
+                        .await
+                        .map_err(|source| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to persist fetch destination '{}': {source}",
+                                plan.destination
+                            ),
+                        })?;
+
+                        let context = ReflogContext {
+                            old_oid: old_oid.clone().unwrap_or_else(|| {
+                                ObjectHash::zero_str(git_internal::hash::get_hash_kind())
+                                    .to_string()
+                            }),
+                            new_oid: plan.reference._hash.clone(),
+                            action: ReflogAction::Fetch,
+                        };
+                        Reflog::insert_single_entry(txn, &context, &plan.destination)
+                            .await
+                            .map_err(|source| FetchError::UpdateRefs {
+                                message: format!(
+                                    "failed to record reflog for fetch destination '{}': {source}",
+                                    plan.destination
+                                ),
+                            })?;
+                        updates.push(FetchRefUpdate {
+                            remote_ref: plan.destination.clone(),
+                            forced,
+                            old_oid,
+                            new_oid: plan.reference._hash.clone(),
+                        });
+                    }
+
+                    // Update the cached remote HEAD to the branch it points at, resolved
+                    // via the shared helper (symref capability, else OID match, else
+                    // main/master/first). The symbolic target must be the mapped local
+                    // tracking destination, not blindly the remote source branch: an
+                    // explicit/configured refspec may rename it or omit it entirely.
+                    let remote_default_branch = resolve_remote_default_branch(
+                        &capabilities,
+                        &ref_heads,
+                        remote_head.as_ref(),
+                    );
+                    let tracking_prefix = format!("refs/remotes/{}/", remote_config.name);
+                    let mapped_branch = remote_default_branch.as_ref().and_then(|branch_name| {
+                        let source_ref = format!("refs/heads/{branch_name}");
+                        plans.iter().find_map(|plan| {
+                            (plan.update_tracking && plan.reference._ref == source_ref)
+                                .then(|| plan.destination.strip_prefix(&tracking_prefix))
+                                .flatten()
+                        })
+                    });
+                    if let Some(mapped_branch) = mapped_branch {
+                        Head::update_result_with_conn(
+                            txn,
+                            Head::Branch(mapped_branch.to_string()),
+                            Some(&remote_config.name),
+                        )
+                        .await
+                        .map_err(|error| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to update refs/remotes/{}/HEAD: {error}",
+                                remote_config.name
+                            ),
+                        })?;
+                    } else if branch.is_none() {
+                        ref_model::Entity::delete_many()
+                            .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
+                            .filter(ref_model::Column::Remote.eq(&remote_config.name))
+                            .exec(txn)
+                            .await
+                            .map_err(|error| FetchError::UpdateRefs {
+                                message: format!(
+                                    "failed to remove stale refs/remotes/{}/HEAD: {error}",
+                                    remote_config.name
+                                ),
+                            })?;
+                    }
+                    if remote_default_branch.is_none() && branch.is_none() && remote_head.is_some()
+                    {
+                        tracing::debug!("remote HEAD does not point to a branch ref");
+                    }
+
+                    Ok::<_, FetchError>(updates)
+                })
+            })
+            .await
+            .map_err(|source| match source {
+                TransactionError::Connection(error) => FetchError::UpdateRefs {
+                    message: error.to_string(),
+                },
+                TransactionError::Transaction(error) => error,
+            })
+        }
+    }
 }
 
 /// Whether `new_oid` updating `old_oid` is a forced (non-fast-forward) change.
@@ -6107,55 +6502,73 @@ async fn persist_fetched_tags(
     if tags.is_empty() {
         return Ok(Vec::new());
     }
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|message| FetchError::LocalState { message })?;
     let tags = tags.to_vec();
-    crate::internal::db::write_transaction(&db, |txn| {
-        Box::pin(async move {
+    let (updates, rejected) = match crate::storage::runtime::detect_current_repo_backend().map_err(
+        |error| FetchError::LocalState {
+            message: format!("failed to detect repository backend: {error}"),
+        },
+    )? {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| FetchError::LocalState {
+                    message: error.to_string(),
+                })?;
             let mut updates = Vec::new();
             let mut rejected: Vec<String> = Vec::new();
             for tag in &tags {
                 if tag._ref.ends_with("^{}") || !tag._ref.starts_with("refs/tags/") {
                     continue;
                 }
-                let existing = ref_model::Entity::find()
-                    .filter(ref_model::Column::Name.eq(tag._ref.clone()))
-                    .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Tag))
-                    .one(txn)
-                    .await
-                    .map_err(|error| FetchError::UpdateRefs {
-                        message: format!("failed to inspect existing tag '{}': {error}", tag._ref),
-                    })?;
-                match existing {
-                    Some(row) if row.commit.as_deref() == Some(tag._hash.as_str()) => {
-                        // Already up to date — nothing to report.
-                    }
-                    Some(row) if force => {
-                        let old = row.commit.clone();
-                        let mut active: ref_model::ActiveModel = row.into();
-                        active.commit = Set(Some(tag._hash.clone()));
-                        active
-                            .update(txn)
+                let key = RefKey::Tag {
+                    name: tag._ref.clone(),
+                };
+                let existing =
+                    git_store
+                        .get_ref(&key)
+                        .await
+                        .map_err(|error| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to inspect existing tag '{}': {error}",
+                                tag._ref
+                            ),
+                        })?;
+                let existing_oid = existing.as_ref().map(|t| match t {
+                    RefTarget::Direct(o) | RefTarget::Symbolic(o) => o.clone(),
+                });
+                match existing_oid {
+                    Some(ref oid) if oid == &tag._hash => {}
+                    Some(old) if force => {
+                        let new_target = RefTarget::Direct(tag._hash.clone());
+                        match git_store
+                            .update_ref_cas(&key, existing.as_ref(), Some(&new_target), &[])
                             .await
                             .map_err(|source| FetchError::UpdateRefs {
                                 message: format!(
                                     "failed to force-update tag '{}': {source}",
                                     tag._ref
                                 ),
-                            })?;
+                            })? {
+                            RefCasOutcome::Applied { .. } => {}
+                            RefCasOutcome::CasConflict { .. } => {
+                                return Err(FetchError::UpdateRefs {
+                                    message: format!(
+                                        "concurrent modification while force-updating tag '{}'",
+                                        tag._ref
+                                    ),
+                                });
+                            }
+                        }
                         updates.push(FetchRefUpdate {
                             remote_ref: tag._ref.clone(),
-                            old_oid: old,
+                            old_oid: Some(old),
                             new_oid: tag._hash.clone(),
                             forced: true,
                         });
                     }
                     Some(_) if fail_on_conflict => {
-                        // Keep the local tag but remember the rejection: the
-                        // fetch reports it and fails as a whole once the other
-                        // tags of this batch have landed (Git parity). An
-                        // auto-follow fetch (no `--tags`) never fails here.
                         rejected.push(tag._ref.clone());
                     }
                     Some(_) => {
@@ -6165,18 +6578,23 @@ async fn persist_fetched_tags(
                         );
                     }
                     None => {
-                        let new_ref = ref_model::ActiveModel {
-                            name: Set(Some(tag._ref.clone())),
-                            kind: Set(ref_model::ConfigKind::Tag),
-                            commit: Set(Some(tag._hash.clone())),
-                            ..Default::default()
-                        };
-                        new_ref
-                            .insert(txn)
+                        let new_target = RefTarget::Direct(tag._hash.clone());
+                        match git_store
+                            .update_ref_cas(&key, None, Some(&new_target), &[])
                             .await
                             .map_err(|source| FetchError::UpdateRefs {
                                 message: format!("failed to persist tag '{}': {source}", tag._ref),
-                            })?;
+                            })? {
+                            RefCasOutcome::Applied { .. } => {}
+                            RefCasOutcome::CasConflict { .. } => {
+                                return Err(FetchError::UpdateRefs {
+                                    message: format!(
+                                        "concurrent modification while persisting tag '{}'",
+                                        tag._ref
+                                    ),
+                                });
+                            }
+                        }
                         updates.push(FetchRefUpdate {
                             remote_ref: tag._ref.clone(),
                             old_oid: None,
@@ -6186,27 +6604,114 @@ async fn persist_fetched_tags(
                     }
                 }
             }
-            Ok::<_, FetchError>((updates, rejected))
-        })
-    })
-    .await
-    .map_err(|source| FetchError::UpdateRefs {
-        message: match source {
-            TransactionError::Connection(error) => error.to_string(),
-            TransactionError::Transaction(error) => error.to_string(),
-        },
-    })
-    .and_then(|(updates, rejected)| {
-        if rejected.is_empty() {
-            return Ok(updates);
+            (updates, rejected)
         }
-        for name in &rejected {
-            let short = name.strip_prefix("refs/tags/").unwrap_or(name);
-            eprintln!(" ! [rejected]        {short} -> {short}  (would clobber existing tag)");
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|message| FetchError::LocalState { message })?;
+            crate::internal::db::write_transaction(&db, |txn| {
+                Box::pin(async move {
+                    let mut updates = Vec::new();
+                    let mut rejected: Vec<String> = Vec::new();
+                    for tag in &tags {
+                        if tag._ref.ends_with("^{}") || !tag._ref.starts_with("refs/tags/") {
+                            continue;
+                        }
+                        let existing = ref_model::Entity::find()
+                            .filter(ref_model::Column::Name.eq(tag._ref.clone()))
+                            .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Tag))
+                            .one(txn)
+                            .await
+                            .map_err(|error| FetchError::UpdateRefs {
+                                message: format!(
+                                    "failed to inspect existing tag '{}': {error}",
+                                    tag._ref
+                                ),
+                            })?;
+                        match existing {
+                            Some(row) if row.commit.as_deref() == Some(tag._hash.as_str()) => {
+                                // Already up to date — nothing to report.
+                            }
+                            Some(row) if force => {
+                                let old = row.commit.clone();
+                                let mut active: ref_model::ActiveModel = row.into();
+                                active.commit = Set(Some(tag._hash.clone()));
+                                active
+                                    .update(txn)
+                                    .await
+                                    .map_err(|source| FetchError::UpdateRefs {
+                                        message: format!(
+                                            "failed to force-update tag '{}': {source}",
+                                            tag._ref
+                                        ),
+                                    })?;
+                                updates.push(FetchRefUpdate {
+                                    remote_ref: tag._ref.clone(),
+                                    old_oid: old,
+                                    new_oid: tag._hash.clone(),
+                                    forced: true,
+                                });
+                            }
+                            Some(_) if fail_on_conflict => {
+                                // Keep the local tag but remember the rejection: the
+                                // fetch reports it and fails as a whole once the other
+                                // tags of this batch have landed (Git parity). An
+                                // auto-follow fetch (no `--tags`) never fails here.
+                                rejected.push(tag._ref.clone());
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    "tag '{}' already exists with a different target; keeping the local tag (use --force to overwrite)",
+                                    tag._ref
+                                );
+                            }
+                            None => {
+                                let new_ref = ref_model::ActiveModel {
+                                    name: Set(Some(tag._ref.clone())),
+                                    kind: Set(ref_model::ConfigKind::Tag),
+                                    commit: Set(Some(tag._hash.clone())),
+                                    ..Default::default()
+                                };
+                                new_ref
+                                    .insert(txn)
+                                    .await
+                                    .map_err(|source| FetchError::UpdateRefs {
+                                        message: format!(
+                                            "failed to persist tag '{}': {source}",
+                                            tag._ref
+                                        ),
+                                    })?;
+                                updates.push(FetchRefUpdate {
+                                    remote_ref: tag._ref.clone(),
+                                    old_oid: None,
+                                    new_oid: tag._hash.clone(),
+                                    forced: false,
+                                });
+                            }
+                        }
+                    }
+                    Ok::<_, FetchError>((updates, rejected))
+                })
+            })
+            .await
+            .map_err(|source| FetchError::UpdateRefs {
+                message: match source {
+                    TransactionError::Connection(error) => error.to_string(),
+                    TransactionError::Transaction(error) => error.to_string(),
+                },
+            })?
         }
-        Err(FetchError::TagConflict {
-            tags: rejected.join(", "),
-        })
+    };
+    if rejected.is_empty() {
+        return Ok(updates);
+    }
+    for name in &rejected {
+        let short = name.strip_prefix("refs/tags/").unwrap_or(name);
+        eprintln!(" ! [rejected]        {short} -> {short}  (would clobber existing tag)");
+    }
+    Err(FetchError::TagConflict {
+        tags: rejected.join(", "),
     })
 }
 
@@ -6359,20 +6864,46 @@ async fn current_have_safe(hash_kind: HashKind) -> Result<Vec<String>, FetchErro
     // the tag objects and their history on every run (the bug that previously
     // forced tag fetching to be backed out). This is unconditional: the client
     // genuinely has these objects, so advertising them is always correct.
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|message| FetchError::LocalState { message })?;
-    let tag_rows = ref_model::Entity::find()
-        .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Tag))
-        .all(&db)
-        .await
-        .map_err(|source| FetchError::LocalState {
-            message: format!("failed to list local tags for have-set: {source}"),
-        })?;
-    for row in tag_rows {
-        let Some(ref_oid) = row.commit else {
-            continue;
-        };
+    let tag_commits: Vec<String> = match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|source| FetchError::LocalState {
+                    message: format!("failed to open redb git store for have-set tags: {source}"),
+                })?;
+            store
+                .list_refs(None)
+                .await
+                .map_err(|source| FetchError::LocalState {
+                    message: format!("failed to list local tags for have-set: {source}"),
+                })?
+                .into_iter()
+                .filter_map(|record| match (record.key, record.target) {
+                    (
+                        crate::storage::git_store::RefKey::Tag { .. },
+                        crate::storage::git_store::RefTarget::Direct(oid),
+                    ) => Some(oid),
+                    _ => None,
+                })
+                .collect()
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|message| FetchError::LocalState { message })?;
+            ref_model::Entity::find()
+                .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Tag))
+                .all(&db)
+                .await
+                .map_err(|source| FetchError::LocalState {
+                    message: format!("failed to list local tags for have-set: {source}"),
+                })?
+                .into_iter()
+                .filter_map(|row| row.commit)
+                .collect()
+        }
+    };
+    for ref_oid in tag_commits {
         if have_set.insert(ref_oid.clone()) {
             have.push(ref_oid.clone());
         }

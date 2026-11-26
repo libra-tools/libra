@@ -797,123 +797,225 @@ impl<R: BufRead> Importer<R> {
             self.pending_note_replacements.clear();
             return Ok(());
         }
-        let db = get_db_conn_instance().await;
-        let written = crate::internal::db::write_transaction(&db, |txn| {
-                Box::pin(async move {
-                    let mut written = 0u64;
-                    for (refname, oid) in &pending_refs {
-                        if let Some(branch) = refname.strip_prefix("refs/heads/") {
-                            match oid {
-                                Some(oid) => {
-                                    Branch::update_branch_with_conn(
-                                        txn,
-                                        branch,
-                                        &oid.to_string(),
-                                        None,
-                                    )
+        let written = match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|error| self.fatal(&format!("failed to detect repository backend: {error}")))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|error| {
+                        self.fatal(&format!(
+                            "failed to open git store for fast-import: {error}"
+                        ))
+                    })?;
+                let mut written = 0u64;
+                for (refname, oid) in &pending_refs {
+                    let key = if let Some(branch) = refname.strip_prefix("refs/heads/") {
+                        RefKey::LocalBranch {
+                            name: branch.to_string(),
+                        }
+                    } else if refname.starts_with("refs/tags/") {
+                        RefKey::Tag {
+                            name: refname.clone(),
+                        }
+                    } else {
+                        return Err(self.fatal(&format!(
+                            "fast-import cannot persist ref namespace '{refname}'"
+                        )));
+                    };
+                    let existing = store.get_ref(&key).await.map_err(|error| {
+                        self.fatal(&format!("failed to inspect ref '{refname}': {error}"))
+                    })?;
+                    let new_target = oid.map(|o| RefTarget::Direct(o.to_string()));
+                    match store
+                        .update_ref_cas(&key, existing.as_ref(), new_target.as_ref(), &[])
+                        .await
+                        .map_err(|error| {
+                            self.fatal(&format!("failed to persist ref '{refname}': {error}"))
+                        })? {
+                        RefCasOutcome::Applied { .. } => {}
+                        RefCasOutcome::CasConflict { .. } => {
+                            return Err(self.fatal(&format!(
+                                "concurrent modification while updating '{refname}'"
+                            )));
+                        }
+                    }
+                    written += 1;
+                }
+
+                let mut note_refs = pending_note_replacements.clone();
+                for notes_ref in &pending_note_replacements {
+                    let existing_notes = store.list_notes(notes_ref).await.map_err(|error| {
+                        self.fatal(&format!("failed to list notes '{notes_ref}': {error}"))
+                    })?;
+                    for rec in existing_notes {
+                        let _ = store
+                            .remove_note_cas(notes_ref, &rec.object, Some(&rec.blob))
+                            .await
+                            .map_err(|error| {
+                                self.fatal(&format!(
+                                    "failed to clear note '{notes_ref}' for '{}': {error}",
+                                    rec.object
+                                ))
+                            })?;
+                    }
+                }
+                for ((notes_ref, object), blob) in &pending_notes {
+                    note_refs.insert(notes_ref.clone());
+                    match blob {
+                        Some(blob) => {
+                            let _ = store
+                                .put_note(notes_ref, object, &blob.to_string(), true)
+                                .await
+                                .map_err(|error| {
+                                    self.fatal(&format!(
+                                        "failed to persist note '{notes_ref}' for '{object}': {error}"
+                                    ))
+                                })?;
+                        }
+                        None => {
+                            let _ = store
+                                .remove_note_cas(notes_ref, object, None)
+                                .await
+                                .map_err(|error| {
+                                    self.fatal(&format!(
+                                        "failed to remove note '{notes_ref}' for '{object}': {error}"
+                                    ))
+                                })?;
+                        }
+                    }
+                }
+                written += note_refs.len() as u64;
+                written
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                crate::internal::db::write_transaction(&db, |txn| {
+                    Box::pin(async move {
+                        let mut written = 0u64;
+                        for (refname, oid) in &pending_refs {
+                            if let Some(branch) = refname.strip_prefix("refs/heads/") {
+                                match oid {
+                                    Some(oid) => {
+                                        Branch::update_branch_with_conn(
+                                            txn,
+                                            branch,
+                                            &oid.to_string(),
+                                            None,
+                                        )
+                                        .await?;
+                                    }
+                                    None => {
+                                        match Branch::delete_branch_result_with_conn(
+                                            txn, branch, None,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) | Err(BranchStoreError::NotFound(_)) => {}
+                                            Err(error) => {
+                                                return Err(DbErr::Custom(error.to_string()));
+                                            }
+                                        }
+                                    }
+                                }
+                                written += 1;
+                                continue;
+                            }
+                            if refname.starts_with("refs/tags/") {
+                                match oid {
+                                    Some(oid) => {
+                                        let existing = reference::Entity::find()
+                                            .filter(reference::Column::Name.eq(refname.clone()))
+                                            .filter(
+                                                reference::Column::Kind
+                                                    .eq(reference::ConfigKind::Tag),
+                                            )
+                                            .one(txn)
+                                            .await?;
+                                        match existing {
+                                            Some(row) => {
+                                                let mut active: reference::ActiveModel = row.into();
+                                                active.commit = Set(Some(oid.to_string()));
+                                                active.update(txn).await?;
+                                            }
+                                            None => {
+                                                reference::ActiveModel {
+                                                    name: Set(Some(refname.clone())),
+                                                    kind: Set(reference::ConfigKind::Tag),
+                                                    commit: Set(Some(oid.to_string())),
+                                                    ..Default::default()
+                                                }
+                                                .insert(txn)
+                                                .await?;
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        reference::Entity::delete_many()
+                                            .filter(reference::Column::Name.eq(refname.clone()))
+                                            .filter(
+                                                reference::Column::Kind
+                                                    .eq(reference::ConfigKind::Tag),
+                                            )
+                                            .exec(txn)
+                                            .await?;
+                                    }
+                                }
+                                written += 1;
+                                continue;
+                            }
+                            return Err(DbErr::Custom(format!(
+                                "fast-import cannot persist ref namespace '{refname}'"
+                            )));
+                        }
+
+                        let mut note_refs = pending_note_replacements.clone();
+                        for notes_ref in &pending_note_replacements {
+                            txn.execute_raw(Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Sqlite,
+                                "DELETE FROM notes WHERE notes_ref = ?",
+                                [notes_ref.clone().into()],
+                            ))
+                            .await?;
+                        }
+                        for ((notes_ref, object), blob) in &pending_notes {
+                            note_refs.insert(notes_ref.clone());
+                            match blob {
+                                Some(blob) => {
+                                    txn.execute_raw(Statement::from_sql_and_values(
+                                        sea_orm::DatabaseBackend::Sqlite,
+                                        "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?) \
+                                         ON CONFLICT(notes_ref, object) DO UPDATE SET blob = excluded.blob",
+                                        [
+                                            notes_ref.clone().into(),
+                                            object.clone().into(),
+                                            blob.to_string().into(),
+                                        ],
+                                    ))
                                     .await?;
                                 }
                                 None => {
-                                    match Branch::delete_branch_result_with_conn(txn, branch, None)
-                                        .await
-                                    {
-                                        Ok(()) | Err(BranchStoreError::NotFound(_)) => {}
-                                        Err(error) => return Err(DbErr::Custom(error.to_string())),
-                                    }
+                                    txn.execute_raw(Statement::from_sql_and_values(
+                                        sea_orm::DatabaseBackend::Sqlite,
+                                        "DELETE FROM notes WHERE notes_ref = ? AND object = ?",
+                                        [notes_ref.clone().into(), object.clone().into()],
+                                    ))
+                                    .await?;
                                 }
                             }
-                            written += 1;
-                            continue;
                         }
-                        if refname.starts_with("refs/tags/") {
-                            match oid {
-                                Some(oid) => {
-                                    let existing = reference::Entity::find()
-                                        .filter(reference::Column::Name.eq(refname.clone()))
-                                        .filter(
-                                            reference::Column::Kind
-                                                .eq(reference::ConfigKind::Tag),
-                                        )
-                                        .one(txn)
-                                        .await?;
-                                    match existing {
-                                        Some(row) => {
-                                            let mut active: reference::ActiveModel = row.into();
-                                            active.commit = Set(Some(oid.to_string()));
-                                            active.update(txn).await?;
-                                        }
-                                        None => {
-                                            reference::ActiveModel {
-                                                name: Set(Some(refname.clone())),
-                                                kind: Set(reference::ConfigKind::Tag),
-                                                commit: Set(Some(oid.to_string())),
-                                                ..Default::default()
-                                            }
-                                            .insert(txn)
-                                            .await?;
-                                        }
-                                    }
-                                }
-                                None => {
-                                    reference::Entity::delete_many()
-                                        .filter(reference::Column::Name.eq(refname.clone()))
-                                        .filter(
-                                            reference::Column::Kind
-                                                .eq(reference::ConfigKind::Tag),
-                                        )
-                                        .exec(txn)
-                                        .await?;
-                                }
-                            }
-                            written += 1;
-                            continue;
-                        }
-                        return Err(DbErr::Custom(format!(
-                            "fast-import cannot persist ref namespace '{refname}'"
-                        )));
-                    }
-
-                    let mut note_refs = pending_note_replacements.clone();
-                    for notes_ref in &pending_note_replacements {
-                        txn.execute_raw(Statement::from_sql_and_values(
-                            sea_orm::DatabaseBackend::Sqlite,
-                            "DELETE FROM notes WHERE notes_ref = ?",
-                            [notes_ref.clone().into()],
-                        ))
-                        .await?;
-                    }
-                    for ((notes_ref, object), blob) in &pending_notes {
-                        note_refs.insert(notes_ref.clone());
-                        match blob {
-                            Some(blob) => {
-                                txn.execute_raw(Statement::from_sql_and_values(
-                                    sea_orm::DatabaseBackend::Sqlite,
-                                    "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?) \
-                                     ON CONFLICT(notes_ref, object) DO UPDATE SET blob = excluded.blob",
-                                    [
-                                        notes_ref.clone().into(),
-                                        object.clone().into(),
-                                        blob.to_string().into(),
-                                    ],
-                                ))
-                                .await?;
-                            }
-                            None => {
-                                txn.execute_raw(Statement::from_sql_and_values(
-                                    sea_orm::DatabaseBackend::Sqlite,
-                                    "DELETE FROM notes WHERE notes_ref = ? AND object = ?",
-                                    [notes_ref.clone().into(), object.clone().into()],
-                                ))
-                                .await?;
-                            }
-                        }
-                    }
-                    written += note_refs.len() as u64;
-                    Ok::<u64, DbErr>(written)
+                        written += note_refs.len() as u64;
+                        Ok::<u64, DbErr>(written)
+                    })
                 })
-        })
-        .await
-        .map_err(|error| self.fatal(&format!("failed to publish refs atomically: {error}")))?;
+                .await
+                .map_err(|error| {
+                    self.fatal(&format!("failed to publish refs atomically: {error}"))
+                })?
+            }
+        };
         self.pending_refs.clear();
         self.pending_notes.clear();
         self.pending_note_replacements.clear();

@@ -2132,6 +2132,26 @@ impl GitStore for RedbGitStore {
         .await
     }
 
+    async fn list_all_reflogs(&self) -> StorageResult<Vec<ReflogEntry>> {
+        self.run_read(move |rtx| {
+            let Some(reflog_table) =
+                open_optional_read_table(rtx, REFLOG_TABLE, "open reflog table")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let iter = reflog_table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iterate reflog table"))?;
+            for entry in iter.rev() {
+                let (k, v) = entry.map_err(|err| map_redb_storage_err(err, "read reflog row"))?;
+                out.push(decode_reflog_row(k.value(), v.value())?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn prepare_bridge_publication(
         &self,
         operation_id: &str,
@@ -2420,6 +2440,36 @@ impl GitStore for RedbGitStore {
                 }
             }
             Ok((updated > 0, updated))
+        })
+        .await
+    }
+
+    async fn delete_object_index_rows(
+        &self,
+        repo_id: &str,
+        o_ids: &[String],
+    ) -> StorageResult<usize> {
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        if o_ids.is_empty() {
+            return Ok(0);
+        }
+        let repo_owned = repo_id.to_string();
+        let oids_owned: Vec<String> = o_ids.to_vec();
+        self.run_write_conditional(move |wtx| {
+            let mut obj_table = wtx
+                .open_table(OBJECT_INDEX_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open object_index table for delete"))?;
+            let mut deleted = 0usize;
+            for oid in &oids_owned {
+                if obj_table
+                    .remove((repo_owned.as_str(), oid.as_str()))
+                    .map_err(|err| map_redb_storage_err(err, "remove object_index row"))?
+                    .is_some()
+                {
+                    deleted += 1;
+                }
+            }
+            Ok((deleted > 0, deleted))
         })
         .await
     }
@@ -2761,6 +2811,31 @@ impl GitStore for RedbGitStore {
                 if found_ref != ref_owned {
                     break;
                 }
+                let blob = decode_note_row(v.value())?;
+                out.push(NoteRecord {
+                    notes_ref: found_ref.to_string(),
+                    object: found_obj.to_string(),
+                    blob,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn list_all_notes(&self) -> StorageResult<Vec<NoteRecord>> {
+        self.run_read(move |rtx| {
+            let Some(table) = open_optional_read_table(rtx, NOTES_TABLE, "open notes table")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let iter = table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iterate notes table"))?;
+            for entry in iter {
+                let (k, v) = entry.map_err(|err| map_redb_storage_err(err, "read note entry"))?;
+                let (found_ref, found_obj) = k.value();
                 let blob = decode_note_row(v.value())?;
                 out.push(NoteRecord {
                     notes_ref: found_ref.to_string(),

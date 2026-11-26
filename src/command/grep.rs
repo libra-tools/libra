@@ -1570,14 +1570,50 @@ async fn ensure_blob_within_size_limit(
 async fn lookup_indexed_blob_size(
     blob_hash: &git_internal::hash::ObjectHash,
 ) -> Result<Option<u64>, GrepReadError> {
-    let db = db::get_db_conn_instance().await;
-    object_index::Entity::find()
-        .filter(object_index::Column::OId.eq(blob_hash.to_string()))
-        .filter(object_index::Column::OType.eq("blob"))
-        .one(&db)
-        .await
-        .map_err(|e| GrepReadError::Fatal(format!("failed to query object index: {}", e)))
-        .map(|record| record.map(|row| row.o_size as u64))
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| GrepReadError::Fatal(format!("failed to detect repository backend: {e}")))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            // Strictly read-only handle (`ADR-RB-03`): never upgrades to writable
+            // and fails closed on `RepairAborted` / `RepairRequired`.
+            let git_store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|e| {
+                    GrepReadError::Fatal(format!("failed to open read-only object index: {e}"))
+                })?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|e| {
+                    GrepReadError::Fatal(format!("failed to open read-only config store: {e}"))
+                })?;
+            let Some(repo_id_entry) =
+                crate::internal::config::ConfigKv::get_with_store(&*cfg_store, "libra.repoid")
+                    .await
+                    .map_err(|e| {
+                        GrepReadError::Fatal(format!("failed to read repository identity: {e}"))
+                    })?
+            else {
+                return Ok(None);
+            };
+            let record = git_store
+                .get_object_index(&repo_id_entry.value, &blob_hash.to_string())
+                .await
+                .map_err(|e| GrepReadError::Fatal(format!("failed to query object index: {e}")))?;
+            Ok(record
+                .filter(|r| r.o_type == "blob")
+                .map(|r| r.o_size as u64))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = db::get_db_conn_instance().await;
+            object_index::Entity::find()
+                .filter(object_index::Column::OId.eq(blob_hash.to_string()))
+                .filter(object_index::Column::OType.eq("blob"))
+                .one(&db)
+                .await
+                .map_err(|e| GrepReadError::Fatal(format!("failed to query object index: {}", e)))
+                .map(|record| record.map(|row| row.o_size as u64))
+        }
+    }
 }
 
 fn read_loose_blob_size(

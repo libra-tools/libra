@@ -8012,7 +8012,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/` 下 10 个传输、维护与只读检查命令（`fetch.rs`、`push.rs`、`bundle.rs`、`cat_file.rs`、`fast_export.rs`、`fast_import.rs`、`gc.rs`、`grep.rs`、`maintenance.rs`、`control_lock.rs`）接入 `crate::storage`，确保写命令经 `crate::storage` 读写且 `cat_file`/`grep`/`fast_export` 保持严格只读打开（`ADR-RB-03`）。
 
@@ -8069,7 +8069,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/fsck.rs` 与 `src/command/alternates.rs`（1 目录、2 文件）接入 `crate::storage`，落实 `fsck.rs` 作为显式授权修复入口完成 `redb` 崩溃恢复与 `cross_store::reconcile_pending_intents()`（只读文件系统 fail-closed 报 `LBR-IO-001`），以及 `alternates.rs` 分别解析指向外部 SQLite 与外部 Redb 仓库。
 
@@ -8125,7 +8125,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/{bisect,cherry_pick,merge,merge_base,rebase}.rs`（5 文件）与 `src/command/merge/{conflict,content,output,rename_merge,tree_merge,virtual_base,workdir}.rs`（7 文件）接入 `crate::storage`，使三方合并、重放、二分与拣选在 `Redb` 仓库完整运行并保持稀疏合并门控语义不变。
 

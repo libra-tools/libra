@@ -2035,10 +2035,24 @@ async fn validate_force_if_includes(
         // branch's reflog OIDs (new first, then old), shared visited set —
         // the tip must be REACHABLE from some entry, not merely equal.
         let branch_ref = &plan.update.local_ref;
-        let db = crate::internal::db::get_db_conn_instance().await;
-        let entries = crate::internal::reflog::Reflog::find_all(&db, branch_ref)
-            .await
-            .unwrap_or_default();
+        let entries = match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                match crate::storage::runtime::open_current_git_store_read_only().await {
+                    Ok(store) => {
+                        crate::internal::reflog::Reflog::find_all_with_store(&*store, branch_ref)
+                            .await
+                            .unwrap_or_default()
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+                let db = crate::internal::db::get_db_conn_instance().await;
+                crate::internal::reflog::Reflog::find_all(&db, branch_ref)
+                    .await
+                    .unwrap_or_default()
+            }
+        };
         let mut starts: Vec<ObjectHash> = Vec::new();
         for entry in &entries {
             for oid_text in [&entry.new_oid, &entry.old_oid] {
@@ -3095,43 +3109,100 @@ async fn update_remote_tracking(
     let remote_name = remote_name.to_string();
     let remote_tracking_branch_for_error = remote_tracking_branch.clone();
 
-    let db = get_db_conn_instance().await;
-    // Reads the remote-tracking ref before it moves it.
-    let transaction_result = crate::internal::db::write_transaction(&db, |txn| {
-            Box::pin(async move {
-                let old_oid = Branch::find_branch_result_with_conn(
-                    txn,
-                    &remote_tracking_branch,
-                    Some(&remote_name),
-                )
-                .await
-                .map_err(|error| {
-                    map_update_remote_tracking_branch_error(&remote_tracking_branch, error)
-                })?
-                .map_or(ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(), |b| {
-                    b.commit.to_string()
-                });
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|source| {
+        CliError::fatal(format!(
+            "failed to update remote tracking branch '{remote_tracking_branch_for_error}': {source}"
+        ))
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
 
-                Branch::update_branch_with_conn(
-                    txn,
-                    &remote_tracking_branch,
-                    &commit_hash,
-                    Some(&remote_name),
-                )
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
                 .await
                 .map_err(|source| {
                     CliError::fatal(format!(
-                        "failed to update remote tracking branch '{remote_tracking_branch}': {source}"
+                        "failed to update remote tracking branch '{remote_tracking_branch_for_error}': {source}"
                     ))
                     .with_stable_code(StableErrorCode::IoWriteFailed)
                 })?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|source| {
+                    CliError::fatal(format!(
+                        "failed to update remote tracking branch '{remote_tracking_branch_for_error}': {source}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+            let key = RefKey::RemoteBranch {
+                remote: remote_name.clone(),
+                name: remote_tracking_branch.clone(),
+            };
+            let existing = git_store.get_ref(&key).await.map_err(|source| {
+                CliError::fatal(format!(
+                    "failed to update remote tracking branch '{remote_tracking_branch_for_error}': {source}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            let old_oid = match &existing {
+                Some(RefTarget::Direct(oid) | RefTarget::Symbolic(oid)) => oid.clone(),
+                None => ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
+            };
+            let context = ReflogContext {
+                old_oid,
+                new_oid: commit_hash.clone(),
+                action: ReflogAction::Push,
+            };
+            let reflog_write = Reflog::build_reflog_write_with_store(
+                &*cfg_store,
+                &context,
+                &remote_tracking_branch,
+            )
+            .await;
+            let new_target = RefTarget::Direct(commit_hash);
+            match git_store
+                .update_ref_cas(&key, existing.as_ref(), Some(&new_target), &[reflog_write])
+                .await
+                .map_err(|source| {
+                    CliError::fatal(format!(
+                        "failed to update remote tracking branch '{remote_tracking_branch_for_error}': {source}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+                })? {
+                RefCasOutcome::Applied { .. } => {}
+                RefCasOutcome::CasConflict { .. } => {
+                    return Err(CliError::fatal(format!(
+                        "failed to update remote tracking branch '{remote_tracking_branch_for_error}': concurrent modification"
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed));
+                }
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            // Reads the remote-tracking ref before it moves it.
+            let transaction_result = crate::internal::db::write_transaction(&db, |txn| {
+                Box::pin(async move {
+                    let old_oid = Branch::find_branch_result_with_conn(
+                        txn,
+                        &remote_tracking_branch,
+                        Some(&remote_name),
+                    )
+                    .await
+                    .map_err(|error| {
+                        map_update_remote_tracking_branch_error(&remote_tracking_branch, error)
+                    })?
+                    .map_or(
+                        ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
+                        |b| b.commit.to_string(),
+                    );
 
-                let context = ReflogContext {
-                    old_oid,
-                    new_oid: commit_hash.clone(),
-                    action: ReflogAction::Push,
-                };
-                Reflog::insert_single_entry(txn, &context, &remote_tracking_branch)
+                    Branch::update_branch_with_conn(
+                        txn,
+                        &remote_tracking_branch,
+                        &commit_hash,
+                        Some(&remote_name),
+                    )
                     .await
                     .map_err(|source| {
                         CliError::fatal(format!(
@@ -3139,19 +3210,35 @@ async fn update_remote_tracking(
                         ))
                         .with_stable_code(StableErrorCode::IoWriteFailed)
                     })?;
-                Ok::<_, CliError>(())
-        })
-    })
-    .await;
 
-    if let Err(error) = transaction_result {
-        return Err(match error {
-            TransactionError::Connection(source) => CliError::fatal(format!(
-                "failed to update remote tracking branch '{remote_tracking_branch_for_error}': {source}"
-            ))
-            .with_stable_code(StableErrorCode::IoWriteFailed),
-            TransactionError::Transaction(cli) => cli,
-        });
+                    let context = ReflogContext {
+                        old_oid,
+                        new_oid: commit_hash.clone(),
+                        action: ReflogAction::Push,
+                    };
+                    Reflog::insert_single_entry(txn, &context, &remote_tracking_branch)
+                        .await
+                        .map_err(|source| {
+                            CliError::fatal(format!(
+                                "failed to update remote tracking branch '{remote_tracking_branch}': {source}"
+                            ))
+                            .with_stable_code(StableErrorCode::IoWriteFailed)
+                        })?;
+                    Ok::<_, CliError>(())
+                })
+            })
+            .await;
+
+            if let Err(error) = transaction_result {
+                return Err(match error {
+                    TransactionError::Connection(source) => CliError::fatal(format!(
+                        "failed to update remote tracking branch '{remote_tracking_branch_for_error}': {source}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed),
+                    TransactionError::Transaction(cli) => cli,
+                });
+            }
+        }
     }
     Ok(())
 }

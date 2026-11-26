@@ -872,6 +872,31 @@ impl GitStore for SqliteGitStore {
         Ok(usize::try_from(res.rows_affected).unwrap_or(usize::MAX))
     }
 
+    async fn list_all_reflogs(&self) -> StorageResult<Vec<ReflogEntry>> {
+        let rows = reflog::Entity::find()
+            .order_by_desc(reflog::Column::Id)
+            .all(&self.conn)
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list all reflog rows", err)
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ReflogEntry {
+                id: row.id,
+                ref_name: row.ref_name,
+                old_oid: row.old_oid,
+                new_oid: row.new_oid,
+                timestamp: row.timestamp,
+                committer_name: row.committer_name,
+                committer_email: row.committer_email,
+                action: row.action,
+                message: row.message,
+                worktree_id: row.worktree_id,
+            })
+            .collect())
+    }
+
     async fn prepare_bridge_publication(
         &self,
         operation_id: &str,
@@ -1292,6 +1317,39 @@ impl GitStore for SqliteGitStore {
             )
         })?;
         Ok(updated)
+    }
+
+    async fn delete_object_index_rows(
+        &self,
+        repo_id: &str,
+        o_ids: &[String],
+    ) -> StorageResult<usize> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        if o_ids.is_empty() {
+            return Ok(0);
+        }
+        let backend = self.conn.get_database_backend();
+        let mut deleted = 0usize;
+        for chunk in o_ids.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql =
+                format!("DELETE FROM object_index WHERE repo_id = ? AND o_id IN ({placeholders})");
+            let mut values = Vec::with_capacity(chunk.len() + 1);
+            values.push(Value::from(repo_id.to_string()));
+            for oid in chunk {
+                values.push(Value::from(oid.clone()));
+            }
+            let res = self
+                .conn
+                .execute_raw(Statement::from_sql_and_values(backend, sql, values))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "delete object_index rows", err)
+                })?;
+            deleted += usize::try_from(res.rows_affected()).unwrap_or(usize::MAX);
+        }
+        Ok(deleted)
     }
 
     async fn begin_object_obliteration(
@@ -1734,6 +1792,36 @@ impl GitStore for SqliteGitStore {
             ))
             .await
             .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "list notes rows", err))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(NoteRecord {
+                notes_ref: row.try_get_by_index(0).map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "decode note notes_ref", err)
+                })?,
+                object: row.try_get_by_index(1).map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "decode note object", err)
+                })?,
+                blob: row.try_get_by_index(2).map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "decode note blob", err)
+                })?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn list_all_notes(&self) -> StorageResult<Vec<NoteRecord>> {
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                "SELECT notes_ref, object, blob FROM notes ORDER BY notes_ref ASC, object ASC"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list all notes rows", err)
+            })?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(NoteRecord {

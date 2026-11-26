@@ -297,23 +297,64 @@ pub async fn resolve_control_scope(
                 working_dir.display()
             )
         })?;
-    let conn = db::get_db_conn_instance_for_path(&storage_path.join(util::DATABASE))
-        .await
+    let repo_id_str = match crate::storage::runtime::detect_repo_backend(&storage_path)
         .with_context(|| {
             format!(
-                "cannot open the repository database under '{}'",
+                "cannot detect repository backend under '{}'",
                 storage_path.display()
             )
-        })?;
-    let repo_id = RepoIdentity::resolve_or_init(&conn)
-        .await
-        .context("cannot resolve the repository identity for the control scope")?;
+        })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_repo_config_store_read_write(&storage_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot open repository config store under '{}'",
+                        storage_path.display()
+                    )
+                })?;
+            if let Some(entry) =
+                crate::internal::config::ConfigKv::get_with_store(&*store, "libra.repoid")
+                    .await
+                    .context("cannot read repository identity for the control scope")?
+                && !entry.value.trim().is_empty()
+            {
+                entry.value
+            } else {
+                let minted = uuid::Uuid::new_v4().to_string();
+                crate::internal::config::ConfigKv::set_with_store(
+                    &*store,
+                    "libra.repoid",
+                    &minted,
+                    false,
+                )
+                .await
+                .context("cannot initialize repository identity for the control scope")?;
+                minted
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let conn = db::get_db_conn_instance_for_path(&storage_path.join(util::DATABASE))
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot open the repository database under '{}'",
+                        storage_path.display()
+                    )
+                })?;
+            RepoIdentity::resolve_or_init(&conn)
+                .await
+                .context("cannot resolve the repository identity for the control scope")?
+                .as_str()
+                .to_string()
+        }
+    };
     let (workspace_id, lease_fence) = match workspace {
         Some((id, fence)) => (Some(id), Some(fence)),
         None => (None, None),
     };
     Ok(ControlScope {
-        repo_id: repo_id.as_str().to_string(),
+        repo_id: repo_id_str,
         worktree_id: util::worktree_id_for_base(Some(working_dir.to_path_buf())),
         workspace_id,
         lease_fence,

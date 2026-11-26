@@ -123,38 +123,83 @@ fn foreign_db_path(objects_dir: &Path) -> Option<PathBuf> {
 }
 
 /// The base repo's `core.objectformat` and `LIBRA_STORAGE_TYPE`, read from its
-/// SQLite via a READ-ONLY sea-orm connection (Codex P1 — the project API, not a
-/// shelled-out sqlite3 that fails OPEN when absent). Returns
-/// `Err` when the config cannot be read (the caller FAILS CLOSED). `Ok(None)`
-/// for a repo with no DB (a plain-git base — no tiering, sha1 by default).
+/// repository config store (supporting both external `redb` repositories with
+/// `storage-format.json`/`redb/` and external SQLite repositories with
+/// `libra.db`). Returns `Err` when the config cannot be read (fail-closed).
+/// Returns `Ok(None)` for a plain-git base with neither Redb nor SQLite storage.
 async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)>, String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    let Some(db_path) = foreign_db_path(objects_dir) else {
+    let Some(storage_dir) = objects_dir.parent() else {
         return Ok(None);
     };
-    if !db_path.exists() {
+    let has_redb = crate::storage::runtime::has_redb_storage_markers(storage_dir);
+    let has_sqlite = foreign_db_path(objects_dir).is_some_and(|p| p.exists());
+    if !has_redb && !has_sqlite {
         return Ok(None);
     }
-    let url = format!("sqlite://{}?mode=ro", db_path.display());
-    let mut options = sea_orm::ConnectOptions::new(url);
-    options.map_sqlx_sqlite_pool_opts(crate::internal::db::sqlite_pool_options);
-    let conn = sea_orm::Database::connect(options)
-        .await
-        .map_err(|e| format!("cannot open the base repo's config database: {e}"))?;
-    // Prefer `config_kv` (same store as CLI preflight / init). Empty or unknown
-    // values fail closed — never default to sha1 for a Libra DB that has a row.
-    let fmt_row = conn
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT value FROM config_kv WHERE key = 'core.objectformat' LIMIT 1".to_string(),
-        ))
-        .await
-        .map_err(|e| format!("cannot read the base repo's objectformat: {e}"))?;
-    let objectformat = match fmt_row {
-        Some(row) => {
-            let value = row
-                .try_get_by_index::<String>(0)
-                .map_err(|e| format!("cannot decode the base repo's objectformat: {e}"))?;
+
+    let backend = if has_redb {
+        crate::storage::StorageBackendKind::Redb
+    } else {
+        crate::storage::StorageBackendKind::Sqlite
+    };
+
+    let (raw_fmt, raw_tier) = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_repo_config_store_read_only(storage_dir)
+                .await
+                .map_err(|e| format!("cannot open the base repo's redb config store: {e}"))?;
+            let fmt =
+                crate::internal::config::ConfigKv::get_with_store(&*store, "core.objectformat")
+                    .await
+                    .map_err(|e| format!("cannot read the base repo's objectformat: {e}"))?
+                    .map(|e| e.value);
+            let tier =
+                crate::internal::config::ConfigKv::get_with_store(&*store, "LIBRA_STORAGE_TYPE")
+                    .await
+                    .map_err(|e| format!("cannot read the base repo's storage type: {e}"))?
+                    .map(|e| e.value);
+            (fmt, tier)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let db_path = foreign_db_path(objects_dir)
+                .ok_or_else(|| "cannot resolve base repo sqlite path".to_string())?;
+            let url = format!("sqlite://{}?mode=ro", db_path.display());
+            let mut options = sea_orm::ConnectOptions::new(url);
+            options.map_sqlx_sqlite_pool_opts(crate::internal::db::sqlite_pool_options);
+            let conn = sea_orm::Database::connect(options)
+                .await
+                .map_err(|e| format!("cannot open the base repo's config database: {e}"))?;
+            let fmt_row = conn
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT value FROM config_kv WHERE key = 'core.objectformat' LIMIT 1"
+                        .to_string(),
+                ))
+                .await
+                .map_err(|e| format!("cannot read the base repo's objectformat: {e}"))?;
+            let fmt = match fmt_row {
+                Some(row) => Some(
+                    row.try_get_by_index::<String>(0)
+                        .map_err(|e| format!("cannot decode the base repo's objectformat: {e}"))?,
+                ),
+                None => None,
+            };
+            let tier_row = conn
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT value FROM config_kv WHERE key = 'LIBRA_STORAGE_TYPE' LIMIT 1"
+                        .to_string(),
+                ))
+                .await
+                .map_err(|e| format!("cannot read the base repo's storage type: {e}"))?;
+            let tier = tier_row.and_then(|row| row.try_get_by_index::<String>(0).ok());
+            (fmt, tier)
+        }
+    };
+
+    let objectformat = match raw_fmt {
+        Some(value) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
                 return Err("base repo has an empty core.objectformat".to_string());
@@ -163,19 +208,9 @@ async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)
                 .map(|kind| crate::internal::object_format::as_str(kind).to_string())
                 .map_err(|_| format!("base repo has unsupported core.objectformat '{trimmed}'"))?
         }
-        // Missing key on a Libra DB → treat as legacy sha1 default (preflight does the same).
         None => "sha1".to_string(),
     };
-    // tiered? (config_kv LIBRA_STORAGE_TYPE = s3/r2).
-    let tier_row = conn
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT value FROM config_kv WHERE key = 'LIBRA_STORAGE_TYPE' LIMIT 1".to_string(),
-        ))
-        .await
-        .map_err(|e| format!("cannot read the base repo's storage type: {e}"))?;
-    let tiered = tier_row
-        .and_then(|row| row.try_get_by_index::<String>(0).ok())
+    let tiered = raw_tier
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "s3" | "r2"))
         .unwrap_or(false);
     Ok(Some((objectformat, tiered)))

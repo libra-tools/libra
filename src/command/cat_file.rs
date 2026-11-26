@@ -1504,19 +1504,43 @@ fn print_tag(hash: &ObjectHash) {
 async fn build_history_manager() -> CliResult<HistoryManager> {
     let repo_path = util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
     let objects_dir = repo_path.join("objects");
-    let db_path = repo_path.join(util::DATABASE);
-    let db_conn = db::get_db_conn_instance_for_path(&db_path)
-        .await
-        .map_err(|e| {
-            CliError::fatal(format!(
-                "failed to open repository database '{}': {}",
-                db_path.display(),
-                e
-            ))
-            .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
-    let storage = Arc::new(LocalStorage::try_new(objects_dir)?);
-    Ok(HistoryManager::new(storage, repo_path, Arc::new(db_conn)))
+    match crate::storage::runtime::detect_repo_backend(&repo_path).map_err(|e| {
+        CliError::fatal(format!("failed to detect repository backend: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            // Strictly read-only handle (`ADR-RB-03`): fails closed on
+            // `RepairAborted` / `RepairRequired` without upgrading to writable.
+            let _ro = crate::storage::runtime::open_git_store_read_only(&repo_path)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to open read-only repository store '{}': {e}",
+                        repo_path.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            Err(CliError::fatal(
+                "AI history inspection on redb storage requires CaptureStore history wiring",
+            )
+            .with_stable_code(StableErrorCode::Unsupported))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = repo_path.join(util::DATABASE);
+            let db_conn = db::get_db_conn_instance_for_path(&db_path)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to open repository database '{}': {}",
+                        db_path.display(),
+                        e
+                    ))
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+            let storage = Arc::new(LocalStorage::try_new(objects_dir)?);
+            Ok(HistoryManager::new(storage, repo_path, Arc::new(db_conn)))
+        }
+    }
 }
 
 /// List all AI object types that have at least one entry in the history branch.

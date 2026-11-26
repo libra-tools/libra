@@ -630,20 +630,44 @@ pub(crate) async fn reject_bare_repository() -> CliResult<()> {
 /// connection that does not apply pending migrations.
 pub(crate) async fn reject_bare_repository_without_migrations() -> CliResult<()> {
     let storage = util::storage_path();
-    let db_path = crate::utils::path::database();
-    let conn = crate::internal::db::open_database_without_migrations(&db_path)
-        .await
-        .map_err(|source| {
-            CliError::fatal(format!(
-                "cannot open the repository database without applying migrations to classify \
-                  this repository: {source}"
-            ))
-            .with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
-    reject_bare_repository_impl(
-        &storage,
-        crate::internal::config::ConfigKv::get_with_conn(&conn, "core.bare").await,
-    )
+    let entry = match crate::storage::runtime::detect_repo_backend(&storage) {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let store = crate::storage::runtime::open_repo_config_store_read_only(&storage)
+                .await
+                .map_err(|source| {
+                    CliError::fatal(format!(
+                        "cannot open the repository database without applying migrations to classify \
+                          this repository: {source}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            store
+                .get("core.bare")
+                .await
+                .map(|opt| {
+                    opt.map(|e| crate::internal::config::ConfigKvEntry {
+                        key: e.key,
+                        value: e.value,
+                        encrypted: e.encrypted,
+                    })
+                })
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db_path = crate::utils::path::database();
+            let conn = crate::internal::db::open_database_without_migrations(&db_path)
+                .await
+                .map_err(|source| {
+                    CliError::fatal(format!(
+                        "cannot open the repository database without applying migrations to classify \
+                          this repository: {source}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            crate::internal::config::ConfigKv::get_with_conn(&conn, "core.bare").await
+        }
+    };
+    reject_bare_repository_impl(&storage, entry)
 }
 
 fn reject_bare_repository_impl(
@@ -717,15 +741,30 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
         // (Migrations may already have applied at the top-level CLI
         // preflight — the contract shared by repository commands using the
         // standard schema preflight, not a worktree-family side effect.)
-        crate::internal::db::get_db_conn_instance_for_path(&crate::utils::path::database())
-            .await
-            .map_err(|source| {
-                CliError::fatal(format!(
-                    "cannot open the repository database before touching the worktree \
-                      registry: {source}"
-                ))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-            })?;
+        match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|source| {
+                        CliError::fatal(format!(
+                            "cannot open the repository database before touching the worktree \
+                              registry: {source}"
+                        ))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+                crate::internal::db::get_db_conn_instance_for_path(&crate::utils::path::database())
+                    .await
+                    .map_err(|source| {
+                        CliError::fatal(format!(
+                            "cannot open the repository database before touching the worktree \
+                              registry: {source}"
+                        ))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+            }
+        }
         // Bare boundary: refused before ANY registry IO (the config read
         // needs the database opened just above).
         reject_bare_repository().await?;
@@ -1284,31 +1323,79 @@ async fn acquire_worktree_ref_lease()
                 "cannot acquire repository ref lease outside a pinned worktree".to_string(),
             )
         })?;
-    let db_path = crate::utils::path::database();
-    let db = crate::internal::db::get_db_conn_instance_for_path(&db_path)
-        .await
-        .map_err(|error| {
-            WorktreeError::OperationBlocked(format!(
-                "cannot open repository database before changing worktree refs: {error}"
-            ))
-        })?;
-    let repo_id = RepoIdentity::resolve(&db)
-        .await
-        .map_err(|error| {
-            WorktreeError::OperationBlocked(format!(
-                "cannot resolve repository identity before changing worktree refs: {error}"
-            ))
-        })?
-        .as_str()
-        .to_string();
-    let shared_repository =
-        crate::internal::config::ConfigKv::get_with_conn(&db, "core.sharedRepository")
+    let (repo_id, shared_repository) = match crate::storage::runtime::detect_repo_backend(
+        &scope.storage,
+    ) {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let store = crate::storage::runtime::open_repo_config_store_read_only(&scope.storage)
+                .await
+                .map_err(|error| {
+                    WorktreeError::OperationBlocked(format!(
+                        "cannot open repository database before changing worktree refs: {error}"
+                    ))
+                })?;
+            let repo_id = store
+                .get("libra.repoid")
+                .await
+                .map_err(|error| {
+                    WorktreeError::OperationBlocked(format!(
+                        "cannot resolve repository identity before changing worktree refs: {error}"
+                    ))
+                })?
+                .map(|entry| entry.value)
+                .filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| {
+                    WorktreeError::OperationBlocked(
+                        "cannot resolve repository identity before changing worktree refs: libra.repoid is missing"
+                            .to_string(),
+                    )
+                })?;
+            let shared_repository = store
+                .get("core.sharedRepository")
+                .await
+                .map_err(|error| {
+                    WorktreeError::OperationBlocked(format!(
+                        "cannot read core.sharedRepository before changing worktree refs: {error}"
+                    ))
+                })?
+                .map(|e| crate::internal::config::ConfigKvEntry {
+                    key: e.key,
+                    value: e.value,
+                    encrypted: e.encrypted,
+                });
+            (repo_id, shared_repository)
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db_path = crate::utils::path::database();
+            let db = crate::internal::db::get_db_conn_instance_for_path(&db_path)
+                .await
+                .map_err(|error| {
+                    WorktreeError::OperationBlocked(format!(
+                        "cannot open repository database before changing worktree refs: {error}"
+                    ))
+                })?;
+            let repo_id = RepoIdentity::resolve(&db)
+                .await
+                .map_err(|error| {
+                    WorktreeError::OperationBlocked(format!(
+                        "cannot resolve repository identity before changing worktree refs: {error}"
+                    ))
+                })?
+                .as_str()
+                .to_string();
+            let shared_repository = crate::internal::config::ConfigKv::get_with_conn(
+                &db,
+                "core.sharedRepository",
+            )
             .await
             .map_err(|error| {
                 WorktreeError::OperationBlocked(format!(
                     "cannot read core.sharedRepository before changing worktree refs: {error}"
                 ))
             })?;
+            (repo_id, shared_repository)
+        }
+    };
     if shared_repository
         .as_ref()
         .is_some_and(|entry| entry.encrypted)

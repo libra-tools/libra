@@ -235,36 +235,77 @@ async fn collect_bundle_heads(
     })?;
     branches.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let db = get_db_conn_instance().await;
-    let rows = reference::Entity::find()
-        .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
-        .all(&db)
-        .await
-        .map_err(|error| {
-            CliError::fatal(format!("failed to list tags for bundle: {error}"))
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
     let mut tags = Vec::new();
-    for row in rows {
-        let name = row.name.ok_or_else(|| {
-            CliError::fatal("bundle: stored tag is missing its ref name")
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
-        let target = row.commit.ok_or_else(|| {
-            CliError::fatal(format!("bundle: stored tag '{name}' is missing its target"))
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
-        let oid = crate::internal::object_format::parse_repo_oid(&target).map_err(|error| {
-            CliError::fatal(format!(
-                "bundle: stored tag '{name}' has invalid target '{target}': {error}"
-            ))
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(format!("failed to detect repository backend: {error}"))
             .with_exit_code(128)
-            .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
-        tags.push(BundleHead { oid, name });
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to open git store for bundle: {error}"))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let refs = store.list_refs(None).await.map_err(|error| {
+                CliError::fatal(format!("failed to list tags for bundle: {error}"))
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            for rec in refs {
+                if let crate::storage::RefKey::Tag { name } = rec.key {
+                    let target = match rec.target {
+                        crate::storage::RefTarget::Direct(t)
+                        | crate::storage::RefTarget::Symbolic(t) => t,
+                    };
+                    let oid = crate::internal::object_format::parse_repo_oid(&target).map_err(
+                        |error| {
+                            CliError::fatal(format!(
+                                "bundle: stored tag '{name}' has invalid target '{target}': {error}"
+                            ))
+                            .with_exit_code(128)
+                            .with_stable_code(StableErrorCode::RepoCorrupt)
+                        },
+                    )?;
+                    tags.push(BundleHead { oid, name });
+                }
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let rows = reference::Entity::find()
+                .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
+                .all(&db)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to list tags for bundle: {error}"))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            for row in rows {
+                let name = row.name.ok_or_else(|| {
+                    CliError::fatal("bundle: stored tag is missing its ref name")
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+                let target = row.commit.ok_or_else(|| {
+                    CliError::fatal(format!("bundle: stored tag '{name}' is missing its target"))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+                let oid =
+                    crate::internal::object_format::parse_repo_oid(&target).map_err(|error| {
+                        CliError::fatal(format!(
+                            "bundle: stored tag '{name}' has invalid target '{target}': {error}"
+                        ))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                    })?;
+                tags.push(BundleHead { oid, name });
+            }
+        }
     }
     tags.sort_by(|left, right| left.name.cmp(&right.name));
 

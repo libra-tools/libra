@@ -2742,27 +2742,112 @@ async fn create_cherry_pick_commit(
     };
 
     let advance = advance.clone();
-    with_reflog(
-        context,
-        move |txn| {
-            Box::pin(async move {
-                update_head(txn, &commit.id.to_string()).await?;
-                match &advance {
-                    SequenceAdvance::NoRow => {}
-                    SequenceAdvance::Save(next) => sequencer::save_with_conn(txn, next).await?,
-                    SequenceAdvance::Clear(_) => {
-                        sequencer::clear_with_conn(txn, SequenceKind::CherryPick).await?
-                    }
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| CherryPickSingleError::SaveFailed(format!("failed to detect backend: {e}")))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|e| {
+                    CherryPickSingleError::SaveFailed(format!("failed to open git store: {e}"))
+                })?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|e| {
+                    CherryPickSingleError::SaveFailed(format!("failed to open config store: {e}"))
+                })?;
+            let current_head = Head::current_result_with_store(&*git_store)
+                .await
+                .map_err(|e| {
+                    CherryPickSingleError::SaveFailed(format!("failed to resolve HEAD: {e}"))
+                })?;
+            let wt_id = crate::utils::util::current_worktree_id();
+            let head_log = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                &*cfg_store,
+                &context,
+                "HEAD",
+            )
+            .await;
+            let (key, reflogs) = match &current_head {
+                Head::Branch(name) => {
+                    let branch_log =
+                        crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                            &*cfg_store,
+                            &context,
+                            &format!("refs/heads/{name}"),
+                        )
+                        .await;
+                    (
+                        RefKey::LocalBranch { name: name.clone() },
+                        vec![head_log, branch_log],
+                    )
                 }
-                Ok(())
-            })
-        },
-        true,
-    )
-    .await
-    .map_err(|e| {
-        CherryPickSingleError::SaveFailed(format!("failed to update branch and reflog: {e}"))
-    })?;
+                Head::Detached(_) => (RefKey::LocalHead { worktree_id: wt_id }, vec![head_log]),
+            };
+            let existing = git_store.get_ref(&key).await.map_err(|e| {
+                CherryPickSingleError::SaveFailed(format!("failed to read ref: {e}"))
+            })?;
+            let new_target = RefTarget::Direct(commit.id.to_string());
+            match git_store
+                .update_ref_cas(&key, existing.as_ref(), Some(&new_target), &reflogs)
+                .await
+                .map_err(|e| {
+                    CherryPickSingleError::SaveFailed(format!(
+                        "failed to update branch and reflog: {e}"
+                    ))
+                })? {
+                RefCasOutcome::Applied { .. } => {}
+                RefCasOutcome::CasConflict { .. } => {
+                    return Err(CherryPickSingleError::SaveFailed(
+                        "concurrent modification while updating branch during cherry-pick"
+                            .to_string(),
+                    ));
+                }
+            }
+            match &advance {
+                SequenceAdvance::NoRow => {}
+                SequenceAdvance::Save(next) => {
+                    sequencer::save(next)
+                        .await
+                        .map_err(CherryPickSingleError::SaveFailed)?;
+                }
+                SequenceAdvance::Clear(_) => {
+                    sequencer::clear(SequenceKind::CherryPick)
+                        .await
+                        .map_err(CherryPickSingleError::SaveFailed)?;
+                }
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            with_reflog(
+                context,
+                move |txn| {
+                    Box::pin(async move {
+                        update_head(txn, &commit.id.to_string()).await?;
+                        match &advance {
+                            SequenceAdvance::NoRow => {}
+                            SequenceAdvance::Save(next) => {
+                                sequencer::save_with_conn(txn, next).await?
+                            }
+                            SequenceAdvance::Clear(_) => {
+                                sequencer::clear_with_conn(txn, SequenceKind::CherryPick).await?
+                            }
+                        }
+                        Ok(())
+                    })
+                },
+                true,
+            )
+            .await
+            .map_err(|e| {
+                CherryPickSingleError::SaveFailed(format!(
+                    "failed to update branch and reflog: {e}"
+                ))
+            })?;
+        }
+    }
     after_head_move_failpoint()?;
     Ok(commit.id)
 }

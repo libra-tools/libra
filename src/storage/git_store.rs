@@ -954,6 +954,9 @@ pub trait GitStore: Send + Sync + fmt::Debug {
         ids: &[i64],
     ) -> StorageResult<usize>;
 
+    /// List all reflog entries across all refs and worktrees, ordered newest-first.
+    async fn list_all_reflogs(&self) -> StorageResult<Vec<ReflogEntry>>;
+
     /// Record a `prepared` bridge publication row before the ref update commits
     /// (`src/internal/ai/agent_bridge/publication.rs::prepare_current`).
     async fn prepare_bridge_publication(
@@ -1017,6 +1020,14 @@ pub trait GitStore: Send + Sync + fmt::Debug {
     /// transitioned from unsynced to synced. Fails closed with zero writes if
     /// any requested OID is tombstoned in `object_obliteration`.
     async fn mark_object_index_synced(
+        &self,
+        repo_id: &str,
+        o_ids: &[String],
+    ) -> StorageResult<usize>;
+
+    /// Atomically remove `object_index` rows for `(repo_id, o_id)` (used by GC
+    /// loose-object pruning), returning the number of deleted rows.
+    async fn delete_object_index_rows(
         &self,
         repo_id: &str,
         o_ids: &[String],
@@ -1099,6 +1110,10 @@ pub trait GitStore: Send + Sync + fmt::Debug {
 
     /// List all notes under `notes_ref` sorted deterministically by `object ASC`.
     async fn list_notes(&self, notes_ref: &str) -> StorageResult<Vec<NoteRecord>>;
+
+    /// List all note mappings across all `notes_ref` namespaces sorted by
+    /// `(notes_ref ASC, object ASC)`.
+    async fn list_all_notes(&self) -> StorageResult<Vec<NoteRecord>>;
 
     /// Insert or (when `overwrite == true`) replace the note for `(notes_ref, object)`.
     async fn put_note(

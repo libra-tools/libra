@@ -361,31 +361,74 @@ fn full_branch_name(name: &str) -> String {
 }
 
 async fn load_export_tags() -> CliResult<Vec<ExportTag>> {
-    let db = get_db_conn_instance().await;
-    let rows = reference::Entity::find()
-        .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
-        .all(&db)
-        .await
-        .map_err(|error| {
-            CliError::fatal(format!("failed to list tag refs for fast-export: {error}"))
+    let raw_tags: Vec<(String, String)> =
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+            CliError::fatal(format!("failed to detect repository backend: {error}"))
                 .with_exit_code(128)
                 .with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
+        })? {
+            crate::storage::StorageBackendKind::Redb => {
+                // Strictly read-only (`ADR-RB-03`): never opens writable, fails closed on RepairAborted.
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "failed to open git store for fast-export: {error}"
+                        ))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+                let refs = store.list_refs(None).await.map_err(|error| {
+                    CliError::fatal(format!("failed to list tag refs for fast-export: {error}"))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+                refs.into_iter()
+                    .filter_map(|rec| match rec.key {
+                        crate::storage::RefKey::Tag { name } => {
+                            let target = match rec.target {
+                                crate::storage::RefTarget::Direct(t)
+                                | crate::storage::RefTarget::Symbolic(t) => t,
+                            };
+                            Some((name, target))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                let rows = reference::Entity::find()
+                    .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
+                    .all(&db)
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!("failed to list tag refs for fast-export: {error}"))
+                            .with_exit_code(128)
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let ref_name = row.name.ok_or_else(|| {
+                        CliError::fatal("fast-export: tag reference is missing its name")
+                            .with_exit_code(128)
+                            .with_stable_code(StableErrorCode::RepoCorrupt)
+                    })?;
+                    let raw = row.commit.ok_or_else(|| {
+                        CliError::fatal(format!(
+                            "fast-export: tag '{ref_name}' is missing its target"
+                        ))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                    })?;
+                    out.push((ref_name, raw));
+                }
+                out
+            }
+        };
     let storage = util::objects_storage()?;
     let mut tags = Vec::new();
-    for row in rows {
-        let ref_name = row.name.ok_or_else(|| {
-            CliError::fatal("fast-export: tag reference is missing its name")
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
-        let raw = row.commit.ok_or_else(|| {
-            CliError::fatal(format!(
-                "fast-export: tag '{ref_name}' is missing its target"
-            ))
-            .with_exit_code(128)
-            .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
+    for (ref_name, raw) in raw_tags {
         let raw_target = crate::internal::object_format::parse_repo_oid(&raw).map_err(|error| {
             CliError::fatal(format!(
                 "fast-export: tag '{ref_name}' has invalid target '{raw}': {error}"
@@ -438,25 +481,73 @@ async fn load_export_tags() -> CliResult<Vec<ExportTag>> {
 }
 
 async fn load_export_notes() -> CliResult<Vec<ExportNote>> {
-    let db = get_db_conn_instance().await;
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Sqlite,
-            "SELECT notes_ref, object, blob FROM notes ORDER BY notes_ref, object".to_string(),
-        ))
-        .await
-        .map_err(|error| {
-            CliError::fatal(format!("failed to list notes for fast-export: {error}"))
+    let raw_notes: Vec<(String, String, String)> =
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+            CliError::fatal(format!("failed to detect repository backend: {error}"))
                 .with_exit_code(128)
                 .with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
+        })? {
+            crate::storage::StorageBackendKind::Redb => {
+                // Strictly read-only (`ADR-RB-03`).
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "failed to open git store for fast-export notes: {error}"
+                        ))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+                store
+                    .list_all_notes()
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!("failed to list notes for fast-export: {error}"))
+                            .with_exit_code(128)
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?
+                    .into_iter()
+                    .map(|rec| (rec.notes_ref, rec.object, rec.blob))
+                    .collect()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                let rows = db
+                    .query_all_raw(Statement::from_string(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "SELECT notes_ref, object, blob FROM notes ORDER BY notes_ref, object"
+                            .to_string(),
+                    ))
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!("failed to list notes for fast-export: {error}"))
+                            .with_exit_code(128)
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let notes_ref = row.try_get::<String>("", "notes_ref").map_err(|error| {
+                        CliError::fatal(format!("fast-export: invalid notes ref row: {error}"))
+                            .with_exit_code(128)
+                            .with_stable_code(StableErrorCode::RepoCorrupt)
+                    })?;
+                    let object = row.try_get::<String>("", "object").map_err(|error| {
+                        CliError::fatal(format!("fast-export: invalid notes object row: {error}"))
+                            .with_exit_code(128)
+                            .with_stable_code(StableErrorCode::RepoCorrupt)
+                    })?;
+                    let blob = row.try_get::<String>("", "blob").map_err(|error| {
+                        CliError::fatal(format!("fast-export: invalid notes blob row: {error}"))
+                            .with_exit_code(128)
+                            .with_stable_code(StableErrorCode::RepoCorrupt)
+                    })?;
+                    out.push((notes_ref, object, blob));
+                }
+                out
+            }
+        };
     let mut notes = Vec::new();
-    for row in rows {
-        let notes_ref = row.try_get::<String>("", "notes_ref").map_err(|error| {
-            CliError::fatal(format!("fast-export: invalid notes ref row: {error}"))
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
+    for (notes_ref, object, blob) in raw_notes {
         if !notes_ref.starts_with("refs/notes/") || !util::is_valid_refname(&notes_ref) {
             return Err(CliError::fatal(format!(
                 "fast-export: invalid stored notes ref '{notes_ref}'"
@@ -464,16 +555,6 @@ async fn load_export_notes() -> CliResult<Vec<ExportNote>> {
             .with_exit_code(128)
             .with_stable_code(StableErrorCode::RepoCorrupt));
         }
-        let object = row.try_get::<String>("", "object").map_err(|error| {
-            CliError::fatal(format!("fast-export: invalid notes object row: {error}"))
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
-        let blob = row.try_get::<String>("", "blob").map_err(|error| {
-            CliError::fatal(format!("fast-export: invalid notes blob row: {error}"))
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?;
         notes.push(ExportNote {
             notes_ref,
             object: crate::internal::object_format::parse_repo_oid(&object).map_err(|error| {

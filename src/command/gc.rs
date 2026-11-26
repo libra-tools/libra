@@ -573,14 +573,56 @@ async fn prune_unreachable_loose(
     // Catalogue first, committed before the first unlink: dropping rows can
     // only under-advertise; unlinking first could leave rows advertising
     // bytes that no longer exist.
-    let db_conn = db::get_db_conn_instance().await;
-    remove_object_index_rows_with_conn(&db_conn, &final_oids)
-        .await
-        .map_err(|e| {
-            CliError::fatal(format!(
-                "failed to remove object_index rows for pruned objects: {e}"
-            ))
-        })?;
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        CliError::fatal(format!(
+            "failed to detect repository backend while pruning object_index rows: {e}"
+        ))
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to open git store for pruned object_index rows: {e}"
+                    ))
+                })?;
+            let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to open config store for pruned object_index rows: {e}"
+                    ))
+                })?;
+            if let Some(repo_id) =
+                crate::internal::config::ConfigKv::get_with_store(&*cfg_store, "libra.repoid")
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!(
+                            "failed to read repo_id for pruned object_index rows: {e}"
+                        ))
+                    })?
+            {
+                let _ = git_store
+                    .delete_object_index_rows(&repo_id.value, &final_oids)
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!(
+                            "failed to remove object_index rows for pruned objects: {e}"
+                        ))
+                    })?;
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_conn = db::get_db_conn_instance().await;
+            remove_object_index_rows_with_conn(&db_conn, &final_oids)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to remove object_index rows for pruned objects: {e}"
+                    ))
+                })?;
+        }
+    }
 
     let mut removed = 0usize;
     for obj_path in &final_paths {

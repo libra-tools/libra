@@ -650,10 +650,69 @@ async fn run_gc(
     // `cleanup_pending` marker does NOT defer: it fully lists its owned
     // OIDs, which the roots walk keeps alive; doctor retires the row.
     if !dry_run {
-        let db_conn = db::get_db_conn_instance().await;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let live =
-            crate::internal::ai::history::list_live_traces_inflight_markers(&db_conn, now_ms)
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+            CliError::fatal(format!("failed to detect repository backend: {e}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })? {
+            crate::storage::StorageBackendKind::Redb => {
+                // Under Redb, check traces-inflight markers via MetadataStore
+                // without opening `libra.db`.
+                let meta_store =
+                    crate::storage::runtime::open_current_repo_metadata_store_read_only()
+                        .await
+                        .map_err(|e| {
+                            CliError::fatal(format!(
+                                "failed to open metadata store for traces-inflight check: {e}"
+                            ))
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                        })?;
+                let entries = meta_store
+                    .list_metadata(
+                        crate::internal::metadata::MetadataScope::AgentTracesInflight.as_str(),
+                        "",
+                        None,
+                    )
+                    .await
+                    .unwrap_or_default();
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let mut live_ordinary = 0usize;
+                for row in entries {
+                    let marker: crate::internal::ai::history::TracesInflightMarker =
+                        serde_json::from_str(&row.value).map_err(|_| {
+                            CliError::fatal(
+                                "traces-inflight markers cannot be trusted before pruning; inspect them with `libra agent doctor`"
+                                    .to_string(),
+                            )
+                            .with_stable_code(StableErrorCode::RepoCorrupt)
+                        })?;
+                    if marker.is_live(now_ms) && !marker.cleanup_pending {
+                        live_ordinary += 1;
+                    }
+                }
+                if live_ordinary > 0 {
+                    return Ok(TaskResult {
+                        task: "gc".to_string(),
+                        success: true,
+                        objects_removed: 0,
+                        objects_packed: 0,
+                        refs_packed: 0,
+                        packs_repacked: 0,
+                        object_index_rows_removed: 0,
+                        message: format!(
+                            "deferred loose-object prune: {live_ordinary} live traces-inflight \
+                              marker(s) — an agent write is in flight and may hold uncataloged \
+                              objects; the marker TTL bounds this, re-run after it completes or \
+                              expires"
+                        ),
+                    });
+                }
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = db::get_db_conn_instance().await;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let live = crate::internal::ai::history::list_live_traces_inflight_markers(
+                    &db_conn, now_ms,
+                )
                 .await
                 .map_err(|_| {
                     CliError::fatal(
@@ -662,34 +721,25 @@ async fn run_gc(
                     )
                     .with_stable_code(StableErrorCode::RepoCorrupt)
                 })?;
-        // Only LIVE ordinary markers defer: their write window may hold
-        // objects not yet listed anywhere (window A), and their TTL bounds
-        // the deferral — an abandoned writer's marker expires and prune
-        // resumes on the next run. A `cleanup_pending` marker fully LISTS
-        // its owned OIDs (`created_oids`) — those are already rooted by the
-        // reachability walk, so it must NOT park prune forever (it never
-        // expires by design; `libra agent doctor` retires it).
-        // Liveness is centrally BOUNDED in `TracesInflightMarker::is_live`
-        // (clamped start + 24h TTL cap), which the listing above already
-        // applied — only the cleanup_pending exclusion is local here (those
-        // rows list their owned OIDs exhaustively; rooting suffices).
-        let live_ordinary = live.iter().filter(|m| !m.cleanup_pending).count();
-        if live_ordinary > 0 {
-            return Ok(TaskResult {
-                task: "gc".to_string(),
-                success: true,
-                objects_removed: 0,
-                objects_packed: 0,
-                refs_packed: 0,
-                packs_repacked: 0,
-                object_index_rows_removed: 0,
-                message: format!(
-                    "deferred loose-object prune: {live_ordinary} live traces-inflight \
-                      marker(s) — an agent write is in flight and may hold uncataloged \
-                      objects; the marker TTL bounds this, re-run after it completes or \
-                      expires"
-                ),
-            });
+                let live_ordinary = live.iter().filter(|m| !m.cleanup_pending).count();
+                if live_ordinary > 0 {
+                    return Ok(TaskResult {
+                        task: "gc".to_string(),
+                        success: true,
+                        objects_removed: 0,
+                        objects_packed: 0,
+                        refs_packed: 0,
+                        packs_repacked: 0,
+                        object_index_rows_removed: 0,
+                        message: format!(
+                            "deferred loose-object prune: {live_ordinary} live traces-inflight \
+                              marker(s) — an agent write is in flight and may hold uncataloged \
+                              objects; the marker TTL bounds this, re-run after it completes or \
+                              expires"
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -831,14 +881,61 @@ async fn run_gc(
     let object_index_rows_removed = if pruned_oids.is_empty() {
         0
     } else if dry_run {
-        let db_conn = db::get_db_conn_instance().await;
-        crate::utils::client_storage::count_object_index_rows_with_conn(&db_conn, &pruned_oids)
-            .await
-            .map_err(|e| {
-                CliError::fatal(format!(
-                    "failed to count object_index rows for pruned objects: {e}"
-                ))
-            })?
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+            CliError::fatal(format!("failed to detect repository backend: {e}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })? {
+            crate::storage::StorageBackendKind::Redb => {
+                let git_store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!(
+                            "failed to open git store to count object_index rows: {e}"
+                        ))
+                    })?;
+                let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!(
+                            "failed to open config store to count object_index rows: {e}"
+                        ))
+                    })?;
+                if let Some(repo_id) =
+                    crate::internal::config::ConfigKv::get_with_store(&*cfg_store, "libra.repoid")
+                        .await
+                        .map_err(|e| CliError::fatal(format!("failed to read repo_id: {e}")))?
+                {
+                    let mut count = 0u64;
+                    for oid in &pruned_oids {
+                        if git_store
+                            .get_object_index(&repo_id.value, oid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some()
+                        {
+                            count += 1;
+                        }
+                    }
+                    count
+                } else {
+                    0u64
+                }
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = db::get_db_conn_instance().await;
+                crate::utils::client_storage::count_object_index_rows_with_conn(
+                    &db_conn,
+                    &pruned_oids,
+                )
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to count object_index rows for pruned objects: {e}"
+                    ))
+                })?
+            }
+        }
     } else {
         // §C.4.3 writer-vs-deleter: the deletion phase runs under the
         // repository maintenance lock, held EXCLUSIVELY.
@@ -911,13 +1008,7 @@ async fn run_gc(
             });
         }
 
-        let db_conn = db::get_db_conn_instance().await;
-        // The last word on reachability. No publisher can be running, so this
-        // needs no transaction of its own — and must not have one: the walk
-        // loads every commit and tree in the repository, and holding a
-        // database read lock across it would block ref writers for the whole
-        // traversal (§C.10 keeps database transactions short).
-        let still_reachable = collect_reachable_objects_with_conn(&storage, &db_conn).await?;
+        let still_reachable = collect_reachable_objects(&storage).await?;
         let mut final_targets: Vec<(&String, &std::path::PathBuf)> = Vec::new();
         let mut final_oids: Vec<String> = Vec::new();
         let mut resurrected_oids: Vec<String> = Vec::new();
@@ -956,21 +1047,63 @@ async fn run_gc(
         }
 
         // Catalogue FIRST, and committed before the first unlink — the two
-        // steps are ordered, not wrapped. A catalogue that has already
-        // dropped rows for objects still on disk merely UNDER-advertises,
-        // which `agent doctor` rebuilds; the inverse — unlinking inside a
-        // transaction that then rolls back — would restore rows advertising
-        // bytes that are gone, and nothing repairs that from the inside.
+        // steps are ordered, not wrapped.
         let rows = if final_oids.is_empty() {
             0
         } else {
-            crate::utils::client_storage::remove_object_index_rows_with_conn(&db_conn, &final_oids)
-                .await
-                .map_err(|e| {
-                    CliError::fatal(format!(
-                        "failed to remove object_index rows for pruned objects: {e}"
-                    ))
-                })?
+            match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+                CliError::fatal(format!("failed to detect repository backend: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })? {
+                crate::storage::StorageBackendKind::Redb => {
+                    let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                        .await
+                        .map_err(|e| {
+                            CliError::fatal(format!(
+                                "failed to open git store to remove object_index rows: {e}"
+                            ))
+                        })?;
+                    let cfg_store =
+                        crate::storage::runtime::open_current_repo_config_store_read_only()
+                            .await
+                            .map_err(|e| {
+                                CliError::fatal(format!(
+                                    "failed to open config store to remove object_index rows: {e}"
+                                ))
+                            })?;
+                    if let Some(repo_id) = crate::internal::config::ConfigKv::get_with_store(
+                        &*cfg_store,
+                        "libra.repoid",
+                    )
+                    .await
+                    .map_err(|e| CliError::fatal(format!("failed to read repo_id: {e}")))?
+                    {
+                        git_store
+                            .delete_object_index_rows(&repo_id.value, &final_oids)
+                            .await
+                            .map_err(|e| {
+                                CliError::fatal(format!(
+                                    "failed to remove object_index rows for pruned objects: {e}"
+                                ))
+                            })? as u64
+                    } else {
+                        0u64
+                    }
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    let db_conn = db::get_db_conn_instance().await;
+                    crate::utils::client_storage::remove_object_index_rows_with_conn(
+                        &db_conn,
+                        &final_oids,
+                    )
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!(
+                            "failed to remove object_index rows for pruned objects: {e}"
+                        ))
+                    })?
+                }
+            }
         };
 
         // The catalogue no longer claims these objects, so unlinking them can
@@ -1619,9 +1752,8 @@ async fn run_incremental_repack(
             ),
         });
     }
-    let repack_db = db::get_db_conn_instance().await;
     let first_pass: HashSet<ObjectHash> = all_hashes.iter().copied().collect();
-    let second_pass = collect_reachable_objects_with_conn(&storage, &repack_db).await?;
+    let second_pass = collect_reachable_objects(&storage).await?;
     if !second_pass.is_subset(&first_pass) {
         // Same honesty rule as the contention path above: the consolidated
         // pack exists on disk, so the counts must say so. Only the old-pack
@@ -2336,8 +2468,240 @@ async fn stop(output: &OutputConfig) -> CliResult<()> {
 pub(crate) async fn collect_reachable_objects(
     storage: &ClientStorage,
 ) -> CliResult<HashSet<ObjectHash>> {
-    let db_conn = db::get_db_conn_instance().await;
-    collect_reachable_objects_with_conn(storage, &db_conn).await
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        CliError::fatal(format!("failed to detect repository backend: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => collect_reachable_objects_redb(storage).await,
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_conn = db::get_db_conn_instance().await;
+            collect_reachable_objects_with_conn(storage, &db_conn).await
+        }
+    }
+}
+
+async fn collect_reachable_objects_redb(storage: &ClientStorage) -> CliResult<HashSet<ObjectHash>> {
+    let mut reachable: HashSet<ObjectHash> = HashSet::new();
+    let storage_root = crate::utils::util::request_storage_path();
+    let storage_root = storage_root.as_path();
+    let boundaries = shallow_boundaries(storage_root)?;
+    let boundaries = &boundaries;
+
+    let git_store = crate::storage::runtime::open_git_store_read_only(storage_root)
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!("failed to open git store for GC roots: {e}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    let state_store = crate::storage::runtime::open_git_state_store_read_only(storage_root)
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!("failed to open git state store for GC roots: {e}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+
+    // 1. All refs and worktree heads.
+    for rec in git_store.list_refs(None).await.map_err(|e| {
+        CliError::fatal(format!("failed to load refs: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        if let crate::storage::RefTarget::Direct(oid) = rec.target {
+            let hash = parse_object_hash(&oid).ok_or_else(|| {
+                CliError::fatal(format!("reference contains invalid object id '{oid}'"))
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            walk_reachable(&hash, storage, boundaries, &mut reachable)?;
+        }
+    }
+    for rec in git_store.list_all_local_heads().await.map_err(|e| {
+        CliError::fatal(format!("failed to load local heads: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        if let crate::storage::RefTarget::Direct(oid) = rec.target {
+            let hash = parse_object_hash(&oid).ok_or_else(|| {
+                CliError::fatal(format!("HEAD contains invalid object id '{oid}'"))
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            walk_reachable(&hash, storage, boundaries, &mut reachable)?;
+        }
+    }
+
+    // 2. All reflogs.
+    let is_null_oid = |oid: &str| oid.chars().all(|c| c == '0');
+    for entry in git_store.list_all_reflogs().await.map_err(|e| {
+        CliError::fatal(format!("failed to load reflogs: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        for (field, oid) in [("old", &entry.old_oid), ("new", &entry.new_oid)] {
+            if is_null_oid(oid) {
+                continue;
+            }
+            let hash = parse_object_hash(oid).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "reflog entry {} contains invalid {field} object id '{oid}'",
+                    entry.id
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            walk_reachable(&hash, storage, boundaries, &mut reachable)?;
+        }
+    }
+
+    // 3. All notes blobs.
+    for note in git_store.list_all_notes().await.map_err(|e| {
+        CliError::fatal(format!("failed to load notes GC roots: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        if !note.blob.trim().is_empty() && !is_null_oid(note.blob.trim()) {
+            let hash = parse_object_hash(note.blob.trim()).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "notes.blob contains invalid object id '{}' while computing GC roots",
+                    note.blob
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            walk_reachable(&hash, storage, boundaries, &mut reachable)?;
+        }
+    }
+
+    // 4. Sequencer, rebase, and bisect state roots across all worktrees.
+    for seq in state_store.list_sequence_states().await.map_err(|e| {
+        CliError::fatal(format!("failed to load sequence_state GC roots: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        for raw in [seq.head_orig, seq.current_oid] {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !is_null_oid(trimmed) {
+                let hash = parse_object_hash(trimmed).ok_or_else(|| {
+                    CliError::fatal(format!("sequence_state invalid oid '{trimmed}'"))
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+                walk_reachable(&hash, storage, boundaries, &mut reachable)?;
+            }
+        }
+        for line in seq.todo.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty()
+                && !is_null_oid(trimmed)
+                && let Some(hash) = parse_object_hash(trimmed)
+            {
+                walk_reachable(&hash, storage, boundaries, &mut reachable)?;
+            }
+        }
+    }
+    for reb in state_store.list_rebase_states().await.map_err(|e| {
+        CliError::fatal(format!("failed to load rebase_state GC roots: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        for raw in [
+            Some(reb.onto),
+            Some(reb.orig_head),
+            Some(reb.current_head),
+            reb.stopped_sha,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !is_null_oid(trimmed) {
+                let hash = parse_object_hash(trimmed).ok_or_else(|| {
+                    CliError::fatal(format!("rebase_state invalid oid '{trimmed}'"))
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+                walk_reachable(&hash, storage, boundaries, &mut reachable)?;
+            }
+        }
+        for list in [&reb.todo, &reb.done] {
+            for line in list.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty()
+                    && !is_null_oid(trimmed)
+                    && let Some(hash) = parse_object_hash(trimmed)
+                {
+                    walk_reachable(&hash, storage, boundaries, &mut reachable)?;
+                }
+            }
+        }
+    }
+    for bis in state_store.list_bisect_states().await.map_err(|e| {
+        CliError::fatal(format!("failed to load bisect_state GC roots: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        for raw in [Some(bis.orig_head), bis.bad, bis.current]
+            .into_iter()
+            .flatten()
+        {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !is_null_oid(trimmed) {
+                let hash = parse_object_hash(trimmed).ok_or_else(|| {
+                    CliError::fatal(format!("bisect_state invalid oid '{trimmed}'"))
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+                walk_reachable(&hash, storage, boundaries, &mut reachable)?;
+            }
+        }
+    }
+
+    // 5. Held autostashes, worktree sidecars, stash roots, and all worktree indexes.
+    for gitdir in worktree_gitdir_roots(storage_root)? {
+        let merge_autostash =
+            crate::command::merge::MergeAutostash::load_optional_sync_in_gitdir(&gitdir)
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to load merge autostash GC root: {error}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .map(|held| {
+                    parse_object_hash(&held.stash_commit).ok_or_else(|| {
+                        CliError::fatal(format!(
+                            "merge-autostash.json contains invalid object id '{}'",
+                            held.stash_commit
+                        ))
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                    })
+                })
+                .transpose()?;
+        let rebase_autostash = crate::command::rebase::held_autostash_oid_in_gitdir(&gitdir)?;
+        for held in [merge_autostash, rebase_autostash].into_iter().flatten() {
+            walk_reachable(&held, storage, boundaries, &mut reachable)?;
+        }
+    }
+    collect_worktree_sidecar_roots(storage_root, storage, boundaries, &mut reachable)?;
+    let stash_roots = crate::command::stash::gc_roots(storage_root).map_err(|error| {
+        CliError::fatal(format!("failed to load stash GC roots: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    for oid in stash_roots {
+        walk_reachable(&oid, storage, boundaries, &mut reachable)?;
+    }
+    for index_path in worktree_index_roots(storage_root)? {
+        let index_exists = index_path.try_exists().map_err(|error| {
+            CliError::fatal(format!(
+                "failed to inspect index GC root '{}': {error}",
+                index_path.display()
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        if !index_exists {
+            continue;
+        }
+        let index = git_internal::internal::index::Index::load(&index_path).map_err(|error| {
+            CliError::fatal(format!(
+                "failed to read index GC root '{}': {error}",
+                index_path.display()
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        for stage in 0..=3 {
+            for entry in index.tracked_entries(stage) {
+                if entry.mode == 0o160000 {
+                    continue;
+                }
+                reachable.insert(entry.hash);
+            }
+        }
+    }
+
+    Ok(reachable)
 }
 
 /// [`collect_reachable_objects`] on a caller-supplied connection.
@@ -6099,5 +6463,313 @@ mod tests {
         assert!(fixture.roots().await.is_empty());
         assert!(fixture.reads().is_empty());
         fixture.assert_private_value_retained(&repaired).await;
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_transport_maintenance_and_readonly_commands() {
+        use clap::Parser;
+
+        use crate::{
+            command::{
+                add, bundle, cat_file, commit, control_lock, fast_export, fast_import, fetch, gc,
+                grep, init, push, remote,
+            },
+            internal::{branch::Branch, config::ConfigKv, head::Head},
+            utils::{output::OutputConfig, test::ChangeDirGuard},
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = OutputConfig {
+            pager: false,
+            ..OutputConfig::default()
+        };
+
+        // 1. Initialize source pure-redb repo and create 2 commits + tag + note.
+        let src_dir = tmp.path().join("src-redb");
+        std::fs::create_dir_all(&src_dir).expect("mkdir src");
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "-q",
+                "-b",
+                "main",
+                src_dir.to_string_lossy().as_ref(),
+            ])
+            .expect("parse init src"),
+            &output,
+        )
+        .await
+        .expect("init src redb");
+
+        let _cwd = ChangeDirGuard::new(&src_dir);
+        let src_libra = src_dir.join(".libra");
+        assert!(!src_libra.join("libra.db").exists());
+
+        ConfigKv::set("user.name", "Redb Maintainer", false)
+            .await
+            .expect("set user.name");
+        ConfigKv::set("user.email", "maint@example.com", false)
+            .await
+            .expect("set user.email");
+
+        std::fs::write(src_dir.join("hello.txt"), b"hello redb world\n").expect("write hello.txt");
+        add::execute_safe(
+            add::AddArgs::try_parse_from(["add", "hello.txt"]).expect("parse add"),
+            &output,
+        )
+        .await
+        .expect("add hello.txt");
+        commit::execute_safe(
+            commit::CommitArgs {
+                message: Some("initial redb commit".to_string()),
+                ..commit::CommitArgs::default()
+            },
+            &output,
+        )
+        .await
+        .expect("commit #1");
+        let c1 = Head::current_commit().await.expect("c1");
+
+        // 2. Strictly read-only commands: `cat-file`, `grep`, `fast-export` (AC2).
+        cat_file::execute_safe(
+            cat_file::CatFileArgs::try_parse_from(["cat-file", "-t", &c1.to_string()])
+                .expect("parse cat-file"),
+            &output,
+        )
+        .await
+        .expect("cat-file -t on redb");
+        let pattern_file = tmp.path().join("grep-patterns.txt");
+        std::fs::write(&pattern_file, "redb\n").expect("write grep pattern file");
+        grep::execute_safe(
+            grep::GrepArgs::try_parse_from([
+                "grep",
+                "--cached",
+                "-f",
+                pattern_file.to_string_lossy().as_ref(),
+            ])
+            .expect("parse grep"),
+            &output,
+        )
+        .await
+        .expect("grep on redb");
+
+        fast_export::execute_safe(
+            fast_export::FastExportArgs::try_parse_from(["fast-export", "--all"])
+                .expect("parse fast-export"),
+            &output,
+        )
+        .await
+        .expect("fast-export on redb");
+
+        // 3. `bundle create`, `control_lock::resolve_control_scope`, `gc`, `maintenance` (AC1).
+        let bundle_file = tmp.path().join("repo.bundle");
+        bundle::execute_safe(
+            bundle::BundleArgs::try_parse_from([
+                "bundle",
+                "create",
+                bundle_file.to_string_lossy().as_ref(),
+                "HEAD",
+            ])
+            .expect("parse bundle create"),
+            &output,
+        )
+        .await
+        .expect("bundle create on redb");
+        assert!(bundle_file.is_file());
+
+        let scope = control_lock::resolve_control_scope(&src_dir, None)
+            .await
+            .expect("resolve_control_scope on redb");
+        assert!(!scope.repo_id.is_empty());
+
+        gc::execute_safe(
+            gc::GcArgs::try_parse_from(["gc"]).expect("parse gc"),
+            &output,
+        )
+        .await
+        .expect("gc on redb");
+
+        execute_safe(
+            MaintenanceArgs::try_parse_from(["maintenance", "run", "--task=gc"])
+                .expect("parse maintenance run"),
+            &output,
+        )
+        .await
+        .expect("maintenance run --task=gc on redb");
+
+        // 4. `fast-import`, `fetch`, and `push` onto a second pure-redb repo (AC1).
+        let dst_dir = tmp.path().join("dst-redb");
+        std::fs::create_dir_all(&dst_dir).expect("mkdir dst");
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "-q",
+                "-b",
+                "main",
+                dst_dir.to_string_lossy().as_ref(),
+            ])
+            .expect("parse init dst"),
+            &output,
+        )
+        .await
+        .expect("init dst redb");
+        let import_file = tmp.path().join("import.fi");
+        std::fs::write(
+            &import_file,
+            "blob\nmark :1\ndata 4\nhi!\n\ncommit refs/heads/imported\nmark :2\nauthor Tester <t@example.com> 1700000000 +0000\ncommitter Tester <t@example.com> 1700000000 +0000\ndata 10\nimported!\nM 100644 :1 imp.txt\ndone\n",
+        )
+        .expect("write import.fi");
+        {
+            let _dst_cwd = ChangeDirGuard::new(&dst_dir);
+            fast_import::execute_safe(
+                fast_import::FastImportArgs::try_parse_from([
+                    "fast-import",
+                    "--input",
+                    import_file.to_string_lossy().as_ref(),
+                ])
+                .expect("parse fast-import"),
+                &output,
+            )
+            .await
+            .expect("fast-import on redb");
+            let imported = Branch::find_branch_result("imported", None)
+                .await
+                .expect("find imported branch")
+                .expect("imported branch exists");
+            assert_ne!(imported.commit.to_string(), "");
+
+            // Register src as remote and fetch.
+            remote::execute_safe(
+                remote::RemoteCmds::Add {
+                    name: "origin".to_string(),
+                    url: src_dir.to_string_lossy().to_string(),
+                    fetch: false,
+                    track: Vec::new(),
+                    master: None,
+                    tags: false,
+                    no_tags: false,
+                    mirror: None,
+                },
+                &output,
+            )
+            .await
+            .expect("add origin remote");
+            fetch::execute_safe(
+                fetch::FetchArgs::try_parse_from(["fetch", "origin"]).expect("parse fetch"),
+                &output,
+            )
+            .await
+            .expect("fetch origin on redb");
+            assert!(!dst_dir.join(".libra/libra.db").exists());
+        }
+
+        // Push a new branch from src -> bare redb remote.
+        let bare_dir = tmp.path().join("bare-redb.libra");
+        std::fs::create_dir_all(&bare_dir).expect("mkdir bare");
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "--bare",
+                "-q",
+                "-b",
+                "main",
+                bare_dir.to_string_lossy().as_ref(),
+            ])
+            .expect("parse init bare"),
+            &output,
+        )
+        .await
+        .expect("init bare redb");
+        remote::execute_safe(
+            remote::RemoteCmds::Add {
+                name: "bare".to_string(),
+                url: bare_dir.to_string_lossy().to_string(),
+                fetch: false,
+                track: Vec::new(),
+                master: None,
+                tags: false,
+                no_tags: false,
+                mirror: None,
+            },
+            &output,
+        )
+        .await
+        .expect("add bare remote");
+        push::execute_safe(
+            push::PushArgs::try_parse_from(["push", "bare", "main"]).expect("parse push"),
+            &output,
+        )
+        .await
+        .expect("push bare main on redb");
+        assert!(!bare_dir.join("libra.db").exists());
+        assert!(!src_libra.join("libra.db").exists());
+
+        // 5. AC3: Read-only commands fail closed on corrupt/unrepaired git.redb without upgrading to writable.
+        let broken_dir = tmp.path().join("broken-ro-redb");
+        std::fs::create_dir_all(&broken_dir).expect("mkdir broken");
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "-q",
+                "-b",
+                "main",
+                broken_dir.to_string_lossy().as_ref(),
+            ])
+            .expect("parse init broken"),
+            &output,
+        )
+        .await
+        .expect("init broken redb");
+        let git_redb = broken_dir.join(".libra/redb/git.gen-00000001.redb");
+        // Flip the redb clean-shutdown flag / corrupt header to trigger read-only fail-closed.
+        let mut raw_bytes = std::fs::read(&git_redb).expect("read git.redb");
+        let mid = raw_bytes.len().min(64);
+        for b in &mut raw_bytes[..mid] {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&git_redb, &raw_bytes).expect("corrupt git.redb copy");
+        let snapshot_before = std::fs::read(&git_redb).expect("snapshot before");
+        {
+            let _broken_cwd = ChangeDirGuard::new(&broken_dir);
+            let export_err = fast_export::execute_safe(
+                fast_export::FastExportArgs::try_parse_from(["fast-export", "--all"])
+                    .expect("parse fast-export broken"),
+                &output,
+            )
+            .await;
+            assert!(
+                export_err.is_err(),
+                "fast-export must fail closed on broken redb"
+            );
+
+            let grep_err = grep::execute_safe(
+                grep::GrepArgs::try_parse_from([
+                    "grep",
+                    "--cached",
+                    "-f",
+                    pattern_file.to_string_lossy().as_ref(),
+                ])
+                .expect("parse grep broken"),
+                &output,
+            )
+            .await;
+            assert!(
+                grep_err.is_err()
+                    || crate::storage::runtime::open_current_git_store_read_only()
+                        .await
+                        .is_err(),
+                "read-only grep / git store must fail closed on broken redb"
+            );
+
+            let ro_open = crate::storage::runtime::open_current_git_store_read_only().await;
+            assert!(ro_open.is_err(), "read-only opener must fail closed");
+        }
+        let snapshot_after = std::fs::read(&git_redb).expect("snapshot after");
+        assert_eq!(
+            snapshot_before, snapshot_after,
+            "strictly read-only commands must never mutate or upgrade git.redb on failure"
+        );
     }
 }

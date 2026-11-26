@@ -316,9 +316,93 @@ impl RebaseState {
     /// adopted. `libra status` asking whether a rebase is in progress must not
     /// be the thing that migrates and deletes crash-recovery state whose owner
     /// it has not established.
+    fn to_record(&self, worktree_id: String) -> crate::storage::git_state_store::RebaseStateRecord {
+        let todo = Self::format_hash_list(self.todo.iter().cloned());
+        let todo_actions = if self.todo_actions.len() == self.todo.len() {
+            self.todo_actions
+                .iter()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            vec!["pick"; self.todo.len()].join("\n")
+        };
+        let done = Self::format_hash_list(self.done.iter().cloned());
+        crate::storage::git_state_store::RebaseStateRecord {
+            worktree_id,
+            head_name: self.head_name.clone(),
+            onto: self.onto.to_string(),
+            orig_head: self.orig_head.to_string(),
+            current_head: self.current_head.to_string(),
+            todo,
+            todo_actions,
+            done,
+            stopped_sha: self.stopped_sha.map(|h| h.to_string()),
+            autosquash: self.autosquash,
+            empty_mode: match self.empty_mode {
+                RebaseEmptyMode::Drop => "drop",
+                RebaseEmptyMode::Keep => "keep",
+            }
+            .to_string(),
+        }
+    }
+
+    fn from_record(
+        rec: crate::storage::git_state_store::RebaseStateRecord,
+    ) -> Result<Self, String> {
+        let empty_mode =
+            parse_rebase_empty_mode(rec.empty_mode.trim()).unwrap_or(RebaseEmptyMode::Keep);
+        let onto = crate::internal::object_format::parse_repo_oid(rec.onto.trim())
+            .map_err(|e| format!("Invalid onto hash: {e}"))?;
+        let orig_head = crate::internal::object_format::parse_repo_oid(rec.orig_head.trim())
+            .map_err(|e| format!("Invalid orig_head hash: {e}"))?;
+        let current_head = crate::internal::object_format::parse_repo_oid(rec.current_head.trim())
+            .map_err(|e| format!("Invalid current_head hash: {e}"))?;
+        let todo = VecDeque::from(Self::parse_hash_list(&rec.todo)?);
+        let todo_actions =
+            Self::parse_action_list(&rec.todo_actions, todo.len(), rec.autosquash, &todo)?;
+        let done = Self::parse_hash_list(&rec.done)?;
+        let stopped_sha = match rec.stopped_sha {
+            Some(s) if !s.trim().is_empty() => Some(
+                crate::internal::object_format::parse_repo_oid(s.trim())
+                    .map_err(|e| format!("Invalid stopped_sha hash: {e}"))?,
+            ),
+            _ => None,
+        };
+        Ok(RebaseState {
+            head_name: rec.head_name,
+            onto,
+            orig_head,
+            todo,
+            todo_actions,
+            done,
+            stopped_sha,
+            current_head,
+            autosquash: rec.autosquash,
+            empty_mode,
+        })
+    }
+
     pub async fn is_in_progress() -> Result<bool, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        if Self::has_state_in_db(&db).await? {
+        let has_in_store = match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| e.to_string())?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                store
+                    .get_rebase_state(&Self::scope_key())
+                    .await
+                    .map_err(|e| format!("failed to query rebase_state: {e}"))?
+                    .is_some()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::has_state_in_db(&db).await?
+            }
+        };
+        if has_in_store {
             return Ok(true);
         }
         Self::legacy_state_is_adoptable()
@@ -363,47 +447,87 @@ impl RebaseState {
     /// and callers have already moved HEAD by then, so the user would be
     /// mid-rebase with nothing to continue or abort.
     pub async fn save(&self) -> Result<(), String> {
-        use sea_orm::TransactionTrait;
-
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let txn = db
-            .begin()
-            .await
-            .map_err(|error| format!("failed to begin the rebase_state transaction: {error}"))?;
-        Self::save_with_conn(&txn, self).await?;
-        txn.commit()
-            .await
-            .map_err(|error| format!("failed to commit the rebase_state transaction: {error}"))
-    }
-
-    /// The FIRST write of a starting rebase, as an atomic claim (§C.4.4).
-    ///
-    /// [`Self::save`] is a scoped DELETE + INSERT — correct for an owner
-    /// advancing its own rebase, wrong for a start: two starts racing in one
-    /// worktree both pass the mutex check (nothing is in progress yet) and the
-    /// loser's replace erases the winner's todo while the winner's checkout
-    /// stays on disk. A bare INSERT against `worktree_id PRIMARY KEY` lets
-    /// exactly one starter win.
-    pub async fn claim_start(&self) -> Result<(), String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        match Self::insert_with_conn(&db, self).await {
-            Ok(()) => Ok(()),
-            Err(err) if crate::internal::sequencer::is_unique_violation_text(&err) => {
-                Err("a rebase is already in progress in this worktree".to_string())
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let rec = self.to_record(Self::scope_key());
+                store
+                    .put_rebase_state(&rec)
+                    .await
+                    .map_err(|e| format!("failed to save rebase_state: {e}"))
             }
-            Err(err) => Err(err),
+            crate::storage::StorageBackendKind::Sqlite => {
+                use sea_orm::TransactionTrait;
+
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let txn = db.begin().await.map_err(|error| {
+                    format!("failed to begin the rebase_state transaction: {error}")
+                })?;
+                Self::save_with_conn(&txn, self).await?;
+                txn.commit().await.map_err(|error| {
+                    format!("failed to commit the rebase_state transaction: {error}")
+                })
+            }
         }
     }
 
-    /// Load rebase state.
-    ///
-    /// Reads the scoped row, then — for the main worktree with no ambiguity —
-    /// READS a legacy directory without adopting it: no DB row is written and
-    /// nothing is deleted (§C.4.2 / ADR-0714-08). Adoption is an explicit act,
-    /// performed by a control action through `Self::adopt_legacy_state`.
+    pub async fn claim_start(&self) -> Result<(), String> {
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let scope_key = Self::scope_key();
+                if store
+                    .get_rebase_state(&scope_key)
+                    .await
+                    .map_err(|e| format!("failed to query rebase_state: {e}"))?
+                    .is_some()
+                {
+                    return Err("a rebase is already in progress in this worktree".to_string());
+                }
+                let rec = self.to_record(scope_key);
+                store
+                    .put_rebase_state(&rec)
+                    .await
+                    .map_err(|e| format!("failed to claim rebase_state: {e}"))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                match Self::insert_with_conn(&db, self).await {
+                    Ok(()) => Ok(()),
+                    Err(err) if crate::internal::sequencer::is_unique_violation_text(&err) => {
+                        Err("a rebase is already in progress in this worktree".to_string())
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
+
     pub async fn load() -> Result<Self, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        if let Some(state) = Self::load_from_db(&db).await? {
+        let state_opt = match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| e.to_string())?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                store
+                    .get_rebase_state(&Self::scope_key())
+                    .await
+                    .map_err(|e| format!("failed to load rebase_state: {e}"))?
+                    .map(Self::from_record)
+                    .transpose()?
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::load_from_db(&db).await?
+            }
+        };
+        if let Some(state) = state_opt {
             return Ok(state);
         }
         if Self::legacy_state_is_adoptable()? {
@@ -412,21 +536,33 @@ impl RebaseState {
         Err("No rebase in progress".to_string())
     }
 
-    /// EXPLICITLY adopt a legacy directory into this worktree's scoped row.
-    ///
-    /// Called only from a control action (`--continue` / `--skip` / `--abort`),
-    /// where the user has said "act on this rebase" — never from a read. The
-    /// same ambiguity rule applies: a linked worktree never adopts, and the
-    /// main worktree refuses while linked worktrees are registered.
     pub(crate) async fn adopt_legacy_state() -> Result<Option<Self>, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::migrate_legacy_state(&db).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => Ok(None),
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::migrate_legacy_state(&db).await
+            }
+        }
     }
 
     /// Remove the rebase state from the database (and any legacy state on disk)
     pub async fn cleanup() -> Result<(), String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::clear_state_in_db(&db).await?;
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                let _ = store
+                    .delete_rebase_state(&Self::scope_key())
+                    .await
+                    .map_err(|e| format!("failed to clear rebase_state: {e}"))?;
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::clear_state_in_db(&db).await?;
+            }
+        }
 
         // The COMMON legacy dir has no owner metadata, and the SAME
         // ambiguity rule that governs adopting it governs deleting it
@@ -501,8 +637,23 @@ impl RebaseState {
     pub(crate) async fn load_for_scope(
         scope: &crate::internal::worktree_scope::WorktreeScope,
     ) -> Result<Option<Self>, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::load_from_db_in_scope(&db, scope.storage_key()).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| e.to_string())? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to open git state store: {e}"))?;
+                store
+                    .get_rebase_state(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to load rebase_state: {e}"))?
+                    .map(Self::from_record)
+                    .transpose()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                Self::load_from_db_in_scope(&db, scope.storage_key()).await
+            }
+        }
     }
 
     pub(super) async fn load_from_db<C: ConnectionTrait>(db: &C) -> Result<Option<Self>, String> {

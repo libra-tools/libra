@@ -101,10 +101,30 @@ pub(crate) async fn fork_point_base(
     } else {
         format!("refs/heads/{reference}")
     };
-    let db = crate::internal::db::get_db_conn_instance().await;
-    let logs = Reflog::find_all(&db, &ref_name)
-        .await
-        .map_err(|error| fatal(format!("failed to read reflog for '{ref_name}': {error}")))?;
+    let logs = match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| fatal(format!("failed to detect repository backend: {error}")))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| {
+                    fatal(format!(
+                        "failed to open reflog store for '{ref_name}': {error}"
+                    ))
+                })?;
+            Reflog::find_all_with_store(&*store, &ref_name)
+                .await
+                .map_err(|error| {
+                    fatal(format!("failed to read reflog for '{ref_name}': {error}"))
+                })?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::db::get_db_conn_instance().await;
+            Reflog::find_all(&db, &ref_name).await.map_err(|error| {
+                fatal(format!("failed to read reflog for '{ref_name}': {error}"))
+            })?
+        }
+    };
     let internal_err = |error: merge_base::MergeBaseError| match &error {
         merge_base::MergeBaseError::Shallow(shallow) => CliError::fatal(error.to_string())
             .with_exit_code(128)

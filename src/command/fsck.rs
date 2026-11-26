@@ -793,6 +793,81 @@ async fn run_fsck(args: &FsckArgs) -> CliResult<FsckResult> {
     // ADR-MX-06: publish the `--strict` state so `report` can escalate warnings.
     STRICT.store(args.strict, Ordering::Relaxed);
     clear_messages();
+
+    // ADR-RB-03 / ADR-RB-06 / RB-18b: `fsck` is an explicit repair authority on
+    // `Redb` repositories. Perform explicit crash repair on `git.redb` and
+    // `capture.redb` and reconcile any pending cross-store outbox intents before
+    // running object/ref integrity checks. On a read-only filesystem or
+    // non-writable store, fail closed with `LBR-IO-001` (`IoReadFailed`).
+    #[cfg(feature = "storage-redb")]
+    if matches!(
+        crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+            CliError::fatal(format!("failed to detect repository backend: {e}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?,
+        crate::storage::StorageBackendKind::Redb
+    ) {
+        let storage_root = crate::utils::util::storage_path();
+        let paths = crate::storage::manifest::resolve_redb_generation_paths(&storage_root)
+            .map_err(|e| {
+                CliError::fatal(format!("failed to resolve redb storage paths: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?
+            .ok_or_else(|| {
+                CliError::fatal("redb repository storage manifest is missing generation paths")
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+        let git_path = paths.git_db_path.clone();
+        let cap_path = paths.capture_db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            use crate::{
+                internal::db::schema::DatabaseRole,
+                storage::opener::{RedbRepairContext, repair_redb_explicit},
+            };
+            repair_redb_explicit(&git_path, DatabaseRole::Repository, RedbRepairContext::Fsck)
+                .map_err(|e| format!("fsck redb repository repair failed: {e}"))?;
+            if cap_path.exists() {
+                repair_redb_explicit(&cap_path, DatabaseRole::Capture, RedbRepairContext::Fsck)
+                    .map_err(|e| format!("fsck redb capture repair failed: {e}"))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!("fsck redb repair task panicked: {e}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?
+        .map_err(|msg| CliError::fatal(msg).with_stable_code(StableErrorCode::IoReadFailed))?;
+
+        if paths.capture_db_path.exists() {
+            let git_store = crate::storage::git_store::RedbGitStore::open_read_write_with_context(
+                &paths.git_db_path,
+                crate::storage::opener::RedbRepairContext::Fsck,
+            )
+            .map_err(|e| {
+                CliError::fatal(format!("fsck failed to open writable git.redb: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            let cap_store = crate::storage::capture_store::RedbCaptureStore::open_read_write(
+                &paths.capture_db_path,
+                crate::storage::opener::RedbRepairContext::Fsck,
+            )
+            .await
+            .map_err(|e| {
+                CliError::fatal(format!("fsck failed to open writable capture.redb: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            let _ = crate::storage::cross_store::reconcile_pending_intents(&git_store, &cap_store)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "fsck cross-store intent reconciliation failed: {e}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+        }
+    }
+
     // lore.md 2.5: load the intentional-absence (obliteration) tombstone
     // snapshot so every seam below distinguishes obliterated objects from
     // corruption and does NOT flip the exit code (empty set = no-op).
@@ -1663,41 +1738,85 @@ async fn check_head() -> bool {
 /// Returns a map like: "abc123..." -> "refs/heads/master", "HEAD@{1234567890}~2^1:src/"
 async fn build_object_name_map() -> std::collections::HashMap<String, String> {
     let mut name_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let db_conn = db::get_db_conn_instance().await;
+    type RawRefs = Vec<(String, String)>;
+    type RawReflogs = Vec<(i64, String, String)>;
+    let (raw_refs, raw_reflogs): (RawRefs, RawReflogs) =
+        match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                match crate::storage::runtime::open_current_git_store_read_only().await {
+                    Ok(store) => {
+                        let mut refs_out = Vec::new();
+                        for rec in store.list_refs(None).await.unwrap_or_default() {
+                            if let crate::storage::RefTarget::Direct(oid) = rec.target {
+                                let name = match rec.key {
+                                    crate::storage::RefKey::LocalHead { .. } => "HEAD".to_string(),
+                                    crate::storage::RefKey::RemoteHead { remote } => {
+                                        format!("refs/remotes/{remote}/HEAD")
+                                    }
+                                    crate::storage::RefKey::LocalBranch { name } => {
+                                        format!("refs/heads/{name}")
+                                    }
+                                    crate::storage::RefKey::RemoteBranch { remote, name } => {
+                                        if name.starts_with("refs/") {
+                                            name
+                                        } else {
+                                            format!("refs/remotes/{remote}/{name}")
+                                        }
+                                    }
+                                    crate::storage::RefKey::Tag { name } => name,
+                                };
+                                refs_out.push((oid, name));
+                            }
+                        }
+                        let logs_out = store
+                            .list_all_reflogs()
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|e| (e.timestamp, e.ref_name, e.new_oid))
+                            .collect();
+                        (refs_out, logs_out)
+                    }
+                    Err(_) => (Vec::new(), Vec::new()),
+                }
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+                let db_conn = db::get_db_conn_instance().await;
+                let refs = reference::Entity::find()
+                    .all(&db_conn)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|r| r.commit.map(|c| (c, r.name.unwrap_or_default())))
+                    .collect();
+                let logs = reflog::Entity::find()
+                    .all(&db_conn)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| (e.timestamp, e.ref_name, e.new_oid))
+                    .collect();
+                (refs, logs)
+            }
+        };
 
-    // Collect names from refs (e.g., "refs/heads/master")
-    let refs = reference::Entity::find()
-        .all(&db_conn)
-        .await
-        .unwrap_or_default();
-
-    for ref_entry in refs {
-        if let Some(commit_hash) = &ref_entry.commit {
-            let ref_name = ref_entry.name.clone().unwrap_or_default();
-            // Store ref name (may have multiple names per object)
-            name_map
-                .entry(commit_hash.clone())
-                .and_modify(|e| *e = format!("{}, {}", e, ref_name))
-                .or_insert(ref_name);
-        }
+    for (commit_hash, ref_name) in raw_refs {
+        name_map
+            .entry(commit_hash)
+            .and_modify(|e| *e = format!("{}, {}", e, ref_name))
+            .or_insert(ref_name);
     }
-
-    // Collect names from reflogs (e.g., "HEAD@{1234567890}")
-    let reflogs = reflog::Entity::find()
-        .all(&db_conn)
-        .await
-        .unwrap_or_default();
 
     // Group reflog entries by hash and ref_name, sorted by timestamp desc
     use std::collections::BTreeMap;
     let mut reflog_by_hash: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
-    for entry in reflogs {
+    for (timestamp, ref_name, new_oid) in raw_reflogs {
         let is_null_oid = |oid: &str| oid.chars().all(|c| c == '0');
-        if !is_null_oid(&entry.new_oid) {
+        if !is_null_oid(&new_oid) {
             reflog_by_hash
-                .entry(entry.new_oid.clone())
+                .entry(new_oid)
                 .or_default()
-                .push((entry.timestamp, entry.ref_name.clone()));
+                .push((timestamp, ref_name));
         }
     }
 
@@ -1762,39 +1881,67 @@ async fn check_reflogs(
     verbose: bool,
     exempt_missing: &HashSet<ObjectHash>,
 ) -> CliResult<()> {
-    let db_conn = db::get_db_conn_instance().await;
+    let entries: Vec<(String, String)> =
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+            CliError::fatal(format!("failed to detect repository backend: {e}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!("failed to open git store for reflogs: {e}"))
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+                store
+                    .list_all_reflogs()
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!("failed to load reflogs: {e}"))
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?
+                    .into_iter()
+                    .map(|e| (e.old_oid, e.new_oid))
+                    .collect()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = db::get_db_conn_instance().await;
+                reflog::Entity::find()
+                    .all(&db_conn)
+                    .await
+                    .map_err(|e| CliError::fatal(format!("failed to load reflogs: {}", e)))?
+                    .into_iter()
+                    .map(|e| (e.old_oid, e.new_oid))
+                    .collect()
+            }
+        };
 
-    let reflogs = reflog::Entity::find()
-        .all(&db_conn)
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to load reflogs: {}", e)))?;
-
-    for entry in reflogs {
+    for (old_oid, new_oid) in entries {
         if verbose && !stdout_suppressed() {
-            println!("Checking reflog {}->{}", entry.old_oid, entry.new_oid);
+            println!("Checking reflog {}->{}", old_oid, new_oid);
         }
 
         // Skip null OID (all zeros)
         let is_null_oid = |oid: &str| oid.chars().all(|c| c == '0');
 
-        if !is_null_oid(&entry.old_oid)
-            && let Some(hash) = parse_object_hash(&entry.old_oid)
+        if !is_null_oid(&old_oid)
+            && let Some(hash) = parse_object_hash(&old_oid)
             && !storage_has_object(storage, &hash)?
             && !exempt_missing.contains(&hash)
             && !is_intentionally_absent(&hash)
         {
             result.reflog_issues += 1;
-            report(FsckMsgId::Missing, "unknown", &entry.old_oid);
+            report(FsckMsgId::Missing, "unknown", &old_oid);
         }
 
-        if !is_null_oid(&entry.new_oid)
-            && let Some(hash) = parse_object_hash(&entry.new_oid)
+        if !is_null_oid(&new_oid)
+            && let Some(hash) = parse_object_hash(&new_oid)
             && !storage_has_object(storage, &hash)?
             && !exempt_missing.contains(&hash)
             && !is_intentionally_absent(&hash)
         {
             result.reflog_issues += 1;
-            report(FsckMsgId::Missing, "unknown", &entry.new_oid);
+            report(FsckMsgId::Missing, "unknown", &new_oid);
         }
     }
     Ok(())
@@ -1899,38 +2046,89 @@ async fn collect_reachability_context(storage: &ClientStorage) -> CliResult<Reac
         .into_iter()
         .collect();
 
-    // Collect objects from refs
-    let db_conn = db::get_db_conn_instance().await;
-    let refs = reference::Entity::find()
-        .all(&db_conn)
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to load refs: {}", e)))?;
-
-    for ref_entry in refs {
-        if let Some(commit_hash_str) = &ref_entry.commit
-            && let Some(hash) = parse_object_hash(commit_hash_str)
-        {
-            ctx.refs_reachable.insert(hash);
+    // Collect objects from refs and reflogs
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        CliError::fatal(format!("failed to detect repository backend: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to open git store: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            for rec in store.list_refs(None).await.map_err(|e| {
+                CliError::fatal(format!("failed to load refs: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })? {
+                if let crate::storage::RefTarget::Direct(oid) = rec.target
+                    && let Some(hash) = parse_object_hash(&oid)
+                {
+                    ctx.refs_reachable.insert(hash);
+                }
+            }
+            for rec in store.list_all_local_heads().await.map_err(|e| {
+                CliError::fatal(format!("failed to load local heads: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })? {
+                if let crate::storage::RefTarget::Direct(oid) = rec.target
+                    && let Some(hash) = parse_object_hash(&oid)
+                {
+                    ctx.refs_reachable.insert(hash);
+                }
+            }
+            let is_null_oid = |oid: &str| oid.chars().all(|c| c == '0');
+            for entry in store.list_all_reflogs().await.map_err(|e| {
+                CliError::fatal(format!("failed to load reflogs: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })? {
+                if !is_null_oid(&entry.old_oid)
+                    && let Some(hash) = parse_object_hash(&entry.old_oid)
+                {
+                    ctx.reflog_objects.insert(hash);
+                }
+                if !is_null_oid(&entry.new_oid)
+                    && let Some(hash) = parse_object_hash(&entry.new_oid)
+                {
+                    ctx.reflog_objects.insert(hash);
+                }
+            }
         }
-    }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_conn = db::get_db_conn_instance().await;
+            let refs = reference::Entity::find()
+                .all(&db_conn)
+                .await
+                .map_err(|e| CliError::fatal(format!("failed to load refs: {}", e)))?;
 
-    // Collect objects from reflogs
-    let reflogs = reflog::Entity::find()
-        .all(&db_conn)
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to load reflogs: {}", e)))?;
+            for ref_entry in refs {
+                if let Some(commit_hash_str) = &ref_entry.commit
+                    && let Some(hash) = parse_object_hash(commit_hash_str)
+                {
+                    ctx.refs_reachable.insert(hash);
+                }
+            }
 
-    for entry in reflogs {
-        let is_null_oid = |oid: &str| oid.chars().all(|c| c == '0');
-        if !is_null_oid(&entry.old_oid)
-            && let Some(hash) = parse_object_hash(&entry.old_oid)
-        {
-            ctx.reflog_objects.insert(hash);
-        }
-        if !is_null_oid(&entry.new_oid)
-            && let Some(hash) = parse_object_hash(&entry.new_oid)
-        {
-            ctx.reflog_objects.insert(hash);
+            // Collect objects from reflogs
+            let reflogs = reflog::Entity::find()
+                .all(&db_conn)
+                .await
+                .map_err(|e| CliError::fatal(format!("failed to load reflogs: {}", e)))?;
+
+            for entry in reflogs {
+                let is_null_oid = |oid: &str| oid.chars().all(|c| c == '0');
+                if !is_null_oid(&entry.old_oid)
+                    && let Some(hash) = parse_object_hash(&entry.old_oid)
+                {
+                    ctx.reflog_objects.insert(hash);
+                }
+                if !is_null_oid(&entry.new_oid)
+                    && let Some(hash) = parse_object_hash(&entry.new_oid)
+                {
+                    ctx.reflog_objects.insert(hash);
+                }
+            }
         }
     }
 
@@ -2140,39 +2338,63 @@ async fn find_and_report_roots(storage: &ClientStorage) -> CliResult<()> {
 /// Output format matches git fsck --tags:
 /// - For annotated tags: "tagged commit <commit-hash> (<tag-name>) in <tag-object-hash>"
 async fn find_and_report_tags() -> CliResult<()> {
-    use sea_orm::EntityTrait;
-
-    use crate::internal::model::reference;
-
-    let db_conn = db::get_db_conn_instance().await;
-
-    // Load all refs that are tags (refs/tags/*)
-    let refs = reference::Entity::find()
-        .all(&db_conn)
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to load refs: {}", e)))?;
-
-    for ref_entry in refs {
-        let ref_name = match &ref_entry.name {
-            Some(name) => name,
-            None => continue,
-        };
-
-        // Only process tag refs (refs/tags/*)
-        if !ref_name.starts_with("refs/tags/") {
-            continue;
+    let tags: Vec<(String, String)> = match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| {
+        CliError::fatal(format!("failed to detect repository backend: {e}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to open git store: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            store
+                .list_refs(None)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to load refs: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .into_iter()
+                .filter_map(|rec| match rec.key {
+                    crate::storage::RefKey::Tag { name } => {
+                        let short = name.strip_prefix("refs/tags/")?.to_string();
+                        let target = match rec.target {
+                            crate::storage::RefTarget::Direct(h)
+                            | crate::storage::RefTarget::Symbolic(h) => h,
+                        };
+                        Some((short, target))
+                    }
+                    _ => None,
+                })
+                .collect()
         }
+        crate::storage::StorageBackendKind::Sqlite => {
+            use sea_orm::EntityTrait;
 
-        let tag_name = ref_name
-            .strip_prefix("refs/tags/")
-            .expect("INVARIANT: ref_name was guarded by starts_with(\"refs/tags/\") above");
-        let commit_hash = match &ref_entry.commit {
-            Some(hash) => hash,
-            None => continue,
-        };
+            use crate::internal::model::reference;
 
-        // Check if this is an annotated tag (tag object exists)
-        // For now, just report the tagged commit
+            let db_conn = db::get_db_conn_instance().await;
+
+            let refs = reference::Entity::find()
+                .all(&db_conn)
+                .await
+                .map_err(|e| CliError::fatal(format!("failed to load refs: {}", e)))?;
+
+            refs.into_iter()
+                .filter_map(|ref_entry| {
+                    let ref_name = ref_entry.name?;
+                    let tag_name = ref_name.strip_prefix("refs/tags/")?.to_string();
+                    let commit_hash = ref_entry.commit?;
+                    Some((tag_name, commit_hash))
+                })
+                .collect()
+        }
+    };
+
+    for (tag_name, commit_hash) in tags {
         if !stdout_suppressed() {
             println!("tagged commit {} ({})", commit_hash, tag_name);
         }
@@ -2867,18 +3089,64 @@ async fn check_refs(storage: &ClientStorage, connectivity_only: bool) -> CliResu
         broken_ref_names: Vec::new(),
     };
 
-    let db_conn = db::get_db_conn_instance().await;
+    let refs: Vec<(Option<String>, Option<String>)> =
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+            CliError::fatal(format!("failed to detect repository backend: {e}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|e| {
+                        CliError::fatal(format!("failed to open git store: {e}"))
+                            .with_stable_code(StableErrorCode::IoReadFailed)
+                    })?;
+                let mut out = Vec::new();
+                for rec in store.list_refs(None).await.map_err(|e| {
+                    CliError::fatal(format!("failed to load refs: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })? {
+                    let name = match rec.key {
+                        crate::storage::RefKey::LocalHead { .. } => "HEAD".to_string(),
+                        crate::storage::RefKey::RemoteHead { remote } => {
+                            format!("refs/remotes/{remote}/HEAD")
+                        }
+                        crate::storage::RefKey::LocalBranch { name } => {
+                            format!("refs/heads/{name}")
+                        }
+                        crate::storage::RefKey::RemoteBranch { remote, name } => {
+                            if name.starts_with("refs/") {
+                                name
+                            } else {
+                                format!("refs/remotes/{remote}/{name}")
+                            }
+                        }
+                        crate::storage::RefKey::Tag { name } => name,
+                    };
+                    let commit = match rec.target {
+                        crate::storage::RefTarget::Direct(oid) => Some(oid),
+                        crate::storage::RefTarget::Symbolic(_) => None,
+                    };
+                    out.push((Some(name), commit));
+                }
+                out
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = db::get_db_conn_instance().await;
+                reference::Entity::find()
+                    .all(&db_conn)
+                    .await
+                    .map_err(|e| CliError::fatal(format!("failed to load refs: {}", e)))?
+                    .into_iter()
+                    .map(|r| (r.name, r.commit))
+                    .collect()
+            }
+        };
 
-    // Check all references in database
-    let refs = reference::Entity::find()
-        .all(&db_conn)
-        .await
-        .map_err(|e| CliError::fatal(format!("failed to load refs: {}", e)))?;
-
-    for ref_entry in refs {
+    for (ref_name_opt, commit_opt) in refs {
         result.checked += 1;
 
-        if let Some(commit_hash_str) = &ref_entry.commit {
+        if let Some(commit_hash_str) = &commit_opt {
             if let Some(hash) = parse_object_hash(commit_hash_str) {
                 if storage_has_object(storage, &hash)? {
                     // Verify the object is actually valid
@@ -2898,24 +3166,24 @@ async fn check_refs(storage: &ClientStorage, connectivity_only: bool) -> CliResu
                         Ok((_check, _reported)) => {
                             // Object exists but is corrupted - already reported in check_objects
                             result.broken += 1;
-                            let ref_name = ref_entry.name.clone().unwrap_or_default();
+                            let ref_name = ref_name_opt.clone().unwrap_or_default();
                             result.broken_ref_names.push(ref_name.clone());
                         }
                         Err(_e) => {
                             result.broken += 1;
-                            let ref_name = ref_entry.name.clone().unwrap_or_default();
+                            let ref_name = ref_name_opt.clone().unwrap_or_default();
                             result.broken_ref_names.push(ref_name.clone());
                         }
                     }
                 } else {
                     result.broken += 1;
-                    let ref_name = ref_entry.name.clone().unwrap_or_default();
+                    let ref_name = ref_name_opt.clone().unwrap_or_default();
                     result.broken_ref_names.push(ref_name.clone());
                     report(FsckMsgId::Missing, "commit", commit_hash_str);
                 }
             } else {
                 result.broken += 1;
-                let ref_name = ref_entry.name.clone().unwrap_or_default();
+                let ref_name = ref_name_opt.clone().unwrap_or_default();
                 result.broken_ref_names.push(ref_name.clone());
                 // Invalid hash format - report as bad ref content
                 eprintln!("bad ref content: {}: invalid hash format", ref_name);
@@ -3220,5 +3488,261 @@ mod tests {
         assert_eq!(object_type_name(ObjectType::Tree), "tree");
         assert_eq!(object_type_name(ObjectType::Blob), "blob");
         assert_eq!(object_type_name(ObjectType::Tag), "tag");
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_fsck_repair_reconcile_ro_fs_and_alternates() {
+        use clap::Parser;
+
+        use crate::{
+            command::{add, alternates, commit, init},
+            internal::config::ConfigKv,
+            storage::{
+                capture_store::{
+                    AgentSessionRecord, CaptureAgentKind, CaptureBatchItem, CaptureBatchPayload,
+                    CaptureScopeState, CaptureSessionState, CaptureStore, RedbCaptureStore,
+                },
+                cross_store::{CrossStoreCommitHook, CrossStoreCoordinator, CrossStoreRefCasOp},
+                git_store::{RedbGitStore, RefKey, RefTarget},
+                manifest::resolve_redb_generation_paths,
+                opener::RedbRepairContext,
+            },
+            utils::{output::OutputConfig, test::ChangeDirGuard},
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = OutputConfig::default();
+
+        // 1. Initialize pure-redb repo with 1 commit.
+        let repo_dir = tmp.path().join("fsck-redb");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir fsck-redb");
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "-q",
+                "-b",
+                "main",
+                repo_dir.to_string_lossy().as_ref(),
+            ])
+            .expect("parse init"),
+            &output,
+        )
+        .await
+        .expect("init fsck redb");
+
+        let _cwd = ChangeDirGuard::new(&repo_dir);
+        let dot_libra = repo_dir.join(".libra");
+        assert!(!dot_libra.join("libra.db").exists());
+        ConfigKv::set("user.name", "Fsck Tester", false)
+            .await
+            .expect("set user.name");
+        ConfigKv::set("user.email", "fsck@example.com", false)
+            .await
+            .expect("set user.email");
+        std::fs::write(repo_dir.join("file.txt"), b"fsck payload\n").expect("write file.txt");
+        add::execute_safe(
+            add::AddArgs::try_parse_from(["add", "file.txt"]).expect("parse add"),
+            &output,
+        )
+        .await
+        .expect("add file.txt");
+        commit::execute_safe(
+            commit::CommitArgs {
+                message: Some("fsck base commit".to_string()),
+                ..commit::CommitArgs::default()
+            },
+            &output,
+        )
+        .await
+        .expect("commit");
+        let head_oid = crate::internal::head::Head::current_commit()
+            .await
+            .expect("HEAD commit")
+            .to_string();
+
+        // 2. AC1 + AC2: Stage a pending cross-store intent (git committed, capture crashed)
+        // and verify `fsck` explicitly repairs + reconciles `capture.redb` to match `git.redb`.
+        let paths = resolve_redb_generation_paths(&dot_libra)
+            .expect("resolve paths")
+            .expect("redb generation paths exist");
+        let git_store = RedbGitStore::open_read_write(&paths.git_db_path).expect("open git");
+        let cap_store = RedbCaptureStore::open_read_write(
+            &paths.capture_db_path,
+            RedbRepairContext::WriteCommand,
+        )
+        .await
+        .expect("open capture");
+        let coord = CrossStoreCoordinator::new(git_store.clone(), cap_store.clone());
+        let pending_item = CaptureBatchItem {
+            dedup_key: "fsck-reconcile:gen1:sess1".to_string(),
+            payload: CaptureBatchPayload::UpsertSession(AgentSessionRecord {
+                session_id: "fsck-reconcile-sess".to_string(),
+                agent_kind: CaptureAgentKind::Codex,
+                provider_session_id: "ext-fsck-1".to_string(),
+                thread_id: None,
+                state: CaptureSessionState::Active,
+                working_dir: repo_dir.to_string_lossy().to_string(),
+                worktree_id: None,
+                parent_commit: Some(head_oid.clone()),
+                parent_session_id: None,
+                metadata_json: "{}".to_string(),
+                redaction_report: "{}".to_string(),
+                started_at: 1_795_360_000,
+                last_event_at: 1_795_360_000,
+                stopped_at: None,
+                schema_version: 1,
+                sync_revision: 0,
+                repo_id: None,
+                workspace_id: None,
+                workspace_fence: None,
+                scope_state: CaptureScopeState::LegacyUnknown,
+            }),
+        };
+        let cas_op = CrossStoreRefCasOp {
+            key: RefKey::LocalBranch {
+                name: "reconcile-probe".to_string(),
+            },
+            expected: None,
+            new_target: Some(RefTarget::Direct(head_oid.clone())),
+            reflogs: Vec::new(),
+            publication: None,
+        };
+        let injected_err = coord
+            .commit_ref_cas_with_capture_inner(
+                &cas_op,
+                &[pending_item],
+                CrossStoreCommitHook::fail_after_git_commit(),
+            )
+            .await;
+        assert!(
+            injected_err.is_err(),
+            "fault hook must simulate crash after git.redb commit"
+        );
+        assert!(
+            cap_store
+                .get_session("fsck-reconcile-sess")
+                .await
+                .expect("query capture pre-fsck")
+                .is_none(),
+            "session must be pending in outbox before fsck"
+        );
+        drop(coord);
+        drop(git_store);
+        drop(cap_store);
+
+        // Run `fsck` on writable Redb repo: must repair + reconcile pending intent!
+        super::execute_safe(
+            super::FsckArgs::try_parse_from(["fsck"]).expect("parse fsck"),
+            &output,
+        )
+        .await
+        .expect("fsck on writable redb");
+        let cap_after = RedbCaptureStore::open_read_only(&paths.capture_db_path)
+            .await
+            .expect("open capture ro post-fsck");
+        assert!(
+            cap_after
+                .get_session("fsck-reconcile-sess")
+                .await
+                .expect("query capture post-fsck")
+                .is_some(),
+            "fsck must reconcile pending cross-store intent into capture.redb"
+        );
+        drop(cap_after);
+
+        // 3. AC3: Read-only storage fails closed with LBR-IO-001 (`IoReadFailed`).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let orig_git_mode = std::fs::metadata(&paths.git_db_path)
+                .expect("stat git.redb")
+                .permissions()
+                .mode();
+            let orig_dir_mode = std::fs::metadata(paths.git_db_path.parent().expect("redb dir"))
+                .expect("stat redb dir")
+                .permissions()
+                .mode();
+            std::fs::set_permissions(&paths.git_db_path, std::fs::Permissions::from_mode(0o444))
+                .expect("chmod 0444 git.redb");
+            std::fs::set_permissions(
+                paths.git_db_path.parent().expect("redb dir"),
+                std::fs::Permissions::from_mode(0o555),
+            )
+            .expect("chmod 0555 redb dir");
+
+            let ro_err = super::execute_safe(
+                super::FsckArgs::try_parse_from(["fsck"]).expect("parse fsck ro"),
+                &output,
+            )
+            .await
+            .expect_err("fsck on read-only redb storage must fail closed");
+            // Restore permissions before asserting so tempdir cleanup always succeeds.
+            let _ = std::fs::set_permissions(
+                paths.git_db_path.parent().expect("redb dir"),
+                std::fs::Permissions::from_mode(orig_dir_mode),
+            );
+            let _ = std::fs::set_permissions(
+                &paths.git_db_path,
+                std::fs::Permissions::from_mode(orig_git_mode),
+            );
+            assert_eq!(
+                ro_err.stable_code().as_str(),
+                "LBR-IO-001",
+                "fsck on RO storage must fail closed with LBR-IO-001 (got {ro_err:?})"
+            );
+        }
+
+        // 4. AC4 + AC5: `alternates` resolves external SQLite AND external Redb repos.
+        let redb_base = tmp.path().join("redb-base");
+        std::fs::create_dir_all(&redb_base).expect("mkdir redb-base");
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "-q",
+                "-b",
+                "main",
+                redb_base.to_string_lossy().as_ref(),
+            ])
+            .expect("parse init redb base"),
+            &output,
+        )
+        .await
+        .expect("init redb base");
+        alternates::guarded_add(
+            &dot_libra.join("objects"),
+            &redb_base.join(".libra/objects"),
+            "sha1",
+        )
+        .await
+        .expect("alternates add external redb repo");
+
+        // Create a real external SQLite repo fixture (`libra.db` with `config_kv`).
+        let sqlite_base = tmp.path().join("sqlite-base");
+        let sqlite_libra = sqlite_base.join(".libra");
+        std::fs::create_dir_all(sqlite_libra.join("objects")).expect("mkdir sqlite objects");
+        let sqlite_db_path = sqlite_libra.join("libra.db");
+        let sqlite_conn = crate::internal::db::create_database(
+            sqlite_db_path.to_str().expect("sqlite path utf8"),
+        )
+        .await
+        .expect("create external sqlite db");
+        ConfigKv::set_with_conn(&sqlite_conn, "core.objectformat", "sha1", false)
+            .await
+            .expect("set external sqlite objectformat");
+        drop(sqlite_conn);
+        alternates::guarded_add(
+            &dot_libra.join("objects"),
+            &sqlite_libra.join("objects"),
+            "sha1",
+        )
+        .await
+        .expect("alternates add external sqlite repo");
+
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "fsck and alternates on Redb must never create libra.db"
+        );
     }
 }
