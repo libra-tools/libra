@@ -7733,39 +7733,124 @@ mod value_pattern {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-}
 
-#[test]
-fn test_cf_41_predicates() {
-    let repo = tempdir().unwrap();
-    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
-    for value in ["one", "o.e", "oXe"] {
-        assert_cli_success(
-            &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
-            "add",
+    #[test]
+    fn test_cf_41_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "o.e", "oXe"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        let fixed = run_libra_command(
+            &["config", "--fixed-value", "--unset", "multi.k", "o.e"],
+            repo.path(),
+        );
+        assert_cli_success(&fixed, "fixed unset");
+        let left = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "one\noXe");
+
+        let before = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        let missing = run_libra_command(
+            &["config", "--fixed-value", "--unset", "multi.k"],
+            repo.path(),
+        );
+        assert_eq!(
+            missing.status.code(),
+            Some(129),
+            "missing pattern exits 129"
+        );
+        let after = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(
+            before.stdout, after.stdout,
+            "missing pattern writes nothing"
         );
     }
-    let fixed = run_libra_command(
-        &["config", "--fixed-value", "--unset", "multi.k", "o.e"],
-        repo.path(),
-    );
-    assert_cli_success(&fixed, "fixed unset");
-    let left = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
-    assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "one\noXe");
 
-    let before = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
-    let missing = run_libra_command(
-        &["config", "--fixed-value", "--unset", "multi.k"],
-        repo.path(),
-    );
-    assert_eq!(
-        missing.status.code(),
-        Some(129),
-        "missing pattern exits 129"
-    );
-    let after = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
-    assert_eq!(
-        before.stdout, after.stdout,
-        "missing pattern writes nothing"
-    );
+    #[test]
+    #[serial(env)]
+    fn test_replace_encrypted_and_reserved() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "set", "--local", "--encrypt", "secret.k", "one"],
+                repo.path(),
+            ),
+            "seed encrypted one",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "config",
+                    "set",
+                    "--local",
+                    "--add",
+                    "--encrypt",
+                    "secret.k",
+                    "two",
+                ],
+                repo.path(),
+            ),
+            "seed encrypted two",
+        );
+        let replaced = run_libra_command(
+            &["config", "--replace-all", "secret.k", "three", "^one$"],
+            repo.path(),
+        );
+        assert_cli_success(&replaced, "replace encrypted by plaintext");
+        let reveal = run_libra_command(
+            &["config", "get", "--local", "--all", "--reveal", "secret.k"],
+            repo.path(),
+        );
+        assert_cli_success(&reveal, "reveal replaced");
+        assert_eq!(String::from_utf8_lossy(&reveal.stdout).trim(), "three\ntwo");
+        let redacted = run_libra_command(&["config", "--get-all", "secret.k"], repo.path());
+        assert!(String::from_utf8_lossy(&redacted.stdout).contains("REDACTED"));
+
+        let reserved = run_libra_command(
+            &[
+                "config",
+                "--global",
+                "--replace-all",
+                "upgrade.mode",
+                "auto",
+            ],
+            repo.path(),
+        );
+        assert!(!reserved.status.success(), "reserved namespace rejected");
+    }
+
+    #[test]
+    fn test_t1300_replace_and_value_pattern() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", "replace.k", "one"], repo.path()),
+            "seed",
+        );
+        let replace = run_libra_command(
+            &["config", "--replace-all", "replace.k", "two"],
+            repo.path(),
+        );
+        assert_cli_success(&replace, "replace-all");
+        let value = run_libra_command(&["config", "--local", "--get", "replace.k"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "two");
+
+        for value in ["red", "blue"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "replace.multi", value], repo.path()),
+                "add multi",
+            );
+        }
+        let patterned = run_libra_command(
+            &["config", "--replace-all", "replace.multi", "green", "^red$"],
+            repo.path(),
+        );
+        assert_cli_success(&patterned, "replace value pattern");
+        let all = run_libra_command(&["config", "--get-all", "replace.multi"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "green\nblue");
+    }
 }

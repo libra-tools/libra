@@ -478,16 +478,26 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
+        // Decrypt before opening the write transaction: loading the unseal key
+        // reads the same database and would block on the transaction's lock.
+        let entries = Self::get_all(scope, key).await?;
+        let mut matched_entries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let matches = if entry.encrypted {
+                let plaintext = decrypt_config_value(&entry.value, scope_name(scope)).await?;
+                matcher(&plaintext)
+            } else {
+                matcher(&entry.value)
+            };
+            matched_entries.push((entry, matches));
+        }
         let txn = Self::begin_mutation(scope).await?;
-        let entries = ConfigKv::get_all_with_conn(&txn, key)
-            .await
-            .map_err(|e| format!("failed to read config '{key}': {e}"))?;
         ConfigKv::unset_all_with_conn(&txn, key)
             .await
             .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
         let mut replaced = 0;
-        for entry in entries {
-            if matcher(&entry.value) {
+        for (entry, matches) in matched_entries {
+            if matches {
                 if replaced == 0 {
                     ConfigKv::add_with_conn(&txn, key, value, encrypted)
                         .await
@@ -1334,6 +1344,9 @@ fn upgrade_namespace_raw_preflight(args: &ConfigArgs) -> CliResult<()> {
             "combining multiple action spellings",
         ));
     }
+    if positional_reserved && args.replace_all {
+        return Err(upgrade_namespace_usage_error("--replace-all"));
+    }
     if positional_reserved && (args.list || args.import) {
         return Err(upgrade_namespace_usage_error(
             "--list/--import with a reserved key operand",
@@ -1417,11 +1430,14 @@ async fn route_upgrade_namespace(
             // nor how a read would have been terminated.
             explicit_set: _,
             null: _,
-            replace_all: _,
-            value_pattern: _,
+            replace_all,
+            value_pattern,
             fixed_value: _,
         } if is_upgrade_namespace_key(key) => Some(match guard_conflicts() {
             Err(err) => Err(err),
+            Ok(()) if *replace_all || value_pattern.is_some() => {
+                Err(upgrade_namespace_usage_error("--replace-all"))
+            }
             Ok(()) => {
                 handle_upgrade_set(
                     args,
