@@ -440,3 +440,51 @@ fn test_cf_49_predicates() {
         }
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_50_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    for (key, value) in [("json.one", "1"), ("json.two", "2")] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", key, value], repo.path()),
+            "set",
+        );
+    }
+    for args in [
+        vec!["config", "--local", "--list"],
+        vec!["config", "--local", "--get-regexp", "^json\\."],
+    ] {
+        let human = run_libra_command(&args, repo.path());
+        assert_cli_success(&human, "human");
+        let human_keys: Vec<String> = String::from_utf8_lossy(&human.stdout)
+            .lines()
+            .map(|line| line.split(['=', ' ']).next().unwrap_or(line).to_string())
+            .collect();
+        let mut json_args = vec!["--json"];
+        json_args.extend(args.iter().copied());
+        let json = run_libra_command(&json_args, repo.path());
+        assert_cli_success(&json, "json");
+        let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+        let entries = parsed["data"]["entries"].as_array().expect("entries");
+        let json_keys: Vec<String> = entries
+            .iter()
+            .map(|entry| entry["key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(human_keys, json_keys, "order for {args:?}");
+        assert!(
+            entries.iter().all(|entry| entry.get("scope").is_some()),
+            "every entry has scope: {parsed}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.get("value").is_some() && entry.get("encrypted").is_some()),
+            "existing fields remain: {parsed}"
+        );
+    }
+}

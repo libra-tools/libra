@@ -308,3 +308,5 @@ edit refuses stdin and blobs.
 edit does not export upgrade.mode.
 
 upstream file-write cases match git bytes.
+
+list json keeps order and adds scope.
