@@ -34,6 +34,7 @@ pub mod mega2_traces_git; // plan-20261015 LTR-16/17: archive locator and pack c
 pub mod mega2_tree; // plan-20260912: bounded mega2 /api/v1/tree listing client
 pub mod repository_arg; // issues/480 HP-06: shared fetch/pull/push repository-arg parsing
 pub mod ssh_client; // to support SSH transport (ssh:// and git@host:path)
+pub(crate) mod ssh_github_port443; // opt-in `ssh.github.com:443` repair after a cut GitHub SSH connection
 pub mod v2; // issues/15: Git wire protocol v2 negotiation, ls-refs and fetch over smart HTTP
 
 pub trait ProtocolClient {

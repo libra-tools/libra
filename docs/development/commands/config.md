@@ -132,6 +132,25 @@ for SSH to exit before requesting termination, within a two-second total
 cleanup deadline. Captured-output tasks are cancelled when their owner exits or
 their deadline expires, including when a descendant keeps a pipe open.
 
+## GitHub SSH over port 443 repair
+
+`SshClient::discovery_reference` offers to route `github.com` through
+`ssh.github.com:443` when discovery fails with a typed `SshConnectionFailed`
+whose kind is `ConnectionClosed`, `TimedOut` or `ConnectionRefused`. Discovery
+is the first connection of every fetch, push and ls-remote and nothing has been
+negotiated yet, so the single retry is safe. Later connections of the same
+command are not covered.
+
+The offer reuses the interactive channel of `HostKeyConfirmation` (so it is
+never made for JSON, machine or non-TTY callers) and requires the URL host to
+be `github.com` on the default port and `ssh -G` to still report
+`github.com:22`. `src/internal/protocol/ssh_github_port443.rs` owns the prompt
+text, answer parsing and the `ssh_config` edit: the block is appended in place
+(a symlinked config keeps its target), `ssh -G` must then report
+`ssh.github.com:443`, and an edit that another entry overrides is truncated
+away again. The retry result still flows through the host-key confirmation,
+because OpenSSH verifies the new endpoint as `[ssh.github.com]:443`.
+
 ## SSH capture validation scope
 
 The twelve named PKT-11 library gates retain the original plan names. They cover

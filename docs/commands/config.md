@@ -1001,6 +1001,43 @@ for SSH to exit before requesting termination, within a two-second total
 cleanup deadline. Captured-output tasks are cancelled when their owner exits or
 their deadline expires, including when a descendant keeps a pipe open.
 
+### GitHub SSH over port 443
+
+Some networks block, reset or throttle SSH on port 22. GitHub serves the same
+SSH endpoint on `ssh.github.com` port 443, and OpenSSH can route `github.com`
+there through `~/.ssh/config`.
+
+When a `github.com` SSH connection is closed, refused or times out before Git
+negotiation, Libra offers to set that up for you. It shows the exact block and
+the file it will edit, and waits for `yes` or `no`:
+
+```text
+Host github.com
+    Hostname ssh.github.com
+    Port 443
+    User git
+```
+
+On `yes`, Libra appends the block to `~/.ssh/config` (creating the file with
+mode `0600` when it is missing), confirms with `ssh -G` that the new route is in
+effect, and retries the connection once. If an earlier entry in your SSH
+configuration overrides the block, Libra removes it again and leaves the file
+as it was. Because OpenSSH verifies the new endpoint under its own known-hosts
+entry (`[ssh.github.com]:443`), the first connection may then show the host-key
+confirmation described above.
+
+The offer is made only when all of the following hold:
+
+- the command runs in a human terminal (never for `--json`, `--machine`,
+  non-TTY or piped invocations);
+- the remote URL targets `github.com` on the default SSH port;
+- `ssh -G` reports that `github.com` still resolves to `github.com` port 22,
+  so an existing `Hostname`, `Port` or host alias of yours is never touched.
+
+It is asked at most once per command. Answering `no`, or pressing Enter,
+changes nothing and the original error is reported. To undo the change later,
+delete the block from `~/.ssh/config`.
+
 ### SSH host identity and diagnostic collection
 
 SSH host identity changes retain a distinct fixed warning: the change may
