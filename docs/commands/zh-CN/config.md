@@ -930,3 +930,5 @@ a syntax error in an edit keeps the temp path.
 edit placeholders do not change encrypted entries.
 
 edit uses core.editor and fails closed without one.
+
+config unset subcommand matches legacy unset.

@@ -268,3 +268,63 @@ fn test_cf_102_predicates() {
         assert_eq!(out.status.code(), Some(1));
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_100_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for (legacy, sub) in [("sub.legacy", "sub.command")] {
+        for key in [legacy, sub] {
+            for value in ["one", "two"] {
+                assert_cli_success(
+                    &run_libra_command(&["config", "--add", key, value], repo.path()),
+                    "add",
+                );
+            }
+        }
+    }
+    let legacy = run_libra_command(&["config", "--unset", "sub.legacy", "^one$"], repo.path());
+    let sub = run_libra_command(
+        &["config", "unset", "sub.command", "--value=^one$"],
+        repo.path(),
+    );
+    assert_eq!(
+        legacy.status.code(),
+        sub.status.code(),
+        "patterned unset exit"
+    );
+    for key in ["sub.legacy", "sub.command"] {
+        let left = run_libra_command(&["config", "--get-all", key], repo.path());
+        assert_cli_success(&left, "remaining");
+        assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "two");
+    }
+
+    for key in ["sub.legacy", "sub.command"] {
+        for value in ["a", "b"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", key, value], repo.path()),
+                "re-add",
+            );
+        }
+    }
+    let legacy_all = run_libra_command(&["config", "--unset-all", "sub.legacy"], repo.path());
+    let sub_all = run_libra_command(&["config", "unset", "--all", "sub.command"], repo.path());
+    assert_eq!(
+        legacy_all.status.code(),
+        sub_all.status.code(),
+        "unset-all exit"
+    );
+    for key in ["sub.legacy", "sub.command"] {
+        let gone = run_libra_command(&["config", "--get-all", key], repo.path());
+        assert_eq!(gone.status.code(), Some(1), "all values removed");
+    }
+
+    let legacy_missing = run_libra_command(&["config", "--unset", "missing.legacy"], repo.path());
+    let sub_missing = run_libra_command(&["config", "unset", "missing.command"], repo.path());
+    assert_eq!(
+        legacy_missing.status.code(),
+        sub_missing.status.code(),
+        "missing key exit"
+    );
+}
