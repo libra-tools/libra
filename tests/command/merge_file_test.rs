@@ -463,3 +463,36 @@ fn merge_file_labels_and_conflict_preferences() {
         "--marker-size=10 must widen the markers: {text}"
     );
 }
+
+#[test]
+fn merge_file_conflict_is_silent_on_stderr() {
+    let outside = tempdir().unwrap();
+    write_inputs(
+        outside.path(),
+        "top\nours\nbottom\n",
+        "top\nbase\nbottom\n",
+        "top\ntheirs\nbottom\n",
+    );
+
+    let stdout_mode = merge_file(outside.path(), &["-p"]);
+    assert_eq!(stdout_mode.status.code(), Some(1));
+    assert!(stdout_str(&stdout_mode).contains("<<<<<<< ours"));
+    assert_eq!(
+        String::from_utf8_lossy(&stdout_mode.stderr),
+        "",
+        "Git does not warn on --stdout conflicts"
+    );
+
+    let in_place = merge_file(outside.path(), &[]);
+    assert_eq!(in_place.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&in_place.stderr),
+        "",
+        "Git does not warn on in-place conflicts"
+    );
+    assert!(
+        fs::read_to_string(outside.path().join("ours.txt"))
+            .unwrap()
+            .contains("<<<<<<< ours")
+    );
+}

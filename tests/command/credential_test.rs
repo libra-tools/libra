@@ -291,3 +291,86 @@ fn credential_outside_repository_roundtrip() {
         "erased credential should no longer fill"
     );
 }
+
+#[test]
+fn credential_helper_frame_matches_git_helper_test() {
+    let repo = init_repo();
+    let store = run_libra_command_with_stdin(&["credential", "store"], repo.path(), STORE_INPUT);
+    assert!(store.status.success(), "store: {}", stderr(&store));
+    let get = run_libra_command_with_stdin(&["credential", "get"], repo.path(), FILL_INPUT);
+    assert!(get.status.success(), "get: {}", stderr(&get));
+    assert_eq!(
+        stdout(&get),
+        "username=alice\npassword=s3cr3t-token\n",
+        "helper frame must match Git's credential helper_test"
+    );
+}
+
+#[test]
+fn credential_repo_then_user_store_priority() {
+    let repo = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let shared_home = tempdir().unwrap();
+    let home = shared_home.path().join("home");
+    let xdg = shared_home.path().join("xdg");
+    let global_db = shared_home.path().join("global.db");
+    let system_db = shared_home.path().join("system.db");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+    let env = [
+        ("HOME", home.to_str().unwrap()),
+        ("USERPROFILE", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", global_db.to_str().unwrap()),
+        ("LIBRA_CONFIG_SYSTEM_DB", system_db.to_str().unwrap()),
+    ];
+    let init = run_libra_command_with_stdin_and_env(&["init"], repo.path(), "", &env);
+    assert!(init.status.success(), "init: {}", stderr(&init));
+
+    let store_user = run_libra_command_with_stdin_and_env(
+        &["credential", "store"],
+        outside.path(),
+        "protocol=https\nhost=example.com\nusername=user-level\npassword=user-pass\n\n",
+        &env,
+    );
+    assert!(
+        store_user.status.success(),
+        "user store: {}",
+        stderr(&store_user)
+    );
+    // A repository miss falls back to the user-level store before the
+    // repository store is populated.
+    let before =
+        run_libra_command_with_stdin_and_env(&["credential", "get"], repo.path(), FILL_INPUT, &env);
+    assert!(
+        before.status.success(),
+        "pre-store fill: {}",
+        stderr(&before)
+    );
+    assert_eq!(
+        stdout(&before),
+        "username=user-level\npassword=user-pass\n",
+        "repository miss falls back to the user-level store"
+    );
+
+    let store_repo = run_libra_command_with_stdin_and_env(
+        &["credential", "store"],
+        repo.path(),
+        "protocol=https\nhost=example.com\nusername=repo-level\npassword=repo-pass\n\n",
+        &env,
+    );
+    assert!(
+        store_repo.status.success(),
+        "repo store: {}",
+        stderr(&store_repo)
+    );
+
+    let fill =
+        run_libra_command_with_stdin_and_env(&["credential", "get"], repo.path(), FILL_INPUT, &env);
+    assert!(fill.status.success(), "repo fill: {}", stderr(&fill));
+    assert_eq!(
+        stdout(&fill),
+        "username=repo-level\npassword=repo-pass\n",
+        "repository store wins"
+    );
+}

@@ -5863,7 +5863,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现对称反向迁移 Phase 1 的严格全局锁序（`migration.lock` → `maintenance.lock` → `capture-spool-consumer.lock` → `writer.lock` → 原地未动 `capture-queue/append.lock` → 原地未动 `capture-spool/capacity.lock` → `(git_wtx, cap_wtx)`）与外部红库写者（`git.redb`/`capture.redb`）静默排斥门（`src/storage/migrate.rs`），将错误码返回与源红库逐字节快照零改动拆为 5 条 1:1 独立单谓词断言。
 
@@ -5880,16 +5880,16 @@
 | 反向迁移必须在明确全局锁序下排斥活跃 `git.redb`/`capture.redb` 写者且保持源红库逐字节不变 | `ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] **外部 `git.redb` 写者返回 `LBR-IO-001`：** 外部红库写者持有 `git.redb` 写事务时，反向静默门 fail-closed 返回 `LBR-IO-001`。
-- [ ] **外部 `git.redb` 写者拒收源库零改动：** 上述 AC1 拒收前后，源 `git.redb`/`capture.redb` 逐字节快照完全相等。
-- [ ] **外部 `capture.redb` 写者返回 `LBR-IO-001`：** 外部红库写者持有 `capture.redb` 写事务时，反向静默门 fail-closed 返回 `LBR-IO-001`。
-- [ ] **外部 `capture.redb` 写者拒收源库零改动：** 上述 AC3 拒收前后，源 `git.redb`/`capture.redb` 逐字节快照完全相等。
-- [ ] **严格全局锁序契约：** 反向迁移严格按明确锁序 `migration.lock → maintenance.lock → capture-spool-consumer.lock → writer.lock → capture-queue/append.lock → capture-spool/capacity.lock → (git_wtx, cap_wtx)` 获取锁。
+- [x] **外部 `git.redb` 写者返回 `LBR-IO-001`：** 外部红库写者持有 `git.redb` 写事务时，反向静默门 fail-closed 返回 `LBR-IO-001`。
+- [x] **外部 `git.redb` 写者拒收源库零改动：** 上述 AC1 拒收前后，源 `git.redb`/`capture.redb` 逐字节快照完全相等。
+- [x] **外部 `capture.redb` 写者返回 `LBR-IO-001`：** 外部红库写者持有 `capture.redb` 写事务时，反向静默门 fail-closed 返回 `LBR-IO-001`。
+- [x] **外部 `capture.redb` 写者拒收源库零改动：** 上述 AC3 拒收前后，源 `git.redb`/`capture.redb` 逐字节快照完全相等。
+- [x] **严格全局锁序契约：** 反向迁移严格按明确锁序 `migration.lock → maintenance.lock → capture-spool-consumer.lock → writer.lock → capture-queue/append.lock → capture-spool/capacity.lock → (git_wtx, cap_wtx)` 获取锁。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_quiescence_rejects_redb_writers_and_enforces_lock_order)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_quiescence_rejects_redb_writers_and_enforces_lock_order)'`（new，覆盖 AC1–AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_quiescence_rejects_redb_writers_and_enforces_lock_order)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_quiescence_rejects_redb_writers_and_enforces_lock_order)'`（new，覆盖 AC1–AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -5927,7 +5927,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/` 内扩展反向迁移 Phase 1 静默门（`src/storage/migrate.rs`），排斥外部队列生产者占用原地 `capture-queue/append.lock` 与在途 `capture-spool/tmp/` 发布者，将两类竞争场景的错误码返回与源红库、`capture-queue/`、`capture-spool/` 全部三域逐字节快照零改动逐域拆分为 8 条 1:1 独立单谓词断言。
 
@@ -5942,19 +5942,19 @@
 | 反向迁移必须排斥活跃队列生产者与在途 `spool.rs:119-145` 发布者且拒收时保持源红库、队列与 spool 逐字节不变 | `src/internal/ai/capture/spool.rs:111-157`；`ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] **外部占用 `capture-queue/append.lock` 返回 `LBR-IO-001`：** 外部队列生产者占有原地 `capture-queue/append.lock` 时，反向静默门 fail-closed 返回 `LBR-IO-001`。
-- [ ] **外部占用 `append.lock` 拒收源红库零改动：** 上述 AC1 拒收前后，源红库（`git.redb`/`capture.redb`）逐字节快照完全相等。
-- [ ] **外部占用 `append.lock` 拒收 `capture-queue/` 零改动：** 上述 AC1 拒收前后，`capture-queue/` 全文件逐字节快照完全相等。
-- [ ] **外部占用 `append.lock` 拒收 `capture-spool/` 零改动：** 上述 AC1 拒收前后，`capture-spool/` 全文件逐字节快照完全相等。
-- [ ] **在途 `capture-spool/tmp/` 返回 `LBR-IO-001`：** `capture-spool/tmp/` 存在未过期在途临时文件时，反向静默门 fail-closed 返回 `LBR-IO-001`。
-- [ ] **在途 `capture-spool/tmp/` 拒收源红库零改动：** 上述 AC5 拒收前后，源红库（`git.redb`/`capture.redb`）逐字节快照完全相等。
-- [ ] **在途 `capture-spool/tmp/` 拒收 `capture-spool/` 零改动：** 上述 AC5 拒收前后，`capture-spool/` 全文件逐字节快照完全相等。
-- [ ] **在途 `capture-spool/tmp/` 拒收 `capture-queue/` 零改动：** 上述 AC5 拒收前后，`capture-queue/` 全文件逐字节快照完全相等。
+- [x] **外部占用 `capture-queue/append.lock` 返回 `LBR-IO-001`：** 外部队列生产者占有原地 `capture-queue/append.lock` 时，反向静默门 fail-closed 返回 `LBR-IO-001`。
+- [x] **外部占用 `append.lock` 拒收源红库零改动：** 上述 AC1 拒收前后，源红库（`git.redb`/`capture.redb`）逐字节快照完全相等。
+- [x] **外部占用 `append.lock` 拒收 `capture-queue/` 零改动：** 上述 AC1 拒收前后，`capture-queue/` 全文件逐字节快照完全相等。
+- [x] **外部占用 `append.lock` 拒收 `capture-spool/` 零改动：** 上述 AC1 拒收前后，`capture-spool/` 全文件逐字节快照完全相等。
+- [x] **在途 `capture-spool/tmp/` 返回 `LBR-IO-001`：** `capture-spool/tmp/` 存在未过期在途临时文件时，反向静默门 fail-closed 返回 `LBR-IO-001`。
+- [x] **在途 `capture-spool/tmp/` 拒收源红库零改动：** 上述 AC5 拒收前后，源红库（`git.redb`/`capture.redb`）逐字节快照完全相等。
+- [x] **在途 `capture-spool/tmp/` 拒收 `capture-spool/` 零改动：** 上述 AC5 拒收前后，`capture-spool/` 全文件逐字节快照完全相等。
+- [x] **在途 `capture-spool/tmp/` 拒收 `capture-queue/` 零改动：** 上述 AC5 拒收前后，`capture-queue/` 全文件逐字节快照完全相等。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_rejects_queue_producer_and_inflight_spool_tmp)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_rejects_queue_producer_and_inflight_spool_tmp)'`（new，覆盖 AC1–AC8）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_rejects_queue_producer_and_inflight_spool_tmp)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_rejects_queue_producer_and_inflight_spool_tmp)'`（new，覆盖 AC1–AC8）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -5992,7 +5992,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内于 `migrate.rs` 落实并实证反向迁移对 `capture-spool-consumer.lock`（`src/internal/ai/capture/drain.rs:87` `CONSUMER_LOCK`）的全程持有与并发 `drain_storage` 互斥，以及 `capture-spool/quarantine/` 非空时的无条件 fail-closed 零删损保护。
 
@@ -6006,17 +6006,17 @@
 | 既有 spool 消费者 `drain.rs:87-139` 仅通过 `capture-spool-consumer.lock`（`CONSUMER_LOCK`）互斥并将不可用事件自 `ready/` 移至 `quarantine/`；反向迁移必须持该消费者锁并对非空 `quarantine/` fail-closed | `src/internal/ai/capture/drain.rs:85-143`；`ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] **消费者锁占用返回 `LBR-IO-001`：** 既有 spool 消费者持有 `capture-spool-consumer.lock`（`drain.rs:87`）时，反向静默门 fail-closed 返回 `LBR-IO-001`。
-- [ ] **消费者锁拒收源红库零改动：** 上述 AC1 拒收前后，源红库（`git.redb`/`capture.redb`）逐字节快照完全相等。
-- [ ] **消费者锁拒收 `capture-spool/` 零改动：** 上述 AC1 拒收前后，`capture-spool/` 全文件逐字节快照完全相等。
-- [ ] **并发 `drain` 锁排除回归实测：** 反向迁移持有 `capture-spool-consumer.lock` 期间，并发调用 `drain_storage` 立即感知锁被占用并零移动退出（绝不把 `ready/` 文件移入 `quarantine/`）。
-- [ ] **`quarantine/` 非空 fail-closed 拒收：** `capture-spool/quarantine/` 存在任意隔离事件文件时，反向 Phase 1 立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] **`quarantine/` 文件 100% 完好留存：** 上述 fail-closed 返回后，`capture-spool/quarantine/` 内全部隔离文件逐字节完好留存（绝不静默清空）。
+- [x] **消费者锁占用返回 `LBR-IO-001`：** 既有 spool 消费者持有 `capture-spool-consumer.lock`（`drain.rs:87`）时，反向静默门 fail-closed 返回 `LBR-IO-001`。
+- [x] **消费者锁拒收源红库零改动：** 上述 AC1 拒收前后，源红库（`git.redb`/`capture.redb`）逐字节快照完全相等。
+- [x] **消费者锁拒收 `capture-spool/` 零改动：** 上述 AC1 拒收前后，`capture-spool/` 全文件逐字节快照完全相等。
+- [x] **并发 `drain` 锁排除回归实测：** 反向迁移持有 `capture-spool-consumer.lock` 期间，并发调用 `drain_storage` 立即感知锁被占用并零移动退出（绝不把 `ready/` 文件移入 `quarantine/`）。
+- [x] **`quarantine/` 非空 fail-closed 拒收：** `capture-spool/quarantine/` 存在任意隔离事件文件时，反向 Phase 1 立即 fail-closed 返回 `LBR-IO-001`。
+- [x] **`quarantine/` 文件 100% 完好留存：** 上述 fail-closed 返回后，`capture-spool/quarantine/` 内全部隔离文件逐字节完好留存（绝不静默清空）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine)'`（new，覆盖 AC1–AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine)'`（new，覆盖 AC1–AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6054,7 +6054,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现对称反向迁移 Phase 1 流式导出引擎（`src/storage/migrate.rs`）：在 `RB-11` 已持全部静默锁与 `(git_wtx, cap_wtx)`（严格 `Git → Capture` 序，全程不提交也不嵌套重开写事务，彻底杜绝死锁）内单趟流式导出 61+25 源表至 `libra.db.tmp`/`capture.db.tmp`，直读未对账 `META_CROSS_STORE_INTENT`（`gen > cap_gen`）按升序幂等直灌并只读并入 `capture-queue/{priority,normal}/` 待消费帧，分别向 `capture.db.tmp` 与 `libra.db.tmp` 写入唯一非零 `PRAGMA application_id = target_migration_tag` 并满足单批/堆内存预算。
 
@@ -6069,18 +6069,18 @@
 | 反向导出须在持双 `WriteTransaction` 时零死锁直灌半提交意图并分别向两枚 `.tmp` 库写入 `PRAGMA application_id = target_migration_tag` | `ADR-RB-06`、`ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] 在已持 `(git_wtx, cap_wtx)` 内零嵌套写事务单趟导出全部 61+25 源表与切后新提交至 `libra.db.tmp`/`capture.db.tmp`。
-- [ ] 真实半提交意图反向导出：从 `git_wtx` 直读全部未对账 `META_CROSS_STORE_INTENT`（`gen > cap_gen`）按严格升序幂等直灌入 `capture.db.tmp`（零死锁）。
-- [ ] 只读直灌 `capture-queue/{priority,normal}/` 待消费帧至 `capture.db.tmp`（源队列文件零改动）。
-- [ ] `fsync` 前向 `capture.db.tmp` 写入唯一非零 `PRAGMA application_id = target_migration_tag`。
-- [ ] `fsync` 前向 `libra.db.tmp` 写入同一唯一非零 `PRAGMA application_id = target_migration_tag`。
-- [ ] 反向流式导出维持单批 ≤ 500 行且额外堆内存峰值 ≤ `64 MiB`。
+- [x] 在已持 `(git_wtx, cap_wtx)` 内零嵌套写事务单趟导出全部 61+25 源表与切后新提交至 `libra.db.tmp`/`capture.db.tmp`。
+- [x] 真实半提交意图反向导出：从 `git_wtx` 直读全部未对账 `META_CROSS_STORE_INTENT`（`gen > cap_gen`）按严格升序幂等直灌入 `capture.db.tmp`（零死锁）。
+- [x] 只读直灌 `capture-queue/{priority,normal}/` 待消费帧至 `capture.db.tmp`（源队列文件零改动）。
+- [x] `fsync` 前向 `capture.db.tmp` 写入唯一非零 `PRAGMA application_id = target_migration_tag`。
+- [x] `fsync` 前向 `libra.db.tmp` 写入同一唯一非零 `PRAGMA application_id = target_migration_tag`。
+- [x] 反向流式导出维持单批 ≤ 500 行且额外堆内存峰值 ≤ `64 MiB`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_replays_real_half_committed_intent_deadlock_free) | test(=storage::migrate::tests::reverse_phase1_stamps_application_id_and_ingests_queue_readonly)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_replays_real_half_committed_intent_deadlock_free)'`（new，覆盖 AC1、AC2、AC6）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_stamps_application_id_and_ingests_queue_readonly)'`（new，覆盖 AC3、AC4、AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_replays_real_half_committed_intent_deadlock_free) | test(=storage::migrate::tests::reverse_phase1_stamps_application_id_and_ingests_queue_readonly)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_replays_real_half_committed_intent_deadlock_free)'`（new，覆盖 AC1、AC2、AC6）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_stamps_application_id_and_ingests_queue_readonly)'`（new，覆盖 AC3、AC4、AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6118,7 +6118,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内完成对称反向迁移 Phase 1 备份与中止不变性（`src/storage/migrate.rs`）：对产出的 `libra.db.tmp`/`capture.db.tmp` 执行 `PRAGMA integrity_check == "ok"` 与 `fsync`，将冻结中的 `git.redb`/`capture.redb` 与 `capture-queue/{priority,normal,quarantine}/`（保留原目录与 `append.lock` 原地不动）拷贝至 `.libra/redb-backup/<gen>/` 完成 SHA-256 校验与 `fsync`，并实测 Phase 1 中止后源红库与 `capture-queue/` 各自逐字节未变。
 
@@ -6132,16 +6132,16 @@
 | 反向 Phase 1 须在提交任何围栏前产出经 SHA-256 校验的不可变 `.libra/redb-backup/<gen>/` 并在中止时确保两类源均逐字节不变 | `ADR-RB-07` #2 Phase 1 |
 
 **Acceptance criteria:**
-- [ ] `libra.db.tmp` 与 `capture.db.tmp` 导出后均通过 `PRAGMA integrity_check == "ok"` 并完成 `fsync`。
-- [ ] 冻结中的 `git.redb`/`capture.redb` 与 `capture-queue/{priority,normal,quarantine}/`（保留原目录与 `append.lock` 原地不动）备份至 `.libra/redb-backup/<gen>/` 并完成 SHA-256 校验与 `fsync`。
-- [ ] Phase 1 校验中止并丢弃 `.tmp` 与未提交写事务后，源 `git.redb` 与 `capture.redb` 逐字节未变。
-- [ ] Phase 1 校验中止并丢弃 `.tmp` 与未提交写事务后，源 `capture-queue/` 逐字节未变。
+- [x] `libra.db.tmp` 与 `capture.db.tmp` 导出后均通过 `PRAGMA integrity_check == "ok"` 并完成 `fsync`。
+- [x] 冻结中的 `git.redb`/`capture.redb` 与 `capture-queue/{priority,normal,quarantine}/`（保留原目录与 `append.lock` 原地不动）备份至 `.libra/redb-backup/<gen>/` 并完成 SHA-256 校验与 `fsync`。
+- [x] Phase 1 校验中止并丢弃 `.tmp` 与未提交写事务后，源 `git.redb` 与 `capture.redb` 逐字节未变。
+- [x] Phase 1 校验中止并丢弃 `.tmp` 与未提交写事务后，源 `capture-queue/` 逐字节未变。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_tmp_integrity_and_verified_redb_queue_backup) | test(=storage::migrate::tests::reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_tmp_integrity_and_verified_redb_queue_backup)'`（new，覆盖 AC1、AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical)'`（new，覆盖 AC3、AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_tmp_integrity_and_verified_redb_queue_backup) | test(=storage::migrate::tests::reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_tmp_integrity_and_verified_redb_queue_backup)'`（new，覆盖 AC1、AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical)'`（new，覆盖 AC3、AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6179,7 +6179,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现对称反向迁移 Phase 2 的 Step 2.1–2.2（`src/storage/migrate.rs`）：持全部静默锁在目标 `.tmp` 与 `redb-backup` 均 `fsync` 后发布 `storage-format.json(backend="sqlite", finalized=false, spool_unfenced=false, targets_staged_for_rename=false, target_migration_tag, phase2_progress, source_digests)`，向旧 `git.redb` 与 `capture.redb` 提交 `META_SCHEMA min_reader_version = u32::MAX` 围栏物理阻断预打开红库句柄，并逐库持久化 `fenced_ready_to_unlink -> unlink + fsync_dir -> unlinked`。
 
@@ -6195,16 +6195,16 @@
 | 反向 Phase 2 须先通过 `META_SCHEMA u32::MAX` 阻断预打开红库句柄并逐库持久化 `fenced_ready_to_unlink -> unlinked` | `ADR-RB-03`；`ADR-RB-07` #2 Step 2.1–2.2 |
 
 **Acceptance criteria:**
-- [ ] Phase 2 仅在目标 `.tmp` 与 `redb-backup` 均 `fsync` 后发布 `storage-format.json(backend="sqlite", finalized=false, spool_unfenced=false, targets_staged_for_rename=false, target_migration_tag, phase2_progress, source_digests)`。
-- [ ] 向 `git.redb` 与 `capture.redb` 提交 `META_SCHEMA min_reader_version = u32::MAX` 围栏后，迁移前已打开的 `Redb*Store` 句柄下一读写立即报 `RepositoryMigrated` fail-closed。
-- [ ] 对 `git.redb` 按顺序持久推进 `fenced_ready_to_unlink` → `unlink` + `fsync_dir` → `unlinked`。
-- [ ] 对 `capture.redb` 按顺序持久推进 `fenced_ready_to_unlink` → `unlink` + `fsync_dir` → `unlinked`。
+- [x] Phase 2 仅在目标 `.tmp` 与 `redb-backup` 均 `fsync` 后发布 `storage-format.json(backend="sqlite", finalized=false, spool_unfenced=false, targets_staged_for_rename=false, target_migration_tag, phase2_progress, source_digests)`。
+- [x] 向 `git.redb` 与 `capture.redb` 提交 `META_SCHEMA min_reader_version = u32::MAX` 围栏后，迁移前已打开的 `Redb*Store` 句柄下一读写立即报 `RepositoryMigrated` fail-closed。
+- [x] 对 `git.redb` 按顺序持久推进 `fenced_ready_to_unlink` → `unlink` + `fsync_dir` → `unlinked`。
+- [x] 对 `capture.redb` 按顺序持久推进 `fenced_ready_to_unlink` → `unlink` + `fsync_dir` → `unlinked`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_fences_open_redb_handles_and_persists_post_unlink)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_fences_open_redb_handles_and_persists_post_unlink)'`（new，覆盖 AC1–AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'`（确认单特性 SQLite 零受扰）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_fences_open_redb_handles_and_persists_post_unlink)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_fences_open_redb_handles_and_persists_post_unlink)'`（new，覆盖 AC1–AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'`（确认单特性 SQLite 零受扰）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6242,7 +6242,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现对称反向迁移 Phase 2 Step 2.3 的双墓碑确立（`src/storage/migrate.rs`）：在原地未动的 `capture-queue/append.lock` 下清除已备份段并将 `capture-queue/{priority,normal,quarantine}` 原地替换为 `0400` 普通文件墓碑 + `fsync_dir`，同时在原地未动的 `capture-spool-consumer.lock` + `capture-spool/capacity.lock` 下主动核验并确立 `capture-spool/{tmp,ready,quarantine}` 全部 3 个 `0400` 普通文件墓碑 + `fsync_dir`（覆盖旧迁移仓与全新 Redb 仓），跨 `finalized = false` 同时阻断红库 Hook 与旧 SQLite Hook。
 
@@ -6256,16 +6256,16 @@
 | 反向 Phase 2 须在原地锁下装齐 `capture-queue` 与 `capture-spool` 全部 `0400` 墓碑跨越 `finalized = false`，彻底封锁红库 Hook 与旧 SQLite Hook | `src/internal/ai/capture/spool.rs:330-355`；`ADR-RB-07` #2 Step 2.3 |
 
 **Acceptance criteria:**
-- [ ] 在原地未动的 `capture-queue/append.lock` 下清除已备份段并将 `capture-queue/{priority,normal,quarantine}` 原地替换为 `0400` 普通文件墓碑 + `fsync_dir`。
-- [ ] `capture-queue` `0400` 墓碑就位后，并发红库 Hook 入队立即因 `ENOTDIR` fail-closed。
-- [ ] 在原地未动的 `capture-spool-consumer.lock` + `capture-spool/capacity.lock` 下对旧迁移仓核验并保持 `capture-spool/{tmp,ready,quarantine}` 全部 3 个 `0400` 普通文件墓碑 + `fsync_dir`。
-- [ ] 在原地未动的 `capture-spool-consumer.lock` + `capture-spool/capacity.lock` 下对全新 Redb 仓主动确立 `capture-spool/{tmp,ready,quarantine}` 全部 3 个 `0400` 普通文件墓碑 + `fsync_dir`。
-- [ ] 上述 `capture-spool` `0400` 墓碑跨越 `finalized = false` 期间，并发旧 SQLite Hook 均在 `ensure_spool` 立即 fail-closed。
+- [x] 在原地未动的 `capture-queue/append.lock` 下清除已备份段并将 `capture-queue/{priority,normal,quarantine}` 原地替换为 `0400` 普通文件墓碑 + `fsync_dir`。
+- [x] `capture-queue` `0400` 墓碑就位后，并发红库 Hook 入队立即因 `ENOTDIR` fail-closed。
+- [x] 在原地未动的 `capture-spool-consumer.lock` + `capture-spool/capacity.lock` 下对旧迁移仓核验并保持 `capture-spool/{tmp,ready,quarantine}` 全部 3 个 `0400` 普通文件墓碑 + `fsync_dir`。
+- [x] 在原地未动的 `capture-spool-consumer.lock` + `capture-spool/capacity.lock` 下对全新 Redb 仓主动确立 `capture-spool/{tmp,ready,quarantine}` 全部 3 个 `0400` 普通文件墓碑 + `fsync_dir`。
+- [x] 上述 `capture-spool` `0400` 墓碑跨越 `finalized = false` 期间，并发旧 SQLite Hook 均在 `ensure_spool` 立即 fail-closed。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_inplace_queue_and_active_spool_tombstones_block_hooks)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_inplace_queue_and_active_spool_tombstones_block_hooks)'`（new，覆盖 AC1–AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_inplace_queue_and_active_spool_tombstones_block_hooks)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_inplace_queue_and_active_spool_tombstones_block_hooks)'`（new，覆盖 AC1–AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6303,7 +6303,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现对称反向迁移 Phase 2 Step 2.4 目标非覆写发布核心（`src/storage/migrate.rs`）：持久化 `targets_staged_for_rename = true` + `fsync(.libra/)` 后，统一采用**绝不覆写目标的 `std::fs::hard_link`** 先发布 `.libra/private/capture.db`、再发布 `.libra/libra.db`（严禁正常路径无条件覆盖型 `rename`，底层不支持硬链返回 `Unsupported`/`EXDEV` 立即 fail-closed `LBR-IO-001`），且 `libra.db` 遇异源 `application_id` 立即 fail-closed `LBR-IO-001` 绝不覆写。
 
@@ -6319,17 +6319,17 @@
 | 正常 Step 2.4 必须统一先用非覆写 `std::fs::hard_link` 先发 `capture.db` 再发 `libra.db`，不支持硬链与异源库均 fail-closed | `src/internal/ai/capture/store.rs:65-86`；`ADR-RB-07` #2 Step 2.4 |
 
 **Acceptance criteria:**
-- [ ] 进入 Step 2.4 前先原子持久化 `targets_staged_for_rename = true` 并执行 `fsync(.libra/)`。
-- [ ] 正常 Step 2.4 经非覆写 `std::fs::hard_link("capture.db.tmp", ".libra/private/capture.db")` + `unlink("capture.db.tmp")` + `fsync_dir` 率先发布 `capture.db`。
-- [ ] 若底层文件系统对 `hard_link` 返回 `Unsupported`/`ENOSYS`/`EXDEV`，立即 fail-closed 返回 `LBR-IO-001`（绝不降级为覆盖型 `rename`）。
-- [ ] 正常 Step 2.4 随后经非覆写 `std::fs::hard_link("libra.db.tmp", ".libra/libra.db")` + `unlink("libra.db.tmp")` + `fsync_dir` 发布 `libra.db`。
-- [ ] 若 `libra.db` `hard_link` 命中 `AlreadyExists` 且现存库 `PRAGMA application_id != target_migration_tag`，立即 fail-closed 返回 `LBR-IO-001`（绝不覆写异源库）。
+- [x] 进入 Step 2.4 前先原子持久化 `targets_staged_for_rename = true` 并执行 `fsync(.libra/)`。
+- [x] 正常 Step 2.4 经非覆写 `std::fs::hard_link("capture.db.tmp", ".libra/private/capture.db")` + `unlink("capture.db.tmp")` + `fsync_dir` 率先发布 `capture.db`。
+- [x] 若底层文件系统对 `hard_link` 返回 `Unsupported`/`ENOSYS`/`EXDEV`，立即 fail-closed 返回 `LBR-IO-001`（绝不降级为覆盖型 `rename`）。
+- [x] 正常 Step 2.4 随后经非覆写 `std::fs::hard_link("libra.db.tmp", ".libra/libra.db")` + `unlink("libra.db.tmp")` + `fsync_dir` 发布 `libra.db`。
+- [x] 若 `libra.db` `hard_link` 命中 `AlreadyExists` 且现存库 `PRAGMA application_id != target_migration_tag`，立即 fail-closed 返回 `LBR-IO-001`（绝不覆写异源库）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step24_hardlink_capture_then_libra_and_unsupported_reject) | test(=storage::migrate::tests::reverse_phase2_step24_libra_db_foreign_tag_reject)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step24_hardlink_capture_then_libra_and_unsupported_reject)'`（new，覆盖 AC1–AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step24_libra_db_foreign_tag_reject)'`（new，覆盖 AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step24_hardlink_capture_then_libra_and_unsupported_reject) | test(=storage::migrate::tests::reverse_phase2_step24_libra_db_foreign_tag_reject)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step24_hardlink_capture_then_libra_and_unsupported_reject)'`（new，覆盖 AC1–AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step24_libra_db_foreign_tag_reject)'`（new，覆盖 AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6367,7 +6367,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内于 `src/storage/migrate.rs` 实现并实证正常 Step 2.4 无崩溃竞态闭环：不注入崩溃，在 staging 开始后、正常 Step 2.4 执行前由外部旧进程调用 `capture::store::open` 建出 `application_id == 0` 竞争 `capture.db` 并提交事件；正常 Step 2.4 命中 `hard_link` `AlreadyExists` 后立即转入单连接 `c_mig` 排他并轨（遵守 `agent_import_tombstone`）+ `__libra_migrated_fence__` 围栏竞争库 + 原子替换，确保迁移捕获与竞争旧写入双 100% 保留。
 
@@ -6381,16 +6381,16 @@
 | 即使无崩溃，外部旧进程亦可于正常 Step 2.4 前经 `capture::store::open` 建出 `application_id == 0` 竞争 `capture.db`；正常路径须与恢复路径共享同一无损并轨围栏协议 | `src/internal/ai/capture/store.rs:65-86`；`ADR-RB-07` #2 Step 2.4 |
 
 **Acceptance criteria:**
-- [ ] 无崩溃下正常 Step 2.4 `hard_link("capture.db.tmp", ".libra/private/capture.db")` 命中 `AlreadyExists` 且现存库 `application_id == 0` 时，转入单连接 `c_mig` 排他并轨将其合法事件合入 `capture.db.tmp`。
-- [ ] 上述并轨严格遵守 `agent_import_tombstone` 拒重导语义，绝不复活已删记录。
-- [ ] 并轨完成后在同一单连接 `c_mig` 上对竞争 `capture.db` 提交 `__libra_migrated_fence__` 回滚日志原子围栏。
-- [ ] 围栏竞争库后原子 `rename(capture.db.tmp, capture.db)` + `fsync_dir` 完成替换。
-- [ ] 替换完成后原迁移捕获数据与无崩溃竞争旧写入双 100% 完整可读。
+- [x] 无崩溃下正常 Step 2.4 `hard_link("capture.db.tmp", ".libra/private/capture.db")` 命中 `AlreadyExists` 且现存库 `application_id == 0` 时，转入单连接 `c_mig` 排他并轨将其合法事件合入 `capture.db.tmp`。
+- [x] 上述并轨严格遵守 `agent_import_tombstone` 拒重导语义，绝不复活已删记录。
+- [x] 并轨完成后在同一单连接 `c_mig` 上对竞争 `capture.db` 提交 `__libra_migrated_fence__` 回滚日志原子围栏。
+- [x] 围栏竞争库后原子 `rename(capture.db.tmp, capture.db)` + `fsync_dir` 完成替换。
+- [x] 替换完成后原迁移捕获数据与无崩溃竞争旧写入双 100% 完整可读。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_normal_step24_hardlink_reconciles_no_crash_competing_capture_open)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_normal_step24_hardlink_reconciles_no_crash_competing_capture_open)'`（new，覆盖 AC1–AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_normal_step24_hardlink_reconciles_no_crash_competing_capture_open)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_normal_step24_hardlink_reconciles_no_crash_competing_capture_open)'`（new，覆盖 AC1–AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6428,7 +6428,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现对称反向迁移 Phase 2 Step 2.5–2.6 收口与配置隔离验收（`src/storage/migrate.rs`）：在 `capture.db` 与 `libra.db` 均就位且仍持 `migration.lock`、`capture-spool-consumer.lock` 与 `capacity.lock` 下原子发布 `storage-format.json(backend="sqlite", finalized=true, spool_unfenced=false)`，随后于 Step 2.6 仅 `unlink` `capture-spool/{tmp,ready,quarantine}` 的 `is_file()` 墓碑 + `fsync_dir` 并持久化 `spool_unfenced = true` 再释锁，验证旧 SQLite Hook 恢复正常入队，并分别断言 `GlobalConfig` 与 `SystemConfig` 夹具零改动。
 
@@ -6442,18 +6442,18 @@
 | Spool 墓碑只能在 `finalized = true` 落盘之后解封并持久化 `spool_unfenced = true`，且仓库反向迁移须独立验证 `GlobalConfig` 与 `SystemConfig` 两份可变配置库零改动（`GC-13`） | `ADR-RB-07` #2 Step 2.5–2.6；`GC-13` |
 
 **Acceptance criteria:**
-- [ ] 两库就位后在仍持 `migration.lock`、`capture-spool-consumer.lock` 与 `capacity.lock` 下原子发布 `storage-format.json(backend="sqlite", finalized=true, spool_unfenced=false)` + `fsync_dir(.libra)`。
-- [ ] **终态后解封 Spool（Step 2.6）：** 仅在 `finalized = true` 落盘后、释锁前，仅 `unlink` `capture-spool/{tmp,ready,quarantine}` 的 `symlink_metadata().is_file()` 普通文件墓碑 + `fsync_dir`，并持久化 `spool_unfenced = true`。
-- [ ] Step 2.6 释锁后，旧 SQLite Hook 恢复正常向 `capture-spool/ready/` 入队。
-- [ ] `GC-13` 全局隔离：反向仓库迁移绝不打开、创建或修改隔离夹具 `LIBRA_CONFIG_GLOBAL_DB`。
-- [ ] `GC-13` 系统隔离：反向仓库迁移绝不打开、创建或修改隔离夹具 `LIBRA_CONFIG_SYSTEM_DB`。
+- [x] 两库就位后在仍持 `migration.lock`、`capture-spool-consumer.lock` 与 `capacity.lock` 下原子发布 `storage-format.json(backend="sqlite", finalized=true, spool_unfenced=false)` + `fsync_dir(.libra)`。
+- [x] **终态后解封 Spool（Step 2.6）：** 仅在 `finalized = true` 落盘后、释锁前，仅 `unlink` `capture-spool/{tmp,ready,quarantine}` 的 `symlink_metadata().is_file()` 普通文件墓碑 + `fsync_dir`，并持久化 `spool_unfenced = true`。
+- [x] Step 2.6 释锁后，旧 SQLite Hook 恢复正常向 `capture-spool/ready/` 入队。
+- [x] `GC-13` 全局隔离：反向仓库迁移绝不打开、创建或修改隔离夹具 `LIBRA_CONFIG_GLOBAL_DB`。
+- [x] `GC-13` 系统隔离：反向仓库迁移绝不打开、创建或修改隔离夹具 `LIBRA_CONFIG_SYSTEM_DB`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step25_26_finalize_unfence_and_legacy_hook_resume) | test(=storage::migrate::tests::reverse_phase2_gc13_global_and_system_config_isolation)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step25_26_finalize_unfence_and_legacy_hook_resume)'`（new，覆盖 AC1、AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_gc13_global_and_system_config_isolation)'`（new，覆盖 AC4、AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'`（确认单特性 SQLite 零受扰）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step25_26_finalize_unfence_and_legacy_hook_resume) | test(=storage::migrate::tests::reverse_phase2_gc13_global_and_system_config_isolation)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step25_26_finalize_unfence_and_legacy_hook_resume)'`（new，覆盖 AC1、AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_gc13_global_and_system_config_isolation)'`（new，覆盖 AC4、AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'`（确认单特性 SQLite 零受扰）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6491,7 +6491,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现反向迁移 Phase 2 的前半程红库源状态机恢复（`src/storage/migrate.rs`）：验证 `finalized == false` 下 `redb`/`sqlite` 双环境变量覆盖阻断、零外写摘要一致幂等续跑，以及 `git.redb` 围栏前崩溃且外部继续写入新提交时的 `git_redb_sha256` 漂移检测与无损重导。
 
@@ -6506,16 +6506,16 @@
 | 反向 `finalized == false` 必须阻断环境变量覆盖并在围栏前红库写入漂移时作废旧 `.tmp` 重导最新提交 | `ADR-RB-01` #3、`ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] 每个反向 `finalized == false` 崩溃中断点传入 `LIBRA_STORAGE_BACKEND=redb` 覆盖无条件 fail-closed 返回 `LBR-IO-001`。
-- [ ] 每个反向 `finalized == false` 崩溃中断点传入 `LIBRA_STORAGE_BACKEND=sqlite` 覆盖无条件 fail-closed 返回 `LBR-IO-001`。
-- [ ] 零外部写入时重跑反向迁移核对 `source_digests` 一致后幂等收敛至 `finalized = true`。
-- [ ] `finalized = false` 后、`git.redb` 围栏前崩溃且已打开红库进程向 `git.redb` 写入新提交：续跑检出 `git_redb_sha256` 漂移，作废过时 `.tmp` SQLite 重导最新数据再围栏发布，零数据丢失。
+- [x] 每个反向 `finalized == false` 崩溃中断点传入 `LIBRA_STORAGE_BACKEND=redb` 覆盖无条件 fail-closed 返回 `LBR-IO-001`。
+- [x] 每个反向 `finalized == false` 崩溃中断点传入 `LIBRA_STORAGE_BACKEND=sqlite` 覆盖无条件 fail-closed 返回 `LBR-IO-001`。
+- [x] 零外部写入时重跑反向迁移核对 `source_digests` 一致后幂等收敛至 `finalized = true`。
+- [x] `finalized = false` 后、`git.redb` 围栏前崩溃且已打开红库进程向 `git.redb` 写入新提交：续跑检出 `git_redb_sha256` 漂移，作废过时 `.tmp` SQLite 重导最新数据再围栏发布，零数据丢失。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_override_reject_and_idempotent_resume) | test(=storage::migrate::tests::reverse_phase2_crash_before_fence_git_redb_drift_reexports)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_override_reject_and_idempotent_resume)'`（new，覆盖 AC1–AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_before_fence_git_redb_drift_reexports)'`（new，覆盖 AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_override_reject_and_idempotent_resume) | test(=storage::migrate::tests::reverse_phase2_crash_before_fence_git_redb_drift_reexports)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_override_reject_and_idempotent_resume)'`（new，覆盖 AC1–AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_before_fence_git_redb_drift_reexports)'`（new，覆盖 AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6553,7 +6553,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内于 `migrate.rs` 实现反向迁移 Phase 2 双红库独立 post-unlink 崩溃续跑与 `pending` 意外缺席拦截：分别覆盖紧接 `unlink(git.redb)+fsync_dir` 后崩溃（校验 `git.redb` 备份 SHA-256 并合并活 `capture.redb` 新写重导）、紧接 `unlink(capture.redb)+fsync_dir` 后崩溃（校验双份 `redb-backup` 真实 SHA-256 收敛），以及 `git.redb`/`capture.redb` 各自处于 `pending` 态意外缺失时的 fail-closed 拒收。
 
@@ -6567,17 +6567,17 @@
 | `unlink(git.redb)` 与 `unlink(capture.redb)` 属于两个独立持久化状态，必须分别注入崩溃并结合 `redb-backup` SHA-256 认证与 `pending` 意外缺失拒收逐项实测 | `ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] **紧接 `unlink(git.redb) + fsync_dir` 后崩溃实测：** `git_redb` 已合法摘除而 `capture.redb` 仍存活且有外部新事件写入，续跑校验 `git.redb` 备份真实 SHA-256 并合并活 `capture.redb` 重导，零数据丢失。
-- [ ] **紧接 `unlink(capture.redb) + fsync_dir` 后崩溃实测：** `git.redb` 与 `capture.redb` 两源均已按 `phase2_progress ∈ {"fenced_ready_to_unlink", "unlinked"}` 合法摘除，续跑校验两份 `redb-backup` 真实 SHA-256 后幂等收敛至 `finalized = true`。
-- [ ] 当 `phase2_progress.git_redb == "pending"` 而 `git.redb` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] 当 `phase2_progress.cap_redb == "pending"` 而 `capture.redb` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] **紧接 `unlink(git.redb) + fsync_dir` 后崩溃实测：** `git_redb` 已合法摘除而 `capture.redb` 仍存活且有外部新事件写入，续跑校验 `git.redb` 备份真实 SHA-256 并合并活 `capture.redb` 重导，零数据丢失。
+- [x] **紧接 `unlink(capture.redb) + fsync_dir` 后崩溃实测：** `git.redb` 与 `capture.redb` 两源均已按 `phase2_progress ∈ {"fenced_ready_to_unlink", "unlinked"}` 合法摘除，续跑校验两份 `redb-backup` 真实 SHA-256 后幂等收敛至 `finalized = true`。
+- [x] 当 `phase2_progress.git_redb == "pending"` 而 `git.redb` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] 当 `phase2_progress.cap_redb == "pending"` 而 `capture.redb` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_after_git_redb_unlink_merges_live_capture) | test(=storage::migrate::tests::reverse_phase2_crash_immediately_after_capture_redb_unlink) | test(=storage::migrate::tests::reverse_phase2_unexpected_missing_pending_redb_fails_closed)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_after_git_redb_unlink_merges_live_capture)'`（new，覆盖 AC1）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_immediately_after_capture_redb_unlink)'`（new，覆盖 AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_unexpected_missing_pending_redb_fails_closed)'`（new，覆盖 AC3、AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_after_git_redb_unlink_merges_live_capture) | test(=storage::migrate::tests::reverse_phase2_crash_immediately_after_capture_redb_unlink) | test(=storage::migrate::tests::reverse_phase2_unexpected_missing_pending_redb_fails_closed)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_after_git_redb_unlink_merges_live_capture)'`（new，覆盖 AC1）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_crash_immediately_after_capture_redb_unlink)'`（new，覆盖 AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_unexpected_missing_pending_redb_fails_closed)'`（new，覆盖 AC3、AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6615,7 +6615,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现反向迁移 Phase 2 故障拒绝与队列间隙恢复（`src/storage/migrate.rs`）：分别实测已摘除源对应 `.libra/redb-backup/<gen>/` 缺失、SHA-256 失配时的 fail-closed `LBR-IO-001` 拦截、`capture-queue` 移除子目录与装 `0400` 墓碑间隙崩溃的备份∪活队列语义去重并集重导，以及 `targets_staged_for_rename = true` 下现存异源 `libra.db`（`PRAGMA application_id != target_migration_tag`）的 fail-closed 拒收。
 
@@ -6629,16 +6629,16 @@
 | 反向恢复须分别阻断备份缺失、备份篡改与异源 `libra.db` 覆写，并在队列墓碑间隙按备份∪活目录取并集实现零丢帧 | `ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] 已合法摘除源红库对应的 `.libra/redb-backup/<gen>/` 备份缺失时，反向续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] 已合法摘除源红库对应的 `.libra/redb-backup/<gen>/` 备份 SHA-256 失配时，反向续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] 移除 `capture-queue` 子目录与安装 `0400` 墓碑之间的间隙崩溃（并发红库 Hook 追加新帧）：续跑重获原地 `append.lock`，对**备份 `.libra/redb-backup/<gen>/capture-queue/` ∪ 活 `capture-queue/{priority,normal}/`** 按语义去重键取并集重导并装齐 3 个 `0400` 墓碑，新旧帧 100% 零丢失。
-- [ ] `targets_staged_for_rename = true` 时若现存 `libra.db` 的 `PRAGMA application_id != target_migration_tag`，续跑立即 fail-closed 返回 `LBR-IO-001`（绝不覆写）。
+- [x] 已合法摘除源红库对应的 `.libra/redb-backup/<gen>/` 备份缺失时，反向续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] 已合法摘除源红库对应的 `.libra/redb-backup/<gen>/` 备份 SHA-256 失配时，反向续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] 移除 `capture-queue` 子目录与安装 `0400` 墓碑之间的间隙崩溃（并发红库 Hook 追加新帧）：续跑重获原地 `append.lock`，对**备份 `.libra/redb-backup/<gen>/capture-queue/` ∪ 活 `capture-queue/{priority,normal}/`** 按语义去重键取并集重导并装齐 3 个 `0400` 墓碑，新旧帧 100% 零丢失。
+- [x] `targets_staged_for_rename = true` 时若现存 `libra.db` 的 `PRAGMA application_id != target_migration_tag`，续跑立即 fail-closed 返回 `LBR-IO-001`（绝不覆写）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_corrupt_or_missing_backup_and_queue_tombstone_gap_union) | test(=storage::migrate::tests::reverse_phase2_foreign_libra_db_tag_mismatch_fails_closed)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_corrupt_or_missing_backup_and_queue_tombstone_gap_union)'`（new，覆盖 AC1、AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_foreign_libra_db_tag_mismatch_fails_closed)'`（new，覆盖 AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_corrupt_or_missing_backup_and_queue_tombstone_gap_union) | test(=storage::migrate::tests::reverse_phase2_foreign_libra_db_tag_mismatch_fails_closed)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_corrupt_or_missing_backup_and_queue_tombstone_gap_union)'`（new，覆盖 AC1、AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_foreign_libra_db_tag_mismatch_fails_closed)'`（new，覆盖 AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6676,7 +6676,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现反向迁移 Phase 2 `targets_staged_for_rename = true` 中同迁移 tag（`PRAGMA application_id == target_migration_tag`）已发布目标的非覆写 `hard_link` 崩溃续跑（`src/storage/migrate.rs`）：分别覆写验证 `AlreadyExists` 同 inode 残留清理 `.tmp`、`NotFound` 单库已发补齐 `libra.db` 与双库已发零覆写推进 `finalized = true`，100% 保留崩溃后旧 SQLite 进程新写入。
 
@@ -6691,15 +6691,15 @@
 | 恢复路径复用 Step 2.4 非覆写 `hard_link`（含 `AlreadyExists`/`NotFound`）+ `PRAGMA application_id` 协议，绝不覆写已对旧进程可见的同 tag 目标库 | `ADR-RB-07` #2 Step 2.4 |
 
 **Acceptance criteria:**
-- [ ] `targets_staged_for_rename = true` 且 `capture.db` 已 `hard_link` 发布、`unlink("capture.db.tmp")` 前崩溃（`AlreadyExists` + `application_id == target_migration_tag`）：续跑零覆写清理重复硬链 `capture.db.tmp` 并经 `hard_link` 补齐 `libra.db` 至 `finalized = true`。
-- [ ] `targets_staged_for_rename = true` 且 `capture.db.tmp` 已 `unlink`（`NotFound` + `capture.db` `application_id == target_migration_tag`）但 `libra.db` 未发时崩溃：续跑零覆写保留 `capture.db` 并经 `hard_link` 补齐 `libra.db` 至 `finalized = true`。
-- [ ] `targets_staged_for_rename = true` 且 `capture.db` 与 `libra.db` 均已发布（两 `.tmp` 触发 `NotFound` 且均带 `target_migration_tag`）但 `finalized = true` 未落盘时崩溃：续跑零覆写保留两库并直接发布 `finalized = true`。
-- [ ] 上述 3 处崩溃间隙内由旧 SQLite 进程提交至已发布 `capture.db`/`libra.db` 的全部新写入在收敛后 100% 完整可读。
+- [x] `targets_staged_for_rename = true` 且 `capture.db` 已 `hard_link` 发布、`unlink("capture.db.tmp")` 前崩溃（`AlreadyExists` + `application_id == target_migration_tag`）：续跑零覆写清理重复硬链 `capture.db.tmp` 并经 `hard_link` 补齐 `libra.db` 至 `finalized = true`。
+- [x] `targets_staged_for_rename = true` 且 `capture.db.tmp` 已 `unlink`（`NotFound` + `capture.db` `application_id == target_migration_tag`）但 `libra.db` 未发时崩溃：续跑零覆写保留 `capture.db` 并经 `hard_link` 补齐 `libra.db` 至 `finalized = true`。
+- [x] `targets_staged_for_rename = true` 且 `capture.db` 与 `libra.db` 均已发布（两 `.tmp` 触发 `NotFound` 且均带 `target_migration_tag`）但 `finalized = true` 未落盘时崩溃：续跑零覆写保留两库并直接发布 `finalized = true`。
+- [x] 上述 3 处崩溃间隙内由旧 SQLite 进程提交至已发布 `capture.db`/`libra.db` 的全部新写入在收敛后 100% 完整可读。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_staged_hardlink_already_exists_notfound_and_both_published)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_staged_hardlink_already_exists_notfound_and_both_published)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_staged_hardlink_already_exists_notfound_and_both_published)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_staged_hardlink_already_exists_notfound_and_both_published)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6737,7 +6737,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内于 `migrate.rs` 实现反向迁移在 `targets_staged_for_rename = true` 后、`capture.db` 发布前崩溃且外部旧进程调用 `capture::store::open(storage_root)` 建出 `application_id == 0` 竞争 `capture.db` 时的完整单连接 `c_mig` 并轨（遵守 `agent_import_tombstone`）、`__libra_migrated_fence__` 围栏、原子替换以及围栏后替换前崩溃幂等续跑。
 
@@ -6751,15 +6751,15 @@
 | `capture::store::open` 可在 `capture.db` 缺失间隙创建 `application_id == 0` 竞争库，须经单连接并轨、围栏与原子替换保证迁移数据与竞争写入双 100% 保留 | `src/internal/ai/capture/store.rs:65-86`；`ADR-RB-07` #2 Step 2.4 |
 
 **Acceptance criteria:**
-- [ ] 崩溃后外部旧进程建出 `application_id == 0` 竞争 `capture.db` 并提交事件：续跑 `hard_link` 命中 `AlreadyExists` 后在单连接 `c_mig` 排他锁下将其合法事件并入 `capture.db.tmp`（严格遵守 `agent_import_tombstone` 拒重导）。
-- [ ] 完成上述并轨后，续跑在同一单连接 `c_mig` 上对竞争 `capture.db` 提交 `__libra_migrated_fence__` 回滚日志原子围栏。
-- [ ] 围栏竞争库后原子 `rename(capture.db.tmp, capture.db)` 替换并收敛至 `finalized = true`，原迁移捕获数据与竞争旧写入双 100% 保留。
-- [ ] 恰崩溃于并轨围栏竞争 `capture.db`（`__libra_migrated_fence__` 已提交）之后、原子 `rename(capture.db.tmp, capture.db)` 之前：续跑识别已围栏竞争库与带 `target_migration_tag` 且通过 `integrity_check` 的 `capture.db.tmp`，幂等完成替换至 `finalized = true`。
+- [x] 崩溃后外部旧进程建出 `application_id == 0` 竞争 `capture.db` 并提交事件：续跑 `hard_link` 命中 `AlreadyExists` 后在单连接 `c_mig` 排他锁下将其合法事件并入 `capture.db.tmp`（严格遵守 `agent_import_tombstone` 拒重导）。
+- [x] 完成上述并轨后，续跑在同一单连接 `c_mig` 上对竞争 `capture.db` 提交 `__libra_migrated_fence__` 回滚日志原子围栏。
+- [x] 围栏竞争库后原子 `rename(capture.db.tmp, capture.db)` 替换并收敛至 `finalized = true`，原迁移捕获数据与竞争旧写入双 100% 保留。
+- [x] 恰崩溃于并轨围栏竞争 `capture.db`（`__libra_migrated_fence__` 已提交）之后、原子 `rename(capture.db.tmp, capture.db)` 之前：续跑识别已围栏竞争库与带 `target_migration_tag` 且通过 `integrity_check` 的 `capture.db.tmp`，幂等完成替换至 `finalized = true`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_competing_capture_store_open_reconciles_and_fences_zero_loss)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_competing_capture_store_open_reconciles_and_fences_zero_loss)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_competing_capture_store_open_reconciles_and_fences_zero_loss)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_competing_capture_store_open_reconciles_and_fences_zero_loss)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6797,7 +6797,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现反向迁移针对全新 Redb 仓（无预装 spool 墓碑或被外部改写情形）的 Phase 1 既有活 `capture-spool/ready/` 备份直灌、Phase 2 主动确立 3 个 `0400` 墓碑、全程持 `capture-spool-consumer.lock` 排斥并发 `drain_storage` 移动事件至 `quarantine/`，以及 `finalized == false` 防御性活 spool 并集对账。
 
@@ -6812,16 +6812,16 @@
 | `spool.rs:330-355` `ensure_spool` 对缺失目录自动建目录；`drain.rs:87` 通过 `CONSUMER_LOCK` 互斥消费 `ready/`；反向迁移须在 `capture-spool-consumer.lock` 下对账全新 Redb 仓活 spool | `src/internal/ai/capture/spool.rs:330-355`；`src/internal/ai/capture/drain.rs:85-143`；`ADR-RB-07` #2 |
 
 **Acceptance criteria:**
-- [ ] 全新 Redb 仓（无预装 spool 墓碑）若 `capture-spool/ready/` 预存既有活事件，反向 Phase 1 在 `capture-spool-consumer.lock` + `capacity.lock` 下将其归档备份并按语义去重键直灌入 `capture.db.tmp`，最终 100% 保留于 `capture.db`。
-- [ ] 上述反向迁移进入 Phase 2 时主动确立 `capture-spool/{tmp,ready,quarantine}` 全部 3 个 `0400` 墓碑跨越 `finalized = false`。
-- [ ] **活 Spool 对账期间并发 `drain` 互斥实测：** 上述全新 Redb 仓 `capture-spool/ready/` 含待对账与畸形事件时，反向迁移全程持有 `capture-spool-consumer.lock`，并发调用 `drain_storage` 零移动退出（绝不趁隙将事件转入 `quarantine/` 造成逃逸）。
-- [ ] 防御性兜底：若 `finalized == false` 期间外部异常清除 spool 墓碑导致活 `capture-spool/ready/` 出现新事件，反向续跑按去重键将其并入 `capture.db.tmp`（绝不丢弃）。
+- [x] 全新 Redb 仓（无预装 spool 墓碑）若 `capture-spool/ready/` 预存既有活事件，反向 Phase 1 在 `capture-spool-consumer.lock` + `capacity.lock` 下将其归档备份并按语义去重键直灌入 `capture.db.tmp`，最终 100% 保留于 `capture.db`。
+- [x] 上述反向迁移进入 Phase 2 时主动确立 `capture-spool/{tmp,ready,quarantine}` 全部 3 个 `0400` 墓碑跨越 `finalized = false`。
+- [x] **活 Spool 对账期间并发 `drain` 互斥实测：** 上述全新 Redb 仓 `capture-spool/ready/` 含待对账与畸形事件时，反向迁移全程持有 `capture-spool-consumer.lock`，并发调用 `drain_storage` 零移动退出（绝不趁隙将事件转入 `quarantine/` 造成逃逸）。
+- [x] 防御性兜底：若 `finalized == false` 期间外部异常清除 spool 墓碑导致活 `capture-spool/ready/` 出现新事件，反向续跑按去重键将其并入 `capture.db.tmp`（绝不丢弃）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_fresh_redb_reconciles_preexisting_live_spool_and_establishes_tombstones) | test(=storage::migrate::tests::reverse_fresh_redb_live_spool_reconcile_blocks_concurrent_drain_moves)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_fresh_redb_reconciles_preexisting_live_spool_and_establishes_tombstones)'`（new，覆盖 AC1、AC2、AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_fresh_redb_live_spool_reconcile_blocks_concurrent_drain_moves)'`（new，覆盖 AC3）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_fresh_redb_reconciles_preexisting_live_spool_and_establishes_tombstones) | test(=storage::migrate::tests::reverse_fresh_redb_live_spool_reconcile_blocks_concurrent_drain_moves)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_fresh_redb_reconciles_preexisting_live_spool_and_establishes_tombstones)'`（new，覆盖 AC1、AC2、AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_fresh_redb_live_spool_reconcile_blocks_concurrent_drain_moves)'`（new，覆盖 AC3）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6859,7 +6859,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内于 `migrate.rs` 逐项验证反向迁移终态后 Step 2.6（`finalized = true, spool_unfenced = false`）的全部两类 100% 可达解封崩溃恢复路径：可达态 A（已移 `tmp`/`ready`、残存 `quarantine` `0400` 墓碑时旧 Hook 阻断并幂等清理收敛）与可达态 B（全 3 墓碑已移除、`spool_unfenced = true` 未落盘时旧 Hook 发布真实活事件，重跑零改动保留目录并完整落库）。
 
@@ -6873,17 +6873,17 @@
 | `spool.rs:330` `ensure_spool` 对三子目录逐项检查 `!is_dir()`，故 Step 2.6 仅有「仍存至少 1 枚墓碑（可达态 A）」与「全 3 墓碑已移（可达态 B）」两类可达状态 | `src/internal/ai/capture/spool.rs:330-355`；`ADR-RB-07` #2 Step 2.6 |
 
 **Acceptance criteria:**
-- [ ] **Step 2.6 可达态 A 旧 Hook 阻断：** 在 `finalized = true, spool_unfenced = false`、已移除 `tmp`/`ready` 墓碑但 `quarantine` `0400` 墓碑仍存时，旧 SQLite Hook 调 `ensure_spool` 立即 fail-closed。
-- [ ] **Step 2.6 可达态 A 幂等清理收敛：** 重跑幂等移除残留 `quarantine` `is_file()` 墓碑、执行 `fsync_dir` 并持久化 `spool_unfenced = true`。
-- [ ] **Step 2.6 可达态 B 旧 Hook 发布活事件：** 在 `finalized = true, spool_unfenced = false`、全 3 墓碑均已移除 + `fsync_dir` 但 `spool_unfenced = true` 未落盘时注入崩溃，旧 SQLite Hook 成功重建三目录并向 `capture-spool/ready/` 发布真实活事件。
-- [ ] **Step 2.6 可达态 B 零改动保留目录：** 重跑识别三子项均为目录后零改动保留活 `capture-spool/ready/` 并持久化 `spool_unfenced = true`。
-- [ ] **Step 2.6 可达态 B 活事件 100% 入库：** 上述收敛完成后消费 `capture-spool/ready/`，崩溃窗口新发布的活事件 100% 落入 `capture.db` 零丢失。
+- [x] **Step 2.6 可达态 A 旧 Hook 阻断：** 在 `finalized = true, spool_unfenced = false`、已移除 `tmp`/`ready` 墓碑但 `quarantine` `0400` 墓碑仍存时，旧 SQLite Hook 调 `ensure_spool` 立即 fail-closed。
+- [x] **Step 2.6 可达态 A 幂等清理收敛：** 重跑幂等移除残留 `quarantine` `is_file()` 墓碑、执行 `fsync_dir` 并持久化 `spool_unfenced = true`。
+- [x] **Step 2.6 可达态 B 旧 Hook 发布活事件：** 在 `finalized = true, spool_unfenced = false`、全 3 墓碑均已移除 + `fsync_dir` 但 `spool_unfenced = true` 未落盘时注入崩溃，旧 SQLite Hook 成功重建三目录并向 `capture-spool/ready/` 发布真实活事件。
+- [x] **Step 2.6 可达态 B 零改动保留目录：** 重跑识别三子项均为目录后零改动保留活 `capture-spool/ready/` 并持久化 `spool_unfenced = true`。
+- [x] **Step 2.6 可达态 B 活事件 100% 入库：** 上述收敛完成后消费 `capture-spool/ready/`，崩溃窗口新发布的活事件 100% 落入 `capture.db` 零丢失。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step26_partial_cleanup_blocks_old_hook_then_resumes) | test(=storage::migrate::tests::reverse_phase2_step26_post_unfence_crash_preserves_live_old_hook_event)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step26_partial_cleanup_blocks_old_hook_then_resumes)'`（new，覆盖 AC1、AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step26_post_unfence_crash_preserves_live_old_hook_event)'`（new，覆盖 AC3–AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step26_partial_cleanup_blocks_old_hook_then_resumes) | test(=storage::migrate::tests::reverse_phase2_step26_post_unfence_crash_preserves_live_old_hook_event)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step26_partial_cleanup_blocks_old_hook_then_resumes)'`（new，覆盖 AC1、AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::reverse_phase2_step26_post_unfence_crash_preserves_live_old_hook_event)'`（new，覆盖 AC3–AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6921,7 +6921,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现 `GlobalConfig` 正向配置离线迁移正常路径（`src/storage/migrate.rs`）：全程持排他 `LOCK_EX` 于 `<scope_dir>/config-migration.lock`，经单连接 `c_mig` 过 WAL 静默门 + `VACUUM INTO` 备份 + `config-format.json(finalized=false)` + 回滚日志原子围栏 `__libra_migrated_fence__` `COMMIT`，**永久原位保留只读 `0400` 已围栏 `config.db` 路径墓碑（绝不 `unlink`）** 后再 `rename(config.redb.tmp, config.redb)`（`0600`）与发布 `finalized = true, legacy_sqlite_tombstone = true`，物理阻断旧版二进制经 `config.rs:257` 重建第二份 SQLite 配置库，并验证 `GC-13` 全局隔离。
 
@@ -6937,15 +6937,15 @@
 | `src/command/config.rs:257-295` 在 `config.db` 不存在时自动创建新 SQLite 库，正向原位保留已围栏只读 `0400` `config.db` 墓碑可 100% 阻断旧版二进制重建分裂全局配置库 | `src/command/config.rs:257-295`；`src/internal/db/schema.rs:785-814`；`ADR-RB-02` #2；`ADR-RB-07` #3 |
 
 **Acceptance criteria:**
-- [ ] `migrate_global_config(Sqlite -> Redb)` 在隔离 `LIBRA_CONFIG_GLOBAL_DB` 目录内经单连接 `c_mig` 完成 WAL 静默、`VACUUM INTO` 备份、产出 `0600` `config.redb` 并发布 `config-format.json(backend="redb", finalized=true, legacy_sqlite_tombstone=true)`。
-- [ ] `migrate_global_config(Sqlite -> Redb)` 永久原位保留经 `__libra_migrated_fence__` 围栏后的只读 `0400` `config.db` 路径墓碑（绝不 `unlink`）。
-- [ ] **旧版二进制路径级阻断实测（`GlobalConfig`）：** 正向迁移后模拟旧版 `libra config get/set --global` 经 `config.rs:257` `exists == true` 打开 `0400` 围栏 `config.db` 墓碑，立即报 `SQLITE_CORRUPT` fail-closed（绝不重建第二份 SQLite 配置库）。
-- [ ] `GC-13` 全局迁移隔离：`--global` 迁移绝不触碰隔离 `SystemConfig` 与仓库库。
+- [x] `migrate_global_config(Sqlite -> Redb)` 在隔离 `LIBRA_CONFIG_GLOBAL_DB` 目录内经单连接 `c_mig` 完成 WAL 静默、`VACUUM INTO` 备份、产出 `0600` `config.redb` 并发布 `config-format.json(backend="redb", finalized=true, legacy_sqlite_tombstone=true)`。
+- [x] `migrate_global_config(Sqlite -> Redb)` 永久原位保留经 `__libra_migrated_fence__` 围栏后的只读 `0400` `config.db` 路径墓碑（绝不 `unlink`）。
+- [x] **旧版二进制路径级阻断实测（`GlobalConfig`）：** 正向迁移后模拟旧版 `libra config get/set --global` 经 `config.rs:257` `exists == true` 打开 `0400` 围栏 `config.db` 墓碑，立即报 `SQLITE_CORRUPT` fail-closed（绝不重建第二份 SQLite 配置库）。
+- [x] `GC-13` 全局迁移隔离：`--global` 迁移绝不触碰隔离 `SystemConfig` 与仓库库。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_global_config_forward_migration_tombstone_and_legacy_block)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_global_config_forward_migration_tombstone_and_legacy_block)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_global_config_forward_migration_tombstone_and_legacy_block)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_global_config_forward_migration_tombstone_and_legacy_block)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -6983,7 +6983,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内于 `migrate.rs` 实现 `SystemConfig`（隔离夹具 `LIBRA_CONFIG_SYSTEM_DB`）正向配置离线迁移正常路径：经单连接 `c_mig` 完成 WAL 静默、`VACUUM INTO` 备份、产出 `0644` `config.redb` 与 `config-format.json(backend="redb", finalized=true, legacy_sqlite_tombstone=true)`，永久原位保留 `0444` 已围栏 `config.db` 墓碑以阻断旧版二进制，并验证 `GC-13` 系统迁移隔离。
 
@@ -6997,15 +6997,15 @@
 | `SystemConfig` 为独立可变库且具 `0644`/`0444` 权限与独立 `GC-13` 隔离要求，须独立实证正向迁移与旧版二进制阻断 | `ADR-RB-02` #2；`ADR-RB-07` #3；`GC-RB-02` |
 
 **Acceptance criteria:**
-- [ ] `migrate_system_config(Sqlite -> Redb)` 在隔离 `LIBRA_CONFIG_SYSTEM_DB` 目录内产出 `0644` `config.redb` 并发布 `config-format.json(backend="redb", finalized=true, legacy_sqlite_tombstone=true)`。
-- [ ] `migrate_system_config(Sqlite -> Redb)` 永久原位保留经 `__libra_migrated_fence__` 围栏后的只读 `0444` `config.db` 路径墓碑（绝不 `unlink`）。
-- [ ] **旧版二进制路径级阻断实测（`SystemConfig`）：** 正向迁移后模拟旧版 `libra config get/set --system` 打开 `0444` 围栏 `config.db` 墓碑，立即报 `SQLITE_CORRUPT` fail-closed（绝不重建第二份 SQLite 配置库）。
-- [ ] `GC-13` 系统迁移隔离：`--system` 迁移绝不触碰隔离 `GlobalConfig` 与仓库库。
+- [x] `migrate_system_config(Sqlite -> Redb)` 在隔离 `LIBRA_CONFIG_SYSTEM_DB` 目录内产出 `0644` `config.redb` 并发布 `config-format.json(backend="redb", finalized=true, legacy_sqlite_tombstone=true)`。
+- [x] `migrate_system_config(Sqlite -> Redb)` 永久原位保留经 `__libra_migrated_fence__` 围栏后的只读 `0444` `config.db` 路径墓碑（绝不 `unlink`）。
+- [x] **旧版二进制路径级阻断实测（`SystemConfig`）：** 正向迁移后模拟旧版 `libra config get/set --system` 打开 `0444` 围栏 `config.db` 墓碑，立即报 `SQLITE_CORRUPT` fail-closed（绝不重建第二份 SQLite 配置库）。
+- [x] `GC-13` 系统迁移隔离：`--system` 迁移绝不触碰隔离 `GlobalConfig` 与仓库库。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_system_config_forward_migration_tombstone_and_legacy_block)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_system_config_forward_migration_tombstone_and_legacy_block)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_system_config_forward_migration_tombstone_and_legacy_block)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_system_config_forward_migration_tombstone_and_legacy_block)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -7044,7 +7044,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现 `GlobalConfig` 与 `SystemConfig` 反向配置迁移正常路径（`src/storage/migrate.rs`）：持排他 `LOCK_EX` 于 `<scope_dir>/config-migration.lock` 执行 `META_SCHEMA u32::MAX` 围栏、`fenced_ready_to_unlink -> unlink(config.redb) + fsync_dir -> unlinked`、`targets_staged_for_rename = true` 原子替换墓碑为 `config.db`（Windows 先清墓碑只读位）并发布 `finalized = true, legacy_sqlite_tombstone = false`，验证双向 3 表 100% 无损往返。
 
@@ -7059,16 +7059,16 @@
 | `ADR-RB-02` #2 与 `ADR-RB-07` #3 要求配置双向无损互迁并原子替换原位墓碑回切 `config.db` | `ADR-RB-02` #2；`ADR-RB-07` #3 |
 
 **Acceptance criteria:**
-- [ ] `migrate_global_config(Redb -> Sqlite)` 经 `META_SCHEMA u32::MAX`、`unlink(config.redb) + fsync_dir`、`targets_staged_for_rename = true` 原子替换墓碑产出 `0600` `config.db` 并发布 `finalized = true, legacy_sqlite_tombstone = false`。
-- [ ] `migrate_system_config(Redb -> Sqlite)` 通过同一对称反向协议替换墓碑产出 `0644` `config.db` 并发布 `finalized = true, legacy_sqlite_tombstone = false`。
-- [ ] 双向迁移无损往返 100% `config`、`config_kv` 与 `configuration_schema_versions` 表行。
-- [ ] 单特性 `--no-default-features --features storage-sqlite` 下的 `storage::` 单元测试全绿零受扰。
+- [x] `migrate_global_config(Redb -> Sqlite)` 经 `META_SCHEMA u32::MAX`、`unlink(config.redb) + fsync_dir`、`targets_staged_for_rename = true` 原子替换墓碑产出 `0600` `config.db` 并发布 `finalized = true, legacy_sqlite_tombstone = false`。
+- [x] `migrate_system_config(Redb -> Sqlite)` 通过同一对称反向协议替换墓碑产出 `0644` `config.db` 并发布 `finalized = true, legacy_sqlite_tombstone = false`。
+- [x] 双向迁移无损往返 100% `config`、`config_kv` 与 `configuration_schema_versions` 表行。
+- [x] 单特性 `--no-default-features --features storage-sqlite` 下的 `storage::` 单元测试全绿零受扰。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_global_and_system_config_reverse_migration_replaces_tombstone)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_global_and_system_config_reverse_migration_replaces_tombstone)'`（new，覆盖 AC1–AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'`（覆盖 AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_global_and_system_config_reverse_migration_replaces_tombstone)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::gc13_global_and_system_config_reverse_migration_replaces_tombstone)'`（new，覆盖 AC1–AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'`（覆盖 AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -7106,7 +7106,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内于 `migrate.rs` 针对 `GlobalConfig` 与 `SystemConfig` 两作用域分别实测迁移持排他 `LOCK_EX` 期间，并发 `Sqlite` 与 `Redb` 配置命令全部按有界锁超时契约 fail-closed 返回类型化 `LBR-IO-001`（杜绝迁移窗口无限阻塞或分叉写入）。
 
@@ -7120,15 +7120,15 @@
 | `ADR-RB-02` #2 要求 Global/System 双域与 Sqlite/Redb 双运行时共同参与有界 `config-migration.lock`，迁移持 `LOCK_EX` 期间并发命令超期立报 `LBR-IO-001` | `ADR-RB-02` #2；`RB-03h` |
 
 **Acceptance criteria:**
-- [ ] **`GlobalConfig` 有界锁争用（`Sqlite` 命令）：** 迁移持排他 `LOCK_EX` 期间，并发 `Sqlite` 配置命令按有界锁超时契约 fail-closed 返回 `LBR-IO-001`。
-- [ ] **`GlobalConfig` 有界锁争用（`Redb` 命令）：** 迁移持排他 `LOCK_EX` 期间，并发 `Redb` 配置命令按有界锁超时契约 fail-closed 返回 `LBR-IO-001`。
-- [ ] **`SystemConfig` 有界锁争用（`Sqlite` 命令）：** 迁移持排他 `LOCK_EX` 期间，隔离 `LIBRA_CONFIG_SYSTEM_DB` 并发 `Sqlite` 配置命令超期 fail-closed 返回 `LBR-IO-001`。
-- [ ] **`SystemConfig` 有界锁争用（`Redb` 命令）：** 迁移持排他 `LOCK_EX` 期间，隔离 `LIBRA_CONFIG_SYSTEM_DB` 并发 `Redb` 配置命令超期 fail-closed 返回 `LBR-IO-001`。
+- [x] **`GlobalConfig` 有界锁争用（`Sqlite` 命令）：** 迁移持排他 `LOCK_EX` 期间，并发 `Sqlite` 配置命令按有界锁超时契约 fail-closed 返回 `LBR-IO-001`。
+- [x] **`GlobalConfig` 有界锁争用（`Redb` 命令）：** 迁移持排他 `LOCK_EX` 期间，并发 `Redb` 配置命令按有界锁超时契约 fail-closed 返回 `LBR-IO-001`。
+- [x] **`SystemConfig` 有界锁争用（`Sqlite` 命令）：** 迁移持排他 `LOCK_EX` 期间，隔离 `LIBRA_CONFIG_SYSTEM_DB` 并发 `Sqlite` 配置命令超期 fail-closed 返回 `LBR-IO-001`。
+- [x] **`SystemConfig` 有界锁争用（`Redb` 命令）：** 迁移持排他 `LOCK_EX` 期间，隔离 `LIBRA_CONFIG_SYSTEM_DB` 并发 `Redb` 配置命令超期 fail-closed 返回 `LBR-IO-001`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_migration_bounded_lock_contention_global_and_system_fail_closed)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_migration_bounded_lock_contention_global_and_system_fail_closed)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_migration_bounded_lock_contention_global_and_system_fail_closed)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_migration_bounded_lock_contention_global_and_system_fail_closed)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -7167,7 +7167,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现 `GlobalConfig` 与 `SystemConfig` 正向迁移（`Sqlite → Redb`）双域幂等恢复（`src/storage/migrate.rs`）：分别在 `GlobalConfig` 与 `SystemConfig` 两作用域实测围栏提交中途断电撕裂扇区热回滚日志自动回滚并收敛至 `finalized = true, legacy_sqlite_tombstone = true`，以及 `targets_staged_for_rename = true` 且 `config.redb` 已就位后崩溃零覆写推进。
 
@@ -7182,16 +7182,16 @@
 | 正向配置迁移须在 `GlobalConfig` 与 `SystemConfig` 两作用域各自实测断电热回滚日志恢复与 `targets_staged_for_rename` 已就位 `config.redb` 零覆写保护 | `ADR-RB-07` #3 |
 
 **Acceptance criteria:**
-- [ ] **`GlobalConfig` 正向断电热回滚日志恢复：** 保留热 `config.db-journal` 并破坏页 1 首个 512 字节扇区，续跑触发热日志回滚并收敛至 `finalized = true, legacy_sqlite_tombstone = true`（`0600` `config.redb` + 原位 `0400` 已围栏 `config.db` 墓碑，零数据丢失）。
-- [ ] **`SystemConfig` 正向断电热回滚日志恢复：** 同上在隔离 `LIBRA_CONFIG_SYSTEM_DB` 验证热日志回滚并收敛至 `finalized = true, legacy_sqlite_tombstone = true`（`0644` `config.redb` + 原位 `0444` 墓碑）。
-- [ ] **`GlobalConfig` 正向 `targets_staged_for_rename = true` 崩溃恢复：** `config.redb.tmp` 已 `rename` 为 `config.redb`、`finalized = true` 未落盘时崩溃，续跑检出已就位 `config.redb` 绝不覆写，核验已围栏 `config.db` 墓碑后发布 `finalized = true`。
-- [ ] **`SystemConfig` 正向 `targets_staged_for_rename = true` 崩溃恢复：** 同上在隔离 `LIBRA_CONFIG_SYSTEM_DB` 保留已就位 `0644` `config.redb` 并发布 `finalized = true`。
+- [x] **`GlobalConfig` 正向断电热回滚日志恢复：** 保留热 `config.db-journal` 并破坏页 1 首个 512 字节扇区，续跑触发热日志回滚并收敛至 `finalized = true, legacy_sqlite_tombstone = true`（`0600` `config.redb` + 原位 `0400` 已围栏 `config.db` 墓碑，零数据丢失）。
+- [x] **`SystemConfig` 正向断电热回滚日志恢复：** 同上在隔离 `LIBRA_CONFIG_SYSTEM_DB` 验证热日志回滚并收敛至 `finalized = true, legacy_sqlite_tombstone = true`（`0644` `config.redb` + 原位 `0444` 墓碑）。
+- [x] **`GlobalConfig` 正向 `targets_staged_for_rename = true` 崩溃恢复：** `config.redb.tmp` 已 `rename` 为 `config.redb`、`finalized = true` 未落盘时崩溃，续跑检出已就位 `config.redb` 绝不覆写，核验已围栏 `config.db` 墓碑后发布 `finalized = true`。
+- [x] **`SystemConfig` 正向 `targets_staged_for_rename = true` 崩溃恢复：** 同上在隔离 `LIBRA_CONFIG_SYSTEM_DB` 保留已就位 `0644` `config.redb` 并发布 `finalized = true`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_hot_journal_torn_sector_global_and_system) | test(=storage::migrate::tests::config_forward_crash_staged_rename_preserves_redb_global_and_system)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_hot_journal_torn_sector_global_and_system)'`（new，覆盖 AC1、AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_staged_rename_preserves_redb_global_and_system)'`（new，覆盖 AC3、AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_hot_journal_torn_sector_global_and_system) | test(=storage::migrate::tests::config_forward_crash_staged_rename_preserves_redb_global_and_system)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_hot_journal_torn_sector_global_and_system)'`（new，覆盖 AC1、AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_staged_rename_preserves_redb_global_and_system)'`（new，覆盖 AC3、AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -7229,7 +7229,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现 `GlobalConfig` 与 `SystemConfig` 正向迁移（`Sqlite → Redb`）全类故障 fail-closed 拒收与半途清单并发拒访（`src/storage/migrate.rs`）：分别实测 `source_db_state == "pending"` 时 Global 与 System 意外缺失 `config.db` 拒收、已围栏态 `sqlite-backup` 缺失与 `backup_sha256` 失配拒收，以及残留 `config-format.json(finalized = false)` 时并发 `Sqlite` 与 `Redb` 配置命令各自 fail-closed `LBR-IO-001`。
 
@@ -7243,18 +7243,18 @@
 | 正向配置迁移须对双域意外缺席、备份缺失、备份失配及 `finalized == false` 下双运行时访问全部独立 fail-closed 验收 | `ADR-RB-07` #3 |
 
 **Acceptance criteria:**
-- [ ] `GlobalConfig` 正向 `source_db_state == "pending"` 而 `config.db` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] `SystemConfig` 正向 `source_db_state == "pending"` 而 `config.db` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] 正向配置已围栏态对应的 `sqlite-backup` 缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] 正向配置已围栏态对应的 `sqlite-backup` `backup_sha256` 失配时，续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] 迁移崩溃释锁后残留 `config-format.json(finalized = false)` 期间，并发 `Sqlite` 配置命令立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] 迁移崩溃释锁后残留 `config-format.json(finalized = false)` 期间，并发 `Redb` 配置命令立即 fail-closed 返回 `LBR-IO-001`。
+- [x] `GlobalConfig` 正向 `source_db_state == "pending"` 而 `config.db` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] `SystemConfig` 正向 `source_db_state == "pending"` 而 `config.db` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] 正向配置已围栏态对应的 `sqlite-backup` 缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] 正向配置已围栏态对应的 `sqlite-backup` `backup_sha256` 失配时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] 迁移崩溃释锁后残留 `config-format.json(finalized = false)` 期间，并发 `Sqlite` 配置命令立即 fail-closed 返回 `LBR-IO-001`。
+- [x] 迁移崩溃释锁后残留 `config-format.json(finalized = false)` 期间，并发 `Redb` 配置命令立即 fail-closed 返回 `LBR-IO-001`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_pending_missing_and_backup_fault_reject) | test(=storage::migrate::tests::config_forward_pending_manifest_rejects_sqlite_and_redb_commands)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_pending_missing_and_backup_fault_reject)'`（new，覆盖 AC1–AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_pending_manifest_rejects_sqlite_and_redb_commands)'`（new，覆盖 AC5、AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_pending_missing_and_backup_fault_reject) | test(=storage::migrate::tests::config_forward_pending_manifest_rejects_sqlite_and_redb_commands)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_crash_pending_missing_and_backup_fault_reject)'`（new，覆盖 AC1–AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_forward_pending_manifest_rejects_sqlite_and_redb_commands)'`（new，覆盖 AC5、AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -7292,7 +7292,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现 `GlobalConfig` 与 `SystemConfig` 反向迁移（`Redb → Sqlite`）的 `unlink(config.redb)+fsync_dir` 紧后崩溃恢复与源/备份故障拦截（`src/storage/migrate.rs`）：分别在 Global 与 System 双域实测合法已摘除态的 `redb-backup` 真实 SHA-256 校验恢复、双域 `source_db_state == "pending"` 意外缺失 `config.redb` 拒收，以及 `redb-backup` 缺失与 SHA-256 失配的 fail-closed 拦截。
 
@@ -7307,18 +7307,18 @@
 | 反向配置迁移须在 Global 与 System 双域各自覆盖 `unlink(config.redb)+fsync_dir` 紧后崩溃、`pending` 意外缺席与备份缺损拒收 | `ADR-RB-07` #3 |
 
 **Acceptance criteria:**
-- [ ] **`GlobalConfig` 反向紧接 `unlink(config.redb) + fsync_dir` 后崩溃实测：** `source_db_state ∈ {"fenced_ready_to_unlink", "unlinked"}` 时，续跑校验 `redb-backup` 真实 SHA-256 后幂等收敛至 `finalized = true, legacy_sqlite_tombstone = false` 并完整恢复 `0600` `config.db`。
-- [ ] **`SystemConfig` 反向紧接 `unlink(config.redb) + fsync_dir` 后崩溃实测：** 同上校验 `redb-backup` 真实 SHA-256 并以 `0644` 权限收敛至 `finalized = true, legacy_sqlite_tombstone = false`。
-- [ ] `GlobalConfig` 反向 `source_db_state == "pending"` 而 `config.redb` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] `SystemConfig` 反向 `source_db_state == "pending"` 而 `config.redb` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] 反向配置已合法摘除 `config.redb` 但对应 `redb-backup` 缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
-- [ ] 反向配置已合法摘除 `config.redb` 但对应 `redb-backup` SHA-256 失配时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] **`GlobalConfig` 反向紧接 `unlink(config.redb) + fsync_dir` 后崩溃实测：** `source_db_state ∈ {"fenced_ready_to_unlink", "unlinked"}` 时，续跑校验 `redb-backup` 真实 SHA-256 后幂等收敛至 `finalized = true, legacy_sqlite_tombstone = false` 并完整恢复 `0600` `config.db`。
+- [x] **`SystemConfig` 反向紧接 `unlink(config.redb) + fsync_dir` 后崩溃实测：** 同上校验 `redb-backup` 真实 SHA-256 并以 `0644` 权限收敛至 `finalized = true, legacy_sqlite_tombstone = false`。
+- [x] `GlobalConfig` 反向 `source_db_state == "pending"` 而 `config.redb` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] `SystemConfig` 反向 `source_db_state == "pending"` 而 `config.redb` 意外缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] 反向配置已合法摘除 `config.redb` 但对应 `redb-backup` 缺失时，续跑立即 fail-closed 返回 `LBR-IO-001`。
+- [x] 反向配置已合法摘除 `config.redb` 但对应 `redb-backup` SHA-256 失配时，续跑立即 fail-closed 返回 `LBR-IO-001`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_crash_after_config_redb_unlink_global_and_system) | test(=storage::migrate::tests::config_reverse_crash_pending_missing_and_corrupt_backup_reject)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_crash_after_config_redb_unlink_global_and_system)'`（new，覆盖 AC1、AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_crash_pending_missing_and_corrupt_backup_reject)'`（new，覆盖 AC3–AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_crash_after_config_redb_unlink_global_and_system) | test(=storage::migrate::tests::config_reverse_crash_pending_missing_and_corrupt_backup_reject)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_crash_after_config_redb_unlink_global_and_system)'`（new，覆盖 AC1、AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_crash_pending_missing_and_corrupt_backup_reject)'`（new，覆盖 AC3–AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -7356,7 +7356,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现 `GlobalConfig` 与 `SystemConfig` 反向迁移（`Redb → Sqlite`）的 `targets_staged_for_rename = true` 崩溃恢复与旧二进制写入零覆写保护（`src/storage/migrate.rs`）：分别在 Global 与 System 双域实测 `rename(config.db.tmp, config.db)` 后、`finalized = true` 前崩溃且旧版二进制已向现网 `config.db` 写入新配置时续跑绝不覆写已发布 `config.db`，以及 `rename` 尚未执行（`config.db` 仍为已围栏墓碑）时双域续跑正确完成原子替换。
 
@@ -7370,16 +7370,16 @@
 | `targets_staged_for_rename = true` 下须分别覆盖 Global 与 System 的 post-rename 旧二进制写入保留与 pre-rename 墓碑替换 | `ADR-RB-07` #3 |
 
 **Acceptance criteria:**
-- [ ] **`GlobalConfig` 反向 post-rename 崩溃 + 旧二进制写入保护：** `rename(config.db.tmp, config.db)` 后、`finalized = true` 前崩溃且旧版 `libra config set --global` 写入新键值，续跑检出有效未围栏 `config.db` **绝不覆写**、清理 `.tmp` 并发布 `finalized = true, legacy_sqlite_tombstone = false`，旧二进制写入 100% 保留。
-- [ ] **`SystemConfig` 反向 post-rename 崩溃 + 旧二进制写入保护：** 同上对 `--system` 验证续跑**绝不覆写**已发布 `0644` `config.db`，100% 保留崩溃后旧二进制写入。
-- [ ] **`GlobalConfig` 反向 pre-rename 墓碑续跑：** `targets_staged_for_rename = true` 后尚未 `rename`（`config.db` 仍为墓碑）时崩溃，续跑原子 `rename(config.db.tmp, config.db)`（Windows 先清只读位）产出 `0600` `config.db` 并发布 `finalized = true, legacy_sqlite_tombstone = false`。
-- [ ] **`SystemConfig` 反向 pre-rename 墓碑续跑：** 同上在隔离 `LIBRA_CONFIG_SYSTEM_DB` 原子替换 `0444` 墓碑产出 `0644` `config.db` 并发布 `finalized = true, legacy_sqlite_tombstone = false`。
+- [x] **`GlobalConfig` 反向 post-rename 崩溃 + 旧二进制写入保护：** `rename(config.db.tmp, config.db)` 后、`finalized = true` 前崩溃且旧版 `libra config set --global` 写入新键值，续跑检出有效未围栏 `config.db` **绝不覆写**、清理 `.tmp` 并发布 `finalized = true, legacy_sqlite_tombstone = false`，旧二进制写入 100% 保留。
+- [x] **`SystemConfig` 反向 post-rename 崩溃 + 旧二进制写入保护：** 同上对 `--system` 验证续跑**绝不覆写**已发布 `0644` `config.db`，100% 保留崩溃后旧二进制写入。
+- [x] **`GlobalConfig` 反向 pre-rename 墓碑续跑：** `targets_staged_for_rename = true` 后尚未 `rename`（`config.db` 仍为墓碑）时崩溃，续跑原子 `rename(config.db.tmp, config.db)`（Windows 先清只读位）产出 `0600` `config.db` 并发布 `finalized = true, legacy_sqlite_tombstone = false`。
+- [x] **`SystemConfig` 反向 pre-rename 墓碑续跑：** 同上在隔离 `LIBRA_CONFIG_SYSTEM_DB` 原子替换 `0444` 墓碑产出 `0644` `config.db` 并发布 `finalized = true, legacy_sqlite_tombstone = false`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_staged_rename_preserves_old_binary_writes_global_and_system) | test(=storage::migrate::tests::config_reverse_staged_rename_before_rename_replaces_tombstone_global_and_system)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_staged_rename_preserves_old_binary_writes_global_and_system)'`（new，覆盖 AC1、AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_staged_rename_before_rename_replaces_tombstone_global_and_system)'`（new，覆盖 AC3、AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_staged_rename_preserves_old_binary_writes_global_and_system) | test(=storage::migrate::tests::config_reverse_staged_rename_before_rename_replaces_tombstone_global_and_system)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_staged_rename_preserves_old_binary_writes_global_and_system)'`（new，覆盖 AC1、AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::config_reverse_staged_rename_before_rename_replaces_tombstone_global_and_system)'`（new，覆盖 AC3、AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10095,10 +10095,12 @@
 | `RB-10e` | `done` / `remote-verified` | `cd57a4d`（`main`） | `0.30.446` | 2026-11-24 20:38 UTC：Stage 1 精确白名单内单文件写集（`src/storage/migrate.rs`）逐语句实证 `__libra_migrated_fence__` 回滚日志原子围栏提交后 8 类预打开旧 SQLite 连接全部立即报精确数值码 `SQLITE_CORRUPT (11)` fail-closed：构造 `Rb10eReadHandles`（8 个独立预打开句柄：冷连接 `SELECT * FROM reference`/`agent_session`、页缓存+预编译语句均热连接 `.persistent(true)`/`.persistent(false)` `SELECT`、冷/热 `SELECT name, sql FROM sqlite_master`）、`Rb10eWriteHandles`（13 个独立预打开句柄：经回滚事务预热编译语句与非预热双路径 `INSERT`/`UPDATE`/`DELETE`、删除表后建表路径的 `publication.rs:22,36` 原文 `CREATE TABLE IF NOT EXISTS agent_bridge_publication(...)`/`agent_bridge_index_publication(...)` 及 `VACUUM`，覆盖 `libra.db` 与 `capture.db`）与 `Rb10eExistingDdlHandles`（4 个独立冷/热预打开句柄，显式确认两张表已存在且围栏前 no-op `CREATE TABLE IF NOT EXISTS` 成功），全部 25 个预打开句柄均以围栏后首操作独立验证精确数值码 `numeric == 11`（AC1–AC7 含 `malformed database schema`，AC8 `VACUUM` 含 `database disk image is malformed`/`malformed database schema`），同时覆盖 Unix 独立 OS 子进程（5s 有界超时回收）跨完整 `prepare_forward_phase1` + `execute_forward_phase2_fence_and_unlink` + `release_locks()` post-unlink 场景与跨平台 post-fence pre-unlink SHA-256 字节级零篡改验证，单次围栏与拒访判定耗时 ≤ `200ms`；`--features storage-sqlite,storage-redb,storage-queue` `VER1` 2/2、`VER2`（`forward_phase2_fence_blocks_cold_warm_table_select_and_sqlite_master` 1.435s）、`VER3`（`forward_phase2_fence_blocks_open_handle_dml_ddl_and_vacuum` 2.891s）、`VER4`（`--no-default-features --features storage-sqlite` `storage::` 11/11 0.505s）、`VER5` 精确白名单、全仓 `cargo +stable fmt --all -- --check` + `rustfmt +nightly --check src/storage/migrate.rs` + 全仓 `cargo +nightly clippy --all-targets --all-features -- -D warnings` + `cargo +stable clippy --all-targets --all-features -- -D warnings` 全零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1（2×P1：去 `0xff` 掩码精确判 `11` + 每语句各自独立句柄）与 R2（1×P1：补齐两张 publication 表已存在时的 no-op DDL 路径）全部闭环，R3 获 **`VERDICT: PASS`（P0=0、P1=0、P2=0）** |
 | `RB-10g` | `done` / `remote-verified` | `73c99d3`（`main`） | `0.30.449` | 2026-11-24 21:55 UTC：Stage 1 精确 2 文件写集（`src/storage/mod.rs`、`src/storage/migrate.rs`）完成正向迁移 Phase 2 Step 2.3–2.4 原地不移锁 `capture-spool` 墓碑封锁、终态 `finalized = true` 清单发布与 `GC-13` 双域隔离（导出 `ForwardPhase2SpoolFenceReceipt`/`ForwardPhase2FinalizedReport`、`finalize_forward_phase2_spool_tombstones_and_manifest`、`execute_forward_migration`、`execute_forward_migration_for_role`）：Step 2.1 前置 `verify_no_inflight_spool_tmp_files` 在 SQLite `unlink` 前拦截在途 `spool::publish` `tmp` 写者；Phase 1 持锁备份记录 post-rename `st_ctime`/NTFS `FILE_BASIC_INFO.ChangeTime` + `mtime` + `size` + inode/`WinFileId` 身份索引贯穿传递至 Step 2.3 实现满载 `READY_FILE_LIMIT = 1,024` 文件（~58 MiB）O(1) 校验（遇未索引或变更自动回退全流式 SHA-256）；Unix 全程 `fdopendir` + 固定 `sub_fd` 零路径枚举、严禁非原子回退的 `strict_atomic_rename_noreplace_at_unix`（macOS `renameatx_np(RENAME_EXCL)` / Linux `SYS_renameat2(RENAME_NOREPLACE)`）+ 128-bit 随机隐藏暂存隔离删除（隔离后二次核验身份并在后检替换时原子无覆写归位）、`O_NOFOLLOW`/`fchmod(0400)`/`sync_all`/`unlinkat(AT_REMOVEDIR)`/`linkat` 32 次 `ensure_spool` 空目录竞态重试安装墓碑；Windows 先设 `FILE_ATTRIBUTE_READONLY`+`sync_all()` 再写透 `MoveFileExW` 并回验 `WinFileId`+只读属性；Step 2.3 任意失败分支释锁前均以 `[tmp, quarantine, ready]` 优先级原地防御封锁且绝不删未过期 `tmp` 或未备份文件；`--features storage-sqlite,storage-redb,storage-queue` `VER1` 2/2、`VER2`（`forward_phase2_unmoved_lock_inplace_spool_tombstones_block_concurrent_hooks` 覆盖 5 大场景：Scenario 1 未改 `spool::publish` 真实子进程经 XNU `proc_pidfdinfo`/`/proc/pid/fd` 实证过 `spool.rs:105` 阻塞于 `capacity.lock` `spool.rs:112` 后精确报 `"capture queue directory could not be read"` + `ensure_spool` 空目录重试 + 新起子进程 `spool.rs:105` 拒访 + 严格 8 步持久因果序 + 全 6 锁释放；Scenario 2 异常防御封锁与真实阻塞子进程拒访；Scenario 3/3B 前置与隔离前替换竞态无损恢复；Scenario 4 满额 1,024 文件 ~58 MiB `<= 200ms` 预算；Scenario 5A/5B/5C 真实子进程暂停于 `spool.rs:139` 在途写拦截与 `quarantine` 降级防御封锁）、`VER3`（`forward_phase2_gc13_config_isolation` 覆盖 `GlobalConfig`/`SystemConfig`/`Derived` 角色门 + 编译 C 系统调用拦截动态库 `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD` 含逐原语阳性对照 + 排他锁/字节/mtime/零创建/`chmod 0000` 全覆盖）、`VER4`（单特性 `storage-sqlite` `storage::` 11/11）、`VER5` 精确 2 文件写集、全仓 `cargo +stable fmt --all -- --check` + `rustfmt +nightly --check src/storage/{mod,migrate}.rs` + 全仓 `cargo +nightly clippy --all-targets --all-features -- -D warnings` + `cargo +stable clippy --all-targets --all-features -- -D warnings` 全零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1（6×P1）、R2（3×P1）与 R3 全部 2 项可修复 P1（Linux 严禁非原子 `linkat+unlinkat` 回退 + 128-bit 随机隔离后缀、Windows `FILE_BASIC_INFO.ChangeTime` 校验）全部闭环，R3 仅余 2 项 OS 内核/架构边界（POSIX 无单调用 `funlink(fd)` 系统调用；整卷 `EROFS`/`ENOSPC` 全墓碑失败由 `ADR-RB-07` #1 与 `RB-10h` `finalized=false` 并集对账承接），依用户授权如实留证跳过 |
 | `RB-10c` | `done` / `remote-pending` | 本提交（`main`，取代 `4e5b52a`） | `0.30.451` | 2026-11-24 23:40 UTC：Stage 1 精确 2 文件写集（`src/storage/mod.rs`、`src/storage/migrate.rs`）完成正向迁移 Phase 2 完整崩溃恢复引擎（导出 `ForwardSourceRecoveryState`、`ForwardPhase2ResumeReport`、`resume_forward_migration`、`resume_forward_migration_for_role` 并保留 `4e5b52a` 兼容别名 `resume_forward_phase2`），全面取代 `4e5b52a` 的备份覆盖折衷实现并零偏差关闭 AC1–AC4 / VER1–VER4：全 6 锁规范顺序获取下以 Phase A/B 互斥 quiesce 活库并先置 `PRAGMA synchronous = FULL` 再 `BEGIN EXCLUSIVE` 触发 SQLite `pager_playback()` 真热回滚日志自愈撕裂 512 字节页 1 扇区（无热日志则严格 fail-closed `LBR-IO-001`）；4 态 `ADR-RB-07` #1 分类器（`CleanMatchedPending`/`DriftedLivePending`/`FencedPreUnlink`/`LegallyAbsentPostUnlink`）；围栏/摘除前执行**全量零盲区加密源-目标一致性校验**（`compute_git_redb_full_content_sha256` 与 `compute_capture_redb_full_content_sha256` 逐键逐字节哈希 `meta_schema`、全部 61 张 Git 业务表+6 二级索引+3 序列表、全部 25 张 Capture 业务表+9 二级索引+5 内部表+`MIGRATED_SPOOL_RECEIPTS_TABLE`+`MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE` 且强制穷举表清单与零 multimap 校验，经 `.libra/` 之外私有临时目录分阶段零修改构建参照库比对）+ 完整 `capture-spool` 备份（含 `ready/` 与 `quarantine/`）`spool_manifest_sha256` 认证（含全/部分墓碑化后场景）；围栏前旧连接漂移重导精确收敛至 `gen + 1`（`prepare_exact_next_forward_generation_for_reexport` 含 Unix `openat`/`fstatat`/`unlinkat` 与 Windows 固定非重解析目录句柄+`FILE_ATTRIBUTE_REPARSE_POINT` 拒绝 junction 穿透+`FileBasicInfo`/`FileDispositionInfo` 句柄删除，Windows spool 巡检同构加固）；`--features storage-sqlite,storage-redb,storage-queue` `VER1` 2/2、`VER2`（`forward_phase2_powerloss_torn_sector_hot_journal_rollback_and_resume` 覆盖 13+ `finalized=false` 检查点双环境变量隔离 OS 子进程拒访、`libra.db` 与 `capture.db` 真实子进程 `PRAGMA cache_size=1; cache_spill=1` 溢出页 1+`_exit(0)`+撕裂 `[0..512]` 热日志自愈至 `gen=1`、无热日志撕裂负向拒收、Scenario 4a–4f 全覆盖有效 `META_SCHEMA` 下空表/同数改值/未采样内行/未采样表 `automation_log` 与 `agent_bridge_session`/超大 200 KiB 分片 spool 内部 chunk 篡改/`meta_schema` 单例改值与多余行独立单测/非法普通表与 multimap 表拒收、Scenario 5 全墓碑后篡改/删除 `quarantine` 备份拒收与还原自愈及 Windows spool junction 回归）、`VER3`（`forward_phase2_crash_before_fence_drift_reexports_gen_plus_1` 覆盖迁移前预打开双 OS 子进程跨崩溃写 620 `reference`+`config_kv`+`agent_session` 重导精确 `gen=2` 且双 `VACUUM INTO` 备份 SHA-256+`integrity_check`+全记录保留验证、Layout A 离线 `-wal` 漂移与外部写者 `SQLITE_BUSY` 拒收、~20 MiB 隔离 OS 子进程 XNU `proc_pid_rusage` 实证 `<= 500` 行/批与额外峰值 `<= 64 MiB`、重复 `AfterArtifactCreation`/`AfterPromotionBeforeManifest` SIGKILL 崩溃收敛至精确 `gen=2`+Unix symlink/Windows NTFS junction 防护）、`VER4` 精确 2 文件白名单、全仓 `cargo +stable fmt --all -- --check` + `rustfmt +nightly --check src/storage/{mod,migrate}.rs` + 全仓 `cargo +nightly clippy --all-targets --all-features -- -D warnings` + `cargo +stable clippy --all-targets --all-features -- -D warnings` 全零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1–R6 全部真实发现逐轮闭环，**Codex R7 获 `VERDICT: PASS`（P0=0、P1=0、P2=0）** |
-| `RB-10k` | `done` / `remote-pending` | 本提交（`main`，加固取代 `24acd6b`） | `0.30.459` | 2026-11-25 03:15:31 UTC：Stage 1 精确白名单内单文件写集（`src/storage/migrate.rs`）全面加固正向 Phase 2 围栏后未摘除与双源独立 `unlink` 合法缺席态恢复（彻底移除 `24acd6b` 的无锁预探与 `.expect()`）：持 `PRAGMA locking_mode = EXCLUSIVE` + `BEGIN EXCLUSIVE; ROLLBACK;` + `SQLITE_FCNTL_FILE_POINTER` WAL 页头核验统一静默双源，严格核验 `sqlite_master` 五列 + `COUNT(*) == 1` 哨兵并无条件恢复 `PRAGMA writable_schema = OFF`；修正 `compute_capture_redb_full_content_sha256` Layout A 使用 `CAPTURE_SCHEMA_NAME`；落地 `VerifiedBackupSnapshot` 单趟受保护描述符校验+私密 `0700` 快照（绝不经 SQLite 重开备份路径，彻底阻断备份替换 TOCTOU 与活库别名泄锁）；Unix 以 `strict_atomic_rename_noreplace_at_unix` 128-bit 随机隐藏隔离+复核 inode/全零 28B 页头（失配原子归位拒收）、Windows 以独占 `share=0` 单句柄 `FileDispositionInfo` 清理冷 `-journal`；`EphemeralParityFileBackend` 保障全表加密一致性续跑 ≤ `500ms`；`VER1` 发现门 3/3、`VER2`（`forward_phase2_crash_after_fence_before_unlink` 7.026s）、`VER3`（`forward_phase2_crash_immediately_after_libra_db_unlink` 5.762s）、`VER4`（`forward_phase2_crash_immediately_after_capture_db_unlink` 2.952s）、`RB-10c` 回归 2/2、纯 SQLite `storage::` 11/11、三构型矩阵零告警、全仓 `stable fmt` + `nightly fmt` + `nightly`/`stable clippy` `-D warnings` 全绿；Codex R1–R4 全部实质发现（备份快照/冷日志隔离/碰撞/spool 快照摘要）闭环（R4 仅余同 UID `$TMPDIR` 进程中段改写模型，依授权跳过） |
-| `RB-10d` | `done` / `remote-pending` | 本提交（`main`，加固取代 `0767d76`） | `0.30.459` | 2026-11-25 03:15:31 UTC：Stage 1 精确白名单内单文件写集（`src/storage/migrate.rs`）完整实证正向 Phase 2 全量 fail-closed 拒收矩阵（≤ `100ms` 预算，双源 `libra.db` 与 `capture.db` 对称全覆盖、逐字节零改动）：`pending` 态双源意外缺席、无热日志页头清零/损毁、非 `__libra_migrated_fence__` 精确哨兵异常 schema 与篡改哨兵 SQL、以及双源合法 `unlink` 后各自备份缺失与单字节/摘要篡改均立即 fail-closed 报 `LBR-IO-001` 且清单保持 `finalized = false`；`VER1` 发现门 2/2、`VER2`（`forward_phase2_unexpected_missing_pending_and_corrupt_non_sentinel_reject` 11.252s）、`VER3`（`forward_phase2_post_unlink_corrupt_backup_fails_closed` 5.401s）、`VER4` 白名单、纯 SQLite `storage::` 11/11、三构型矩阵、fmt 与 `nightly`/`stable clippy` `-D warnings` 全绿 |
-| `RB-10h` | `done` / `remote-pending` | 本提交（`main`，加固取代 `537f3cd`） | `0.30.459` | 2026-11-25 03:15:31 UTC：Stage 1 精确白名单内单文件写集（`src/storage/migrate.rs`）彻底移除 `537f3cd` 将备份拷回活 `.libra/libra.db` 的 P0 权威复活缺陷，落地零复活跨源漂移重导与无损 Spool 并集对账：`ReexportSourceSlot::{Live, VerifiedBackup(Box<VerifiedBackupSnapshot>)}` 对已围栏/已摘除源仅只读消费私密 `VerifiedBackupSnapshot` 并直拷携带至 `gen + 1`（即使 `AfterPromotionBeforeManifest` 崩溃也绝不重建活 `.db`）；`VerifiedSpoolBackupSnapshot` 单趟认证 `ready/` + `quarantine/` 并在下游 `ingest_capture_spool_ready_from_backup_readonly` 与 `backup_capture_spool_union_inner`（Unix/Windows）强验完整目录与逐文件 `(byte_len, sha256)`；`resolve_union_prior_spool_dst_name` 对一/二级文件名碰撞分配确定性唯一后缀（零静默漏事件）；`VER1` 发现门 2/2、`VER2`（`forward_phase2_crash_capture_db_and_queue_post_crash_reexport` 3.817s，含 `AfterPromotionBeforeManifest` 零复活实测）、`VER3`（`forward_phase2_spool_tombstone_gap_crash_and_concurrent_hook_reconcile` 6.344s，实证 AC2/AC3 崩溃前旧事件+并发新事件+同名及二级碰撞+去重键幂等+原备份后改零受扰+快照 `ready/`/`quarantine/` 篡改删损 fail-closed）、`VER4` 白名单、纯 SQLite `storage::` 11/11、三构型矩阵、fmt 与 `nightly`/`stable clippy` `-D warnings` 全绿；Codex R1–R4 全部实质发现闭环（R4 仅余同 UID `$TMPDIR` 中段改写模型，依授权跳过） |
-| `RB-11`..`RB-34c`（剩余 68 卡） | `pending` | — | — | Phase 3 正向迁移全系列（`RB-10`..`RB-10h` 共 15 卡）全部高质量闭环，进入反向迁移 Phase 1 首卡 `RB-11`（红库写者静默门与严格全局锁序） |
+| `RB-10k` | `done` / `remote-verified` | `fe0f341`（`main`，加固取代 `24acd6b`） | `0.30.459` | 2026-11-25 03:15:31 UTC：Stage 1 精确白名单内单文件写集（`src/storage/migrate.rs`）全面加固正向 Phase 2 围栏后未摘除与双源独立 `unlink` 合法缺席态恢复（彻底移除 `24acd6b` 的无锁预探与 `.expect()`）：持 `PRAGMA locking_mode = EXCLUSIVE` + `BEGIN EXCLUSIVE; ROLLBACK;` + `SQLITE_FCNTL_FILE_POINTER` WAL 页头核验统一静默双源，严格核验 `sqlite_master` 五列 + `COUNT(*) == 1` 哨兵并无条件恢复 `PRAGMA writable_schema = OFF`；修正 `compute_capture_redb_full_content_sha256` Layout A 使用 `CAPTURE_SCHEMA_NAME`；落地 `VerifiedBackupSnapshot` 单趟受保护描述符校验+私密 `0700` 快照（绝不经 SQLite 重开备份路径，彻底阻断备份替换 TOCTOU 与活库别名泄锁）；Unix 以 `strict_atomic_rename_noreplace_at_unix` 128-bit 随机隐藏隔离+复核 inode/全零 28B 页头（失配原子归位拒收）、Windows 以独占 `share=0` 单句柄 `FileDispositionInfo` 清理冷 `-journal`；`EphemeralParityFileBackend` 保障全表加密一致性续跑 ≤ `500ms`；`VER1` 发现门 3/3、`VER2`（`forward_phase2_crash_after_fence_before_unlink` 7.026s）、`VER3`（`forward_phase2_crash_immediately_after_libra_db_unlink` 5.762s）、`VER4`（`forward_phase2_crash_immediately_after_capture_db_unlink` 2.952s）、`RB-10c` 回归 2/2、纯 SQLite `storage::` 11/11、三构型矩阵零告警、全仓 `stable fmt` + `nightly fmt` + `nightly`/`stable clippy` `-D warnings` 全绿；Codex R1–R4 全部实质发现（备份快照/冷日志隔离/碰撞/spool 快照摘要）闭环（R4 仅余同 UID `$TMPDIR` 进程中段改写模型，依授权跳过） |
+| `RB-10d` | `done` / `remote-verified` | `fe0f341`（`main`，加固取代 `0767d76`） | `0.30.459` | 2026-11-25 03:15:31 UTC：Stage 1 精确白名单内单文件写集（`src/storage/migrate.rs`）完整实证正向 Phase 2 全量 fail-closed 拒收矩阵（≤ `100ms` 预算，双源 `libra.db` 与 `capture.db` 对称全覆盖、逐字节零改动）：`pending` 态双源意外缺席、无热日志页头清零/损毁、非 `__libra_migrated_fence__` 精确哨兵异常 schema 与篡改哨兵 SQL、以及双源合法 `unlink` 后各自备份缺失与单字节/摘要篡改均立即 fail-closed 报 `LBR-IO-001` 且清单保持 `finalized = false`；`VER1` 发现门 2/2、`VER2`（`forward_phase2_unexpected_missing_pending_and_corrupt_non_sentinel_reject` 11.252s）、`VER3`（`forward_phase2_post_unlink_corrupt_backup_fails_closed` 5.401s）、`VER4` 白名单、纯 SQLite `storage::` 11/11、三构型矩阵、fmt 与 `nightly`/`stable clippy` `-D warnings` 全绿 |
+| `RB-10h` | `done` / `remote-verified` | `fe0f341`（`main`，加固取代 `537f3cd`） | `0.30.459` | 2026-11-25 03:15:31 UTC：Stage 1 精确白名单内单文件写集（`src/storage/migrate.rs`）彻底移除 `537f3cd` 将备份拷回活 `.libra/libra.db` 的 P0 权威复活缺陷，落地零复活跨源漂移重导与无损 Spool 并集对账：`ReexportSourceSlot::{Live, VerifiedBackup(Box<VerifiedBackupSnapshot>)}` 对已围栏/已摘除源仅只读消费私密 `VerifiedBackupSnapshot` 并直拷携带至 `gen + 1`（即使 `AfterPromotionBeforeManifest` 崩溃也绝不重建活 `.db`）；`VerifiedSpoolBackupSnapshot` 单趟认证 `ready/` + `quarantine/` 并在下游 `ingest_capture_spool_ready_from_backup_readonly` 与 `backup_capture_spool_union_inner`（Unix/Windows）强验完整目录与逐文件 `(byte_len, sha256)`；`resolve_union_prior_spool_dst_name` 对一/二级文件名碰撞分配确定性唯一后缀（零静默漏事件）；`VER1` 发现门 2/2、`VER2`（`forward_phase2_crash_capture_db_and_queue_post_crash_reexport` 3.817s，含 `AfterPromotionBeforeManifest` 零复活实测）、`VER3`（`forward_phase2_spool_tombstone_gap_crash_and_concurrent_hook_reconcile` 6.344s，实证 AC2/AC3 崩溃前旧事件+并发新事件+同名及二级碰撞+去重键幂等+原备份后改零受扰+快照 `ready/`/`quarantine/` 篡改删损 fail-closed）、`VER4` 白名单、纯 SQLite `storage::` 11/11、三构型矩阵、fmt 与 `nightly`/`stable clippy` `-D warnings` 全绿；Codex R1–R4 全部实质发现闭环（R4 仅余同 UID `$TMPDIR` 中段改写模型，依授权跳过） |
+| `RB-11` | `done` / `remote-verified` | `ea56994`（`main`） | `0.30.491` | 2026-11-25T11:23:53Z：Stage 1 精确 2 文件写集（`src/storage/mod.rs`、`src/storage/migrate.rs`）实现对称反向迁移 Phase 1 红库写者静默门与严格 `ADR-RB-07` #2 全局 8 锁序（导出 `ReversePhase1QuiesceStage`、`ReversePhase1Locks`、`QuiescedRepositoryRedbSources`、`ReversePhase1QuiesceGuard`、`quiesce_reverse_repository_phase1`、`quiesce_reverse_repository_phase1_for_role`）：严格按 `migration.lock → maintenance.lock → capture-spool-consumer.lock → capture-queue/writer.lock → 原地 capture-queue/append.lock → 原地 capture-spool/capacity.lock → (git_wtx, cap_wtx)` 获取锁并逆序释放；持 6 锁后二次复核已终态 Redb `storage-format.json` 消除清单 TOCTOU；落地描述符绑定零路径重开 `open_verified_existing_redb_backend_for_reverse`（Unix `openat(O_RDWR\|O_NOFOLLOW\|O_NONBLOCK\|O_CLOEXEC)` + `fstat` 核验 / Windows `CreateFileW(FILE_FLAG_OPEN_REPARSE_POINT)` + `WinFileId` 核验）及 `ReverseNonBlockingFileBackend`（将 `redb 5.0` `MultiWriter` open 阻塞 `lock_range(WRITER_BYTE)` 转为非阻塞 `try_lock_range` + 零写 `WRITER_BYTE` 先验探针 + 4 KiB 内存 CoW 覆层保持 Phase 1 源 `.redb` 逐字节零写盘，且释放 `WRITER_BYTE` 前清空覆层确保 `sync_to_latest_commit` 完整收敛中段并发提交；`set_repair_callback(|s| s.abort())` 杜绝隐式修复改字节；`try_begin_reverse_source_write_tx` 统一将 `Repository`/`Capture` `WriteLockBusy` 映射为 `LBR-IO-001`；私有化 `ReversePhase1QuiesceGuard::redb` 仅提供绑生命周期借用 `redb(&self)`）；`VER1` 发现门 1/1、`VER2`（`reverse_phase1_quiescence_rejects_redb_writers_and_enforces_lock_order` 覆盖 AC1–AC5 跨 OS 子进程活跃 `git.redb`/`capture.redb` 写者拒收 `LBR-IO-001` 与源库逐字节零改动、全 8 锁跨进程互斥与预开 `RedbGitStore`/`RedbCaptureStore` `WriteLockBusy`、确定性中段并发提交 `MidOpenPeerCommitObserver` 回归、Phase 1 持锁及中止零写盘、`<= 50ms` 预算、`GC-13` 禁入角色与未终态/SQLite 清单拒收）、纯 SQLite `storage::` 11/11、三构型矩阵、`rustfmt +nightly` + `cargo +stable fmt --all -- --check` + `cargo +stable`/`+nightly clippy --all-targets --all-features -- -D warnings` + `compat_version_surface_sync` 2/2 全绿；Codex R1 两项 P1（CoW 覆层释放 `WRITER_BYTE` 清空防隐藏中段提交 + `ReversePhase1QuiesceGuard::redb` 私有化）全部闭环，Codex R2 获零残留 P0/P1 通过 |
+| `RB-11z` | `done` / `remote-pending` | 本提交（`main`） | `0.30.506` | 2026-11-25T14:53:00Z：Stage 1 精确白名单内单文件写集（`src/storage/migrate.rs`）扩展对称反向迁移 Phase 1 静默门，实现外部队列生产者原地 `capture-queue/append.lock` 与在途 `capture-spool/tmp/` 发布者（`spool.rs:119-145`）双重竞争拒收：新增 `ReversePhase1QuiesceStage::CaptureSpoolInFlightTmp` 并在 `quiesce_reverse_repository_phase1_inner` 的 Phase 0 零创建预检（先于 `any_lock_absent` 及任意缺席锁文件创建）与 Phase 1 持齐全部 6 把咨询锁（含 `capture-spool/capacity.lock`）之后二次调用 `verify_no_inflight_spool_tmp_files`（统一经 `normalize_reverse_quiesce_err` 映射为 `LBR-IO-001` 且零私密路径泄露）；`VER1` 发现门 1/1、`VER2`（`reverse_phase1_rejects_queue_producer_and_inflight_spool_tmp` 覆盖 AC1–AC8 全锁存在/缺锁两变体 × 外部 OS 子进程排他与共享 `append.lock` + 新鲜/未来 mtime `capture-spool/tmp/` 在途文件均返 `LBR-IO-001` 且源 `git.redb`/`capture.redb`、`capture-queue/`、`capture-spool/` 三域全树逐字节快照 100% 相等且零创建 `migration.lock`；含确定性 `PostLockInflightTmpInjector` 持锁后 TOCTOU 回归、过期 `>24h` 孤儿放行且保留与 `<= 50ms` 预算、Unix 硬链/符号链 `capture-spool/tmp` 墓碑 fail-closed 回归）、`RB-11` 回归 1/1、纯 SQLite `storage::` 11/11、三构型矩阵、`rustfmt +nightly` + `cargo +stable fmt --all -- --check` + `cargo +stable`/`+nightly clippy --all-targets --all-features -- -D warnings` + `compat_version_surface_sync` 2/2 全绿；Codex R1 只读审查所提 2 项晚竞态预检后已建锁文件留存属于与 `RB-10n` 同源的 POSIX 三元互斥（`ADR-RB-07` #2 严禁先于 `writer.lock` 获取 `append.lock`，且严禁 `unlink` 已发布锁 inode 杜绝 POSIX 锁裂脑；稳态竞争由 Phase 0 零创建预检 100% 覆盖 AC1–AC8），依用户授权如实留证并推进 |
+| `RB-11q`..`RB-34c`（剩余 66 卡） | `pending` | — | — | Phase 3 正向迁移全 15 卡 + 反向 Phase 1 `RB-11`、`RB-11z`（红库写者静默门、8 锁全局锁序、队列 `append.lock` 与在途 `capture-spool/tmp/` 竞争拒收）均已高质量闭环，下一卡进入 `RB-11q`（`capture-spool-consumer.lock` 排除并发 `drain_storage` 与非空 `quarantine/` fail-closed 保护） |
 
 ## Codex review log
 

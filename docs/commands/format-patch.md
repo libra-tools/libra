@@ -5,19 +5,25 @@ Generate mbox-formatted email patch files from commits.
 ## Synopsis
 
 ```bash
-libra format-patch [OPTIONS] [revision-range]
+libra format-patch [OPTIONS] [<revision>...]
 ```
 
 ## Description
 
 `libra format-patch` walks a revision range (`A..B` or a single commit treated
 as `<commit>..HEAD`), while `-1 [commit]` selects exactly one commit and
-`--root [commit]` includes the root and every reachable non-merge ancestor. It
+`--root [commit]` includes the root and every reachable non-merge ancestor.
+Multiple positional revisions are combined as a union, `^<rev>` excludes the
+commits reachable from `<rev>`, and `A..B` excludes `A` while including `B`
+(`<rev> main`-style selections use Git's revision-set semantics). It
 produces one patch file per non-merge commit (named with the `--suffix`,
 default `.patch`, unless `--numbered-files` is set, which uses bare sequence
 numbers). Filenames include a zero-padded sequence prefix regardless of `-n`
-or `-N`. Each patch is formatted as an mbox message with RFC 2822 headers, a
-plain-text diffstat, and a unified diff. The output is compatible with `git am`.
+or `-N`; the subject slug follows Git's `format_sanitized_subject` (case is preserved, ASCII letters/digits/`.`/`_` are kept, dot runs collapse, other runs become one `-`, and trailing dots/dashes are trimmed); under `-v <N>` every generated file also gets a `v<N>-` prefix (`v4-0000-cover-letter.patch`, `v4-0001-…`); non-integer or non-alphanumeric versions are accepted and sanitized like Git for the filename while `Subject:` keeps the raw version (a fractional reroll uses the plain `Interdiff:` title) (`--reroll-count=4.4` → `v4.4-…`, `4---..././../--1/.2//` → `v4-.-.-.-1-.2-…`, always confined to the output directory). Each patch is formatted as an mbox message with RFC 2822 headers, a
+plain-text diffstat, and a unified diff. Without `--stdout`, the generated
+paths are printed one per line to stdout (bare file names when `-o` is absent,
+the given path when `-o` is relative/absolute); `--quiet` and `--json` suppress
+that path list. The output is compatible with `git am`.
 
 Merge commits are skipped by default. When the revision range resolves to zero
 commits, the command exits successfully without generating patches. Plain output
@@ -32,26 +38,35 @@ body, and series metadata.
 
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
-| `[revision-range]` | | `A..B` range or single commit; single commit means `<commit>..HEAD` | `HEAD` |
+| `[<revision>...]` | | One or more revisions: a single commit means `<commit>..HEAD`, `A..B` excludes `A`, `^<rev>` excludes everything reachable from `<rev>`, and multiple positive revisions are unioned | `HEAD` |
 | `-1` | `-1` | Generate only the named commit, or `HEAD` when no revision is given | false |
 | `--root` | | Include the root commit and all reachable non-merge ancestors | false |
 | `--output-directory <DIR>` | `-o` | Write patch files into `DIR` | current directory |
 | `--stdout` | | Print all patches to stdout | false |
-| `--numbered` | `-n` | Add the `[PATCH n/m]` counter to commit patch Subject lines | false |
+| `--numbered` | `-n` | Add the `[PATCH n/m]` counter to commit patch Subject lines | auto (multi-patch or cover letter) |
 | `--no-numbered` | `-N` | Do not add `[PATCH n/m]` counters to commit patch or cover-letter Subject lines | off |
 | `--rfc[=<text>]` | | Prefix the subject with `RFC` (`[RFC PATCH]`); with a value, that text is used instead (`--rfc=WIP` → `[WIP PATCH]`). The value must be attached with `=` so a revision argument is never swallowed | off |
 | `--no-rfc` | | Cancel a preceding `--rfc` (last flag wins) | off |
 | `--filename-max-length <N>` | | Truncate output filenames to at most `N` bytes, counting the `0001-` prefix and the suffix; the stem may collapse to just the sequence number, matching Git's cut points | unlimited |
-| `--commit-list-format <FMT>` | | Cover-letter commit list and an implicit cover letter (unless `--no-cover-letter`). Default (or `short`/`shortlog`) is Git's author-grouped shortlog (`Name (N):` + subjects wrapped at 72 columns); `modern` renders `[i/N] subject`; any other value is a pretty-format string supporting `%h`, `%H`, `%s`, `%an`, `%ae`, `%n` and `%%` (unsupported conversions fail with `'<fmt>' is not a valid format string`) | `short` |
+| `--commit-list-format <FMT>` | | Cover-letter commit list and an implicit cover letter (unless `--no-cover-letter`). Default (or `short`/`shortlog`) is Git's author-grouped shortlog (`Name (N):` + subjects wrapped at 72 columns); `modern` renders `[i/N] subject`; any other value is a pretty-format string (optionally prefixed with `log:`) supporting `%h`, `%H`, `%s`, `%an`, `%ae`, `%n`, `%%`, and `%(count)`/`%(total)` (`%(count)` is zero-padded to the width of `%(total)` and counts from 1 regardless of `--start-number`); a literal without `%` (and without `log:`) is rejected with `'<fmt>' is not a valid format string` | `short` |
 | `--relative[=<path>]` | | Restrict the series to a directory and strip that prefix from diffstat and patch paths. With a value, `<path>` is resolved from the repository root (unlike `libra diff --relative`, which resolves from the current directory); bare `--relative` uses the current directory. `diff.relative=true` applies the same view when the flag is absent; `--no-relative` restores repository-relative paths (last of `--relative`/`--no-relative` wins). A prefix that is missing inside the repository or escapes it (`../outside`) produces Git's empty patch body (headers and message only, no `---` separator/diffstat/diff), writes no files, and never prints the outside path | off |
 | `--all` (unsupported) | | Accepted only to name the gap: Libra's revision grammar has no all-refs selector; name branches explicitly (`main..topic`) | — |
 | `--no-base` | | Do not emit the `base-commit:` trailer, overriding `--base` (Libra has no `format.useAutoBase` config to reset) | off |
 | `--start-number <N>` | | Start numbering at `N` | 1 |
 | `--subject-prefix <PREFIX>` | | Use `PREFIX` instead of `PATCH` in the Subject: line | `PATCH` |
+| `--interdiff <REV>` | | Show `Interdiff against v<n-1>:` (or `Interdiff:` without `-v`) in the cover letter, comparing `<REV>`'s tree directly with the last patch's tree. The option implies a cover letter for multi-patch series; for a single patch without a cover letter the block is placed after the patch diff and before the signature, indented by two spaces, and it is not repeated in the patch when a cover letter exists | off |
+| `--cover-from-description <MODE>` | | How `branch.<name>.description` feeds the cover letter: `default`/`message` put the whole description in the body, `subject` puts the first paragraph (joined with spaces) in `Subject:` and the rest in the body, `none` keeps the placeholders, and `auto` uses subject mode only when the formatted first paragraph is at most 100 bytes. An invalid mode is rejected even without `--cover-letter` | `default` |
 | `--cover-letter` | | Generate a cover-letter template (`0000-cover-letter<suffix>`, or `0` under `--numbered-files`). Overrides `format.coverLetter=false` | false |
 | `--no-cover-letter` | | Do not generate a cover letter; overrides `format.coverLetter` and the implicit cover letter requested by `--commit-list-format` (last of `--cover-letter`/`--no-cover-letter` wins) | — |
-| `--thread` | | Add `In-Reply-To` and `References` headers (default on) | true |
-| `--no-thread` | | Disable threading headers | false |
+| `--thread[=<STYLE>]` | | Add generated `Message-ID`/`In-Reply-To`/`References` headers (default off). Bare `--thread` or `--thread=shallow` makes every patch reply to the cover letter/first patch; `--thread=deep` chains each patch as a reply to its predecessor, with `References` pointing at the thread root | false |
+| `--no-thread` | | Disable generated threading headers; an explicit `--in-reply-to` still adds the external parent to every mail | false |
+| `format.filenameMaxLength` (config) | | Default whole-filename byte budget (Git default 64, including the `NNNN-` prefix, slug, suffix and any `v<N>-` reroll prefix); `--filename-max-length` wins | `64` |
+| `format.attach` (config) | | Non-empty value supplies the multipart boundary (literal `true` is the boundary `true`); empty disables multipart. Local empty overrides a global value; `--no-attach` wins | — |
+| `format.coverFromDescription` (config) | | Default cover-letter description mode (same values as `--cover-from-description`; the CLI wins). An invalid configured value is rejected with `invalid cover from description mode` even when the CLI supplies a valid mode and even without `--cover-letter` | `default` |
+| `branch.<name>.description` (config) | | Replaces the cover-letter `*** BLURB HERE ***` paragraph with that branch's description. Git's branch choice applies: the current branch for no selector or a single bare revision, otherwise the unique positive revision's branch | — |
+| `format.useAutoBase` (config) | | `true` behaves like `--base=auto`; `whenAble` uses auto only when a unique upstream merge base can be determined and silently omits the base block otherwise; `false` disables it. `--no-base` and an explicit `--base` override the config | — |
+| `format.commitListFormat` (config) | | Default cover-letter commit-list format (same syntax as `--commit-list-format`, including `log:`/atoms). The CLI option wins; unlike the CLI option, this config alone does not imply a cover letter, and `full` is rejected as an invalid format string | — |
+| `format.thread` (config) | | `true`/`shallow` (case-insensitive) select shallow threading, `deep` selects deep threading, and `false`/empty disable it. The local layer wins over global and a later same-layer value wins; CLI flags override the config, and the last of `--thread`/`--thread=<style>`/`--no-thread` wins | — |
 | `--in-reply-to <MESSAGE_ID>` | | Make the first mail a reply to the given Message-ID | none |
 | `--to <ADDRESS>` | | Add a `To:` header (repeatable; multiple addresses fold like git). Placed after the MIME headers, on each patch and the cover letter | none |
 | `--cc <ADDRESS>` | | Add a `Cc:` header (repeatable; folds like git) | none |
@@ -63,8 +78,9 @@ body, and series metadata.
 | `--no-signoff` | | Disable signoff, overriding `format.signOff` | false |
 | `--notes[=<REF>]` | | Append each commit's notes after the `---` line, before the diffstat. Bare `--notes` uses the default ref (`refs/notes/commits`); `--notes=<ref>` reads `<ref>`. Rendered as `Notes:` (default ref) or `Notes (<ref>):`, each line indented four spaces; commits without a note are emitted unchanged | off |
 | `--attach` | | Emit each patch as a `multipart/mixed` MIME message: the log message + diffstat in a `text/plain` part, the diff in a `text/x-patch` part with `Content-Disposition: attachment`. Mutually exclusive with `--inline` | off |
-| `--inline` | | Like `--attach`, but the patch part uses `Content-Disposition: inline` | off |
-| `--base <COMMIT>` | | Record a `base-commit:` trailer (and a `prerequisite-patch-id:` line for each non-merge commit between the base and the series, oldest-first) so `git am --base` can verify the series applies. The trailer rides on the last patch, or the cover letter under `--cover-letter`. The base must be an ancestor of the series (otherwise exit 128). `--base=auto` is not supported (exit 129). Patch-ids match `git patch-id --stable` for text diffs; **binary-file prerequisites are not guaranteed to match Git** | off |
+| `--no-attach` | | Do not create a multipart message; overrides `format.attach` and `--attach`/`--inline` | off |
+| `--inline[=<BOUNDARY>]` | | Like `--attach`, but the patch part uses `Content-Disposition: inline`; an optional boundary works the same way | off |
+| `--base <COMMIT>` | | Record a `base-commit:` trailer (and a `prerequisite-patch-id:` line for each non-merge commit between the base and the series, oldest-first) so `git am --base` can verify the series applies. The trailer rides on the first patch, or the cover letter under `--cover-letter` (Git's `print_bases` emits it once). The base must be an ancestor of the series (otherwise exit 128). `--base=auto` infers the base as the unique merge base between the current branch's upstream and every positive revision; it fails with `LBR-CLI-003` when there is no upstream, the merge base is ambiguous (criss-cross), the base is not an ancestor of every revision, or the base itself is in the revision list. Patch-ids match `git patch-id --stable` for text diffs; **binary-file prerequisites are not guaranteed to match Git** | off |
 | `--full-index` | | Show full object IDs in diff index header lines | false |
 | `-U <N>`, `--unified=<N>` | | Generate hunks with `N` lines of context (Git's `-U<n>` / `--unified=<n>`); default 3 | 3 |
 | `--diff-filter=<FILTER>` | | Only include changed paths matching the Git diff-filter letters (e.g. `A` for added paths); applies to both the patch and the diffstat | all |
@@ -154,7 +170,7 @@ Each patch file is an mbox message:
 ```
 From <commit-oid> <unix-mbox-date>
 From: Author Name <email>
-Date: <RFC 2822 date>
+Date: <RFC 2822 author date with the author timezone>
 Subject: [PATCH n/m] commit subject
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -185,14 +201,16 @@ The cover letter emits `MIME-Version`/`Content-Type`/`Content-Transfer-Encoding`
 headers only when at least one commit's raw object buffer contains non-ASCII
 bytes (Git's `make_cover_letter` rule); an all-ASCII series has no MIME headers.
 
-`format.coverLetter=true|false|auto` supplies the default (`auto` = only for series with more than one patch); `--cover-letter`/`--no-cover-letter` override it, and `--commit-list-format` implies a cover letter unless `--no-cover-letter` is given. When `--cover-letter` is set, the list includes the cover letter as record
+The cover letter's `From:` defaults to the execution-time committer identity (`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`, else `user.name`/`user.email`) when no `--from`/`format.from` is given; patches keep the commit author. `format.coverLetter=true|false|auto` supplies the default (`auto` = only for series with more than one patch); `--cover-letter`/`--no-cover-letter` override it, and `--commit-list-format` implies a cover letter unless `--no-cover-letter` is given. The cover letter also carries the series diffstat (the tree difference from the unique boundary commit — the oldest patch's parent — to the last patch). `--no-stat`/`-p` only suppress the per-patch diffstat, and a series that starts at a root commit (no unique boundary) omits the cover diffstat. The cover diffstat inherits the patch rename options (`-M`/`--find-renames`/`--no-renames`, last one wins). When `--cover-letter` is set, the list includes the cover letter as record
 number `0` before the commit patch records. Its filename is
 `0000-cover-letter` with the configured suffix (default `.patch`), or just `0`
 under `--numbered-files`.
 
 `-N` keeps the `NNNN-` sequence prefix in filenames and suppresses `[PATCH n/m]`
-counters on commit patch and cover-letter Subject lines. Without `-N`, a
-requested cover letter has a `[PATCH 0/N]` counter. Counter width follows the
+counters on commit patch and cover-letter Subject lines. By default Git's
+`format.numbered=auto` semantics apply: a multi-patch series and any requested
+cover letter get counters (the cover letter uses `[PATCH 0/N]`), while a lone
+patch stays `[PATCH]`. Counter width follows the
 displayed final number, including `--start-number`: a single patch uses
 `[PATCH 1/1]`; two patches starting at 9 use `[PATCH 00/10]` on the cover
 letter and `[PATCH 09/10]` / `[PATCH 10/10]` on the patches. A ten-patch

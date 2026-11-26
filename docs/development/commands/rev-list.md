@@ -86,3 +86,9 @@ flowchart TD
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 
 - 2026-11-23（PM-03 / #747）：新增 `--missing=<error|allow-any|print|allow-promisor>`（`require_equals`，默认 `error`）；`--objects` 行以 `ClientStorage::exist_checked_many` 一次有界批量探测，存储错误按错误上报；`error`/`allow-promisor` 对任何缺失对象 `LBR-REPO-002`，`allow-any` 丢弃，`print` 丢弃并在全部普通行之后追加 `?<oid>`；树加载失败改为停止下探（缺失子树由探测标记），修掉缺失 blob 被当普通行静默输出的问题。回归：`rev_list_missing_actions_on_local_missing_objects`（AC1–AC4/AC6/AC7）、`rev_list_missing_print_reports_a_missing_subtree`（AC5）；`rev_list_test` 82/82。
+
+## 2026-11-25（LG-23 / issues/478）
+
+- `--no-walk` 升级为 `--no-walk[=sorted|unsorted]`（默认 sorted，unsorted 保留输入顺序）并新增 `--do-walk`；非法取值 `LBR-CLI-002`。`--objects-edge` 的 `-<oid>` 边界行改为位于提交行之前（对齐 Git t6000）。
+- `--disk-usage` 改为统计所选对象的存储大小：松散对象取压缩文件 `metadata.len()`，包内对象取 pack 条目大小（通过 idx 偏移表，不解压），`--objects` 时把 tree/blob 纳入；`human`（默认）/`raw` 输出，非法格式 `LBR-CLI-002`。对象存储压缩策略与 Git 不同的仓库可能得到不同字节数（记录为存储格式差异，不改变遍历/统计口径）。
+- 回归：`test_rev_list_no_walk_matrix`、`test_rev_list_disk_usage_matrix`、`test_rev_list_objects_edge_order`；`command_test` rev-list 87/87、`--lib command::rev_list` 19/19、`compat_ledger_schema`/`compat_version_surface_sync` 45/45。

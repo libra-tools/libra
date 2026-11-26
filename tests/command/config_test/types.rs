@@ -426,3 +426,48 @@ fn test_t1300_expiry_date() {
     assert!(listed.contains("date.good="), "{listed:?}");
     assert!(!listed.contains("date.invalid1"), "{listed:?}");
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_71_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "x.bool", "yes"], repo.path()),
+        "set bool",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "x.text", "hello"], repo.path()),
+        "set text",
+    );
+    for (key, expected) in [("x.bool", "true"), ("x.text", "hello")] {
+        let shortcut = run_libra_command(&["config", "--get", "--bool-or-str", key], repo.path());
+        let typed = run_libra_command(&["config", "--get", "--type=bool-or-str", key], repo.path());
+        assert_eq!(
+            String::from_utf8_lossy(&shortcut.stdout).trim(),
+            expected,
+            "shortcut {key}"
+        );
+        assert_eq!(
+            shortcut.stdout, typed.stdout,
+            "shortcut equals --type for {key}"
+        );
+    }
+}
+
+#[test]
+#[serial(cwd)]
+fn test_cf_73_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let out = run_libra_command(
+        &["config", "--get", "--type=bool", "--int", "x.k"],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "conflicting type switches exit 129: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

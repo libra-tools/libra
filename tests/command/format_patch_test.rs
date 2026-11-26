@@ -1597,12 +1597,17 @@ fn base_auto_is_rejected() {
         &["format-patch", "--base=auto", "--stdout", "HEAD~1..HEAD"],
         repo.path(),
     );
+    // Without branch tracking `--base=auto` cannot infer the upstream.
     assert_eq!(
         out.status.code(),
-        Some(129),
-        "--base=auto is a usage error: {}",
+        Some(128),
+        "missing upstream: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("failed to get upstream"), "{stderr}");
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(out.stdout.is_empty());
 }
 
 #[test]
@@ -4118,8 +4123,7 @@ fn relative_outside_and_missing_prefix() {
 /// implicit cover letter requested by `--commit-list-format` (#900, #909).
 #[test]
 fn format_cover_letter_auto_config() {
-    use std::collections::BTreeSet;
-    use std::process::Command;
+    use std::{collections::BTreeSet, process::Command};
 
     fn seed(root: &std::path::Path, libra: bool) {
         let run = |args: &[&str]| {
@@ -4303,5 +4307,4407 @@ fn format_cover_letter_auto_config() {
         segment(&libra_cover),
         segment(&git_cover),
         "AC6 shortlog cover list"
+    );
+}
+
+/// FPG-58: the cover-letter body starts with `*** BLURB HERE ***`; the subject
+/// placeholder stays in the `Subject:` header only (#905).
+#[test]
+fn cover_letter_body_template_matches_git() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("second.txt"), "second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], p),
+        "commit",
+    );
+
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "cover letter");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let cover = text
+        .split_once("\nFrom ")
+        .map(|(cover, _)| cover)
+        .unwrap_or(&text);
+    let mut lines = cover.lines();
+    let subject = lines
+        .find(|line| line.starts_with("Subject: "))
+        .unwrap_or_default();
+    assert_eq!(
+        subject, "Subject: [PATCH 0/2] *** SUBJECT HERE ***",
+        "AC2 subject header"
+    );
+    let (_, body) = cover.split_once("\n\n").expect("header/body separator");
+    assert!(
+        body.starts_with("*** BLURB HERE ***\n"),
+        "AC1 body starts with the blurb placeholder: {body:?}"
+    );
+    assert!(
+        !body.contains("*** SUBJECT HERE ***"),
+        "AC1 subject placeholder is not repeated in the body: {body:?}"
+    );
+}
+
+/// FPG-13: the cover letter carries a series diffstat from the unique boundary
+/// commit to the last patch, independent of `--no-stat`/`-p`; it is omitted when
+/// the series starts at a root commit (#905).
+#[test]
+fn cover_letter_includes_diffstat() {
+    use std::process::Command;
+
+    fn header(libra: bool, root: &std::path::Path, args: &[&str]) -> std::process::Output {
+        if libra {
+            run_libra_command(args, root)
+        } else {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("HOME", root)
+                .output()
+                .expect("git")
+        }
+    }
+    let cover_body = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail[1..]
+            .find("\nFrom ")
+            .map(|idx| idx + 1)
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    let seed = |root: &std::path::Path, libra: bool| {
+        let run = |args: &[&str]| {
+            let out = header(libra, root, args);
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for (content, subject) in [
+            ("a\nb\nc\n", "one"),
+            ("a\nB\nc\n", "two"),
+            ("a\nB\nC\n", "three"),
+        ] {
+            fs::write(root.join("f"), content).unwrap();
+            run(&["add", "f"]);
+            run(&["commit", "-m", subject]);
+        }
+    };
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let cover = |dir: &std::path::Path, libra: bool, flags: &[&str]| -> String {
+        let mut args = vec!["format-patch", "--cover-letter"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread"]);
+        if !flags.iter().any(|flag| flag.starts_with("--signature")) {
+            args.push("--no-signature");
+        }
+        cover_body(&header(libra, dir, &args).stdout)
+    };
+
+    // AC1: default series body matches Git (list + series diffstat).
+    assert_eq!(cover(lp, true, &["-2"]), cover(gp, false, &["-2"]), "AC1");
+    // AC3/AC4: --no-stat and -p only affect the patches.
+    assert_eq!(
+        cover(lp, true, &["-2", "--no-stat"]),
+        cover(gp, false, &["-2", "--no-stat"]),
+        "AC3 no-stat"
+    );
+    assert_eq!(
+        cover(lp, true, &["-2", "-p"]),
+        cover(gp, false, &["-2", "-p"]),
+        "AC4 -p"
+    );
+    // AC5: a series rooted at the root commit has no boundary diffstat.
+    assert_eq!(
+        cover(lp, true, &["--root", "HEAD"]),
+        cover(gp, false, &["--root", "HEAD"]),
+        "AC5 root"
+    );
+    // AC6: the diffstat precedes the signature.
+    assert_eq!(
+        cover(lp, true, &["-2", "--signature=SIG"]),
+        cover(gp, false, &["-2", "--signature=SIG"]),
+        "AC6 signature"
+    );
+    // AC7: --root with an explicit bounded range still has a boundary.
+    assert_eq!(
+        cover(lp, true, &["--root", "HEAD~2..HEAD"]),
+        cover(gp, false, &["--root", "HEAD~2..HEAD"]),
+        "AC7 root range"
+    );
+
+    // AC2: the diffstat is the shared stat renderer over origin..last.
+    let rename_repo = tempdir().expect("rename");
+    let rp = rename_repo.path();
+    assert_cli_success(&run_libra_command(&["init", "."], rp), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], rp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], rp),
+        "email",
+    );
+    fs::write(rp.join("file"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file"], rp), "add");
+    assert_cli_success(&run_libra_command(&["commit", "-m", "base"], rp), "commit");
+    assert_cli_success(&run_libra_command(&["mv", "file", "foo"], rp), "mv");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "rename"], rp),
+        "commit rename",
+    );
+    let stat_out = run_libra_command(&["diff", "--stat", "HEAD~1", "HEAD"], rp);
+    assert_cli_success(&stat_out, "diff stat");
+    let expected_stat = String::from_utf8_lossy(&stat_out.stdout)
+        .trim_end()
+        .to_string();
+    let rename_cover = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        rp,
+    );
+    assert_cli_success(&rename_cover, "rename cover");
+    assert!(
+        cover_body(&rename_cover.stdout).contains(&expected_stat),
+        "AC2 stat renderer: {}",
+        cover_body(&rename_cover.stdout)
+    );
+}
+
+/// FPG-39: rename options follow last-one-wins and the cover diffstat inherits
+/// them; `--no-renames` emits delete+add and still writes a cover letter.
+#[test]
+fn rename_options_and_cover_inherit() {
+    use std::{collections::BTreeSet, process::Command};
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            out
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        fs::write(root.join("file"), "1\n2\n3\n4\n5\n").unwrap();
+        run(&["add", "file"]);
+        run(&["commit", "-m", "base"]);
+        run(&["mv", "file", "foo"]);
+        run(&["commit", "-m", "rename"]);
+    }
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let libra_run = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let out = run_libra_command(&args, lp);
+        assert_cli_success(&out, "libra format-patch");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let git_run = |flags: &[&str]| -> String {
+        let mut cmd = Command::new("git");
+        cmd.args(["format-patch"])
+            .args(flags)
+            .args(["--stdout", "--no-thread", "--no-signature"])
+            .current_dir(gp)
+            .env("HOME", gp);
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "git {flags:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let diff_segment = |text: &str| -> String {
+        // Compare the unified diff itself: Git's rename summary line
+        // (`rename file => foo (100%)`) is covered by DEFER-FPG-03.
+        text.find("diff --git ")
+            .map(|start| text[start..].to_string())
+            .unwrap_or_else(|| text.to_string())
+    };
+    let without_hunk_headers = |text: &str| -> String {
+        text.lines()
+            .filter(|line| !line.starts_with("@@"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // AC1/AC2: a later -M re-enables rename detection.
+    let ac1 = diff_segment(&libra_run(&["--no-renames", "-M", "-1"]));
+    assert_eq!(
+        ac1,
+        diff_segment(&git_run(&["--no-renames", "-M", "-1"])),
+        "AC1 -M last wins"
+    );
+    assert_eq!(
+        diff_segment(&libra_run(&["--no-renames", "--find-renames", "-1"])),
+        ac1,
+        "AC2 --find-renames"
+    );
+    // AC3: --no-renames emits delete + add.
+    assert_eq!(
+        without_hunk_headers(&diff_segment(&libra_run(&["--no-renames", "-1"]))),
+        without_hunk_headers(&diff_segment(&git_run(&["--no-renames", "-1"]))),
+        "AC3 no-renames"
+    );
+
+    // AC4/AC5: cover letter + patch file on disk match Git.
+    let libra_files = run_libra_command(
+        &[
+            "format-patch",
+            "--no-renames",
+            "--cover-letter",
+            "-1",
+            "-o",
+            "d",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra_files, "AC4 libra files");
+    let git_files = Command::new("git")
+        .args([
+            "format-patch",
+            "--no-renames",
+            "--cover-letter",
+            "-1",
+            "-o",
+            "d",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_files.status.success(), "{git_files:?}");
+    let names = |root: &std::path::Path| -> BTreeSet<String> {
+        fs::read_dir(root.join("d"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect()
+    };
+    assert_eq!(names(lp), names(gp), "AC4 file names");
+    let patch_name = names(lp)
+        .into_iter()
+        .find(|name| name.starts_with("0001-"))
+        .expect("patch file");
+    assert_eq!(
+        without_hunk_headers(&diff_segment(
+            &fs::read_to_string(lp.join("d").join(&patch_name)).unwrap()
+        )),
+        without_hunk_headers(&diff_segment(
+            &fs::read_to_string(gp.join("d").join(&patch_name)).unwrap()
+        )),
+        "AC5 patch diff"
+    );
+
+    // AC6/AC7: cover diffstat paths inherit -M / --no-renames.
+    let cover_stat_paths = |stdout: &[u8]| -> BTreeSet<String> {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail[1..]
+            .find("\nFrom ")
+            .map(|i| i + 1)
+            .unwrap_or(tail.len());
+        tail[..end]
+            .lines()
+            .filter_map(|line| {
+                line.split_once(" | ")
+                    .map(|(path, _)| path.trim().to_string())
+            })
+            .collect()
+    };
+    let libra_cover = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let out = run_libra_command(&args, lp);
+        assert_cli_success(&out, "cover");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    assert_eq!(
+        cover_stat_paths(libra_cover(&["--no-renames", "-M"]).as_bytes()),
+        BTreeSet::from(["file => foo".to_string()]),
+        "AC6 cover inherits -M"
+    );
+    assert_eq!(
+        cover_stat_paths(libra_cover(&["--no-renames"]).as_bytes()),
+        BTreeSet::from(["file".to_string(), "foo".to_string()]),
+        "AC7 cover inherits --no-renames"
+    );
+}
+
+/// FPG-62: a cover-letter path occupied by a directory fails with the write
+/// error and leaves no patch or temporary files behind (#904).
+#[test]
+fn cover_letter_write_failure_leaves_no_partial_output() {
+    use std::collections::BTreeSet;
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("second.txt"), "second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], p),
+        "commit",
+    );
+    fs::create_dir_all(p.join("d/0000-cover-letter.patch")).unwrap();
+    let snapshot = |root: &std::path::Path| -> BTreeSet<String> {
+        let mut entries = BTreeSet::new();
+        let base = root.join("d");
+        let mut stack = vec![base.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(&base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let kind = if entry.file_type().unwrap().is_dir() {
+                    "dir"
+                } else {
+                    "file"
+                };
+                entries.insert(format!("{relative}:{kind}"));
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        entries
+    };
+    let before = snapshot(p);
+
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--no-renames",
+            "--cover-letter",
+            "-1",
+            "-o",
+            "d",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert!(!out.status.success(), "AC1 write failure");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.lines().any(|line| line == "Error-Code: LBR-IO-002"),
+        "AC1 stable code: {stderr}"
+    );
+    assert!(
+        stderr.contains("0000-cover-letter.patch"),
+        "AC1 path in message: {stderr}"
+    );
+    assert!(out.stdout.is_empty(), "AC1 stdout empty");
+    assert_eq!(snapshot(p), before, "AC2 no partial output");
+    assert_eq!(
+        before,
+        BTreeSet::from(["0000-cover-letter.patch:dir".to_string()]),
+        "AC2 snapshot is only the pre-created directory"
+    );
+}
+
+/// FPG-63: threading headers sit between the envelope line and `From:`, in the
+/// same field order as Git (values intentionally not compared).
+#[test]
+fn thread_headers_follow_envelope() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("变更{i}")]);
+        }
+    }
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let fields = |stdout: &[u8]| -> Vec<Vec<String>> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        let mut messages = Vec::new();
+        for segment in text.split("\nFrom ").skip(1) {
+            let headers = segment
+                .split_once("\n\n")
+                .map(|(headers, _)| headers)
+                .unwrap_or(segment);
+            let mut lines = headers.lines();
+            lines.next(); // envelope remainder
+            let mut names = Vec::new();
+            for line in lines {
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    continue; // folded continuation
+                }
+                if let Some((name, _)) = line.split_once(':') {
+                    names.push(name.to_string());
+                }
+            }
+            messages.push(names);
+        }
+        messages
+    };
+    let flags = [
+        "format-patch",
+        "--thread",
+        "--cover-letter",
+        "--in-reply-to=<test.message>",
+        "-3",
+        "--stdout",
+        "--no-signature",
+    ];
+    let libra_out = run_libra_command(&flags, lp);
+    assert_cli_success(&libra_out, "libra");
+    let git_out = Command::new("git")
+        .args(flags)
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_out.status.success(), "{git_out:?}");
+    let libra_fields = fields(&libra_out.stdout);
+    assert_eq!(libra_fields.len(), 4, "cover + three patches");
+    assert_eq!(libra_fields, fields(&git_out.stdout), "AC1 field order");
+    // The threading headers are the first fields after the envelope, before
+    // `From:`, for every message including the cover.
+    for message in &libra_fields {
+        assert_eq!(message[0], "Message-ID", "{message:?}");
+        assert!(message.iter().position(|name| name == "From").is_some());
+        let from = message.iter().position(|name| name == "From").unwrap();
+        assert!(
+            message[..from]
+                .iter()
+                .all(|name| matches!(name.as_str(), "Message-ID" | "In-Reply-To" | "References"))
+        );
+    }
+}
+
+/// FPG-28: generated Message-IDs are pairwise non-substrings and the threading
+/// structure matches Git (#916).
+#[test]
+fn message_id_no_substring() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool, commits: usize) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=commits {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+    }
+    let messages = |stdout: &[u8]| -> Vec<(String, Option<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = String::new();
+                let mut parent = None;
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = value.trim().trim_matches(['<', '>']).to_string();
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        parent = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    }
+                }
+                (id, parent)
+            })
+            .collect()
+    };
+    let assert_pairwise = |ids: &[String]| {
+        for (i, a) in ids.iter().enumerate() {
+            for (j, b) in ids.iter().enumerate() {
+                if i != j {
+                    assert!(!a.contains(b), "{a:?} must not contain {b:?}");
+                    assert!(!b.contains(a), "{b:?} must not contain {a:?}");
+                }
+            }
+        }
+    };
+
+    // AC1: three patches without a cover.
+    let repo = tempdir().expect("libra");
+    let lp = repo.path();
+    seed(lp, true, 3);
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--thread",
+            "-3",
+            "--stdout",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&out, "AC1");
+    let ac1 = messages(&out.stdout);
+    assert_eq!(ac1.len(), 3);
+    assert_pairwise(&ac1.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>());
+
+    // AC2/AC3: a 12-message series (cover + 11 patches).
+    let big = tempdir().expect("big");
+    let bp = big.path();
+    seed(bp, true, 12);
+    let big_out = run_libra_command(
+        &[
+            "format-patch",
+            "--thread",
+            "--cover-letter",
+            "-11",
+            "--stdout",
+            "--no-signature",
+        ],
+        bp,
+    );
+    assert_cli_success(&big_out, "AC2");
+    let big_messages = messages(&big_out.stdout);
+    assert_eq!(big_messages.len(), 12);
+    assert_pairwise(
+        &big_messages
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+    );
+    let cover_id = &big_messages[0].0;
+    for (id, parent) in &big_messages[1..] {
+        assert_eq!(parent.as_deref(), Some(cover_id.as_str()), "AC3 {id}");
+    }
+
+    // AC4: normalized parent indices match Git's shallow threading.
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false, 3);
+    let git_out = Command::new("git")
+        .args([
+            "format-patch",
+            "--thread",
+            "-3",
+            "--stdout",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_out.status.success(), "{git_out:?}");
+    let structure = |msgs: &[(String, Option<String>)]| -> Vec<Option<usize>> {
+        let ids: Vec<&str> = msgs.iter().map(|(id, _)| id.as_str()).collect();
+        msgs.iter()
+            .map(|(_, parent)| {
+                parent
+                    .as_deref()
+                    .and_then(|parent| ids.iter().position(|id| *id == parent))
+            })
+            .collect()
+    };
+    assert_eq!(
+        structure(&messages(&out.stdout)),
+        structure(&messages(&git_out.stdout)),
+        "AC4 threading structure"
+    );
+}
+
+/// FPG-35: `--thread=shallow|deep` and `--no-thread --in-reply-to` produce the
+/// same normalized threading structure as Git (#916).
+#[test]
+fn thread_shallow_and_deep() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Msg {
+        id: Option<usize>,
+        reply: Option<String>,
+        references: Vec<String>,
+    }
+    let parse = |stdout: &[u8]| -> Vec<(Option<String>, Option<String>, Vec<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = None;
+                let mut reply = None;
+                let mut refs = Vec::new();
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        reply = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("References: ") {
+                        refs = value
+                            .split_whitespace()
+                            .map(|value| value.trim_matches(['<', '>']).to_string())
+                            .collect();
+                    }
+                }
+                (id, reply, refs)
+            })
+            .collect()
+    };
+    let normalize = |stdout: &[u8]| -> Vec<Msg> {
+        let messages = parse(stdout);
+        let ids: Vec<&str> = messages
+            .iter()
+            .filter_map(|(id, _, _)| id.as_deref())
+            .collect();
+        let map = |value: &str| -> String {
+            ids.iter()
+                .position(|id| *id == value)
+                .map(|index| format!("#{index}"))
+                .unwrap_or_else(|| value.to_string())
+        };
+        messages
+            .iter()
+            .map(|(id, reply, refs)| Msg {
+                id: id
+                    .as_deref()
+                    .and_then(|id| ids.iter().position(|known| *known == id)),
+                reply: reply.as_deref().map(map),
+                references: refs.iter().map(|value| map(value)).collect(),
+            })
+            .collect()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "AC1 shallow cover external",
+            &[
+                "--thread=shallow",
+                "--cover-letter",
+                "--in-reply-to=<test.message>",
+                "-3",
+            ],
+        ),
+        ("AC2 deep", &["--thread=deep", "-3"]),
+        (
+            "AC3 deep external",
+            &["--thread=deep", "--in-reply-to=<test.message>", "-3"],
+        ),
+        ("AC4 deep cover", &["--thread=deep", "--cover-letter", "-3"]),
+        (
+            "AC5 deep cover external",
+            &[
+                "--thread=deep",
+                "--cover-letter",
+                "--in-reply-to=<test.message>",
+                "-3",
+            ],
+        ),
+        (
+            "AC6 no-thread external",
+            &["--no-thread", "--in-reply-to=<test.message>", "-3"],
+        ),
+        ("AC7 bare thread", &["--thread", "-3"]),
+    ];
+    for (label, args) in cases {
+        let mut libra_args = vec!["format-patch"];
+        libra_args.extend_from_slice(args);
+        libra_args.extend_from_slice(&["--stdout", "--no-signature"]);
+        let libra_out = run_libra_command(&libra_args, lp);
+        assert_cli_success(&libra_out, label);
+        let git_out = Command::new("git")
+            .args(&libra_args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git_out.status.success(), "{label}: {git_out:?}");
+        assert_eq!(
+            normalize(&libra_out.stdout),
+            normalize(&git_out.stdout),
+            "{label}"
+        );
+    }
+}
+
+/// FPG-23: threading is off by default, while `--in-reply-to` alone keeps the
+/// external parent on every mail (#917).
+#[test]
+fn format_thread_default_off() {
+    use std::process::Command;
+
+    let repo = create_committed_repo_via_cli();
+    let lp = repo.path();
+    for i in 1..=2 {
+        fs::write(lp.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", &format!("extra{i}")], lp),
+            "add",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", &format!("subject {i}"), "--no-verify"],
+                lp,
+            ),
+            "commit",
+        );
+    }
+
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    for name in ["first", "extra1", "extra2"] {
+        fs::write(gp.join(name), format!("{name}\n")).unwrap();
+        git(&["add", name]);
+        git(&["commit", "-q", "-m", &format!("subject {name}")]);
+    }
+
+    let headers = |stdout: &[u8]| -> Vec<(Option<String>, Option<String>, Vec<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = None;
+                let mut reply = None;
+                let mut refs = Vec::new();
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        reply = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("References: ") {
+                        refs.push(value.trim().trim_matches(['<', '>']).to_string());
+                    }
+                }
+                (id, reply, refs)
+            })
+            .collect()
+    };
+
+    // AC1: no thread headers by default, matching Git.
+    let libra = run_libra_command(&["format-patch", "-3", "--stdout", "--no-signature"], lp);
+    assert_cli_success(&libra, "AC1 libra");
+    let git_out = git(&["format-patch", "-3", "--stdout", "--no-signature"]);
+    let libra_default = headers(&libra.stdout);
+    assert_eq!(libra_default.len(), 3, "three patches");
+    assert!(
+        libra_default
+            .iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+    assert_eq!(libra_default, headers(&git_out.stdout), "AC1 default off");
+
+    // AC2: --in-reply-to alone adds the external parent everywhere, no IDs.
+    let libra = run_libra_command(
+        &[
+            "format-patch",
+            "--in-reply-to=<test.message>",
+            "-3",
+            "--stdout",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra, "AC2 libra");
+    let git_out = git(&[
+        "format-patch",
+        "--in-reply-to=<test.message>",
+        "-3",
+        "--stdout",
+        "--no-signature",
+    ]);
+    let with_parent = headers(&libra.stdout);
+    assert_eq!(with_parent.len(), 3);
+    for (id, reply, refs) in &with_parent {
+        assert!(id.is_none(), "no generated Message-ID");
+        assert_eq!(reply.as_deref(), Some("test.message"));
+        assert_eq!(refs, &["test.message".to_string()]);
+    }
+    assert_eq!(
+        with_parent,
+        headers(&git_out.stdout),
+        "AC2 in-reply-to only"
+    );
+}
+
+/// FPG-47: `format.thread` accepts true/false/shallow/deep/empty with Git's
+/// cascade semantics (#917).
+#[test]
+fn format_thread_config_values() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+    }
+
+    let parse = |stdout: &[u8]| -> Vec<(Option<String>, Option<String>, Vec<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = None;
+                let mut reply = None;
+                let mut refs = Vec::new();
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        reply = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("References: ") {
+                        refs.push(value.trim().trim_matches(['<', '>']).to_string());
+                    }
+                }
+                (id, reply, refs)
+            })
+            .collect()
+    };
+    let normalize = |stdout: &[u8]| -> Vec<(Option<usize>, Option<String>, Vec<String>)> {
+        let messages = parse(stdout);
+        let ids: Vec<&str> = messages
+            .iter()
+            .filter_map(|(id, _, _)| id.as_deref())
+            .collect();
+        let map = |value: &str| -> String {
+            ids.iter()
+                .position(|id| *id == value)
+                .map(|index| format!("#{index}"))
+                .unwrap_or_else(|| value.to_string())
+        };
+        messages
+            .iter()
+            .map(|(id, reply, refs)| {
+                (
+                    id.as_deref()
+                        .and_then(|id| ids.iter().position(|known| *known == id)),
+                    reply.as_deref().map(map),
+                    refs.iter().map(|value| map(value)).collect(),
+                )
+            })
+            .collect()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let libra_config = |args: &[&str]| {
+        let _ = run_libra_command(args, lp);
+    };
+    let git_config = |args: &[&str]| {
+        let _ = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .status();
+    };
+    let clear = || {
+        libra_config(&["config", "unset", "format.thread"]);
+        libra_config(&["config", "--global", "unset", "format.thread"]);
+        git_config(&["config", "--unset", "format.thread"]);
+        git_config(&["config", "--global", "--unset", "format.thread"]);
+    };
+    let set_both = |value: &str| {
+        libra_config(&["config", "set", "format.thread", value]);
+        git_config(&["config", "format.thread", value]);
+    };
+    let compare = |label: &str| {
+        let libra_out =
+            run_libra_command(&["format-patch", "-3", "--stdout", "--no-signature"], lp);
+        assert_cli_success(&libra_out, label);
+        let git_out = Command::new("git")
+            .args(["format-patch", "-3", "--stdout", "--no-signature"])
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git_out.status.success(), "{label}: {git_out:?}");
+        assert_eq!(
+            normalize(&libra_out.stdout),
+            normalize(&git_out.stdout),
+            "{label}"
+        );
+        normalize(&libra_out.stdout)
+    };
+
+    clear();
+    set_both("true");
+    assert!(compare("AC1 true").iter().any(|(id, _, _)| id.is_some()));
+    set_both("Shallow");
+    assert!(compare("AC2 Shallow").iter().any(|(id, _, _)| id.is_some()));
+    set_both("deep");
+    let deep = compare("AC3 deep");
+    assert_eq!(deep[0].0, Some(0));
+    assert_eq!(deep[1].1.as_deref(), Some("#0"));
+    assert_eq!(deep[2].1.as_deref(), Some("#1"));
+
+    clear();
+    libra_config(&["config", "--global", "set", "format.thread", "deep"]);
+    git_config(&["config", "--global", "format.thread", "deep"]);
+    set_both("false");
+    let off = compare("AC4 local false");
+    assert!(
+        off.iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+
+    clear();
+    libra_config(&["config", "--global", "set", "format.thread", "deep"]);
+    git_config(&["config", "--global", "format.thread", "deep"]);
+    set_both("");
+    let empty = compare("AC5 local empty");
+    assert!(
+        empty
+            .iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+
+    clear();
+    libra_config(&["config", "--add", "format.thread", "deep"]);
+    libra_config(&["config", "--add", "format.thread", "false"]);
+    git_config(&["config", "--add", "format.thread", "deep"]);
+    git_config(&["config", "--add", "format.thread", "false"]);
+    let last = compare("AC6 same-layer last wins");
+    assert!(
+        last.iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+    clear();
+}
+
+/// FPG-50: CLI thread flags override `format.thread` in argv order (#917).
+#[test]
+fn thread_cli_overrides_config() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+    }
+    let normalize = |stdout: &[u8]| -> Vec<(Option<usize>, Option<String>, Vec<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        let messages: Vec<(Option<String>, Option<String>, Vec<String>)> = text
+            .split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = None;
+                let mut reply = None;
+                let mut refs = Vec::new();
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        reply = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("References: ") {
+                        refs.push(value.trim().trim_matches(['<', '>']).to_string());
+                    }
+                }
+                (id, reply, refs)
+            })
+            .collect();
+        let ids: Vec<&str> = messages
+            .iter()
+            .filter_map(|(id, _, _)| id.as_deref())
+            .collect();
+        let map = |value: &str| -> String {
+            ids.iter()
+                .position(|id| *id == value)
+                .map(|index| format!("#{index}"))
+                .unwrap_or_else(|| value.to_string())
+        };
+        messages
+            .iter()
+            .map(|(id, reply, refs)| {
+                (
+                    id.as_deref()
+                        .and_then(|id| ids.iter().position(|known| *known == id)),
+                    reply.as_deref().map(map),
+                    refs.iter().map(|value| map(value)).collect(),
+                )
+            })
+            .collect()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let set_config = |value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "format.thread", value], lp),
+            "libra config",
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "format.thread", value])
+                .current_dir(gp)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let compare =
+        |label: &str, flags: &[&str]| -> Vec<(Option<usize>, Option<String>, Vec<String>)> {
+            let mut libra_args = vec!["format-patch"];
+            libra_args.extend_from_slice(flags);
+            libra_args.extend_from_slice(&["-3", "--stdout", "--no-signature"]);
+            let libra_out = run_libra_command(&libra_args, lp);
+            assert_cli_success(&libra_out, label);
+            let git_out = Command::new("git")
+                .args(&libra_args)
+                .current_dir(gp)
+                .env("HOME", gp)
+                .output()
+                .expect("git");
+            assert!(git_out.status.success(), "{label}: {git_out:?}");
+            assert_eq!(
+                normalize(&libra_out.stdout),
+                normalize(&git_out.stdout),
+                "{label}"
+            );
+            normalize(&libra_out.stdout)
+        };
+
+    set_config("deep");
+    let shallow = compare("AC1 bare --thread", &["--thread"]);
+    assert_eq!(shallow[1].1.as_deref(), Some("#0"));
+    assert_eq!(shallow[2].1.as_deref(), Some("#0"));
+    let off = compare("AC2 --no-thread", &["--no-thread"]);
+    assert!(
+        off.iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+
+    set_config("shallow");
+    let deep = compare("AC3 deep override", &["--thread=deep"]);
+    assert_eq!(deep[2].1.as_deref(), Some("#1"));
+
+    set_config("deep");
+    let shallow = compare("AC4 shallow override", &["--thread=shallow"]);
+    assert_eq!(shallow[2].1.as_deref(), Some("#0"));
+
+    set_config("true");
+    let off = compare(
+        "AC5 deep then --no-thread",
+        &["--thread=deep", "--no-thread"],
+    );
+    assert!(
+        off.iter()
+            .all(|(id, reply, refs)| id.is_none() && reply.is_none() && refs.is_empty())
+    );
+
+    set_config("false");
+    let deep = compare(
+        "AC6 --no-thread then deep",
+        &["--no-thread", "--thread=deep"],
+    );
+    assert_eq!(deep[2].1.as_deref(), Some("#1"));
+
+    let _ = run_libra_command(&["config", "unset", "format.thread"], lp);
+}
+
+/// FPG-14: `%(count)`/`%(total)` atoms, padding, and the `log:` prefix match
+/// Git; a literal format without `%` is rejected (#899).
+#[test]
+fn commit_list_format_git_atoms() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "A U Thor"]);
+            run(&["config", "set", "user.email", "author@example.com"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "A U Thor"]);
+            run(&["config", "user.email", "author@example.com"]);
+        }
+        for i in 1..=11 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("This is a subject {i}")]);
+        }
+    }
+    let segment = |text: &str| -> String {
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail
+            .lines()
+            .scan(0usize, |offset, line| {
+                let line_start = *offset;
+                *offset += line.len() + 1;
+                Some((line_start, line))
+            })
+            .find(|(_, line)| line.contains(" | ") && line.starts_with(' '))
+            .map(|(offset, _)| offset)
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let libra_run = |flags: &[&str]| -> std::process::Output {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let out = run_libra_command(&args, lp);
+        assert_cli_success(&out, "libra format-patch");
+        out
+    };
+    let git_run = |flags: &[&str]| -> String {
+        let mut cmd = Command::new("git");
+        cmd.args(["format-patch"])
+            .args(flags)
+            .args(["--stdout", "--no-thread", "--no-signature"])
+            .current_dir(gp)
+            .env("HOME", gp);
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "git {flags:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let compare = |label: &str, format: &str, extra: &[&str]| {
+        let format_flag = format!("--commit-list-format={format}");
+        let mut flags = vec!["--cover-letter", format_flag.as_str()];
+        flags.extend_from_slice(extra);
+        let libra = libra_run(&flags);
+        let git = git_run(&flags);
+        assert_eq!(
+            segment(&String::from_utf8_lossy(&libra.stdout)),
+            segment(&git),
+            "{label}"
+        );
+    };
+
+    compare("AC1 count", "[%(count)] %s", &["-2"]);
+    compare("AC2 total", "[%(total)] %s", &["-2"]);
+    compare("AC3 combined", "[%(count)/%(total)] %s (%an)", &["-2"]);
+    compare("AC6 padded count", "[%(count)/%(total)] %s", &["-10"]);
+    compare(
+        "AC7 start number",
+        "[%(count)/%(total)] %s",
+        &["--start-number=5", "-2"],
+    );
+
+    // AC4: the `log:` prefix is stripped before rendering.
+    let git_files = Command::new("git")
+        .args([
+            "format-patch",
+            "--commit-list-format=log:[%(count)/%(total)] %s (%an)",
+            "-o",
+            "patches",
+            "HEAD~1",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_files.status.success(), "{git_files:?}");
+    let libra_files = run_libra_command(
+        &[
+            "format-patch",
+            "--commit-list-format=log:[%(count)/%(total)] %s (%an)",
+            "-o",
+            "patches",
+            "HEAD~1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra_files, "AC4");
+    assert_eq!(
+        segment(&fs::read_to_string(lp.join("patches/0000-cover-letter.patch")).unwrap()),
+        segment(&fs::read_to_string(gp.join("patches/0000-cover-letter.patch")).unwrap()),
+        "AC4 log: prefix"
+    );
+
+    // AC5: a literal without `%` is rejected as an invalid format string.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--commit-list-format=this should fail",
+            "-1",
+            "--stdout",
+        ],
+        lp,
+    );
+    assert!(!invalid.status.success(), "AC5");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"));
+    assert!(stderr.contains("is not a valid format string"), "{stderr}");
+    assert!(invalid.stdout.is_empty());
+}
+
+/// FPG-59: the patch `Date:` header uses the author time and timezone, and both
+/// `libra am` and `git am` preserve it (#893).
+#[test]
+fn patch_date_uses_author_time_and_zone() {
+    use std::process::Command;
+
+    let author_env = [
+        ("GIT_AUTHOR_DATE", "2005-04-07 15:13:13 +0800"),
+        ("GIT_COMMITTER_DATE", "2006-01-02 03:04:05 +0000"),
+    ];
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    assert_cli_success(&run_libra_command(&["init", "."], lp), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], lp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], lp),
+        "email",
+    );
+    fs::write(lp.join("file"), "0\nbase\n2\n3\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file"], lp), "add base");
+    assert_cli_success(
+        &run_libra_command_with_env(&["commit", "-m", "base", "--no-verify"], lp, &author_env),
+        "commit base",
+    );
+    for i in 1..=2 {
+        fs::write(lp.join("file"), format!("0\n{i}\n2\n3\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", "file"], lp), "add");
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["commit", "-m", &format!("subject {i}"), "--no-verify"],
+                lp,
+                &author_env,
+            ),
+            "commit",
+        );
+    }
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_AUTHOR_DATE", "2005-04-07 15:13:13 +0800")
+            .env("GIT_COMMITTER_DATE", "2006-01-02 03:04:05 +0000")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    fs::write(gp.join("file"), "0\nbase\n2\n3\n").unwrap();
+    git(&["add", "file"]);
+    git(&["commit", "-q", "-m", "base"]);
+    for i in 1..=2 {
+        fs::write(gp.join("file"), format!("0\n{i}\n2\n3\n")).unwrap();
+        git(&["add", "file"]);
+        git(&["commit", "-q", "-m", &format!("subject {i}")]);
+    }
+
+    let libra_mbox = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra_mbox, "libra format-patch");
+    let git_mbox = git(&[
+        "format-patch",
+        "-2",
+        "--stdout",
+        "--no-thread",
+        "--no-signature",
+    ]);
+    let dates = |bytes: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter(|line| line.starts_with("Date: "))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        dates(&libra_mbox.stdout),
+        dates(&git_mbox.stdout),
+        "AC1 Date headers"
+    );
+    assert_eq!(
+        dates(&libra_mbox.stdout),
+        vec![
+            "Date: Thu, 7 Apr 2005 15:13:13 +0800".to_string(),
+            "Date: Thu, 7 Apr 2005 15:13:13 +0800".to_string(),
+        ],
+        "AC1 author date"
+    );
+
+    let mbox = String::from_utf8_lossy(&libra_mbox.stdout).to_string();
+    // AC2: libra am preserves the author timestamp and zone.
+    let recv = tempdir().expect("recv");
+    let rp = recv.path();
+    assert_cli_success(&run_libra_command(&["init", "."], rp), "recv init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "R"], rp),
+        "recv name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "r@r"], rp),
+        "recv email",
+    );
+    fs::write(rp.join("file"), "0\nbase\n2\n3\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file"], rp), "recv add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], rp),
+        "recv base commit",
+    );
+    // `libra am` consumes one mail per invocation here; the two mbox entries
+    // still carry the same Date headers and author identities.
+    let split_at = mbox.find("\nFrom ").expect("second mail");
+    let first_mail = &mbox[..split_at];
+    let second_mail = &mbox[split_at + 1..];
+    for (index, mail) in [first_mail, second_mail].iter().enumerate() {
+        let path = format!("mail{index}.mbox");
+        fs::write(rp.join(&path), mail).unwrap();
+        let am = run_libra_command(&["am", &path], rp);
+        assert_cli_success(&am, "AC2 libra am");
+    }
+    let log = run_libra_command(&["log", "-2", "--format=%at %ai"], rp);
+    assert_cli_success(&log, "AC2 log");
+    let log_text = String::from_utf8_lossy(&log.stdout).to_string();
+    let lines: Vec<&str> = log_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines, ["1112857993 2005-04-07 15:13:13 +0800"; 2], "AC2");
+
+    // AC3: git am preserves the same author identity.
+    let grecv = tempdir().expect("git recv");
+    let grp = grecv.path();
+    let init = Command::new("git")
+        .args(["init", "-q", "-b", "main", "."])
+        .current_dir(grp)
+        .env("HOME", grp)
+        .status()
+        .unwrap();
+    assert!(init.success());
+    for (key, value) in [("user.name", "R"), ("user.email", "r@r")] {
+        Command::new("git")
+            .args(["config", key, value])
+            .current_dir(grp)
+            .status()
+            .unwrap();
+    }
+    fs::write(grp.join("file"), "0\nbase\n2\n3\n").unwrap();
+    Command::new("git")
+        .args(["add", "file"])
+        .current_dir(grp)
+        .status()
+        .unwrap();
+    let base = Command::new("git")
+        .args(["commit", "-q", "-m", "base"])
+        .current_dir(grp)
+        .env("HOME", grp)
+        .env("GIT_AUTHOR_NAME", "R")
+        .env("GIT_AUTHOR_EMAIL", "r@r")
+        .env("GIT_COMMITTER_NAME", "R")
+        .env("GIT_COMMITTER_EMAIL", "r@r")
+        .status()
+        .unwrap();
+    assert!(base.success());
+    fs::write(grp.join("series.mbox"), &mbox).unwrap();
+    let out = Command::new("git")
+        .args(["am", "series.mbox"])
+        .current_dir(grp)
+        .env("HOME", grp)
+        .output()
+        .expect("git am");
+    assert!(out.status.success(), "AC3 git am: {out:?}");
+    let log = Command::new("git")
+        .args(["log", "-2", "--format=%at %ai"])
+        .current_dir(grp)
+        .env("HOME", grp)
+        .output()
+        .expect("git log");
+    assert!(log.status.success());
+    let log_text = String::from_utf8_lossy(&log.stdout).to_string();
+    let lines: Vec<&str> = log_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines, ["1112857993 2005-04-07 15:13:13 +0800"; 2], "AC3");
+}
+
+/// FPG-64: the base block rides on the first mail (cover letter or first patch)
+/// exactly once (#894).
+#[test]
+fn base_block_rides_on_first_mail() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=5 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            if libra {
+                let out = run_libra_command_with_env(
+                    &["commit", "-m", &format!("subject {i}")],
+                    root,
+                    &[
+                        ("GIT_AUTHOR_DATE", "2005-04-07 15:13:13 +0800"),
+                        ("GIT_COMMITTER_DATE", "2005-04-07 15:13:13 +0800"),
+                    ],
+                );
+                assert!(out.status.success(), "{out:?}");
+            } else {
+                let out = Command::new("git")
+                    .args(["commit", "-m", &format!("subject {i}")])
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .env("GIT_AUTHOR_DATE", "2005-04-07 15:13:13 +0800")
+                    .env("GIT_COMMITTER_DATE", "2005-04-07 15:13:13 +0800")
+                    .output()
+                    .expect("git");
+                assert!(out.status.success(), "{out:?}");
+            }
+        }
+    }
+    let mail_blocks = |stdout: &[u8]| -> Vec<Vec<String>> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                segment
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with("base-commit:")
+                            || line.starts_with("prerequisite-patch-id:")
+                    })
+                    // The fixtures are independent repositories, so compare the
+                    // base line's placement/kind rather than its object id.
+                    .map(|line| {
+                        if line.starts_with("base-commit:") {
+                            "base-commit: <oid>".to_string()
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let compare = |label: &str, extra: &[&str]| {
+        let mut args = vec!["format-patch", "--base=HEAD~3", "-2"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let libra = run_libra_command(&args, lp);
+        assert_cli_success(&libra, label);
+        let git = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git.status.success(), "{label}: {git:?}");
+        assert_eq!(
+            mail_blocks(&libra.stdout),
+            mail_blocks(&git.stdout),
+            "{label}"
+        );
+        mail_blocks(&libra.stdout)
+    };
+
+    // AC1: without a cover the first patch carries the block.
+    let blocks = compare("AC1", &[]);
+    assert_eq!(blocks.len(), 2);
+    assert!(!blocks[0].is_empty(), "AC1 first patch has base block");
+    assert!(blocks[1].is_empty(), "AC1 second patch has none");
+    // AC2: with a cover the cover letter carries it and patches are empty.
+    let blocks = compare("AC2", &["--cover-letter"]);
+    assert_eq!(blocks.len(), 3);
+    assert!(!blocks[0].is_empty(), "AC2 cover has base block");
+    assert!(blocks[1].is_empty() && blocks[2].is_empty(), "AC2 patches");
+}
+
+/// FPG-49: `format.commitListFormat` supplies only the default format (it does
+/// not imply a cover letter); `full` is rejected and `--no-cover-letter`
+/// combines with a CLI format (#899, #900, #909).
+#[test]
+fn commit_list_format_config_and_full() {
+    use std::{collections::BTreeSet, process::Command};
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "A U Thor"]);
+            run(&["config", "set", "user.email", "author@example.com"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "A U Thor"]);
+            run(&["config", "user.email", "author@example.com"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("This is a subject {i}")]);
+        }
+    }
+    let segment = |text: &str| -> String {
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail
+            .lines()
+            .scan(0usize, |offset, line| {
+                let start = *offset;
+                *offset += line.len() + 1;
+                Some((start, line))
+            })
+            .find(|(_, line)| line.contains(" | ") && line.starts_with(' '))
+            .map(|(offset, _)| offset)
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let set_both = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], lp),
+            "libra config",
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", key, value])
+                .current_dir(gp)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let unset_both = |key: &str| {
+        let _ = run_libra_command(&["config", "unset", key], lp);
+        let _ = Command::new("git")
+            .args(["config", "--unset", key])
+            .current_dir(gp)
+            .status();
+    };
+    let run_both = |label: &str, flags: &[&str]| -> (std::path::PathBuf, std::path::PathBuf) {
+        let _ = fs::remove_dir_all(lp.join("patches"));
+        let _ = fs::remove_dir_all(gp.join("patches"));
+        let mut libra_args = vec!["format-patch"];
+        libra_args.extend_from_slice(flags);
+        libra_args.extend_from_slice(&["--no-thread", "--no-signature"]);
+        let libra = run_libra_command(&libra_args, lp);
+        assert_cli_success(&libra, label);
+        let mut cmd = Command::new("git");
+        cmd.args(&libra_args).current_dir(gp).env("HOME", gp);
+        let git = cmd.output().expect("git");
+        assert!(git.status.success(), "{label}: {git:?}");
+        (lp.join("patches"), gp.join("patches"))
+    };
+    let compare_cover = |label: &str, flags: &[&str]| {
+        let (lpatches, gpatches) = run_both(label, flags);
+        let libra = fs::read_to_string(lpatches.join("0000-cover-letter.patch")).unwrap();
+        let git = fs::read_to_string(gpatches.join("0000-cover-letter.patch")).unwrap();
+        assert_eq!(segment(&libra), segment(&git), "{label}");
+    };
+    let names = |dir: &std::path::Path| -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect()
+    };
+
+    // AC1: `full` is not a valid Git format string.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--commit-list-format=full",
+            "-2",
+            "--stdout",
+        ],
+        lp,
+    );
+    assert!(!invalid.status.success(), "AC1");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"));
+    assert!(stderr.contains("is not a valid format string"), "{stderr}");
+    assert!(invalid.stdout.is_empty());
+
+    // AC2: log: atoms via config.
+    set_both("format.coverLetter", "true");
+    set_both(
+        "format.commitListFormat",
+        "log:[%(count)/%(total)] %s (%an)",
+    );
+    compare_cover("AC2 config log atoms", &["-o", "patches", "HEAD~2"]);
+    // AC3/AC4: modern/shortlog keywords via config.
+    set_both("format.commitListFormat", "modern");
+    compare_cover("AC3 config modern", &["-o", "patches", "HEAD~2"]);
+    set_both("format.commitListFormat", "shortlog");
+    compare_cover("AC4 config shortlog", &["-o", "patches", "HEAD~2"]);
+    // AC5: CLI format wins over the config.
+    set_both("format.commitListFormat", "modern");
+    compare_cover(
+        "AC5 CLI wins",
+        &[
+            "--commit-list-format=[%(count)] %s",
+            "-o",
+            "patches",
+            "HEAD~2",
+        ],
+    );
+
+    // AC6: config format alone does not force a cover letter.
+    unset_both("format.coverLetter");
+    set_both("format.commitListFormat", "[%(count)] %s");
+    let (lpatches, _) = run_both("AC6 no implicit cover", &["-o", "patches", "HEAD~1"]);
+    let names6 = names(&lpatches);
+    assert_eq!(names6.len(), 1, "AC6 files: {names6:?}");
+    assert!(names6.iter().all(|name| name.starts_with("0001-")));
+
+    // AC7: --no-cover-letter with a CLI format succeeds without writing one.
+    let (lpatches, _) = run_both(
+        "AC7 no cover with format",
+        &[
+            "--no-cover-letter",
+            "--commit-list-format=[%(count)] %s",
+            "-o",
+            "patches",
+            "HEAD~1",
+        ],
+    );
+    let names7 = names(&lpatches);
+    assert_eq!(names7.len(), 1, "AC7 files: {names7:?}");
+    assert!(names7.iter().all(|name| name.starts_with("0001-")));
+    unset_both("format.commitListFormat");
+}
+
+/// FPG-15: multiple revision arguments and `^<rev>` exclusions select the same
+/// patch set as Git, without changing single-revision semantics (#892).
+#[test]
+fn revision_range_caret_exclusion() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run_env = |args: &[&str], date: &str| {
+            let out = if libra {
+                run_libra_command_with_env(
+                    args,
+                    root,
+                    &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+                )
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .env("GIT_AUTHOR_DATE", date)
+                    .env("GIT_COMMITTER_DATE", date)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        let dates = [
+            "2005-04-07 15:11:00 +0800",
+            "2005-04-07 15:12:00 +0800",
+            "2005-04-07 15:13:00 +0800",
+            "2005-04-07 15:14:00 +0800",
+            "2005-04-07 15:15:00 +0800",
+        ];
+        fs::write(root.join("f"), "base\n").unwrap();
+        run(&["add", "f"]);
+        run_env(&["commit", "-m", "base"], dates[0]);
+        for (index, subject) in ["m1", "m2"].iter().enumerate() {
+            fs::write(root.join("f"), format!("{subject}\n")).unwrap();
+            run(&["add", "f"]);
+            run_env(&["commit", "-m", subject], dates[index + 1]);
+        }
+        run(&["branch", "rebuild-1"]);
+        run(&["checkout", "rebuild-1"]);
+        for (index, subject) in ["r1", "r2"].iter().enumerate() {
+            fs::write(root.join("r"), format!("{subject}\n")).unwrap();
+            run(&["add", "r"]);
+            run_env(&["commit", "-m", subject], dates[index + 3]);
+        }
+        run(&["branch", "r1", "rebuild-1~1"]);
+        run(&["checkout", "main"]);
+    }
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let output = |libra: bool, flags: &[&str]| -> String {
+        if libra {
+            let out = run_libra_command(flags, lp);
+            assert_cli_success(&out, "libra");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        } else {
+            let out = Command::new("git")
+                .args(flags)
+                .current_dir(gp)
+                .env("HOME", gp)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{flags:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        }
+    };
+    let subjects = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.starts_with("Subject: "))
+            .map(str::to_string)
+            .collect()
+    };
+    let cover_list = |text: &str| -> String {
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail
+            .lines()
+            .scan(0usize, |offset, line| {
+                let start = *offset;
+                *offset += line.len() + 1;
+                Some((start, line))
+            })
+            .find(|(_, line)| line.contains(" | ") && line.starts_with(' '))
+            .map(|(offset, _)| offset)
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+    let run_case = |_label: &str, args: &[&str]| -> (String, String) {
+        let mut flags = vec!["format-patch"];
+        flags.extend_from_slice(args);
+        flags.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let libra = output(true, &flags);
+        let git = output(false, &flags);
+        (libra, git)
+    };
+
+    // AC1: cover-letter list with a caret exclusion.
+    let (libra, git) = run_case("AC1", &["--cover-letter", "^main", "rebuild-1"]);
+    assert_eq!(cover_list(&libra), cover_list(&git), "AC1 cover list");
+    // AC2/AC3: no cover; the exclusion equals the explicit range.
+    let (libra_a, git_a) = run_case("AC2", &["^main", "rebuild-1"]);
+    assert_eq!(subjects(&libra_a), subjects(&git_a), "AC2 subjects");
+    let (libra_b, _) = run_case("AC3", &["main..rebuild-1"]);
+    let normalize = |text: &str| -> String {
+        text.lines()
+            .filter(|line| !line.starts_with("Date: ") && !line.starts_with("From "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(normalize(&libra_a), normalize(&libra_b), "AC3 range equals");
+
+    // AC4: two positive revisions union all reachable commits.
+    let (libra, git) = run_case("AC4", &["main", "rebuild-1"]);
+    assert_eq!(subjects(&libra), subjects(&git), "AC4 two positives");
+    // AC5: an inner commit is excluded by `^r1`.
+    let (libra, git) = run_case("AC5", &["main~2..rebuild-1", "^r1"]);
+    assert_eq!(subjects(&libra), subjects(&git), "AC5 inner caret");
+    assert_eq!(subjects(&libra).len(), 1, "AC5 only r2");
+    // AC6/AC7: single-revision and `a~n..b` semantics are unchanged.
+    let (libra, git) = run_case("AC6", &["HEAD~2"]);
+    assert_eq!(subjects(&libra), subjects(&git), "AC6 single revision");
+    let (libra, git) = run_case("AC7", &["rebuild-1~2..rebuild-1"]);
+    assert_eq!(subjects(&libra), subjects(&git), "AC7 a~n..b");
+}
+
+/// FPG-17: `--base=auto` resolves the unique merge base between the branch's
+/// upstream and the whole revision list (#894).
+#[test]
+fn base_auto_cli() {
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+    fn import(git_dir: &std::path::Path, parent: &std::path::Path) -> std::path::PathBuf {
+        let target = parent.join("libra");
+        fs::create_dir_all(&target).unwrap();
+        let out = run_libra_command(
+            &[
+                "init",
+                "--from-git-repository",
+                git_dir.to_str().unwrap(),
+                ".",
+            ],
+            &target,
+        );
+        assert_cli_success(&out, "import");
+        target
+    }
+    fn configure(lp: &std::path::Path, upstream_oid: &str) {
+        assert_cli_success(
+            &run_libra_command(&["branch", "upstream", upstream_oid], lp),
+            "branch upstream",
+        );
+        let branch = String::from_utf8_lossy(
+            &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], lp).stdout,
+        )
+        .trim()
+        .to_string();
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "set", &format!("branch.{branch}.remote"), "."],
+                lp,
+            ),
+            "remote",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "config",
+                    "set",
+                    &format!("branch.{branch}.merge"),
+                    "refs/heads/upstream",
+                ],
+                lp,
+            ),
+            "merge",
+        );
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "user.name", "T"], lp),
+            "name",
+        );
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "user.email", "t@t"], lp),
+            "email",
+        );
+    }
+    let base_block = |stdout: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter(|line| {
+                line.starts_with("base-commit:") || line.starts_with("prerequisite-patch-id:")
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let stderr_error = |label: &str, out: &std::process::Output, phrase: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"),
+            "{label}: {stderr}"
+        );
+        assert!(
+            stderr.contains(phrase),
+            "{label}: missing {phrase:?}: {stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{label} stdout: {out:?}");
+    };
+
+    // AC1/AC2: upstream advanced after the fork; auto picks the old merge base
+    // and records the intervening prerequisite commit.
+    let g1 = tempdir().unwrap();
+    let gp = g1.path();
+    git(gp, &["init", "-q", "-b", "main", "."]);
+    git(gp, &["config", "user.name", "T"]);
+    git(gp, &["config", "user.email", "t@t"]);
+    fs::write(gp.join("f"), "base\n").unwrap();
+    git(gp, &["add", "f"]);
+    git(gp, &["commit", "-q", "-m", "base"]);
+    git(gp, &["branch", "upstream"]);
+    fs::write(gp.join("f"), "prereq\n").unwrap();
+    git(gp, &["add", "f"]);
+    git(gp, &["commit", "-q", "-m", "prereq"]);
+    for subject in ["m1", "m2"] {
+        fs::write(gp.join("f"), format!("{subject}\n")).unwrap();
+        git(gp, &["add", "f"]);
+        git(gp, &["commit", "-q", "-m", subject]);
+    }
+    git(gp, &["checkout", "-q", "upstream"]);
+    fs::write(gp.join("u"), "u2\n").unwrap();
+    git(gp, &["add", "u"]);
+    git(gp, &["commit", "-q", "-m", "u2"]);
+    let upstream_oid = git(gp, &["rev-parse", "HEAD"]);
+    git(gp, &["checkout", "-q", "main"]);
+    git(gp, &["config", "branch.main.remote", "."]);
+    git(gp, &["config", "branch.main.merge", "refs/heads/upstream"]);
+    let parent = tempdir().unwrap();
+    let lp = import(gp, parent.path());
+    configure(&lp, &upstream_oid);
+    let libra = run_libra_command(
+        &[
+            "format-patch",
+            "--base=auto",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&libra, "AC1 auto");
+    let git_out = Command::new("git")
+        .args([
+            "format-patch",
+            "--base=auto",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .unwrap();
+    assert!(git_out.status.success(), "{git_out:?}");
+    assert_eq!(
+        base_block(&libra.stdout),
+        base_block(&git_out.stdout),
+        "AC1/AC2"
+    );
+    assert_eq!(
+        base_block(&libra.stdout)
+            .iter()
+            .filter(|line| line.starts_with("base-commit:"))
+            .count(),
+        1
+    );
+    assert!(
+        base_block(&libra.stdout)
+            .iter()
+            .any(|line| line.starts_with("prerequisite-patch-id:"))
+    );
+
+    // AC3: no upstream tracking fails.
+    let no_up = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init", "."], no_up.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], no_up.path()),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], no_up.path()),
+        "email",
+    );
+    fs::write(no_up.path().join("f"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], no_up.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "one", "--no-verify"], no_up.path()),
+        "commit",
+    );
+    let out = run_libra_command(
+        &["format-patch", "--base=auto", "-1", "--stdout"],
+        no_up.path(),
+    );
+    assert!(!out.status.success());
+    stderr_error("AC3", &out, "failed to get upstream");
+
+    // AC4: criss-cross merge bases are ambiguous.
+    let g4 = tempdir().unwrap();
+    let g4p = g4.path();
+    git(g4p, &["init", "-q", "-b", "main", "."]);
+    git(g4p, &["config", "user.name", "T"]);
+    git(g4p, &["config", "user.email", "t@t"]);
+    fs::write(g4p.join("f"), "base\n").unwrap();
+    git(g4p, &["add", "f"]);
+    git(g4p, &["commit", "-q", "-m", "base"]);
+    git(g4p, &["branch", "a"]);
+    git(g4p, &["branch", "b"]);
+    git(g4p, &["checkout", "-q", "a"]);
+    fs::write(g4p.join("a"), "a\n").unwrap();
+    git(g4p, &["add", "a"]);
+    git(g4p, &["commit", "-q", "-m", "a"]);
+    let a1_oid = git(g4p, &["rev-parse", "HEAD"]);
+    git(g4p, &["checkout", "-q", "b"]);
+    fs::write(g4p.join("b"), "b\n").unwrap();
+    git(g4p, &["add", "b"]);
+    git(g4p, &["commit", "-q", "-m", "b"]);
+    git(g4p, &["checkout", "-q", "a"]);
+    git(g4p, &["merge", "-q", "--no-edit", "b"]);
+    git(g4p, &["checkout", "-q", "b"]);
+    git(g4p, &["merge", "-q", "--no-edit", &a1_oid]);
+    // Advance both sides past their merge commits; the merge bases of the two
+    // tips remain the criss-cross pair.
+    git(g4p, &["checkout", "-q", "a"]);
+    fs::write(g4p.join("a2"), "a2\n").unwrap();
+    git(g4p, &["add", "a2"]);
+    git(g4p, &["commit", "-q", "-m", "a2"]);
+    let a2_oid = git(g4p, &["rev-parse", "HEAD"]);
+    git(g4p, &["checkout", "-q", "b"]);
+    fs::write(g4p.join("b2"), "b2\n").unwrap();
+    git(g4p, &["add", "b2"]);
+    git(g4p, &["commit", "-q", "-m", "b2"]);
+    let crisscross_upstream = git(g4p, &["rev-parse", "HEAD"]);
+    git(g4p, &["checkout", "-q", "a"]);
+    let parent4 = tempdir().unwrap();
+    let lp4 = import(g4p, parent4.path());
+    configure(&lp4, &crisscross_upstream);
+    let out = run_libra_command(
+        &["format-patch", "--base=auto", "-1", "--stdout", &a2_oid],
+        &lp4,
+    );
+    assert!(!out.status.success(), "AC4 should fail: {out:?}");
+    stderr_error("AC4", &out, "exact merge base");
+
+    // AC6: the whole-list merge base must be an ancestor of every tip.
+    let g6 = tempdir().unwrap();
+    let g6p = g6.path();
+    git(g6p, &["init", "-q", "-b", "main", "."]);
+    git(g6p, &["config", "user.name", "T"]);
+    git(g6p, &["config", "user.email", "t@t"]);
+    fs::write(g6p.join("root"), "root\n").unwrap();
+    git(g6p, &["add", "root"]);
+    git(g6p, &["commit", "-q", "-m", "A"]);
+    let a_oid = git(g6p, &["rev-parse", "HEAD"]);
+    fs::write(g6p.join("b"), "b\n").unwrap();
+    git(g6p, &["add", "b"]);
+    git(g6p, &["commit", "-q", "-m", "B"]);
+    let b_oid = git(g6p, &["rev-parse", "HEAD"]);
+    let mut side6 = Vec::new();
+    for (branch, from) in [
+        ("side1", a_oid.as_str()),
+        ("side3", a_oid.as_str()),
+        ("side2", b_oid.as_str()),
+    ] {
+        git(g6p, &["checkout", "-q", "-b", branch, from]);
+        fs::write(g6p.join(branch), format!("{branch}\n")).unwrap();
+        git(g6p, &["add", branch]);
+        git(g6p, &["commit", "-q", "-m", branch]);
+        side6.push((branch, git(g6p, &["rev-parse", "HEAD"])));
+    }
+    git(g6p, &["checkout", "-q", "main"]);
+    let parent6 = tempdir().unwrap();
+    let lp6 = import(g6p, parent6.path());
+    configure(&lp6, &b_oid);
+    for (branch, oid) in &side6 {
+        let _ = run_libra_command(&["branch", branch, oid], &lp6);
+    }
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--base=auto",
+            "--stdout",
+            &format!("^{b_oid}"),
+            "side1",
+            "side2",
+            "side3",
+        ],
+        &lp6,
+    );
+    assert!(!out.status.success(), "AC6 should fail: {out:?}");
+    stderr_error("AC6", &out, "should be the ancestor of revision list");
+
+    // AC7: the merge base itself is inside the selected revision list.
+    let g7 = tempdir().unwrap();
+    let g7p = g7.path();
+    git(g7p, &["init", "-q", "-b", "main", "."]);
+    git(g7p, &["config", "user.name", "T"]);
+    git(g7p, &["config", "user.email", "t@t"]);
+    fs::write(g7p.join("root"), "root\n").unwrap();
+    git(g7p, &["add", "root"]);
+    git(g7p, &["commit", "-q", "-m", "A"]);
+    let a7 = git(g7p, &["rev-parse", "HEAD"]);
+    fs::write(g7p.join("u"), "u\n").unwrap();
+    git(g7p, &["add", "u"]);
+    git(g7p, &["commit", "-q", "-m", "U"]);
+    let u7 = git(g7p, &["rev-parse", "HEAD"]);
+    let mut side7 = Vec::new();
+    for branch in ["side1", "side2"] {
+        git(g7p, &["checkout", "-q", "-b", branch, &u7]);
+        fs::write(g7p.join(branch), format!("{branch}\n")).unwrap();
+        git(g7p, &["add", branch]);
+        git(g7p, &["commit", "-q", "-m", branch]);
+        side7.push((branch, git(g7p, &["rev-parse", "HEAD"])));
+    }
+    let parent7 = tempdir().unwrap();
+    let lp7 = import(g7p, parent7.path());
+    configure(&lp7, &u7);
+    for (branch, oid) in &side7 {
+        let _ = run_libra_command(&["branch", branch, oid], &lp7);
+    }
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--base=auto",
+            "--stdout",
+            &format!("^{a7}"),
+            "side1",
+            "side2",
+        ],
+        &lp7,
+    );
+    assert!(!out.status.success(), "AC7 should fail: {out:?}");
+    stderr_error("AC7", &out, "shouldn't be in revision list");
+}
+
+/// FPG-43: `format.useAutoBase` (true/false/whenAble) and `--no-base` override.
+#[test]
+fn format_use_auto_base() {
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+    fn setup_upstream() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        String,
+    ) {
+        let g = tempdir().unwrap();
+        let gp = g.path();
+        git(gp, &["init", "-q", "-b", "main", "."]);
+        git(gp, &["config", "user.name", "T"]);
+        git(gp, &["config", "user.email", "t@t"]);
+        fs::write(gp.join("f"), "base\n").unwrap();
+        git(gp, &["add", "f"]);
+        git(gp, &["commit", "-q", "-m", "base"]);
+        git(gp, &["branch", "upstream"]);
+        fs::write(gp.join("f"), "prereq\n").unwrap();
+        git(gp, &["add", "f"]);
+        git(gp, &["commit", "-q", "-m", "prereq"]);
+        for subject in ["m1", "m2"] {
+            fs::write(gp.join("f"), format!("{subject}\n")).unwrap();
+            git(gp, &["add", "f"]);
+            git(gp, &["commit", "-q", "-m", subject]);
+        }
+        git(gp, &["checkout", "-q", "upstream"]);
+        fs::write(gp.join("u"), "u2\n").unwrap();
+        git(gp, &["add", "u"]);
+        git(gp, &["commit", "-q", "-m", "u2"]);
+        let upstream = git(gp, &["rev-parse", "HEAD"]);
+        git(gp, &["checkout", "-q", "main"]);
+        git(gp, &["config", "branch.main.remote", "."]);
+        git(gp, &["config", "branch.main.merge", "refs/heads/upstream"]);
+        let parent = tempdir().unwrap();
+        let lp = parent.path().join("libra");
+        fs::create_dir_all(&lp).unwrap();
+        assert_cli_success(
+            &run_libra_command(
+                &["init", "--from-git-repository", gp.to_str().unwrap(), "."],
+                &lp,
+            ),
+            "import",
+        );
+        let branch = String::from_utf8_lossy(
+            &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &lp).stdout,
+        )
+        .trim()
+        .to_string();
+        assert_cli_success(
+            &run_libra_command(&["branch", "upstream", &upstream], &lp),
+            "upstream branch",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "set", &format!("branch.{branch}.remote"), "."],
+                &lp,
+            ),
+            "remote",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "config",
+                    "set",
+                    &format!("branch.{branch}.merge"),
+                    "refs/heads/upstream",
+                ],
+                &lp,
+            ),
+            "merge",
+        );
+        (g, parent, lp, upstream)
+    }
+    let base_block = |stdout: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter(|line| {
+                line.starts_with("base-commit:") || line.starts_with("prerequisite-patch-id:")
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let config = |lp: &std::path::Path, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "format.useAutoBase", value], lp),
+            "config",
+        );
+    };
+
+    let (g1, _parent, lp, _) = setup_upstream();
+    let gp = g1.path();
+    // AC1: true behaves like --base=auto.
+    config(&lp, "true");
+    assert!(
+        Command::new("git")
+            .args(["config", "format.useAutoBase", "true"])
+            .current_dir(gp)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let libra = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&libra, "AC1");
+    let git_out = Command::new("git")
+        .args([
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .unwrap();
+    assert!(git_out.status.success(), "{git_out:?}");
+    assert_eq!(
+        base_block(&libra.stdout),
+        base_block(&git_out.stdout),
+        "AC1"
+    );
+    // AC6: whenAble also emits the block when the upstream exists.
+    config(&lp, "whenAble");
+    let whenable = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&whenable, "AC6");
+    assert_eq!(
+        base_block(&whenable.stdout),
+        base_block(&git_out.stdout),
+        "AC6 whenAble"
+    );
+    // AC5: --no-base wins over the config.
+    config(&lp, "true");
+    let no_base = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--no-base",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&no_base, "AC5");
+    assert!(base_block(&no_base.stdout).is_empty(), "AC5 --no-base");
+    // AC7: local false overrides global true.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--global", "set", "format.useAutoBase", "true"],
+            &lp,
+        ),
+        "global true",
+    );
+    config(&lp, "false");
+    let local_false = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&local_false, "AC7");
+    assert!(
+        base_block(&local_false.stdout).is_empty(),
+        "AC7 local false"
+    );
+    let _ = run_libra_command(&["config", "--global", "unset", "format.useAutoBase"], &lp);
+
+    // AC2/AC3/AC4: no upstream.
+    let no_up = tempdir().unwrap();
+    let np = no_up.path();
+    assert_cli_success(&run_libra_command(&["init", "."], np), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], np),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], np),
+        "email",
+    );
+    fs::write(np.join("f"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], np), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "one", "--no-verify"], np),
+        "commit",
+    );
+    let baseline = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        np,
+    );
+    assert_cli_success(&baseline, "baseline");
+    config(np, "whenAble");
+    let whenable = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        np,
+    );
+    assert_cli_success(&whenable, "AC3");
+    assert!(base_block(&whenable.stdout).is_empty(), "AC3 omitted");
+    assert_eq!(whenable.stderr, baseline.stderr, "AC4 no extra diagnostics");
+    config(np, "true");
+    let true_no_up = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        np,
+    );
+    assert!(!true_no_up.status.success(), "AC2");
+    let stderr = String::from_utf8_lossy(&true_no_up.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(stderr.contains("failed to get upstream"), "{stderr}");
+    assert!(true_no_up.stdout.is_empty());
+}
+
+/// FPG-24: the cover-letter body uses `branch.<name>.description` for the
+/// branch Git selects (#891, #892).
+#[test]
+fn cover_letter_branch_description() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        fs::write(root.join("base"), "base\n").unwrap();
+        run(&["add", "base"]);
+        run(&["commit", "-m", "base"]);
+        for (branch, file) in [
+            ("topic", "topic"),
+            ("side", "side"),
+            ("rebuild-1", "rebuild"),
+        ] {
+            if libra {
+                run(&["checkout", "-b", branch, "main"]);
+            } else {
+                run(&["checkout", "-q", "-b", branch, "main"]);
+            }
+            fs::write(root.join(file), format!("{file}\n")).unwrap();
+            run(&["add", file]);
+            run(&["commit", "-m", branch]);
+        }
+        if libra {
+            run(&["checkout", "topic"]);
+        } else {
+            run(&["checkout", "-q", "topic"]);
+        }
+        for (key, value) in [
+            ("branch.main.description", "main-desc"),
+            ("branch.topic.description", "topic-desc"),
+            ("branch.side.description", "side-desc"),
+            ("branch.rebuild-1.description", "rebuild-desc"),
+        ] {
+            if libra {
+                let _ = run_libra_command(&["config", "set", key, value], root);
+            } else {
+                let _ = Command::new("git")
+                    .args(["config", key, value])
+                    .current_dir(root)
+                    .status();
+            }
+        }
+    }
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let description = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover.find("Subject:").expect("subject");
+        let tail = &cover[start..];
+        let end = tail
+            .find("\nT (")
+            .or_else(|| tail.find("\n\nT ("))
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+    let compare = |label: &str, flags: &[&str]| {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let libra = run_libra_command(&args, lp);
+        assert_cli_success(&libra, label);
+        let git = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git.status.success(), "{label}: {git:?}");
+        assert_eq!(
+            description(&libra.stdout),
+            description(&git.stdout),
+            "{label}"
+        );
+        description(&libra.stdout)
+    };
+
+    assert!(compare("AC1 current branch", &["main"]).contains("topic-desc"));
+    assert!(compare("AC2 positive branch", &["^main", "rebuild-1"]).contains("rebuild-desc"));
+    assert!(!compare("AC2 positive branch", &["^main", "rebuild-1"]).contains("side-desc"));
+    assert!(compare("AC3 default", &["-2"]).contains("topic-desc"));
+}
+
+/// FPG-60: the cover letter's default `From:` is the execution-time committer
+/// identity, not the patch author (#891).
+#[test]
+fn cover_letter_default_from_identity() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("second"), "second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], p),
+        "commit",
+    );
+    let cover_from = |stdout: &[u8]| -> Vec<String> {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let headers = cover
+            .split_once("\n\n")
+            .map(|(headers, _)| headers)
+            .unwrap_or(cover);
+        headers
+            .lines()
+            .filter(|line| line.starts_with("From: "))
+            .map(str::to_string)
+            .collect()
+    };
+
+    // AC1: GIT_COMMITTER_* wins over the configured identity/author.
+    let out = run_libra_command_with_env(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+        &[
+            ("GIT_COMMITTER_NAME", "Env Name"),
+            ("GIT_COMMITTER_EMAIL", "env@example.com"),
+        ],
+    );
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        cover_from(&out.stdout),
+        ["From: Env Name <env@example.com>"],
+        "AC1 committer env"
+    );
+
+    // AC2: no env identity -> the configured user.name/user.email.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "Config User"], p),
+        "config name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "config@example.com"], p),
+        "config email",
+    );
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        cover_from(&out.stdout),
+        ["From: Config User <config@example.com>"],
+        "AC2 config identity"
+    );
+}
+
+/// FPG-25: `--cover-from-description` modes and CLI validation (#906).
+#[test]
+fn cover_from_description() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool, description: &str) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+        if libra {
+            let _ = run_libra_command(
+                &["config", "set", "branch.main.description", description],
+                root,
+            );
+        } else {
+            let _ = Command::new("git")
+                .args(["config", "branch.main.description", description])
+                .current_dir(root)
+                .status();
+        }
+    }
+    let segment = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover.find("Subject:").expect("subject");
+        let tail = &cover[start..];
+        let end = tail
+            .find("\nT (")
+            .or_else(|| tail.find("\n\nT ("))
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+
+    let desc = "First line one\nfirst line two\n\nSecond paragraph\nmore second\n\nThird";
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true, desc);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false, desc);
+
+    let libra_run = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let out = run_libra_command(&args, lp);
+        assert_cli_success(&out, "libra");
+        segment(&out.stdout)
+    };
+    let git_run = |flags: &[&str]| -> String {
+        let mut cmd = Command::new("git");
+        cmd.args(["format-patch"])
+            .args(flags)
+            .args([
+                "--cover-letter",
+                "-2",
+                "--stdout",
+                "--no-thread",
+                "--no-signature",
+            ])
+            .current_dir(gp)
+            .env("HOME", gp);
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "{flags:?}: {out:?}");
+        segment(&out.stdout)
+    };
+
+    assert_eq!(
+        libra_run(&["--cover-from-description=none"]),
+        git_run(&["--cover-from-description=none"]),
+        "AC1 none"
+    );
+    let message = libra_run(&["--cover-from-description=message"]);
+    assert_eq!(
+        message,
+        git_run(&["--cover-from-description=message"]),
+        "AC2 message"
+    );
+    assert_eq!(
+        libra_run(&["--cover-from-description=default"]),
+        message,
+        "AC3 default"
+    );
+    let subject = libra_run(&["--cover-from-description=subject"]);
+    assert_eq!(
+        subject,
+        git_run(&["--cover-from-description=subject"]),
+        "AC4 subject"
+    );
+    assert_eq!(
+        libra_run(&["--cover-from-description", "subject"]),
+        subject,
+        "AC7 space form"
+    );
+
+    // AC5: exactly 100 bytes stays in subject mode.
+    let set_libra_desc = |text: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "branch.main.description", text], lp),
+            "set desc",
+        );
+    };
+    set_libra_desc(&"a".repeat(100));
+    assert_eq!(
+        libra_run(&["--cover-from-description=auto"]),
+        libra_run(&["--cover-from-description=subject"]),
+        "AC5 auto boundary"
+    );
+    // AC6: 60 non-ASCII chars are 120 bytes, so auto falls back to message.
+    let wide = "é".repeat(60);
+    set_libra_desc(&wide);
+    assert_eq!(
+        libra_run(&["--cover-from-description=auto"]),
+        libra_run(&["--cover-from-description=message"]),
+        "AC6 byte boundary"
+    );
+
+    // AC8: an invalid mode is rejected even without a cover letter.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-from-description",
+            "garbage",
+            "-1",
+            "--stdout",
+        ],
+        lp,
+    );
+    assert!(!invalid.status.success(), "AC8");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"));
+    assert!(
+        stderr.contains("invalid cover from description mode"),
+        "{stderr}"
+    );
+    assert!(invalid.stdout.is_empty());
+}
+
+/// FPG-33: `format.coverFromDescription` is validated on read, supplies the
+/// default mode, and is overridden by the CLI (#906).
+#[test]
+fn format_cover_from_description_config() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "branch.main.description",
+                "Short subject\n\nbody one\nbody two",
+            ],
+            p,
+        ),
+        "desc",
+    );
+    let segment = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover.find("Subject:").expect("subject");
+        let tail = &cover[start..];
+        let end = tail
+            .find("\nT (")
+            .or_else(|| tail.find("\n\nT ("))
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+    let cli = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, "cli");
+        segment(&out.stdout)
+    };
+    let config_run = |value: &str, flags: &[&str]| -> String {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "format.coverFromDescription", value], p),
+            "config",
+        );
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, "config run");
+        segment(&out.stdout)
+    };
+    let unset = || {
+        let _ = run_libra_command(&["config", "unset", "format.coverFromDescription"], p);
+    };
+
+    assert_eq!(
+        config_run("subject", &[]),
+        cli(&["--cover-from-description=subject"]),
+        "AC1 subject"
+    );
+    assert_eq!(
+        config_run("default", &[]),
+        cli(&["--cover-from-description=default"]),
+        "AC2 default"
+    );
+    let auto = config_run("auto", &[]);
+    assert_eq!(auto, cli(&["--cover-from-description=auto"]), "AC3 auto");
+    assert!(
+        auto.contains("Short subject") && !auto.contains("BLURB"),
+        "AC3 threshold"
+    );
+    assert_eq!(
+        config_run("none", &[]),
+        cli(&["--cover-from-description=none"]),
+        "AC4 none"
+    );
+    assert_eq!(
+        config_run("message", &[]),
+        cli(&["--cover-from-description=message"]),
+        "AC5 message"
+    );
+    // AC7: CLI none wins over the configured subject.
+    assert_eq!(
+        config_run("subject", &["--cover-from-description=none"]),
+        cli(&["--cover-from-description=none"]),
+        "AC7 CLI wins"
+    );
+    unset();
+
+    // AC6: an invalid configured mode is rejected without a cover letter.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "format.coverFromDescription", "garbage"],
+            p,
+        ),
+        "garbage config",
+    );
+    let invalid = run_libra_command(&["format-patch", "-1", "--stdout"], p);
+    assert!(!invalid.status.success(), "AC6");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(
+        stderr.contains("invalid cover from description mode"),
+        "{stderr}"
+    );
+    assert!(invalid.stdout.is_empty());
+    // AC8: a valid CLI mode does not mask the invalid config.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--cover-from-description=subject",
+            "-2",
+            "--stdout",
+        ],
+        p,
+    );
+    assert!(!invalid.status.success(), "AC8");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(
+        stderr.contains("invalid cover from description mode"),
+        "{stderr}"
+    );
+    assert!(invalid.stdout.is_empty());
+    unset();
+}
+
+/// FPG-18: `--attach[=<boundary>]`/`--inline[=<boundary>]` and the space-form
+/// revision behaviour (#895).
+#[test]
+fn attach_custom_boundary() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    let run = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, "format-patch");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let first_message = |text: &str| -> String {
+        text.split_once("\nFrom ")
+            .map(|(first, _)| first.to_string())
+            .unwrap_or_else(|| text.to_string())
+    };
+
+    // AC1/AC6: custom attach boundary and patch part.
+    let attach = run(&["--attach=mimemime", "-1"]);
+    assert!(attach.contains("boundary=\"------------mimemime\""));
+    assert!(attach.contains("\n--------------mimemime\n"));
+    assert!(attach.contains("Content-Type: text/x-patch"));
+    assert!(attach.contains("Content-Disposition: attachment"));
+    assert!(attach.contains("\ndiff --git "), "AC6 diff part");
+    // AC2: inline disposition with the same boundary.
+    let inline = run(&["--inline=mimemime", "-1"]);
+    assert!(inline.contains("boundary=\"------------mimemime\""));
+    assert!(inline.contains("Content-Disposition: inline"));
+    // AC3: base trailer stays inside the attachment part before the terminator.
+    let base = run(&["--attach=mimemime", "--base=HEAD~", "-1"]);
+    assert!(base.contains("base-commit: "));
+    let terminator = base.find("\n--------------mimemime--").expect("terminator");
+    let base_pos = base.find("base-commit: ").expect("base");
+    assert!(base_pos < terminator, "base inside attachment");
+    // AC4/AC5: cover letters are not multipart.
+    let cover = run(&["--attach", "--cover-letter", "-1"]);
+    assert!(!first_message(&cover).contains("multipart/mixed"));
+    let cover = run(&["--attach=mimemime", "--cover-letter", "-1"]);
+    assert!(!first_message(&cover).contains("multipart/mixed"));
+    // AC7: the space-separated token is a revision, not a boundary value.
+    let spaced = run(&["--attach", "HEAD~1"]);
+    assert!(spaced.contains("boundary=\"------------libra "));
+    let subjects: Vec<&str> = spaced
+        .lines()
+        .filter(|line| line.starts_with("Subject: "))
+        .collect();
+    assert_eq!(subjects.len(), 1, "{subjects:?}");
+    assert!(subjects[0].contains("subject 2"), "{subjects:?}");
+}
+
+/// FPG-38: `format.attach` boundary/empty semantics and `--no-attach` (#912).
+#[test]
+fn format_attach_config() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("extra"), "extra\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "extra"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "extra", "--no-verify"], p),
+        "commit",
+    );
+    let out = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["-1", "--stdout", "--no-thread", "--no-signature"]);
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, "format-patch");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let set = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], p),
+            "config",
+        );
+    };
+    let unset = |key: &str| {
+        let _ = run_libra_command(&["config", "unset", key], p);
+    };
+
+    set("format.attach", "true");
+    assert!(out(&[]).contains("Content-Type: multipart/mixed; boundary=\"------------true\""));
+    set("format.attach", "attachment-separator");
+    assert!(
+        out(&[]).contains(
+            "Content-Type: multipart/mixed; boundary=\"------------attachment-separator\""
+        )
+    );
+    set("format.attach", "");
+    assert!(!out(&[]).contains("multipart/"), "AC3 empty disables");
+    // AC4: a local empty value overrides a global boundary.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "--global",
+                "set",
+                "format.attach",
+                "attachment-separator",
+            ],
+            p,
+        ),
+        "global",
+    );
+    set("format.attach", "");
+    assert!(!out(&[]).contains("multipart/"), "AC4 local empty");
+    let _ = run_libra_command(&["config", "--global", "unset", "format.attach"], p);
+    // AC5: --no-attach overrides the configured boundary.
+    set("format.attach", "true");
+    assert!(!out(&["--no-attach"]).contains("multipart/"), "AC5");
+    unset("format.attach");
+}
+
+/// FPG-19: multi-patch `--interdiff` renders the tree difference in the cover
+/// letter (#898).
+#[test]
+fn interdiff_multi_patch_cover_letter() {
+    use std::process::Command;
+
+    let g = tempdir().unwrap();
+    let gp = g.path();
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    fs::write(gp.join("f"), "a1\nold\n").unwrap();
+    git(&["add", "f"]);
+    git(&["commit", "-q", "-m", "base"]);
+    fs::write(gp.join("f"), "a1\na2\n").unwrap();
+    git(&["commit", "-qam", "m1"]);
+    let v1 = git(&["rev-parse", "HEAD"]);
+    git(&["branch", "v1"]);
+    fs::write(gp.join("f"), "a1\na2\na3\n").unwrap();
+    git(&["commit", "-qam", "m2"]);
+
+    let parent = tempdir().unwrap();
+    let lp = parent.path().join("libra");
+    fs::create_dir_all(&lp).unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--from-git-repository", gp.to_str().unwrap(), "."],
+            &lp,
+        ),
+        "import",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "v1", &v1], &lp), "v1 branch");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], &lp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], &lp),
+        "email",
+    );
+
+    let cover_tail = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover
+            .lines()
+            .position(|line| line.contains("file changed"))
+            .and_then(|index| {
+                cover
+                    .lines()
+                    .take(index)
+                    .map(|line| line.len() + 1)
+                    .sum::<usize>()
+                    .checked_sub(0)
+            })
+            .unwrap_or(0);
+        let tail = &cover[start..];
+        // Skip the summary line itself; the mapping compares from it onward.
+        tail.trim_end().to_string()
+    };
+    let compare = |label: &str, flags: &[&str]| {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let libra = run_libra_command(&args, &lp);
+        assert_cli_success(&libra, label);
+        let git_out = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git_out.status.success(), "{label}: {git_out:?}");
+        assert_eq!(
+            cover_tail(&libra.stdout),
+            cover_tail(&git_out.stdout),
+            "{label}"
+        );
+    };
+
+    compare("AC1 implicit cover", &["--interdiff=v1", "-2", "-v3"]);
+    compare(
+        "AC2 explicit cover",
+        &["--cover-letter", "--interdiff=v1", "-2", "-v2"],
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.coverLetter", "false"], &lp),
+        "cover config",
+    );
+    compare(
+        "AC3 config false",
+        &["--cover-letter", "--interdiff=v1", "-2", "-v2"],
+    );
+    compare(
+        "AC4 spaced value",
+        &["--cover-letter", "--interdiff", "v1", "-2", "-v2"],
+    );
+    compare("AC5 no reroll", &["--cover-letter", "--interdiff=v1", "-2"]);
+
+    // AC6: an unknown revision is rejected with the stable code.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--interdiff=no-such-rev",
+            "-2",
+            "--stdout",
+        ],
+        &lp,
+    );
+    assert!(!invalid.status.success(), "AC6");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(stderr.contains("no-such-rev"), "{stderr}");
+    assert!(invalid.stdout.is_empty());
+}
+
+/// FPG-34: a single patch renders `Interdiff` after its diff and before the
+/// signature, or only in an explicitly requested cover letter (#898).
+#[test]
+fn interdiff_single_patch_placement() {
+    use std::process::Command;
+
+    let g = tempdir().unwrap();
+    let gp = g.path();
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    fs::write(gp.join("blorp"), "a1\nold\n").unwrap();
+    git(&["add", "blorp"]);
+    git(&["commit", "-q", "-m", "base"]);
+    git(&["checkout", "-q", "-b", "boop"]);
+    fs::write(gp.join("blorp"), "a1\nfnorp\n").unwrap();
+    git(&["commit", "-qam", "fnorp"]);
+    fs::write(gp.join("blorp"), "a1\nfleep\n").unwrap();
+    git(&["commit", "-qam", "fleep"]);
+
+    let parent = tempdir().unwrap();
+    let lp = parent.path().join("libra");
+    fs::create_dir_all(&lp).unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--from-git-repository", gp.to_str().unwrap(), "."],
+            &lp,
+        ),
+        "import",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], &lp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], &lp),
+        "email",
+    );
+
+    let patch_tail = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        text.find("diff --git ")
+            .map(|start| text[start..].trim_end().to_string())
+            .unwrap_or_default()
+    };
+    let compare_patch = |label: &str, extra: &[&str]| {
+        let mut args = vec!["format-patch", "--interdiff=boop~2", "-1", "boop"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--signature=SIG"]);
+        let libra = run_libra_command(&args, &lp);
+        assert_cli_success(&libra, label);
+        let git_out = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git_out.status.success(), "{label}: {git_out:?}");
+        assert_eq!(
+            patch_tail(&libra.stdout),
+            patch_tail(&git_out.stdout),
+            "{label}"
+        );
+    };
+
+    compare_patch("AC1", &[]);
+    compare_patch("AC2", &["--no-cover-letter"]);
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.coverLetter", "false"], &lp),
+        "cover config",
+    );
+    compare_patch("AC3", &[]);
+
+    // AC4: explicit cover keeps the interdiff in the cover.
+    let cover_tail = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover
+            .lines()
+            .position(|line| line.contains("file changed"))
+            .map(|index| cover.lines().take(index).map(|line| line.len() + 1).sum())
+            .unwrap_or(0);
+        cover[start..].trim_end().to_string()
+    };
+    let flags = [
+        "format-patch",
+        "--cover-letter",
+        "--interdiff=boop~2",
+        "-1",
+        "boop",
+        "--stdout",
+        "--no-thread",
+        "--no-signature",
+    ];
+    let libra = run_libra_command(&flags, &lp);
+    assert_cli_success(&libra, "AC4");
+    let git_out = Command::new("git")
+        .args(flags)
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_out.status.success());
+    assert_eq!(
+        cover_tail(&libra.stdout),
+        cover_tail(&git_out.stdout),
+        "AC4 cover"
+    );
+    // AC5: only the cover carries the interdiff; the patch does not repeat it.
+    let text = String::from_utf8_lossy(&libra.stdout);
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("Interdiff"))
+            .count(),
+        1,
+        "{text}"
+    );
+}
+
+/// FPG-20: reroll version prefixes file names and matches Subject versions;
+/// file output carries the interdiff block (#901).
+#[test]
+fn reroll_filename_prefix() {
+    use std::{collections::BTreeSet, process::Command};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    let out1 = p.join("out1");
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-v",
+            "4",
+            "-2",
+            "-o",
+            out1.to_str().unwrap(),
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC1");
+    let names: BTreeSet<String> = fs::read_dir(&out1)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.iter().any(|name| name.starts_with("v4-0001-")));
+    assert!(names.iter().any(|name| name.starts_with("v4-0002-")));
+
+    let out2 = p.join("out2");
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-v",
+            "4",
+            "--cover-letter",
+            "-2",
+            "-o",
+            out2.to_str().unwrap(),
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC2");
+    let cover = fs::read_to_string(out2.join("v4-0000-cover-letter.patch")).unwrap();
+    assert!(
+        cover.contains("Subject: [PATCH v4 0/2] "),
+        "AC3 cover subject"
+    );
+    for (index, version) in [("0001", "1"), ("0002", "2")] {
+        let name = fs::read_dir(&out2)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .find(|name| name.starts_with(&format!("v4-{index}-")))
+            .expect("patch file");
+        let text = fs::read_to_string(out2.join(name)).unwrap();
+        assert!(
+            text.contains(&format!("Subject: [PATCH v4 {version}/2] ")),
+            "AC{version} patch subject"
+        );
+    }
+
+    // AC6: file output carries the full interdiff block.
+    let g = tempdir().unwrap();
+    let gp = g.path();
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    fs::write(gp.join("f"), "a1\nold\n").unwrap();
+    git(&["add", "f"]);
+    git(&["commit", "-q", "-m", "base"]);
+    fs::write(gp.join("f"), "a1\na2\n").unwrap();
+    git(&["commit", "-qam", "m1"]);
+    let v1 = git(&["rev-parse", "HEAD"]);
+    git(&["branch", "v1"]);
+    fs::write(gp.join("f"), "a1\na2\na3\n").unwrap();
+    git(&["commit", "-qam", "m2"]);
+    let parent = tempdir().unwrap();
+    let lp = parent.path().join("libra");
+    fs::create_dir_all(&lp).unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--from-git-repository", gp.to_str().unwrap(), "."],
+            &lp,
+        ),
+        "import",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "v1", &v1], &lp), "v1 branch");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], &lp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], &lp),
+        "email",
+    );
+    let lout = lp.join("out");
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "--interdiff=v1",
+            "-2",
+            "-v",
+            "23",
+            "-o",
+            lout.to_str().unwrap(),
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&res, "AC6 libra");
+    let gout = gp.join("gout");
+    let git_out = Command::new("git")
+        .args([
+            "format-patch",
+            "--interdiff=v1",
+            "-2",
+            "-v",
+            "23",
+            "-o",
+            gout.to_str().unwrap(),
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .unwrap();
+    assert!(git_out.status.success(), "{git_out:?}");
+    let tail = |text: &str| -> String {
+        let start = text
+            .lines()
+            .position(|line| line.contains("file changed"))
+            .map(|index| text.lines().take(index).map(|line| line.len() + 1).sum())
+            .unwrap_or(0);
+        text[start..].trim_end().to_string()
+    };
+    let libra_cover = fs::read_to_string(lout.join("v23-0000-cover-letter.patch")).unwrap();
+    let git_cover = fs::read_to_string(gout.join("v23-0000-cover-letter.patch")).unwrap();
+    assert_eq!(tail(&libra_cover), tail(&git_cover), "AC6 interdiff file");
+}
+
+/// FPG-45: generated file paths print to stdout (or stay silent for
+/// --quiet/--json/--stdout) (#901).
+#[test]
+fn generated_paths_on_stdout() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    let names = |dir: &std::path::Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    let lines = |stdout: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+
+    let out = p.join("out");
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "-o",
+            "out",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC1");
+    let expected: Vec<String> = names(&out)
+        .into_iter()
+        .map(|name| format!("out/{name}"))
+        .collect();
+    assert_eq!(lines(&res.stdout), expected, "AC1 stdout paths");
+    assert!(
+        !String::from_utf8_lossy(&res.stderr)
+            .lines()
+            .any(|line| line.starts_with("out/")),
+        "AC2 stderr has no paths"
+    );
+
+    let quiet = run_libra_command(
+        &[
+            "--quiet",
+            "format-patch",
+            "-2",
+            "-o",
+            "out2",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&quiet, "AC3");
+    assert!(quiet.stdout.is_empty(), "AC3 quiet");
+
+    let json = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "-o",
+            "out3",
+            "--json",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&json, "AC4");
+    serde_json::from_slice::<serde_json::Value>(&json.stdout).expect("AC4 JSON only");
+
+    // AC5: no -o prints bare file names in the cwd.
+    let no_dir = run_libra_command(&["format-patch", "-2", "--no-thread", "--no-signature"], p);
+    assert_cli_success(&no_dir, "AC5");
+    let expected_bare = names(p)
+        .into_iter()
+        .filter(|name| name.starts_with("0001-") || name.starts_with("0002-"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines(&no_dir.stdout), expected_bare, "AC5 bare names");
+    for name in &expected_bare {
+        let _ = fs::remove_file(p.join(name));
+    }
+
+    // AC6: an absolute -o prints absolute paths.
+    let abs = tempdir().unwrap();
+    let abs_path = abs.path().to_string_lossy().to_string();
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "-o",
+            &abs_path,
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC6");
+    let expected: Vec<String> = names(abs.path())
+        .into_iter()
+        .map(|name| format!("{abs_path}/{name}"))
+        .collect();
+    assert_eq!(lines(&res.stdout), expected, "AC6 absolute paths");
+}
+
+/// FPG-26: non-integer and non-numeric reroll values sanitize the file prefix
+/// the way Git does (#903).
+#[test]
+fn reroll_non_integer() {
+    use std::{collections::BTreeSet, process::Command};
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        fs::write(root.join("f"), "base\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-m", "base"]);
+        fs::write(root.join("f"), "base\nsecond\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-m", "second"]);
+    }
+    let names = |dir: &std::path::Path| -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect()
+    };
+
+    let libra_repo = tempdir().unwrap();
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().unwrap();
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let cover = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p",
+            "--cover-letter",
+            "--reroll-count=4.4",
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&cover, "AC1");
+    let names1 = names(&lp.join("p"));
+    assert!(names1.contains("v4.4-0000-cover-letter.patch"));
+    assert!(names1.iter().any(|name| name.starts_with("v4.4-0001-")));
+
+    let rev2 = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p2",
+            "-v4rev2",
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&rev2, "AC2");
+    let names2 = names(&lp.join("p2"));
+    assert_eq!(names2.len(), 1);
+    assert!(names2.iter().next().unwrap().starts_with("v4rev2-0001-"));
+
+    // AC3: the pathological value sanitizes to `v4-.-.-.-1-.2-`.
+    let weird = "4---..././../--1/.2//";
+    let libra = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p3",
+            &format!("--reroll-count={weird}"),
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra, "AC3 libra");
+    let git = Command::new("git")
+        .args([
+            "format-patch",
+            "-o",
+            "p3",
+            &format!("--reroll-count={weird}"),
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .unwrap();
+    assert!(git.status.success(), "{git:?}");
+    assert_eq!(names(&lp.join("p3")), names(&gp.join("p3")), "AC3");
+    assert!(
+        names(&lp.join("p3"))
+            .iter()
+            .all(|name| name.starts_with("v4-.-.-.-1-.2-"))
+    );
+}
+
+/// FPG-52: non-integer reroll versions stay verbatim in `Subject:` and use the
+/// generic `Interdiff:` title (#903).
+#[test]
+fn reroll_non_integer_subjects() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["branch", "v1", "HEAD~1"], p),
+        "v1 branch",
+    );
+    let subject_of = |path: &std::path::Path| -> String {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("Subject: "))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let weird = "4---..././../--1/.2//";
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p1",
+            &format!("--reroll-count={weird}"),
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC1");
+    let name = fs::read_dir(p.join("p1"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        subject_of(&p.join("p1").join(name)).starts_with(&format!("Subject: [PATCH v{weird}] ")),
+        "AC1 raw subject"
+    );
+
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p2",
+            "-v4rev2",
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC2");
+    let name = fs::read_dir(p.join("p2"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        subject_of(&p.join("p2").join(name)).starts_with("Subject: [PATCH v4rev2] "),
+        "AC2 raw subject"
+    );
+
+    // AC3: a fractional version keeps the generic interdiff title.
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--interdiff=v1",
+            "-2",
+            "-v2.2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC3");
+    let text = String::from_utf8_lossy(&res.stdout);
+    let interdiff: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("Interdiff"))
+        .collect();
+    assert_eq!(interdiff, ["Interdiff:"], "AC3 title");
+
+    // AC4–AC6: the 4.4 version is shared by filenames and Subjects.
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p4",
+            "--cover-letter",
+            "-v4.4",
+            "-2",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC4");
+    assert!(
+        subject_of(&p.join("p4/v4.4-0000-cover-letter.patch"))
+            .starts_with("Subject: [PATCH v4.4 0/2] ")
+    );
+    for (prefix, counter) in [("v4.4-0001-", "1"), ("v4.4-0002-", "2")] {
+        let name = fs::read_dir(p.join("p4"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .find(|name| name.starts_with(prefix))
+            .expect("patch file");
+        assert!(
+            subject_of(&p.join("p4").join(name))
+                .starts_with(&format!("Subject: [PATCH v4.4 {counter}/2] ")),
+            "AC c{counter}"
+        );
+    }
+}
+
+/// FPG-21: filenames use Git's `format_sanitized_subject` rules (#908).
+#[test]
+fn filename_git_sanitized_slug() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) -> Vec<(String, String)> {
+        let run = |args: &[&str]| -> String {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        let subjects = [
+            "Side changes #1",
+            "Mixed CASE Subject",
+            "ALL CAPS",
+            "Update README..md v1.2_x.",
+            "Fix café crash",
+        ];
+        let mut hashes = Vec::new();
+        for subject in subjects {
+            fs::write(root.join("f"), format!("{subject}\n")).unwrap();
+            run(&["add", "f"]);
+            run(&["commit", "-m", subject]);
+            hashes.push((subject.to_string(), run(&["rev-parse", "HEAD"])));
+        }
+        hashes
+    }
+    let filename = |dir: &std::path::Path| -> String {
+        fs::read_dir(dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .to_string()
+    };
+
+    let libra_repo = tempdir().unwrap();
+    let lp = libra_repo.path();
+    let libra_hashes = seed(lp, true);
+    let git_repo = tempdir().unwrap();
+    let gp = git_repo.path();
+    let git_hashes = seed(gp, false);
+    let expected = [
+        "0001-Side-changes-1.patch",
+        "0001-Mixed-CASE-Subject.patch",
+        "0001-ALL-CAPS.patch",
+        "0001-Update-README.md-v1.2_x.patch",
+        "0001-Fix-caf-crash.patch",
+    ];
+    for (index, expected_name) in expected.iter().enumerate() {
+        let libra_dir = lp.join(format!("l{index}"));
+        let res = run_libra_command(
+            &[
+                "format-patch",
+                "-1",
+                &libra_hashes[index].1,
+                "-o",
+                libra_dir.to_str().unwrap(),
+                "--no-thread",
+                "--no-signature",
+            ],
+            lp,
+        );
+        assert_cli_success(&res, expected_name);
+        let git_dir = gp.join(format!("g{index}"));
+        let git = Command::new("git")
+            .args([
+                "format-patch",
+                "-1",
+                &git_hashes[index].1,
+                "-o",
+                git_dir.to_str().unwrap(),
+                "--no-thread",
+                "--no-signature",
+            ])
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .unwrap();
+        assert!(git.status.success());
+        assert_eq!(filename(&libra_dir), *expected_name, "AC{}", index + 1);
+        assert_eq!(
+            filename(&libra_dir),
+            filename(&git_dir),
+            "AC{} git",
+            index + 1
+        );
+    }
+}
+
+/// FPG-40: `--filename-max-length`/`format.filenameMaxLength` match Git's
+/// whole-file truncation (default 64, reroll prefix included) (#910).
+#[test]
+fn filename_max_length_git_parity() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for subject in [
+            "first",
+            "second",
+            "third",
+            "This is an excessively long subject line for a message",
+        ] {
+            fs::write(root.join("f"), format!("{subject}\n")).unwrap();
+            run(&["add", "f"]);
+            run(&["commit", "-m", subject]);
+        }
+    }
+    let fourth = |dir: &std::path::Path| -> String {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .find(|name| name.starts_with("0004-") || name.starts_with("v4-0004-"))
+            .expect("fourth file")
+    };
+
+    let libra_repo = tempdir().unwrap();
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().unwrap();
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let run = |label: &str, flags: &[&str], dir: &str| -> String {
+        let mut args = vec!["format-patch", "-4"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["-o", dir, "--no-thread", "--no-signature"]);
+        let libra = run_libra_command(&args, lp);
+        assert_cli_success(&libra, label);
+        let git = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{label}: {git:?}");
+        fourth(&lp.join(dir))
+    };
+    let compare = |label: &str, flags: &[&str], dir: &str| -> String {
+        let name = run(label, flags, dir);
+        let mut args = vec!["format-patch", "-4"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["-o", dir, "--no-thread", "--no-signature"]);
+        // Re-run Git only to read its own output directory.
+        let name_git = fourth(&gp.join(dir));
+        assert_eq!(name, name_git, "{label}");
+        name
+    };
+
+    compare("AC1 100", &["--filename-max-length=100"], "o100");
+    assert_eq!(
+        run("AC2 default", &[], "odef"),
+        "0004-This-is-an-excessively-long-subject-line-for-a-messa.patch"
+    );
+    assert_eq!(
+        compare("AC3 64", &["--filename-max-length=64"], "o64"),
+        "0004-This-is-an-excessively-long-subject-line-for-a-messa.patch"
+    );
+    compare("AC4 15", &["--filename-max-length=15"], "o15");
+    compare("AC5 25", &["--filename-max-length=25"], "o25");
+    compare("AC6 35", &["--filename-max-length=35"], "o35");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.filenameMaxLength", "40"], lp),
+        "config",
+    );
+    let configured = run("AC7 config", &[], "o40cfg");
+    let cli = run("AC7 cli", &["--filename-max-length=40"], "o40cli");
+    assert_eq!(configured, cli, "AC7 config vs CLI");
+    let _ = run_libra_command(&["config", "unset", "format.filenameMaxLength"], lp);
+    assert_eq!(
+        run("AC8 v4", &["-v4"], "ov4"),
+        "v4-0004-This-is-an-excessively-long-subject-line-for-a-me.patch"
     );
 }

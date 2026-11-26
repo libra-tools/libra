@@ -221,12 +221,9 @@ pub async fn execute_safe(args: MergeFileArgs, output: &OutputConfig) -> CliResu
                     .with_exit_code(128)
                     .with_stable_code(StableErrorCode::IoWriteFailed)
             })?;
-            if conflict && !args.quiet {
-                eprintln!("warning: conflicts during merge");
-            }
         }
     } else {
-        write_with_backup(&args.current, &current, &merged, conflict, args.quiet)?;
+        write_with_backup(&args.current, &current, &merged, conflict)?;
     }
 
     if output.is_json() {
@@ -260,13 +257,12 @@ fn read_input(path: &str) -> CliResult<Vec<u8>> {
 
 /// Overwrite `<current>` with the merged result, backing up the original first
 /// (under `.libra/merge-file-backup/` when inside a repository). The backup is
-/// removed on a clean merge and kept (with a note) when conflicts remain.
+/// removed on a clean merge and kept silently when conflicts remain.
 fn write_with_backup(
     current_path: &str,
     original: &[u8],
     merged: &[u8],
     conflict: bool,
-    quiet: bool,
 ) -> CliResult<()> {
     let write_err = |error: io::Error| {
         CliError::fatal(format!(
@@ -301,14 +297,9 @@ fn write_with_backup(
             // Clean merge: the backup is no longer needed.
             let _ = fs::remove_file(backup_path);
         }
-        (Some(backup_path), true) if !quiet => {
-            eprintln!(
-                "warning: conflicts during merge of '{current_path}'; original backed up at {}",
-                backup_path.display()
-            );
-        }
-        (None, true) if !quiet => {
-            eprintln!("warning: conflicts during merge of '{current_path}'");
+        (Some(_), true) | (None, true) => {
+            // Git stays silent on both success and conflict; the exit code and
+            // conflict markers carry the outcome.
         }
         _ => {}
     }

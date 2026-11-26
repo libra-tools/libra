@@ -1146,6 +1146,14 @@ impl From<FetchError> for CliError {
                     .with_stable_code(StableErrorCode::NetworkProtocol)
                     .with_hint("retry after the remote repository stops changing")
             }
+            FetchError::FetchObjects { source, .. }
+                if let Some(failure) =
+                    crate::internal::protocol::ssh_client::ssh_connection_failed(source) =>
+            {
+                CliError::fatal(failure.to_string())
+                    .with_stable_code(StableErrorCode::NetworkUnavailable)
+                    .with_hint(failure.hint())
+            }
             FetchError::FetchObjects { source, .. } if is_pkt_line_io_error(source) => {
                 CliError::fatal(error.to_string())
                     .with_stable_code(StableErrorCode::NetworkProtocol)
@@ -1279,6 +1287,14 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
             CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::AuthPermissionDenied)
                 .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
+        }
+        GitError::IOError(error)
+            if let Some(failure) =
+                crate::internal::protocol::ssh_client::ssh_connection_failed(error) =>
+        {
+            CliError::fatal(failure.to_string())
+                .with_stable_code(StableErrorCode::NetworkUnavailable)
+                .with_hint(failure.hint())
         }
         GitError::IOError(error)
             if let Some(config_error) = error.get_ref().and_then(|inner| {
@@ -1942,7 +1958,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     }
 
     let prune = resolve_prune_mode(&remote_config.name, prune_cli).await?;
-    let remote_name_for_set_upstream = remote_config.name.clone();
+    let remote_name_for_set_upstream = remote.clone();
     let result = fetch_repository_with_result(
         remote_config,
         refspec.clone(),

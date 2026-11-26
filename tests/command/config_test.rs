@@ -7560,3 +7560,81 @@ fn config_default_implies_get() {
     let missing = run_libra_command(&["config", "new.key"], repo.path());
     assert!(!missing.status.success(), "AC5 must not write the key");
 }
+
+mod value_pattern {
+    use super::*;
+
+    #[test]
+    fn test_cf_62_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two", "thr"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add value",
+            );
+        }
+        let out = run_libra_command(
+            &["config", "set", "--value", "thr", "multi.k", "four"],
+            repo.path(),
+        );
+        assert_cli_success(&out, "set --value thr");
+        let all = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        let all_text = String::from_utf8_lossy(&all.stdout).to_string();
+        let values: Vec<&str> = all_text.lines().collect();
+        assert_eq!(values, ["one", "two", "four"]);
+    }
+
+    #[test]
+    fn test_cf_67_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        let out = run_libra_command(
+            &["config", "set", "--value", "(", "multi.k", "x"],
+            repo.path(),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(6),
+            "invalid set pattern exits 6: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn test_cf_69_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        let out = run_libra_command(
+            &["config", "--replace-all", "upgrade.mode", "auto"],
+            repo.path(),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(129),
+            "replace-all refuses upgrade.mode: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("reserved upgrade.* namespace"),
+            "reserved namespace diagnostic"
+        );
+    }
+
+    #[test]
+    fn test_cf_38_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["v1", "v2"] {
+            let set = run_libra_command(&["config", "--add", "p.k", value], repo.path());
+            assert_cli_success(&set, "config --add p.k");
+        }
+        let out = run_libra_command(&["config", "--unset-all", "p.k", "zzz"], repo.path());
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "pattern unset with no match exits 5: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

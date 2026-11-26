@@ -1966,3 +1966,127 @@ fn rev_list_missing_print_reports_a_missing_subtree() {
         "AC5 placement: {text}"
     );
 }
+
+#[test]
+fn test_rev_list_no_walk_matrix() {
+    let repo = create_committed_repo_via_cli();
+    std::fs::write(repo.path().join("second.txt"), "second\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "second.txt"], repo.path()),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", "second", "--no-verify"],
+            repo.path(),
+            &[
+                ("GIT_AUTHOR_DATE", "2030-01-01 00:00:00 +0000"),
+                ("GIT_COMMITTER_DATE", "2030-01-01 00:00:00 +0000"),
+            ],
+        ),
+        "commit",
+    );
+    std::fs::write(repo.path().join("third.txt"), "third\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "third.txt"], repo.path()),
+        "add third",
+    );
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", "third", "--no-verify"],
+            repo.path(),
+            &[
+                ("GIT_AUTHOR_DATE", "2031-01-01 00:00:00 +0000"),
+                ("GIT_COMMITTER_DATE", "2031-01-01 00:00:00 +0000"),
+            ],
+        ),
+        "commit third",
+    );
+    let head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .trim()
+            .to_string();
+    let parent =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD~1"], repo.path()).stdout)
+            .trim()
+            .to_string();
+    let lines = |args: &[&str]| -> Vec<String> {
+        let out = run_libra_command(args, repo.path());
+        assert_cli_success(&out, "rev-list");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+
+    // Input order parent -> head, but sorted mode emits newest first.
+    let sorted = lines(&["rev-list", "--no-walk", "HEAD~1", "HEAD"]);
+    assert_eq!(sorted, [head.clone(), parent.clone()], "sorted");
+    let unsorted = lines(&["rev-list", "--no-walk=unsorted", "HEAD~1", "HEAD"]);
+    assert_eq!(unsorted, [parent.clone(), head.clone()], "unsorted");
+    let walked = lines(&["rev-list", "--no-walk", "--do-walk", "HEAD~1", "HEAD"]);
+    assert!(walked.len() > 2, "do-walk walks ancestors: {walked:?}");
+    assert_eq!(walked[0], head, "do-walk newest first");
+    let invalid = run_libra_command(&["rev-list", "--no-walk=bogus", "HEAD"], repo.path());
+    assert_eq!(invalid.status.code(), Some(129));
+}
+
+#[test]
+fn test_rev_list_disk_usage_matrix() {
+    let repo = create_committed_repo_via_cli();
+    std::fs::write(repo.path().join("second.txt"), "second\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "second.txt"], repo.path()),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], repo.path()),
+        "commit",
+    );
+    let raw = run_libra_command(&["rev-list", "--disk-usage=raw", "HEAD"], repo.path());
+    assert_cli_success(&raw, "raw");
+    let raw_text = String::from_utf8_lossy(&raw.stdout).trim().to_string();
+    assert!(raw_text.parse::<u64>().expect("numeric raw bytes") > 0);
+    let human = run_libra_command(&["rev-list", "--disk-usage", "HEAD"], repo.path());
+    assert_cli_success(&human, "human");
+    let human_text = String::from_utf8_lossy(&human.stdout).trim().to_string();
+    assert!(
+        human_text.ends_with(" B")
+            || human_text.ends_with(" KiB")
+            || human_text.ends_with(" MiB")
+            || human_text.ends_with(" GiB"),
+        "human format: {human_text}"
+    );
+    let invalid = run_libra_command(&["rev-list", "--disk-usage=bogus", "HEAD"], repo.path());
+    assert_eq!(invalid.status.code(), Some(129));
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("invalid --disk-usage format"),
+        "{invalid:?}"
+    );
+}
+
+#[test]
+fn test_rev_list_objects_edge_order() {
+    let repo = create_committed_repo_via_cli();
+    std::fs::write(repo.path().join("second.txt"), "second\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "second.txt"], repo.path()),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], repo.path()),
+        "commit",
+    );
+    let out = run_libra_command(&["rev-list", "--objects-edge", "HEAD~1..HEAD"], repo.path());
+    assert_cli_success(&out, "objects-edge");
+    let lines: Vec<&str> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .leak()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert!(lines[0].starts_with('-'), "edge marker first: {lines:?}");
+    assert!(!lines[1].starts_with('-'), "commit follows edge: {lines:?}");
+}

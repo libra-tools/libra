@@ -38,7 +38,7 @@
 ### Task FIX-LTR-11: bare 仓库快照排除元数据目录
 
 **Task type:** `implementation`  
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成，本地 signed+DCO 子提交 `dfed4cbca17624daf7a9b9a2a42e15514cdc780f` 已核 VALIDSIG；家族最终 C/D 待。  
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：A/B 与本地 signed+DCO 子提交 `dfed4cb` 的 VALIDSIG 证据保留，本轮按用户授权收口 family child，D 组继承 REL-QUAL-11；不 bump。）
 **Description:** 已用同一 0.30.153 二进制在 16 个独立 bare 仓库实测：操作快照的 untracked manifest 收入 `libra.db`、`objects/` 和内部锁路径。bare 无工作树，扫描不得把仓库元数据当作工作区内容。按请求固定的仓库身份判定 bare，空工作区扫描仍保留已有 HEAD、引用、原始 index/facet 和操作日志流程。  
 **Out of scope:** 不改 worker wire 错误编码、不吞 I/O 错误、不放宽时间/并发、不改普通工作区 ignore/layer/gitlink/稀疏规则；原 full 的具体出错文件和时序仍 unknown。  
 **Acceptance criteria:**
@@ -137,7 +137,7 @@
 ### Task FIX-LTR-09: 隔离 rebase exec 回归测试的嵌套签名
 
 **Task type:** `implementation`  
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（两次定向 RED 保留，修复后单例 1/1、同 target 32/32；FIX-LTR-09 签名+DCO 提交 `6819631a1d23b6110b250f8a0a1f347b2525f997` 已合入当前上游；A9 最终来源树本地六阶段 exit0，当前树 main D 成功。终态文档自身提交及其 D、原工作区受控整合仍待，不提前记 complete）。
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：本地六阶段与 main D 证据保留；签名+DCO 子提交 `6819631` 已在当前上游，本轮按用户授权收口 family child，D 组继承 REL-QUAL-11；不 bump。）
 **Current evidence:** 两个未修改源码的单例失败收据 `f60ebeda31b53bab26e62c5c35d6f2e97e67f8ce7423971d577d0ea9fbecdcb2` / `25fee5d188c7272724d7b44cacbe92585a967168d46b995d7e9bc05501b29895`；修复后单例 1/1 `864bf8b0925a69968abb001b2f9c2bace3296acf6a7edd82d4dc67e24a35da88`、完整 target 32/32 `27313e43b0aae0c74f16c409539d0cd90ce5ef15796a1de691ff5356d506b522`；测试文件 SHA256 `8a1978974f8b60514aca6790e21d0094a245d3bf645b6cf020aa684828143e68`。仅测试命令增加 `--no-gpg-sign`，未改断言或沙箱。  
 **Description:** 在 `rebase_exec_failure_stops_and_continue_retries_the_command` 的测试命令中对嵌套测试提交显式传 `--no-gpg-sign`，使该 rebase 重试/引用更新用例不依赖沙箱禁止读取的 vault 私钥；保持 DCO、全部断言和沙箱凭据保护不变。  
 **Out of scope:** 产品源码、沙箱策略、真实用户默认签名、其它测试及既有结果。  
@@ -957,7 +957,7 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `in-progress` / 空（已推送 main `6177646`；family child 无独立发布，所以不是 done。session `71cf457d-5724-48c9-b2e4-68c4ac1a8bc4` 已准入 `client_storage.rs`；实现审查 `d6849287-9d4e-46c7-8148-a41e8e5e412d` VERDICT PASS）
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：两个 lib 门复跑 1/1 + 1/1；本卡不 bump、不打 tag，D 组按 family child 继承。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** `ensure_existing_object_index` 在存储读取失败时不再说载荷已经不存在。`search_result` 在 `~` / `^` 导览里过滤提交类型时，类型读取失败返回 `Err`；对象缺失和类型不符仍丢弃该哈希。`storage.search` 仍返回 `Vec`。
 
@@ -967,13 +967,13 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Acceptance criteria:**
 
-- [ ] AC-1: `ensure_existing_object_index` 的存储读取失败不是 `NotFound`，正文不含 “no longer present”。`Ok(false)` 仍是这句缺失文案。
-- [ ] AC-2: `search_result` 的 `~` / `^` 类型读取失败返回 `Err`，不是空列表。`ObjectNotFound` 仍得到空列表。
+- [x] AC-1: 存储读取失败不是 `NotFound`、正文不含 no longer present；`Ok(false)` 仍保留缺失文案（`ensure_existing_object_index_read_error_is_not_missing`）。
+- [x] AC-2: `search_result` 的 `~`/`^` 类型读取失败返回 `Err`，不是空列表；`ObjectNotFound` 仍得到空列表（`search_result_type_read_error_is_not_empty`）。
 
 **Verification:**
 
-- [ ] VER-1: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(ensure_existing_object_index_read_error_is_not_missing)' --no-fail-fast --retries 0`
-- [ ] VER-2: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(search_result_type_read_error_is_not_empty)' --no-fail-fast --retries 0`
+- [x] VER-1: 同上命令（1/1 passed，2026-11-25 复跑）。
+- [x] VER-2: 同上命令（1/1 passed，2026-11-25 复跑）。
 
 **Full-suite trigger:** `N/A`（本卡不改 `sql/**`、`src/cli.rs`、稳定错误码或版本面）。
 
@@ -1011,7 +1011,7 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `in-progress` / 空（已推送 main `e728736`；family child 无独立发布，所以不是 done。session `986c352a-927e-4f3f-855e-f9879764e9e7` 已准入这四个生产文件；实现审查 `02aa713c-60c8-4b6a-b5c6-7e09cf2096af` VERDICT PASS。前一轮 `de5171c1` 的 Windows 测试模块 P1 已用 `cfg(all(test, unix))` 关闭）
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：实现已在 main `e728736`；`am_unreadable_object_dir_is_not_a_missing_base` 复跑 1/1；本卡不 bump、不打 tag，D 组按 family child 继承。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** `Storage::search_checked` 在本地对象目录或 pack 索引读失败时返回 `Err`。对象目录不存在仍是空的 loose 结果。`am` 的三方基线解析使用这条路径。没有唯一匹配时仍留下该 id。读失败是 `StableErrorCode::IoReadFailed`，不说成缺失。`Storage::search` 的 `Vec` 行为保持不变。
 
@@ -1021,12 +1021,12 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Acceptance criteria:**
 
-- [ ] AC-1: 本地对象目录不可读时，`search_checked` 返回 `Err`。目录不存在仍是空结果。
-- [ ] AC-2: `am` 把该错误显示为 `IoReadFailed`，正文不是 missing、absent 或 not found。没有唯一匹配时仍不解析该 id。
+- [x] AC-1: 本地对象目录不可读时，`search_checked` 返回 `Err`。目录不存在仍是空结果（`am_unreadable_object_dir_is_not_a_missing_base`）。
+- [x] AC-2: `am` 把该错误显示为 `IoReadFailed`，正文不是 missing、absent 或 not found。没有唯一匹配时仍不解析该 id（同一测试）。
 
 **Verification:**
 
-- [ ] VER-1: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(am_unreadable_object_dir_is_not_a_missing_base)' --no-fail-fast --retries 0`
+- [x] VER-1: 同上命令（1/1 passed，2026-11-25 复跑）。
 
 **Full-suite trigger:** `N/A`（本卡不改 `sql/**`、`src/cli.rs`、稳定错误码表或版本面）。
 
@@ -1064,7 +1064,7 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `in-progress` / 空（已推送 main `1d3c8d2`；family child 无独立发布，所以不是 done。session `c1d476b0-876f-46a7-bb94-ce56405a85ee` 已准入 `remote.rs` 与 `tiered.rs`；实现审查 `bc600c5b-b019-4988-a347-7f25472ba8b7` VERDICT PASS）
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：三个 search_checked 门复跑 3/3；本卡不 bump、不打 tag，D 组按 family child 继承。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** `RemoteStorage::search_checked` 在对象列举失败时返回 `Err`。`NotFound` 和空列举仍是没有匹配。`TieredStorage::search_checked` 同时采用本地和远端的可失败结果。离线或 local 读策略不访问远端。两端的 `search -> Vec` 保持原样。
 
@@ -1074,12 +1074,12 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Acceptance criteria:**
 
-- [ ] AC-1: 远端列举失败是 `Err`，空列举和 `NotFound` 仍是空结果。
-- [ ] AC-2: tiered 在自动策略下传播任一端的读失败。离线策略不访问远端。本地目录不可读仍是 `Err`。
+- [x] AC-1: 远端列举失败是 `Err`，空列举和 `NotFound` 仍是空结果（`remote_search_checked_distinguishes_list_failure_from_absence`）。
+- [x] AC-2: tiered 在自动策略下传播任一端的读失败；离线策略不访问远端；本地目录不可读仍是 `Err`（两个 tiered 测试）。
 
 **Verification:**
 
-- [ ] VER-1: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(remote_search_checked_distinguishes_list_failure_from_absence) or test(tiered_search_checked_local_only_skips_unreachable_remote) or test(tiered_search_checked_unreadable_local_dir_is_not_empty)' --no-fail-fast --retries 0`
+- [x] VER-1: 同上命令（3/3 passed，2026-11-25 复跑）。
 
 **Full-suite trigger:** `N/A`（本卡不改 `sql/**`、`src/cli.rs`、稳定错误码或版本面）。
 
@@ -1117,7 +1117,7 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `in-progress` / 空（已推送 main `835cfc5`；family child 无独立发布，所以不是 done。session `95af8652-b4f3-4116-8eba-16ae3237a780` 已准入 `fetch.rs`、`pull.rs`、`clone.rs`；实现审查 `72196c7f-6172-41c8-ae03-c5d1ccb2dccf` VERDICT PASS）
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`autofollow_storage_read_error_is_not_a_missing_tag` 复跑 1/1；本卡不 bump、不打 tag，D 组按 family child 继承。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** AutoFollow 用一次 `exist_checked_many` 判断标签对象是否已在本地。`Ok(true)` 保留标签。`Ok(false)` 仍丢弃。无法解析的哈希仍丢弃。读取失败或结果缺键是 `FetchError::TagObjectProbe`，稳定错误码仍是 `StableErrorCode::IoReadFailed`。不新增错误码。
 
@@ -1127,12 +1127,12 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Acceptance criteria:**
 
-- [ ] AC-1: 存储读取失败是 `TagObjectProbe` / `IoReadFailed`，Display 模板不含 missing、absent 或 not found。`Ok(false)` 仍丢弃标签。
-- [ ] AC-2: `pull` 与 `clone` 把该变体映射为 `IoReadFailed`，不落到网络不可用。
+- [x] AC-1: 存储读取失败是 `TagObjectProbe` / `IoReadFailed`，Display 模板不含 missing/absent/not found；`Ok(false)` 仍丢弃标签（`autofollow_storage_read_error_is_not_a_missing_tag`）。
+- [x] AC-2: `pull` 与 `clone` 把该变体映射为 `IoReadFailed`，不落到网络不可用。
 
 **Verification:**
 
-- [ ] VER-1: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(autofollow_storage_read_error_is_not_a_missing_tag)' --no-fail-fast --retries 0`
+- [x] VER-1: 同上命令（1/1 passed，2026-11-25 复跑）。
 
 **Full-suite trigger:** `N/A`（本卡不改 `sql/**`、`src/cli.rs`、稳定错误码表或版本面）。
 

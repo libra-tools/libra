@@ -30,7 +30,7 @@ With `--diff3`, the base section is included between `|||||||` and `=======`.
 By default the result is written back into `<current>`; with `-p` it is printed
 to stdout and no file is touched. When writing in place inside a repository, the
 original `<current>` is first copied to this worktree's `merge-file-backup/` (in its local gitdir — each worktree keeps its own backups); the backup
-is removed on a clean merge and kept (with a note) when conflicts remain.
+is removed on a clean merge and kept silently when conflicts remain.
 
 The three arguments are read as raw bytes; `merge-file` does not require them to
 be tracked or to correspond to stored blobs.
@@ -49,7 +49,7 @@ a NUL byte is still rejected before driver dispatch.
 |--------|-------------|---------|
 | `-p`, `--stdout` | Print the merged result to stdout; do not modify `<current>`. | `libra merge-file -p a b c` |
 | `--diff3` | Include the `<base>` section in conflict markers. | `libra merge-file --diff3 -p a b c` |
-| `-q`, `--quiet` | Do not warn about conflicts on stderr. | `libra merge-file -q a b c` |
+| `-q`, `--quiet` | Suppress conflict warnings; `merge-file` already stays silent like Git, so this is a no-op. | `libra merge-file -q a b c` |
 | `--json` / `--machine` | Structured output: `{ conflict, written, merged? }` (`merged` only with `-p`). | `libra --json merge-file -p a b c` |
 
 ## Exit codes

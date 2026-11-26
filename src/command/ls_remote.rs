@@ -230,6 +230,14 @@ impl From<LsRemoteError> for CliError {
                         .with_stable_code(StableErrorCode::AuthPermissionDenied)
                         .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
                 }
+                GitError::IOError(source)
+                    if let Some(failure) =
+                        crate::internal::protocol::ssh_client::ssh_connection_failed(source) =>
+                {
+                    CliError::fatal(failure.to_string())
+                        .with_stable_code(StableErrorCode::NetworkUnavailable)
+                        .with_hint(failure.hint())
+                }
                 GitError::IOError(source) if is_pkt_line_io_error(source) => {
                     CliError::fatal(error.to_string())
                         .with_stable_code(StableErrorCode::NetworkProtocol)
@@ -296,7 +304,8 @@ async fn run_ls_remote(
         .map_err(|source| {
             let source = match &source {
                 GitError::IOError(error)
-                    if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error) =>
+                    if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error)
+                        || crate::internal::protocol::ssh_client::is_ssh_connection_failed(error) =>
                 {
                     source
                 }

@@ -188,3 +188,15 @@ separate from the two-second direct-child cleanup budget; no benchmark or
 arbitrary-descendant cleanup guarantee is implied.
 
 - 2026-11-23（PM-02 / #717）：`--default` 在无显式动作且只有单个 `<key>` 时按 Git 的隐式 GET 处理（`resolve_command_typed` 前置校验，先于 `--list`/`--remove-section`/写动作派发），与 `--list`、写动作、`edit`/`path`、多余值参数同用一律 `LBR-CLI-002`（修复 `--list` 忽略 `--default`、`--remove-section` 仍会删除的行为）；`--get-all`/`--get-regexp` 继续接受（有意差异）。回归：`config_default_implies_get`（AC1–AC7）。
+
+pattern unset with no match exits 5.
+
+value pattern replaces one matching value.
+
+invalid set pattern exits 6.
+
+replace-all refuses upgrade.mode.
+
+bool-or-str shortcut matches the type value.
+
+conflicting type switches exit 129.

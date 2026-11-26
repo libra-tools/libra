@@ -1035,3 +1035,15 @@ A successful discovery whose child waits for a request normally incurs the full
 100 ms native-exit observation window, once per discovery operation. This is
 separate from the two-second direct-child cleanup budget; no benchmark or
 arbitrary-descendant cleanup guarantee is implied.
+
+pattern unset with no match exits 5.
+
+value pattern replaces one matching value.
+
+invalid set pattern exits 6.
+
+replace-all refuses upgrade.mode.
+
+bool-or-str shortcut matches the type value.
+
+conflicting type switches exit 129.

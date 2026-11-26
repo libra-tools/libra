@@ -3289,7 +3289,7 @@ ER-01 至 ER-14 按模板原文对本计划全部任务生效（见 [`plan-templ
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / 空
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读子进程执行器 8 个具名门全部复跑通过（超时 SIGKILL/槽位回收、hash kind、schema 不自迁移、不修对象索引、跳过升级检查）；同卡文档门与网站源文件检查已勾选，版本 patch +1。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；T-1 全量未运行，线上页面/远端 D 未重验。
 
 **Description:** 自 MC-19 拆出。新增读执行器 `mcp_server/exec.rs`：每次读工具调用由服务进程派生一个隐藏的读子进程 `libra agent mcp --read-worker`（`#[arg(hide = true)]`，不出现在 help；只从 stdin 读取一个由服务端构造的内部请求、向 stdout 写一个结果；在 `src/cli.rs` 中先于常规预检被分派到**只读预检**：只做仓库发现并以只读方式读取 `core.objectformat` 设置 hash kind（SHA-1/SHA-256 仓库都正确），不执行数据库迁移（schema 不是当前版本即以 `LBR-AGENT-037` 失败）、不修复对象索引、不启动自动升级检查或任何启动维护；以发起进程的工作目录启动，只读访问仓库），容量 4 的信号量限制同时存在的读子进程数。读 deadline 到期时服务立即回复 `LBR-AGENT-036`，并在 Unix 上向读子进程的进程组发送 `SIGKILL`、在 Windows 上 `TerminateProcess`，**回收（wait）完成后才归还槽位**（≤ 1 s）。因此任何读路径（status、diff 含 rename 检测、checkpoint、workspace、trace）的阻塞计算、I/O 与内存都随子进程一起被强制终止，超时的读工作不会继续占用槽位或资源。另注册仅在 `cfg(debug_assertions)` 且 `LIBRA_TEST=1` 时存在的 `libra_test_block`（在读子进程内阻塞并写 PID 文件）与 `libra_test_hash_kind`（在读子进程内返回当前 hash kind），以及 debug-only 读 deadline 覆盖 `LIBRA_MCP_TEST_READ_DEADLINE_MS`。唯一行为轴：「读工具子进程执行器」。
 
@@ -3807,7 +3807,7 @@ Libra现行v2.14粒度规范止于G-11（含G-07a），不引入Mega G-12/G-13�
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：有界工作树读取 4 个具名单测全部复跑通过（TooLarge、≤ limit+1、并发增长、符号链接目标字节）；文档按卡 N/A，版本 patch +1。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；T-1 全量未运行。
 
 **Description:** 自 MC-32 拆出（R29）。在 `src/command/mod.rs` 的 `read_worktree_blob_bytes`（`:359`）旁新增 `read_worktree_blob_bytes_bounded(path, limit)`，与现有函数**同一 blob 语义**：路径为符号链接时返回链接目标字节、绝不跟随（Unix 以 `O_NOFOLLOW` 打开、遇链接改为 `read_link`；Windows 以 `FILE_FLAG_OPEN_REPARSE_POINT`）；其余情形先以不跟随方式**打开一次**句柄，此后分类（`fstat` 判定普通文件）与普通文件正文读取都只使用**这同一个句柄**（LFS 跟踪路径的句柄交给 MC-39 的指针生成）：普通文件从该句柄读取至多 `limit + 1` 字节，超过即返回 `TooLarge`。因此打开之后路径被替换（含替换为指向外部的符号链接）不会改变读取的对象，消除增长/替换竞态。上限对实际返回的那种表示（链接目标、指针或正文）生效。现有 `read_worktree_blob_bytes` 与 CLI 不变。唯一行为轴：「工作树 blob 有界读取」。
 

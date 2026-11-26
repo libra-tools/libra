@@ -147,6 +147,9 @@ pub struct ConfigArgs {
     /// Shortcut for `--type=int`.
     #[clap(long = "int", hide = true, group = "config_type_sel")]
     pub type_int: bool,
+    /// Shortcut for `--type=bool-or-str`.
+    #[clap(long = "bool-or-str", hide = true, group = "config_type_sel")]
+    pub type_bool_or_str: bool,
     /// Shortcut for `--type=path`.
     #[clap(long = "path", hide = true, group = "config_type_sel")]
     pub type_path: bool,
@@ -2208,6 +2211,9 @@ fn resolve_value_type(args: &ConfigArgs) -> CliResult<Option<ConfigValueType>> {
     if args.type_int {
         return Ok(Some(ConfigValueType::Int));
     }
+    if args.type_bool_or_str {
+        return Ok(Some(ConfigValueType::BoolOrStr));
+    }
     if args.type_path {
         return Ok(Some(ConfigValueType::Path));
     }
@@ -3229,7 +3235,7 @@ fn compile_config_regexp(pattern: &str) -> CliResult<regex::Regex> {
     regex::Regex::new(pattern).map_err(|error| {
         CliError::failure(format!("invalid pattern '{pattern}': {error}"))
             .with_stable_code(StableErrorCode::CliInvalidArguments)
-            .with_exit_code(2)
+            .with_exit_code(6)
     })
 }
 

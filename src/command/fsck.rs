@@ -65,11 +65,16 @@ fn strict_enabled() -> bool {
     STRICT.load(Ordering::Relaxed)
 }
 
-fn clear_messages() {
+fn message_buffer() -> std::sync::MutexGuard<'static, Vec<FsckMessage>> {
+    // A panic while a previous caller held the buffer must not make every later
+    // fsck run panic; recover the poisoned guard's contents instead.
     MESSAGES
         .lock()
-        .expect("fsck message buffer poisoned")
-        .clear();
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn clear_messages() {
+    message_buffer().clear();
 }
 
 /// Presence probe that keeps a storage read failure distinct from absence.
@@ -83,7 +88,7 @@ fn storage_has_object(storage: &ClientStorage, hash: &ObjectHash) -> CliResult<b
 }
 
 fn take_messages() -> Vec<FsckMessage> {
-    std::mem::take(&mut *MESSAGES.lock().expect("fsck message buffer poisoned"))
+    std::mem::take(&mut *message_buffer())
 }
 
 /// Severity of an fsck message (ADR-MX-06). Mirrors Git's msg-id table:
@@ -291,13 +296,10 @@ pub fn report(msg_id: FsckMsgId, obj_type: &str, obj_id: &str) -> bool {
     }
     // Structured output carries every severity-carrying finding (M-FSCK F6).
     if msg_id.is_error() {
-        MESSAGES
-            .lock()
-            .expect("fsck message buffer poisoned")
-            .push(FsckMessage {
-                severity,
-                message: output,
-            });
+        message_buffer().push(FsckMessage {
+            severity,
+            message: output,
+        });
     }
     if msg_id == FsckMsgId::ZeroPaddedFilemode {
         // A warning flips the exit code only when `--strict` escalates it.
@@ -2191,7 +2193,13 @@ async fn write_lost_found_objects(
     let lost_found_dir = storage
         .base_path()
         .parent()
-        .expect("storage should have parent")
+        .ok_or_else(|| {
+            CliError::fatal(format!(
+                "object storage path '{}' has no parent directory",
+                storage.base_path().display()
+            ))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?
         .join("lost-found");
 
     // Create lost-found directory structure
@@ -3062,6 +3070,16 @@ mod tests {
         assert!(!super::is_valid_timezone("+00:0"), "non-digit");
         assert!(!super::is_valid_timezone("+000"), "wrong length");
         assert!(!super::is_valid_timezone("+"), "too short");
+    }
+
+    #[test]
+    fn poisoned_message_buffer_recovers_without_panicking() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = super::MESSAGES.lock().unwrap();
+            panic!("poison the fsck message buffer");
+        });
+        super::clear_messages();
+        assert!(super::take_messages().is_empty());
     }
 
     #[test]

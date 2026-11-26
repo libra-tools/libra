@@ -48,7 +48,7 @@ use redb::{
     backends::FileBackend,
 };
 use sea_orm::sqlx::{
-    AssertSqlSafe, Connection as _, Executor as _, Row as _, SqliteConnection,
+    AssertSqlSafe, ConnectOptions as _, Connection as _, Executor as _, Row as _, SqliteConnection,
     sqlite::SqliteConnectOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -68,19 +68,20 @@ use crate::{
             AgentSessionRecord, AgentSubagentContentClaimRecord,
             AgentSubagentContentRevisionRecord, AgentSubagentLinkRecord, AgentUsageStatsRecord,
             AgentWorkspaceScopeAuditRecord, BridgeLinkSourceType, BridgeOperationStatus,
-            BridgeSessionState, CAPTURE_SOURCE_TABLES, CAPTURE_SOURCE_TABLES_COUNT,
-            CaptureAgentKind, CaptureBatchItem, CaptureBatchPayload,
-            CaptureCatalogCopyReceiptRecord, CaptureCheckpointScope, CaptureCompleteness,
-            CaptureCoverageClaimState, CaptureExportJobState, CaptureHashKind,
-            CaptureImportIdentityState, CaptureQueueHighwater, CaptureQueueLane,
-            CaptureSchemaVersionRecord, CaptureScopeState, CaptureSessionState,
-            CaptureSourceChannel, CaptureSubagentClaimState, CaptureSubagentLinkState,
-            CaptureSubagentSourceChannel, RedbCaptureStore, invert_capture_timestamp,
-            redb_capture_store as redb_cap, validate_capture_batch_item,
+            BridgeSessionState, CAPTURE_APPEND_ONLY_ERROR_PREFIX, CAPTURE_SOURCE_TABLES,
+            CAPTURE_SOURCE_TABLES_COUNT, CAPTURE_TOMBSTONE_ERROR_PREFIX, CaptureAgentKind,
+            CaptureBatchItem, CaptureBatchPayload, CaptureCatalogCopyReceiptRecord,
+            CaptureCheckpointScope, CaptureCompleteness, CaptureCoverageClaimState,
+            CaptureExportJobState, CaptureHashKind, CaptureImportIdentityState,
+            CaptureQueueHighwater, CaptureQueueLane, CaptureSchemaVersionRecord, CaptureScopeState,
+            CaptureSessionState, CaptureSourceChannel, CaptureSubagentClaimState,
+            CaptureSubagentLinkState, CaptureSubagentSourceChannel, RedbCaptureStore,
+            invert_capture_timestamp, redb_capture_store as redb_cap, validate_capture_batch_item,
             validate_capture_dedup_key,
         },
         codec::{decode_versioned, encode_versioned},
         config_store::{LegacyConfigEntry, SQLITE_MIGRATED_FENCE_SQL, SQLITE_MIGRATED_FENCE_TABLE},
+        cross_store::{CROSS_STORE_INTENT_CODEC_VERSION, CrossStoreIntentRecord},
         error::{StorageBackendError, StorageResult},
         git_state_store::{
             AiDecisionProposalRecord, AiFinalDecisionRecord, AiIndexIntentContextFrameRecord,
@@ -104,16 +105,19 @@ use crate::{
             repository_active_source_tables,
         },
         git_store::{
-            BridgePublicationPhase, ObjectHashKind, ObliterationState, RefKey, RefTarget,
-            redb as redb_git,
+            BridgePublicationPhase, ObjectHashKind, ObliterationState, RedbGitStore, RefKey,
+            RefTarget, redb as redb_git,
         },
         manifest::{
             LEGACY_SQLITE_DB_FILE, ManifestOrigin, PRIVATE_SUBDIR, Phase2DbState, Phase2Progress,
             REDB_SUBDIR, STORAGE_FORMAT_MANIFEST_FILE, SourceDigests, StorageFormatManifest,
             canonical_capture_redb_rel_path, canonical_git_redb_rel_path, format_generation_id,
-            read_storage_manifest,
+            publish_storage_manifest, read_storage_manifest,
         },
-        meta::{begin_checked_read, init_meta_schema},
+        meta::{
+            begin_checked_read, begin_checked_write_blocking, init_meta_schema,
+            write_migration_tombstone,
+        },
         opener::{begin_write_bounded_blocking, open_redb_read_only},
         queue::{
             CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION, CAPTURE_QUEUE_SUBDIR,
@@ -121,9 +125,9 @@ use crate::{
             CAPTURE_SPOOL_TOMBSTONE_SENTINEL, CaptureSpoolTombstonePaths, FrameDecodeError,
             FrameStreamDecoder, FrameStreamItem, LTM2_MAX_LEN, LaneTailMeta,
             QUEUE_APPEND_LOCK_FILE, QUEUE_LANE_NORMAL_DIR, QUEUE_LANE_PRIORITY_DIR,
-            QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE, QUEUE_WRITER_LOCK_FILE, crc32c_append,
-            decode_postcard_payload, parse_segment_log_file_name, read_converged_lane_tail_meta,
-            segment_log_file_name,
+            QUEUE_QUARANTINE_DIR, QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE,
+            QUEUE_WRITER_LOCK_FILE, crc32c_append, decode_postcard_payload,
+            parse_segment_log_file_name, read_converged_lane_tail_meta, segment_log_file_name,
         },
         redb::{
             config_store as redb_cfg, map_redb_commit_err, map_redb_database_err,
@@ -304,6 +308,8 @@ pub enum ForwardPhase1QuiesceStage {
     CaptureQueueAppendLock,
     /// Active unexpired staging file check under `<common_storage>/private/capture-spool/tmp/`.
     CaptureSpoolInFlightTmp,
+    /// Non-empty quarantine directory check under `<common_storage>/private/capture-spool/quarantine/`.
+    CaptureSpoolQuarantine,
     /// Single-connection SQLite Phase 1 quiescence on `libra.db` and optional `capture.db`.
     SqliteSources,
 }
@@ -321,6 +327,7 @@ impl ForwardPhase1QuiesceStage {
             Self::CaptureSpoolCapacityLock => "capture-spool/capacity.lock",
             Self::CaptureQueueAppendLock => "capture-queue/append.lock",
             Self::CaptureSpoolInFlightTmp => "capture-spool/tmp in-flight publisher check",
+            Self::CaptureSpoolQuarantine => "capture-spool/quarantine non-empty check",
             Self::SqliteSources => "sqlite sources quiescence",
         }
     }
@@ -2887,6 +2894,355 @@ fn verify_no_inflight_spool_tmp_files_non_unix(
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+/// Fail closed if `.libra/private/capture-spool/quarantine/` contains any
+/// quarantined event entry (`ADR-RB-07` #2, `RB-11q`).
+///
+/// Mirrors [`verify_no_inflight_spool_tmp_files`]: on Unix, pins `common_storage`
+/// -> `private` -> `capture-spool` -> `quarantine` with `openat(O_NOFOLLOW)` and
+/// `fstatat(AT_SYMLINK_NOFOLLOW)`, accepts an absent `quarantine` path, an empty
+/// `quarantine/` directory, or a verified `0400` Redb tombstone sentinel regular
+/// file (`S_IFREG`, `nlink == 1`, `uid == geteuid()`, exact `(dev, ino)` match,
+/// bounded read), and unconditionally fails closed (`LBR-IO-001`) without
+/// deleting or modifying any file when `quarantine/` is non-empty or unsafe.
+fn verify_no_spool_quarantine_files(common_storage: &Path) -> StorageResult<()> {
+    let stage = ForwardPhase1QuiesceStage::CaptureSpoolQuarantine;
+    #[cfg(unix)]
+    {
+        verify_no_spool_quarantine_files_unix(common_storage, stage)
+            .map_err(normalize_reverse_quiesce_err)
+    }
+    #[cfg(not(unix))]
+    {
+        verify_no_spool_quarantine_files_non_unix(common_storage, stage)
+            .map_err(normalize_reverse_quiesce_err)
+    }
+}
+
+#[cfg(unix)]
+fn verify_no_spool_quarantine_files_unix(
+    common_storage: &Path,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<()> {
+    use std::{
+        ffi::CString,
+        io::Read as _,
+        os::unix::{
+            ffi::OsStrExt as _,
+            io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        },
+    };
+
+    let c_storage = CString::new(common_storage.as_os_str().as_bytes()).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: invalid storage path",
+                stage.as_str()
+            ),
+        }
+    })?;
+    // SAFETY: `c_storage` is NUL-terminated.
+    let raw_root = unsafe {
+        libc::open(
+            c_storage.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw_root < 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: storage root must be a non-symlink directory",
+                stage.as_str()
+            ),
+        });
+    }
+    // SAFETY: `raw_root >= 0` is exclusively owned here.
+    let root_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
+
+    let Some((private_fd, _)) = open_verified_dir_at_unix(&root_fd, c"private", true, stage)?
+    else {
+        return Ok(());
+    };
+    let Some((spool_fd, _)) =
+        open_verified_dir_at_unix(&private_fd, c"capture-spool", true, stage)?
+    else {
+        return Ok(());
+    };
+
+    let mut quar_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `spool_fd` is valid and `c"quarantine"` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            spool_fd.as_raw_fd(),
+            c"quarantine".as_ptr(),
+            quar_stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(StorageBackendError::io(
+            "inspect capture-spool/quarantine metadata",
+            err,
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let quar_stat = unsafe { quar_stat.assume_init() };
+    let quar_kind = quar_stat.st_mode & libc::S_IFMT;
+    if quar_kind == libc::S_IFLNK {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine must not be a symlink",
+                stage.as_str()
+            ),
+        });
+    }
+    if quar_kind == libc::S_IFREG {
+        // SAFETY: `spool_fd` is valid and `c"quarantine"` is NUL-terminated.
+        let raw_tomb = unsafe {
+            libc::openat(
+                spool_fd.as_raw_fd(),
+                c"quarantine".as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw_tomb < 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: unable to open capture-spool/quarantine tombstone safely",
+                    stage.as_str()
+                ),
+            });
+        }
+        // SAFETY: `raw_tomb >= 0` is exclusively owned here.
+        let tomb_file = File::from(unsafe { OwnedFd::from_raw_fd(raw_tomb) });
+        let mut fd_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `tomb_file` is valid.
+        if unsafe { libc::fstat(tomb_file.as_raw_fd(), fd_st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat capture-spool/quarantine tombstone descriptor",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let fd_st = unsafe { fd_st.assume_init() };
+        let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if (fd_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || fd_st.st_nlink != 1
+            || fd_st.st_uid != euid
+            || fd_st.st_dev != quar_stat.st_dev
+            || fd_st.st_ino != quar_stat.st_ino
+            || fd_st.st_size != expected_len as i64
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: capture-spool/quarantine is an unsafe or non-tombstone file",
+                    stage.as_str()
+                ),
+            });
+        }
+        let mut buf = Vec::with_capacity(expected_len + 1);
+        tomb_file
+            .take((expected_len + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: failed to read capture-spool/quarantine tombstone",
+                    stage.as_str()
+                ),
+            })?;
+        if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: capture-spool/quarantine regular file does not match Redb tombstone sentinel",
+                    stage.as_str()
+                ),
+            });
+        }
+        return Ok(());
+    }
+    if quar_kind != libc::S_IFDIR {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is neither a directory nor a valid tombstone",
+                stage.as_str()
+            ),
+        });
+    }
+
+    let Some((quar_fd, _)) = open_verified_dir_at_unix(&spool_fd, c"quarantine", true, stage)?
+    else {
+        return Ok(());
+    };
+    // SAFETY: `quar_fd` is valid.
+    let dup_raw = unsafe { libc::fcntl(quar_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_raw < 0 {
+        return Err(StorageBackendError::io(
+            "duplicate capture-spool/quarantine directory descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `dup_raw` is an open directory fd; on success `fdopendir` owns it.
+    let dir_ptr = unsafe { libc::fdopendir(dup_raw) };
+    if dir_ptr.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so close `dup_raw`.
+        unsafe {
+            libc::close(dup_raw);
+        }
+        return Err(StorageBackendError::io(
+            "open capture-spool/quarantine directory stream",
+            err,
+        ));
+    }
+
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was returned by `fdopendir`.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+    }
+    let _dir_guard = DirGuard(dir_ptr);
+
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        // SAFETY: `dir_ptr` is open and valid for the lifetime of `_dir_guard`.
+        let entry = unsafe { libc::readdir(dir_ptr) };
+        if entry.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error().unwrap_or(0) != 0 {
+                return Err(StorageBackendError::io(
+                    "iterate capture-spool/quarantine directory",
+                    err,
+                ));
+            }
+            break;
+        }
+        // SAFETY: `entry` is non-null and `d_name` is NUL-terminated.
+        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name_bytes = name_cstr.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is non-empty; inspect and resolve quarantined events before migrating",
+                stage.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_no_spool_quarantine_files_non_unix(
+    common_storage: &Path,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<()> {
+    use std::io::Read as _;
+
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    if !validate_existing_dir_no_mutate(&private_dir, true, stage)? {
+        return Ok(());
+    }
+    let spool_dir = capture_spool_dir_path(common_storage);
+    if !validate_existing_dir_no_mutate(&spool_dir, true, stage)? {
+        return Ok(());
+    }
+    let quar_path = spool_dir.join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+    let quar_meta = match fs::symlink_metadata(&quar_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "inspect capture-spool/quarantine metadata",
+                err,
+            ));
+        }
+    };
+    if quar_meta.file_type().is_symlink() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine must not be a symlink",
+                stage.as_str()
+            ),
+        });
+    }
+    if quar_meta.file_type().is_file() {
+        let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+        if quar_meta.len() != expected_len as u64 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: capture-spool/quarantine is an unexpected non-directory file",
+                    stage.as_str()
+                ),
+            });
+        }
+        let file = File::open(&quar_path).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: unable to open capture-spool/quarantine tombstone",
+                stage.as_str()
+            ),
+        })?;
+        let mut buf = Vec::with_capacity(expected_len + 1);
+        file.take((expected_len + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: failed to read capture-spool/quarantine tombstone",
+                    stage.as_str()
+                ),
+            })?;
+        if buf.as_slice() == CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+            return Ok(());
+        }
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is an unexpected non-directory file",
+                stage.as_str()
+            ),
+        });
+    }
+    if !quar_meta.file_type().is_dir() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is neither a directory nor a valid tombstone",
+                stage.as_str()
+            ),
+        });
+    }
+    let mut entries = fs::read_dir(&quar_path)
+        .map_err(|err| StorageBackendError::io("read capture-spool/quarantine directory", err))?;
+    if let Some(entry_res) = entries.next() {
+        let _ = entry_res.map_err(|err| {
+            StorageBackendError::io("iterate capture-spool/quarantine directory", err)
+        })?;
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: capture-spool/quarantine is non-empty; inspect and resolve quarantined events before migrating",
+                stage.as_str()
+            ),
+        });
     }
     Ok(())
 }
@@ -29394,7 +29750,7 @@ async fn verify_quiesced_connection_ready_for_fence(
     source: &mut QuiescedSqliteConnection,
 ) -> StorageResult<()> {
     let role = source.role;
-    validate_repository_forward_role(role)?;
+    validate_any_migration_role(role)?;
     verify_connection_not_moved(&mut source.conn, role).await?;
 
     let wal_path = sqlite_sidecar_path(&source.path, "-wal");
@@ -40936,6 +41292,11913 @@ async fn resume_forward_migration_inner(
     })
 }
 
+// ============================================================================
+// RB-11: Reverse Migration Phase 1 Redb Writer Quiescence & Global Lock Order
+// ============================================================================
+
+/// Sanitized stage identifier for symmetric reverse migration (`redb -> SQLite`)
+/// Phase 1 quiescence (`ADR-RB-07` #2, `RB-11`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReversePhase1QuiesceStage {
+    /// Repository storage root validation (`<common_storage>`).
+    StorageRoot,
+    /// Finalized Redb `storage-format.json` manifest validation.
+    StorageManifest,
+    /// Exclusive advisory lock on `<common_storage>/migration.lock`.
+    MigrationLock,
+    /// Exclusive advisory lock on `<common_storage>/maintenance.lock`.
+    MaintenanceLock,
+    /// Exclusive advisory lock on `<common_storage>/private/capture-spool-consumer.lock`.
+    CaptureSpoolConsumerLock,
+    /// Exclusive advisory lock on `<common_storage>/private/capture-queue/writer.lock`.
+    CaptureQueueWriterLock,
+    /// In-place exclusive advisory lock on `<common_storage>/private/capture-queue/append.lock`.
+    CaptureQueueAppendLock,
+    /// In-place exclusive advisory lock on `<common_storage>/private/capture-spool/capacity.lock`.
+    CaptureSpoolCapacityLock,
+    /// In-flight `<common_storage>/private/capture-spool/tmp/` publisher check (`RB-11z`).
+    CaptureSpoolInFlightTmp,
+    /// Exclusive uncommitted redb `WriteTransaction` on `redb/git.gen-<id>.redb`.
+    GitRedbWriteTransaction,
+    /// Exclusive uncommitted redb `WriteTransaction` on `private/capture.gen-<id>.redb`.
+    CaptureRedbWriteTransaction,
+}
+
+impl ReversePhase1QuiesceStage {
+    /// Human-readable sanitized stage label (zero private paths).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StorageRoot => "storage root validation",
+            Self::StorageManifest => "storage-format.json manifest validation",
+            Self::MigrationLock => "migration.lock",
+            Self::MaintenanceLock => "maintenance.lock",
+            Self::CaptureSpoolConsumerLock => "capture-spool-consumer.lock",
+            Self::CaptureQueueWriterLock => "capture-queue/writer.lock",
+            Self::CaptureQueueAppendLock => "capture-queue/append.lock",
+            Self::CaptureSpoolCapacityLock => "capture-spool/capacity.lock",
+            Self::CaptureSpoolInFlightTmp => "capture-spool/tmp in-flight check",
+            Self::GitRedbWriteTransaction => "git.redb WriteTransaction",
+            Self::CaptureRedbWriteTransaction => "capture.redb WriteTransaction",
+        }
+    }
+}
+
+/// Exclusive non-redb advisory locks held across reverse migration Phase 1 and
+/// Phase 2 (`ADR-RB-07` #2, `RB-11`).
+///
+/// Fields are declared in **strict reverse acquisition order** so dropping the
+/// struct always releases inner locks before outer locks:
+/// `capacity.lock -> append.lock -> writer.lock -> capture-spool-consumer.lock -> maintenance.lock -> migration.lock`.
+#[derive(Debug)]
+pub struct ReversePhase1Locks {
+    _spool_capacity_lock: File,
+    _queue_append_lock: File,
+    _queue_writer_lock: File,
+    _spool_consumer_lock: File,
+    _maintenance_lock: File,
+    _migration_lock: File,
+}
+
+/// Quiesced source `redb` databases (`git.gen-<id>.redb` and
+/// `capture.gen-<id>.redb`) holding live uncommitted `WriteTransaction`s
+/// acquired in strict `Git -> Capture` order (`ADR-RB-07` #2, `RB-11`).
+///
+/// Field declaration order guarantees `capture_wtx` drops before `git_wtx`, and
+/// both transactions drop before their backing `RedbDatabase` handles, ensuring
+/// zero committed mutations if Phase 1 aborts.
+pub struct QuiescedRepositoryRedbSources {
+    generation: u64,
+    git_redb_path: PathBuf,
+    capture_redb_path: PathBuf,
+    capture_wtx: redb::WriteTransaction,
+    git_wtx: redb::WriteTransaction,
+    capture_db: RedbDatabase,
+    git_db: RedbDatabase,
+    #[cfg(any(unix, windows))]
+    #[allow(dead_code)] // Used by `RB-11d` Phase 2 fence commit transition.
+    capture_backend_ctrl: std::sync::Arc<ReverseNonBlockingFileBackendInner>,
+    #[cfg(any(unix, windows))]
+    #[allow(dead_code)] // Used by `RB-11d` Phase 2 fence commit transition.
+    git_backend_ctrl: std::sync::Arc<ReverseNonBlockingFileBackendInner>,
+}
+
+impl std::fmt::Debug for QuiescedRepositoryRedbSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuiescedRepositoryRedbSources")
+            .field("generation", &self.generation)
+            .field("git_redb_path", &self.git_redb_path)
+            .field("capture_redb_path", &self.capture_redb_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QuiescedRepositoryRedbSources {
+    /// Active source redb generation read from `storage-format.json`.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Canonical source `git.gen-<id>.redb` path.
+    #[must_use]
+    pub fn git_redb_path(&self) -> &Path {
+        &self.git_redb_path
+    }
+
+    /// Canonical source `capture.gen-<id>.redb` path.
+    #[must_use]
+    pub fn capture_redb_path(&self) -> &Path {
+        &self.capture_redb_path
+    }
+
+    /// Borrow the held uncommitted `git.redb` write transaction (strictly
+    /// read-only during Phase 1; NEVER committed in Phase 1).
+    #[must_use]
+    pub fn git_wtx(&self) -> &redb::WriteTransaction {
+        &self.git_wtx
+    }
+
+    /// Borrow the held uncommitted `capture.redb` write transaction (strictly
+    /// read-only during Phase 1; NEVER committed in Phase 1).
+    #[must_use]
+    pub fn capture_wtx(&self) -> &redb::WriteTransaction {
+        &self.capture_wtx
+    }
+
+    /// Explicitly abort both uncommitted write transactions in strict reverse
+    /// order (`capture_wtx` then `git_wtx`) and close both database handles
+    /// without modifying a single byte of either source `.redb` file.
+    pub fn abort_and_close(self) -> StorageResult<()> {
+        let Self {
+            capture_wtx,
+            git_wtx,
+            capture_db,
+            git_db,
+            ..
+        } = self;
+        let cap_abort = capture_wtx
+            .abort()
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("reverse migration failed aborting capture.redb write tx: {err}"),
+            });
+        let git_abort = git_wtx
+            .abort()
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("reverse migration failed aborting git.redb write tx: {err}"),
+            });
+        drop(capture_db);
+        drop(git_db);
+        cap_abort?;
+        git_abort?;
+        Ok(())
+    }
+}
+
+/// Full Phase 1 reverse migration quiescence guard holding all 6 non-redb
+/// advisory locks in strict `ADR-RB-07` #2 order plus live uncommitted
+/// `(git_wtx, cap_wtx)` write transactions on the finalized source redb stores
+/// (`RB-11`).
+///
+/// Dropping or calling [`Self::abort_and_release`] always aborts `(cap_wtx, git_wtx)`
+/// and closes both `RedbDatabase` handles BEFORE releasing `ReversePhase1Locks`.
+#[derive(Debug)]
+pub struct ReversePhase1QuiesceGuard {
+    /// Quiesced source `git.redb` and `capture.redb` write transactions.
+    /// Kept private so callers cannot move `redb` out and drop `locks` while
+    /// `(git_wtx, cap_wtx)` remain live (`ADR-RB-07` #2, `RB-11` AC5).
+    redb: QuiescedRepositoryRedbSources,
+    /// Held non-redb exclusive advisory locks (dropped AFTER `redb` closes).
+    locks: ReversePhase1Locks,
+}
+
+impl ReversePhase1QuiesceGuard {
+    /// Borrow the quiesced source redb handles and uncommitted write
+    /// transactions for the lifetime of this guard.
+    #[must_use]
+    pub fn redb(&self) -> &QuiescedRepositoryRedbSources {
+        &self.redb
+    }
+
+    /// Abort both uncommitted redb write transactions, close both redb handles,
+    /// and release all 6 advisory locks in strict reverse acquisition order.
+    pub fn abort_and_release(self) -> StorageResult<()> {
+        let Self { redb, locks } = self;
+        let res = redb.abort_and_close();
+        drop(locks);
+        res
+    }
+}
+
+#[cfg(test)]
+trait ReversePhase1LockObserver {
+    fn on_stage_acquired(&mut self, stage: ReversePhase1QuiesceStage);
+    /// Deterministic test hook invoked after `git.redb` opens and drops its
+    /// open-time `WRITER_BYTE`, immediately before `git_wtx` is acquired.
+    fn on_after_git_db_open_before_git_wtx(&mut self) {}
+}
+
+#[cfg(unix)]
+type ReverseRedbFileIdentity = (u64, u64);
+
+#[cfg(windows)]
+type ReverseRedbFileIdentity = win_tmp_guard::WinFileId;
+
+#[cfg(all(not(unix), not(windows)))]
+type ReverseRedbFileIdentity = ();
+
+/// `redb 5.0` multi-process byte-range lock offset for the exclusive writer
+/// lock (`LOCK_BASE = 1 << 62`, held across every `MultiWriter` `WriteTransaction`
+/// and during `Database::new` header/repair opens; `redb-5.0.0/src/db.rs:190`).
+#[cfg(any(unix, windows))]
+const REDB_WRITER_LOCK_BYTE: u64 = 1u64 << 62;
+
+/// Upper bound on brief retry for sub-millisecond header-lock (`0..512`)
+/// contention against concurrent read-only header reads during reverse Phase 1.
+#[cfg(any(unix, windows))]
+const REDB_HEADER_LOCK_RETRY_BUDGET: Duration = Duration::from_millis(20);
+
+/// Page granularity for the Phase 1 in-memory copy-on-write overlay that keeps
+/// source `git.redb` and `capture.redb` 100% byte-for-byte untouched on disk
+/// throughout reverse migration Phase 1 (`RB-11`, `RB-11p`).
+#[cfg(any(unix, windows))]
+const REVERSE_PHASE1_COW_PAGE_SIZE: usize = 4096;
+
+/// Hard cap on Phase 1 in-memory CoW overlay size (`4 MiB`). Normal Phase 1
+/// open/abort touches only ~8–16 KiB (header + abort metadata).
+#[cfg(any(unix, windows))]
+const REVERSE_PHASE1_COW_MAX_PAGES: usize = 1024;
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Default)]
+struct ReversePhase1OverlayState {
+    allow_disk_writes: bool,
+    virtual_len: Option<u64>,
+    dirty_pages: BTreeMap<u64, [u8; REVERSE_PHASE1_COW_PAGE_SIZE]>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug)]
+struct ReverseNonBlockingFileBackendInner {
+    backend: FileBackend,
+    overlay: std::sync::Mutex<ReversePhase1OverlayState>,
+}
+
+#[cfg(any(unix, windows))]
+impl ReverseNonBlockingFileBackendInner {
+    fn new(file: File) -> Self {
+        Self {
+            backend: FileBackend::new(file),
+            overlay: std::sync::Mutex::new(ReversePhase1OverlayState::default()),
+        }
+    }
+
+    fn lock_overlay(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ReversePhase1OverlayState>, BackendError> {
+        self.overlay.lock().map_err(|_| {
+            BackendError::Io(io::Error::other(
+                "reverse migration Phase 1 redb CoW overlay lock poisoned",
+            ))
+        })
+    }
+
+    /// Flush buffered Phase 1 header writes to disk and enable direct disk
+    /// writes for Phase 2 (`META_SCHEMA u32::MAX` fencing in `RB-11d`).
+    #[allow(dead_code)]
+    fn enable_phase2_writes_and_flush(&self) -> StorageResult<()> {
+        let mut state =
+            self.lock_overlay()
+                .map_err(|err| StorageBackendError::BackendInternal {
+                    detail: format!("reverse migration Phase 2 failed locking overlay: {err}"),
+                })?;
+        if state.allow_disk_writes {
+            return Ok(());
+        }
+        let disk_len = self
+            .backend
+            .len()
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("reverse migration Phase 2 failed reading redb length: {err}"),
+            })?;
+        if let Some(vlen) = state.virtual_len
+            && vlen != disk_len
+        {
+            self.backend
+                .set_len(vlen)
+                .map_err(|err| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "reverse migration Phase 2 failed setting redb length before fence: {err}"
+                    ),
+                })?;
+        }
+        let target_len = state.virtual_len.unwrap_or(disk_len);
+        let page_sz = REVERSE_PHASE1_COW_PAGE_SIZE as u64;
+        for (&page_idx, page) in &state.dirty_pages {
+            let base = page_idx.saturating_mul(page_sz);
+            if base < target_len {
+                let write_len = ((target_len - base).min(page_sz)) as usize;
+                self.backend
+                    .write(base, &page[..write_len])
+                    .map_err(|err| StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "reverse migration Phase 2 failed flushing redb overlay page: {err}"
+                        ),
+                    })?;
+            }
+        }
+        self.backend
+            .sync_data()
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration Phase 2 failed syncing flushed redb overlay: {err}"
+                ),
+            })?;
+        state.dirty_pages.clear();
+        state.virtual_len = None;
+        state.allow_disk_writes = true;
+        Ok(())
+    }
+}
+
+/// Non-blocking, Phase-1 zero-disk-write `StorageBackend` wrapper over
+/// `redb::backends::FileBackend` for reverse migration (`RB-11`, `RB-11p`).
+///
+/// 1. `redb 5.0` `MultiWriter` `Database::new()` calls the blocking
+///    `StorageBackend::lock_range(WRITER_BYTE)` during open. Delegating
+///    `lock_range` / `lock_shared_range` through `try_lock_range` /
+///    `try_lock_shared_range` guarantees that an active external `git.redb` or
+///    `capture.redb` writer fails closed immediately (`WouldBlock` -> `LBR-IO-001`)
+///    with zero blocking and zero disk writes, while tolerating transient
+///    microsecond header-lock reads (`start < REDB_WRITER_LOCK_BYTE`) within
+///    [`REDB_HEADER_LOCK_RETRY_BUDGET`].
+/// 2. `redb 5.0` `Database::new()` writes `recovery_required = true` to the
+///    512-byte header on open and `Database::drop()` writes allocator/shutdown
+///    metadata on close even when no transaction is committed. Buffering all
+///    Phase 1 writes inside an in-memory copy-on-write overlay ensures source
+///    `git.redb` and `capture.redb` remain 100% clean and byte-for-byte
+///    unchanged on disk throughout Phase 1 (both during backup and on abort),
+///    while preserving real OS kernel byte-range locks on the underlying file.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone)]
+struct ReverseNonBlockingFileBackend(std::sync::Arc<ReverseNonBlockingFileBackendInner>);
+
+#[cfg(any(unix, windows))]
+impl ReverseNonBlockingFileBackend {
+    fn new(file: File) -> Self {
+        Self(std::sync::Arc::new(
+            ReverseNonBlockingFileBackendInner::new(file),
+        ))
+    }
+
+    fn controller(&self) -> std::sync::Arc<ReverseNonBlockingFileBackendInner> {
+        std::sync::Arc::clone(&self.0)
+    }
+
+    fn is_header_lock_range(start: std::ops::Bound<u64>, end: std::ops::Bound<u64>) -> bool {
+        let starts_low = matches!(
+            start,
+            std::ops::Bound::Included(s) | std::ops::Bound::Excluded(s) if s < REDB_WRITER_LOCK_BYTE
+        );
+        let ends_low = matches!(
+            end,
+            std::ops::Bound::Included(e) | std::ops::Bound::Excluded(e) if e < REDB_WRITER_LOCK_BYTE
+        );
+        starts_low && ends_low
+    }
+
+    /// Non-mutating check that no external OS process holds `redb`'s writer
+    /// lock byte (`WRITER_BYTE`), failing closed with `LBR-IO-001` before
+    /// `redb::Builder` ever opens the database (`RB-11` AC1–AC4).
+    fn ensure_writer_byte_uncontended(
+        &self,
+        stage: ReversePhase1QuiesceStage,
+    ) -> StorageResult<()> {
+        let writer_bound = std::ops::Bound::Included(REDB_WRITER_LOCK_BYTE);
+        let busy = self
+            .0
+            .backend
+            .query_lock_range(writer_bound, writer_bound)
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence failed querying redb writer lock at {}: {err}",
+                    stage.as_str()
+                ),
+            })?;
+        if busy {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: an active external redb writer holds the write lock",
+                    stage.as_str()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl StorageBackend for ReverseNonBlockingFileBackend {
+    fn len(&self) -> Result<u64, BackendError> {
+        let state = self.0.lock_overlay()?;
+        if !state.allow_disk_writes
+            && let Some(vlen) = state.virtual_len
+        {
+            return Ok(vlen);
+        }
+        self.0.backend.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
+        let state = self.0.lock_overlay()?;
+        if state.allow_disk_writes || (state.dirty_pages.is_empty() && state.virtual_len.is_none())
+        {
+            return self.0.backend.read(offset, out);
+        }
+        let disk_len = self.0.backend.len()?;
+        let vlen = state.virtual_len.unwrap_or(disk_len);
+        let end = offset
+            .checked_add(out.len() as u64)
+            .ok_or_else(|| BackendError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+        if end > vlen {
+            return Err(BackendError::Io(io::Error::from(
+                io::ErrorKind::UnexpectedEof,
+            )));
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        if offset < disk_len {
+            let disk_read_len = out.len().min((disk_len - offset) as usize);
+            self.0.backend.read(offset, &mut out[..disk_read_len])?;
+            out[disk_read_len..].fill(0);
+        } else {
+            out.fill(0);
+        }
+        let page_sz = REVERSE_PHASE1_COW_PAGE_SIZE as u64;
+        let first_page = offset / page_sz;
+        let last_page = (end - 1) / page_sz;
+        for page_idx in first_page..=last_page {
+            if let Some(page) = state.dirty_pages.get(&page_idx) {
+                let page_start = page_idx * page_sz;
+                let page_end = page_start + page_sz;
+                let copy_start = offset.max(page_start);
+                let copy_end = end.min(page_end);
+                let src_off = (copy_start - page_start) as usize;
+                let dst_off = (copy_start - offset) as usize;
+                let copy_len = (copy_end - copy_start) as usize;
+                out[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&page[src_off..src_off + copy_len]);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
+        let mut state = self.0.lock_overlay()?;
+        if state.allow_disk_writes {
+            return self.0.backend.set_len(len);
+        }
+        let page_sz = REVERSE_PHASE1_COW_PAGE_SIZE as u64;
+        let keep_pages = len.div_ceil(page_sz);
+        state.dirty_pages.retain(|&idx, _| idx < keep_pages);
+        if !len.is_multiple_of(page_sz) {
+            let tail_page_idx = len / page_sz;
+            let tail_off = (len % page_sz) as usize;
+            if let Some(page) = state.dirty_pages.get_mut(&tail_page_idx) {
+                page[tail_off..].fill(0);
+            }
+        }
+        state.virtual_len = Some(len);
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result<(), BackendError> {
+        let state = self.0.lock_overlay()?;
+        if state.allow_disk_writes {
+            return self.0.backend.sync_data();
+        }
+        // Phase 1 writes stay exclusively in-memory; never touch disk.
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
+        let mut state = self.0.lock_overlay()?;
+        if state.allow_disk_writes {
+            return self.0.backend.write(offset, data);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| BackendError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+        let disk_len = self.0.backend.len()?;
+        let cur_len = state.virtual_len.unwrap_or(disk_len);
+        let page_sz = REVERSE_PHASE1_COW_PAGE_SIZE as u64;
+        let first_page = offset / page_sz;
+        let last_page = (end - 1) / page_sz;
+        for page_idx in first_page..=last_page {
+            if !state.dirty_pages.contains_key(&page_idx) {
+                if state.dirty_pages.len() >= REVERSE_PHASE1_COW_MAX_PAGES {
+                    return Err(BackendError::Io(io::Error::other(
+                        "reverse migration Phase 1 CoW overlay exceeded bounded page budget",
+                    )));
+                }
+                let mut buf = [0u8; REVERSE_PHASE1_COW_PAGE_SIZE];
+                let page_start = page_idx * page_sz;
+                if page_start < disk_len {
+                    let read_len = ((disk_len - page_start).min(page_sz)) as usize;
+                    self.0.backend.read(page_start, &mut buf[..read_len])?;
+                }
+                state.dirty_pages.insert(page_idx, buf);
+            }
+            if let Some(page) = state.dirty_pages.get_mut(&page_idx) {
+                let page_start = page_idx * page_sz;
+                let page_end = page_start + page_sz;
+                let copy_start = offset.max(page_start);
+                let copy_end = end.min(page_end);
+                let dst_off = (copy_start - page_start) as usize;
+                let src_off = (copy_start - offset) as usize;
+                let copy_len = (copy_end - copy_start) as usize;
+                page[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&data[src_off..src_off + copy_len]);
+            }
+        }
+        state.virtual_len = Some(cur_len.max(end));
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), BackendError> {
+        self.0.backend.close()
+    }
+
+    fn try_lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.0.backend.try_lock_range(start, end)
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.0.backend.try_lock_shared_range(start, end)
+    }
+
+    fn lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<(), BackendError> {
+        if self.0.backend.try_lock_range(start, end)? {
+            return Ok(());
+        }
+        if Self::is_header_lock_range(start, end) {
+            let deadline = Instant::now() + REDB_HEADER_LOCK_RETRY_BUDGET;
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                if self.0.backend.try_lock_range(start, end)? {
+                    return Ok(());
+                }
+            }
+        }
+        Err(BackendError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "redb exclusive byte-range lock is held by an active external process",
+        )))
+    }
+
+    fn lock_shared_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<(), BackendError> {
+        if self.0.backend.try_lock_shared_range(start, end)? {
+            return Ok(());
+        }
+        if Self::is_header_lock_range(start, end) {
+            let deadline = Instant::now() + REDB_HEADER_LOCK_RETRY_BUDGET;
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                if self.0.backend.try_lock_shared_range(start, end)? {
+                    return Ok(());
+                }
+            }
+        }
+        Err(BackendError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "redb shared byte-range lock is held by an active external process",
+        )))
+    }
+
+    fn unlock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<(), BackendError> {
+        let is_writer_byte = start == std::ops::Bound::Included(REDB_WRITER_LOCK_BYTE)
+            && end == std::ops::Bound::Included(REDB_WRITER_LOCK_BYTE);
+        if is_writer_byte {
+            // While Phase 1 disk writes are suppressed (`allow_disk_writes == false`),
+            // releasing `WRITER_BYTE` (e.g. at the end of `Database::new()`) allows
+            // pre-opened peer writers to commit before our `WriteTransaction` begins.
+            // Discard buffered Phase 1 overlay pages BEFORE releasing `WRITER_BYTE`
+            // so `redb::sync_to_latest_commit()` reads the real latest on-disk header
+            // and never serves a stale overlaid header page (`RB-11`).
+            let mut state = self.0.lock_overlay()?;
+            if !state.allow_disk_writes {
+                state.dirty_pages.clear();
+                state.virtual_len = None;
+            }
+        }
+        self.0.backend.unlock_range(start, end)
+    }
+
+    fn query_lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.0.backend.query_lock_range(start, end)
+    }
+}
+
+/// Validate and open an existing reverse-migration source `.redb` file
+/// descriptor (`O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` on Unix;
+/// `FILE_FLAG_OPEN_REPARSE_POINT` on Windows) without invoking `redb` yet so
+/// both source descriptors can be validated and writer-lock-probed BEFORE any
+/// `redb` open touches disk (`RB-11`).
+#[cfg(any(unix, windows))]
+fn open_verified_existing_redb_backend_for_reverse(
+    common_storage: &Path,
+    parent_subdir: &'static str,
+    file_name: &str,
+    role: DatabaseRole,
+) -> StorageResult<(ReverseNonBlockingFileBackend, ReverseRedbFileIdentity)> {
+    let stage = match role {
+        DatabaseRole::Repository => ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+        DatabaseRole::Capture => ReversePhase1QuiesceStage::CaptureRedbWriteTransaction,
+        _ => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("invalid role {role} for reverse migration source redb open"),
+            });
+        }
+    };
+    let require_private = role == DatabaseRole::Capture;
+
+    #[cfg(unix)]
+    let (file, file_id) = {
+        use std::{
+            ffi::CString,
+            os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        };
+        let root_fd = open_readonly_root_dir_unix(common_storage)?;
+        let c_subdir = CString::new(parent_subdir.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: format!("invalid parent subdir for {role} reverse source"),
+            }
+        })?;
+        let forbidden_dir_bits = if require_private { 0o077 } else { 0o022 };
+        let Some((parent_fd, _)) =
+            open_readonly_subdir_unix(&root_fd, &c_subdir, forbidden_dir_bits, stage.as_str())?
+        else {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: missing source directory",
+                    stage.as_str()
+                ),
+            });
+        };
+        let c_name = CString::new(file_name.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: format!("invalid filename for {role} reverse source"),
+            }
+        })?;
+        // SAFETY: `parent_fd` is a valid pinned directory fd and `c_name` is NUL-terminated.
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            let err = io::Error::last_os_error();
+            return Err(StorageBackendError::io(
+                "open source redb writable for reverse migration",
+                err,
+            ));
+        }
+        // SAFETY: `raw >= 0` is exclusively owned here.
+        let file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `file` is valid.
+        if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat source redb for reverse migration",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let st = unsafe { st.assume_init() };
+        // SAFETY: `geteuid` has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let mode = (st.st_mode as u32) & 0o777;
+        let forbidden_file_bits = if require_private { 0o077 } else { 0o022 };
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || st.st_uid != euid
+            || st.st_nlink != 1
+            || st.st_size <= 0
+            || (mode & forbidden_file_bits) != 0
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected unsafe, empty, foreign, or hard-linked source redb at {}",
+                    stage.as_str()
+                ),
+            });
+        }
+        (file, (st.st_dev as u64, st.st_ino as u64))
+    };
+
+    #[cfg(windows)]
+    let (file, file_id) = {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::{
+                CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            },
+        };
+
+        let (_root_pin, root_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+        let parent_path = common_storage.join(parent_subdir);
+        let (_parent_pin, parent_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(&parent_path, stage.as_str())?;
+        let ancestors = [
+            (common_storage, root_id, "repository storage root"),
+            (parent_path.as_path(), parent_id, stage.as_str()),
+        ];
+        win_tmp_guard::verify_pinned_dir_ids(&ancestors)?;
+        let target_path = parent_path.join(file_name);
+        let wide = win_tmp_guard::encode_wide_nul(&target_path);
+        // SAFETY: `wide` is NUL-terminated UTF-16.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(StorageBackendError::io(
+                "open source redb writable for reverse migration",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `handle` is a valid exclusively owned Win32 handle.
+        let file = unsafe { File::from_raw_handle(handle as std::os::windows::io::RawHandle) };
+        win_tmp_guard::verify_pinned_dir_ids(&ancestors)?;
+        let raw = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let info = win_tmp_guard::file_info(raw, stage.as_str())?;
+        let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+            || info.nNumberOfLinks != 1
+            || size == 0
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected unsafe, empty, reparse, or hard-linked source redb at {}",
+                    stage.as_str()
+                ),
+            });
+        }
+        let fid = win_tmp_guard::WinFileId {
+            volume_serial: info.dwVolumeSerialNumber,
+            index_high: info.nFileIndexHigh,
+            index_low: info.nFileIndexLow,
+        };
+        (file, fid)
+    };
+
+    Ok((ReverseNonBlockingFileBackend::new(file), file_id))
+}
+
+/// Validate and pre-check BOTH source redb descriptors (`git.redb` and
+/// `capture.redb`), rejecting inode aliasing and active external writers
+/// (`WRITER_BYTE`) BEFORE invoking `redb::Builder` on either file (`RB-11`).
+#[cfg(any(unix, windows))]
+fn prepare_verified_redb_backends_for_reverse(
+    common_storage: &Path,
+    git_file_name: &str,
+    cap_file_name: &str,
+) -> StorageResult<(ReverseNonBlockingFileBackend, ReverseNonBlockingFileBackend)> {
+    let (git_backend, git_id) = open_verified_existing_redb_backend_for_reverse(
+        common_storage,
+        REDB_SUBDIR,
+        git_file_name,
+        DatabaseRole::Repository,
+    )?;
+    let (cap_backend, cap_id) = open_verified_existing_redb_backend_for_reverse(
+        common_storage,
+        PRIVATE_SUBDIR,
+        cap_file_name,
+        DatabaseRole::Capture,
+    )?;
+    if git_id == cap_id {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "reverse migration quiescence rejected aliased git.redb and capture.redb inodes"
+                    .to_string(),
+        });
+    }
+    git_backend
+        .ensure_writer_byte_uncontended(ReversePhase1QuiesceStage::GitRedbWriteTransaction)?;
+    cap_backend
+        .ensure_writer_byte_uncontended(ReversePhase1QuiesceStage::CaptureRedbWriteTransaction)?;
+    Ok((git_backend, cap_backend))
+}
+
+#[cfg(any(unix, windows))]
+fn open_reverse_redb_with_backend(
+    backend: ReverseNonBlockingFileBackend,
+    role: DatabaseRole,
+) -> StorageResult<(
+    RedbDatabase,
+    std::sync::Arc<ReverseNonBlockingFileBackendInner>,
+)> {
+    let ctrl = backend.controller();
+    let mut builder = redb::Builder::new();
+    builder
+        .set_concurrency_mode(redb::ConcurrencyMode::MultiWriter)
+        .set_cache_size(FORWARD_MIGRATION_REDB_CACHE_BYTES)
+        // Phase 1 quiescence MUST NOT mutate a single byte of source `.redb`
+        // files on disk; abort immediately if crash recovery is required.
+        .set_repair_callback(|session| session.abort());
+    let db = builder.create_with_backend(backend).map_err(|err| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence failed opening {role} redb writable: {err}"
+            ),
+        }
+    })?;
+    Ok((db, ctrl))
+}
+
+/// Begin an immediate non-blocking (`Duration::ZERO`), `META_SCHEMA`-checked
+/// `WriteTransaction` on a source redb store for reverse migration Phase 1,
+/// normalizing active writer contention on BOTH `Repository` and `Capture` to
+/// fail-closed `LBR-IO-001` (`RB-11` AC1 & AC3).
+fn try_begin_reverse_source_write_tx(
+    db: &RedbDatabase,
+    role: DatabaseRole,
+) -> StorageResult<redb::WriteTransaction> {
+    let stage = match role {
+        DatabaseRole::Repository => ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+        DatabaseRole::Capture => ReversePhase1QuiesceStage::CaptureRedbWriteTransaction,
+        _ => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("invalid role {role} for reverse migration write transaction"),
+            });
+        }
+    };
+    match begin_checked_write_blocking(db, role, Duration::ZERO) {
+        Ok(wtx) => Ok(wtx),
+        Err(StorageBackendError::WriteLockBusy { .. }) => {
+            Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: an active external redb writer holds the write lock",
+                    stage.as_str()
+                ),
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Strictly non-mutating pre-flight validation of both source `.redb` files and
+/// their `WRITER_BYTE` lock availability used ONLY before creating any absent
+/// advisory lock file so contention on `git.redb` or `capture.redb` never
+/// creates stray lock files and never writes a single byte to either `.redb`
+/// (`RB-11` AC1–AC4).
+fn probe_reverse_redb_sources_uncontended(
+    common_storage: &Path,
+    git_file_name: &str,
+    cap_file_name: &str,
+) -> StorageResult<()> {
+    #[cfg(any(unix, windows))]
+    {
+        let (git_backend, git_id) = open_verified_existing_redb_backend_for_reverse(
+            common_storage,
+            REDB_SUBDIR,
+            git_file_name,
+            DatabaseRole::Repository,
+        )?;
+        let (cap_backend, cap_id) = open_verified_existing_redb_backend_for_reverse(
+            common_storage,
+            PRIVATE_SUBDIR,
+            cap_file_name,
+            DatabaseRole::Capture,
+        )?;
+        if git_id == cap_id {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "reverse migration quiescence rejected aliased git.redb and capture.redb inodes"
+                        .to_string(),
+            });
+        }
+        git_backend
+            .ensure_writer_byte_uncontended(ReversePhase1QuiesceStage::GitRedbWriteTransaction)?;
+        cap_backend.ensure_writer_byte_uncontended(
+            ReversePhase1QuiesceStage::CaptureRedbWriteTransaction,
+        )?;
+        Ok(())
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (common_storage, git_file_name, cap_file_name);
+        Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration source redb open is unsupported on this platform"
+                .to_string(),
+        })
+    }
+}
+
+/// Read and validate the finalized `Redb` `storage-format.json` manifest and
+/// return `(generation, git_redb_path, capture_redb_path, git_file_name, cap_file_name)`
+/// for reverse migration Phase 1 (`RB-11`).
+fn resolve_finalized_redb_sources_for_reverse(
+    common_storage: &Path,
+) -> StorageResult<(u64, PathBuf, PathBuf, String, String)> {
+    let manifest = read_storage_manifest(common_storage)?.ok_or_else(|| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: missing finalized redb storage-format.json",
+                ReversePhase1QuiesceStage::StorageManifest.as_str()
+            ),
+        }
+    })?;
+    if !manifest.finalized {
+        return Err(StorageBackendError::ManifestNotFinalized {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: storage-format.json is not finalized (backend={:?}, generation={})",
+                ReversePhase1QuiesceStage::StorageManifest.as_str(),
+                manifest.backend,
+                manifest.generation
+            ),
+        });
+    }
+    if manifest.backend != StorageBackendKind::Redb {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: repository backend is {:?}, expected Redb",
+                ReversePhase1QuiesceStage::StorageManifest.as_str(),
+                manifest.backend
+            ),
+        });
+    }
+    let expected_git_rel = canonical_git_redb_rel_path(manifest.generation);
+    let expected_cap_rel = canonical_capture_redb_rel_path(manifest.generation);
+    if manifest.git_path.as_deref() != Some(expected_git_rel.as_str())
+        || manifest.capture_path.as_deref() != Some(expected_cap_rel.as_str())
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: non-canonical redb paths in manifest",
+                ReversePhase1QuiesceStage::StorageManifest.as_str()
+            ),
+        });
+    }
+    let git_db = git_redb_path(common_storage, manifest.generation);
+    let capture_db = capture_redb_path(common_storage, manifest.generation);
+    let git_name = git_db
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "invalid git redb filename in manifest".to_string(),
+        })?
+        .to_string();
+    let cap_name = capture_db
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "invalid capture redb filename in manifest".to_string(),
+        })?
+        .to_string();
+    Ok((manifest.generation, git_db, capture_db, git_name, cap_name))
+}
+
+/// Full Phase 1 symmetric reverse migration (`redb -> SQLite`) quiescence gate
+/// enforcing strict `ADR-RB-07` #2 global lock order (`RB-11`):
+///
+/// `migration.lock` -> `maintenance.lock` -> `capture-spool-consumer.lock` ->
+/// `capture-queue/writer.lock` -> in-place `capture-queue/append.lock` ->
+/// in-place `capture-spool/capacity.lock` -> `(git_wtx, cap_wtx)`.
+///
+/// Immediately fails closed (`LBR-IO-001`) if any external writer holds
+/// `git.redb` or `capture.redb` (or any advisory migration/queue/spool lock),
+/// leaving source `git.redb` and `capture.redb` 100% byte-for-byte unchanged.
+pub fn quiesce_reverse_repository_phase1(
+    common_storage: &Path,
+) -> StorageResult<ReversePhase1QuiesceGuard> {
+    quiesce_reverse_repository_phase1_inner(
+        common_storage,
+        #[cfg(test)]
+        None,
+    )
+}
+
+/// Role-validated variant of [`quiesce_reverse_repository_phase1`] enforcing
+/// `GC-13` isolation (rejects `GlobalConfig`, `SystemConfig`, and `Derived`).
+pub fn quiesce_reverse_repository_phase1_for_role(
+    common_storage: &Path,
+    role: DatabaseRole,
+) -> StorageResult<ReversePhase1QuiesceGuard> {
+    validate_forward_migration_role(role).map_err(normalize_reverse_quiesce_err)?;
+    quiesce_reverse_repository_phase1(common_storage)
+}
+
+fn normalize_reverse_quiesce_err(err: StorageBackendError) -> StorageBackendError {
+    match err {
+        StorageBackendError::BackendInternal { detail }
+            if detail.starts_with("forward migration quiescence") =>
+        {
+            StorageBackendError::BackendInternal {
+                detail: detail.replacen(
+                    "forward migration quiescence",
+                    "reverse migration quiescence",
+                    1,
+                ),
+            }
+        }
+        other => other,
+    }
+}
+
+fn quiesce_reverse_repository_phase1_inner(
+    common_storage: &Path,
+    #[cfg(test)] mut observer: Option<&mut dyn ReversePhase1LockObserver>,
+) -> StorageResult<ReversePhase1QuiesceGuard> {
+    if !validate_existing_dir_no_mutate(
+        common_storage,
+        false,
+        ForwardPhase1QuiesceStage::StorageRoot,
+    )
+    .map_err(normalize_reverse_quiesce_err)?
+    {
+        return Err(StorageBackendError::NotFound {
+            resource: "repository storage directory".to_string(),
+        });
+    }
+
+    let (
+        _preflight_generation,
+        _preflight_git_path,
+        _preflight_cap_path,
+        preflight_git_name,
+        preflight_cap_name,
+    ) = resolve_finalized_redb_sources_for_reverse(common_storage)?;
+
+    let redb_dir = common_storage.join(REDB_SUBDIR);
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let queue_dir = capture_queue_dir_path(common_storage);
+    let spool_dir = capture_spool_dir_path(common_storage);
+    let mig_lock_path = migration_lock_path(common_storage);
+    let maint_lock_path = common_storage.join("maintenance.lock");
+    let consumer_lock_path = capture_spool_consumer_lock_path(common_storage);
+    let writer_lock_path = capture_queue_writer_lock_path(common_storage);
+    let append_lock_path = capture_queue_append_lock_path(common_storage);
+    let capacity_lock_path = capture_spool_capacity_lock_path(common_storage);
+
+    // Phase 0: 100% non-creating pre-flight validation and contention probes
+    // (creates ZERO files or directories anywhere on disk).
+    if !validate_existing_dir_no_mutate(&redb_dir, false, ForwardPhase1QuiesceStage::StorageRoot)
+        .map_err(normalize_reverse_quiesce_err)?
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration quiescence rejected: missing .libra/redb directory"
+                .to_string(),
+        });
+    }
+    if !validate_existing_dir_no_mutate(
+        &private_dir,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration quiescence rejected: missing .libra/private directory"
+                .to_string(),
+        });
+    }
+    let _ = validate_existing_dir_no_mutate(
+        &queue_dir,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let _ = validate_existing_dir_no_mutate(
+        &spool_dir,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+
+    // Probe all 6 existing lock files in strict reverse order without creating any file.
+    probe_existing_lock_uncontended(
+        &mig_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::MigrationLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &maint_lock_path,
+        false,
+        ForwardPhase1QuiesceStage::MaintenanceLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &consumer_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &writer_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &append_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &capacity_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+
+    // Reject active in-flight `capture-spool/tmp/` publishers (`spool.rs:119-145`)
+    // and any non-empty `capture-spool/quarantine/` BEFORE creating any absent
+    // lock file so rejections leave source redb, `capture-spool/`, and
+    // `capture-queue/` 100% byte-for-byte untouched (`RB-11z`, `RB-11q`).
+    verify_no_inflight_spool_tmp_files(common_storage).map_err(normalize_reverse_quiesce_err)?;
+    verify_no_spool_quarantine_files(common_storage)?;
+
+    // If any of the 6 lock files is not yet materialized on disk, run a
+    // non-creating redb writer contention probe BEFORE materializing any
+    // missing lock file so active redb writer rejection leaves disk 100%
+    // untouched.
+    let any_lock_absent = !path_exists_no_open(&mig_lock_path)?
+        || !path_exists_no_open(&maint_lock_path)?
+        || !path_exists_no_open(&consumer_lock_path)?
+        || !path_exists_no_open(&writer_lock_path)?
+        || !path_exists_no_open(&append_lock_path)?
+        || !path_exists_no_open(&capacity_lock_path)?;
+    if any_lock_absent {
+        probe_reverse_redb_sources_uncontended(
+            common_storage,
+            &preflight_git_name,
+            &preflight_cap_name,
+        )?;
+    }
+
+    // Phase 1: Acquire ALL 8 locks in 100% STRICT CANONICAL `ADR-RB-07` #2 ORDER:
+    // 1. migration.lock
+    // 2. maintenance.lock
+    // 3. capture-spool-consumer.lock
+    // 4. capture-queue/writer.lock
+    // 5. capture-queue/append.lock  (BEFORE capacity.lock!)
+    // 6. capture-spool/capacity.lock
+    // 7. git.redb WriteTransaction
+    // 8. capture.redb WriteTransaction
+    let migration_lock = open_and_try_lock_inplace(
+        &mig_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::MigrationLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::MigrationLock);
+    }
+
+    let maintenance_lock = open_and_try_lock_inplace(
+        &maint_lock_path,
+        0o600,
+        false,
+        ForwardPhase1QuiesceStage::MaintenanceLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::MaintenanceLock);
+    }
+
+    ensure_private_dir_nofollow(
+        &private_dir,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let spool_consumer_lock = open_and_try_lock_inplace(
+        &consumer_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureSpoolConsumerLock);
+    }
+
+    ensure_private_dir_nofollow(
+        &queue_dir,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let queue_writer_lock = open_and_try_lock_inplace(
+        &writer_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureQueueWriterLock);
+    }
+
+    let queue_append_lock = open_and_try_lock_inplace(
+        &append_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureQueueAppendLock);
+    }
+
+    ensure_private_dir_nofollow(
+        &spool_dir,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let spool_capacity_lock = open_and_try_lock_inplace(
+        &capacity_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureSpoolCapacityLock);
+    }
+
+    let locks = ReversePhase1Locks {
+        _spool_capacity_lock: spool_capacity_lock,
+        _queue_append_lock: queue_append_lock,
+        _queue_writer_lock: queue_writer_lock,
+        _spool_consumer_lock: spool_consumer_lock,
+        _maintenance_lock: maintenance_lock,
+        _migration_lock: migration_lock,
+    };
+
+    // Re-check `capture-spool/tmp/` and `capture-spool/quarantine/` strictly
+    // AFTER acquiring all 6 advisory locks (including `capture-spool-consumer.lock`
+    // and `capture-spool/capacity.lock`) to close any TOCTOU race (`RB-11z`, `RB-11q`).
+    verify_no_inflight_spool_tmp_files(common_storage).map_err(normalize_reverse_quiesce_err)?;
+    verify_no_spool_quarantine_files(common_storage)?;
+
+    // Re-read and verify `storage-format.json` strictly AFTER holding
+    // `migration.lock .. capacity.lock` to close any pre-lock manifest TOCTOU.
+    let (generation, git_path, cap_path, git_file_name, cap_file_name) =
+        resolve_finalized_redb_sources_for_reverse(common_storage)?;
+
+    // Validate both source redb descriptors and pre-check `WRITER_BYTE`
+    // uncontended BEFORE opening either `RedbDatabase`, then acquire
+    // `git_db -> git_wtx` followed strictly by `cap_db -> cap_wtx` (`ADR-RB-07` #2).
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (
+            generation,
+            git_path,
+            cap_path,
+            git_file_name,
+            cap_file_name,
+            locks,
+        );
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration source redb open is unsupported on this platform"
+                .to_string(),
+        });
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        let (git_backend, cap_backend) = prepare_verified_redb_backends_for_reverse(
+            common_storage,
+            &git_file_name,
+            &cap_file_name,
+        )?;
+        let (git_db, git_backend_ctrl) =
+            open_reverse_redb_with_backend(git_backend, DatabaseRole::Repository)?;
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_after_git_db_open_before_git_wtx();
+        }
+        let git_wtx = try_begin_reverse_source_write_tx(&git_db, DatabaseRole::Repository)?;
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_stage_acquired(ReversePhase1QuiesceStage::GitRedbWriteTransaction);
+        }
+
+        let (cap_db, capture_backend_ctrl) =
+            match open_reverse_redb_with_backend(cap_backend, DatabaseRole::Capture) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = git_wtx.abort();
+                    return Err(err);
+                }
+            };
+        let capture_wtx = match try_begin_reverse_source_write_tx(&cap_db, DatabaseRole::Capture) {
+            Ok(wtx) => wtx,
+            Err(err) => {
+                let _ = git_wtx.abort();
+                return Err(err);
+            }
+        };
+        #[cfg(test)]
+        if let Some(obs) = observer {
+            obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureRedbWriteTransaction);
+        }
+
+        let redb = QuiescedRepositoryRedbSources {
+            generation,
+            git_redb_path: git_path,
+            capture_redb_path: cap_path,
+            capture_wtx,
+            git_wtx,
+            capture_db: cap_db,
+            git_db,
+            capture_backend_ctrl,
+            git_backend_ctrl,
+        };
+
+        Ok(ReversePhase1QuiesceGuard { redb, locks })
+    }
+}
+
+// ============================================================================
+// Symmetric Reverse Migration Phase 1: Deadlock-Free Streaming Export, Direct
+// Intent Replay, Read-Only Queue Ingest, `PRAGMA application_id` Tagging,
+// Verified `.tmp` Integrity & SHA-256 `redb-backup` (`ADR-RB-07` #2, `RB-11i`, `RB-11p`)
+// ============================================================================
+
+/// Canonical subdirectory under `<common_storage>` storing generation-scoped
+/// reverse migration backups (`.libra/redb-backup/<gen>/`).
+pub const REDB_BACKUP_SUBDIR: &str = "redb-backup";
+
+/// Return the canonical relative reverse backup directory under `<common_storage>`,
+/// e.g. `"redb-backup/00000001"`.
+#[must_use]
+pub fn canonical_redb_backup_rel_dir(generation: u64) -> String {
+    format!("{REDB_BACKUP_SUBDIR}/{}", format_generation_id(generation))
+}
+
+/// Return the canonical absolute reverse backup directory
+/// `<common_storage>/redb-backup/<gen>`.
+#[must_use]
+pub fn redb_backup_dir_path(common_storage: &Path, generation: u64) -> PathBuf {
+    common_storage.join(canonical_redb_backup_rel_dir(generation))
+}
+
+/// Return the canonical backed-up `git.gen-<id>.redb` path inside
+/// `<common_storage>/redb-backup/<gen>/`.
+#[must_use]
+pub fn redb_backup_git_redb_path(common_storage: &Path, generation: u64) -> PathBuf {
+    redb_backup_dir_path(common_storage, generation)
+        .join(format!("git.gen-{}.redb", format_generation_id(generation)))
+}
+
+/// Return the canonical backed-up `capture.gen-<id>.redb` path inside
+/// `<common_storage>/redb-backup/<gen>/`.
+#[must_use]
+pub fn redb_backup_capture_redb_path(common_storage: &Path, generation: u64) -> PathBuf {
+    redb_backup_dir_path(common_storage, generation).join(format!(
+        "capture.gen-{}.redb",
+        format_generation_id(generation)
+    ))
+}
+
+/// Return the canonical backed-up `capture-queue/` directory inside
+/// `<common_storage>/redb-backup/<gen>/`.
+#[must_use]
+pub fn redb_backup_capture_queue_dir_path(common_storage: &Path, generation: u64) -> PathBuf {
+    redb_backup_dir_path(common_storage, generation).join(CAPTURE_QUEUE_SUBDIR)
+}
+
+/// Return the canonical staged SQLite repository temporary path:
+/// `<common_storage>/libra.db.tmp`.
+#[must_use]
+pub fn git_sqlite_tmp_path(common_storage: &Path) -> PathBuf {
+    common_storage.join(format!("{LEGACY_SQLITE_DB_FILE}.tmp"))
+}
+
+/// Return the canonical staged SQLite capture temporary path:
+/// `<common_storage>/private/capture.db.tmp`.
+#[must_use]
+pub fn capture_sqlite_tmp_path(common_storage: &Path) -> PathBuf {
+    common_storage.join(PRIVATE_SUBDIR).join("capture.db.tmp")
+}
+
+/// Summary report of unreconciled `META_CROSS_STORE_INTENT` entries replayed
+/// directly from the held `git_wtx` into `capture.db.tmp` during reverse
+/// migration Phase 1 (`RB-11i` AC2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrossStoreIntentReplayReport {
+    /// `git.redb` `META_GENERATION` observed inside the held `git_wtx`.
+    pub git_generation: u64,
+    /// `capture.redb` `META_GENERATION` observed inside the held `capture_wtx`.
+    pub capture_generation: u64,
+    /// Strictly ascending generations replayed from `META_CROSS_STORE_INTENT`.
+    pub replayed_generations: Vec<u64>,
+    /// Capture batch items applied into `capture.db.tmp`.
+    pub applied_items: u64,
+    /// Capture batch items skipped via idempotent deduplication.
+    pub deduplicated_items: u64,
+    /// SQLite transaction batches committed during intent replay.
+    pub batches_committed: u64,
+}
+
+/// Complete report returned after reverse migration Phase 1 streaming export,
+/// direct intent replay, read-only queue ingest, and `PRAGMA application_id`
+/// tagging (`RB-11i`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReversePhase1ExportReport {
+    /// Active source redb generation being migrated back to SQLite.
+    pub generation: u64,
+    /// Unique non-zero `PRAGMA application_id` stamped onto both `.tmp` SQLite targets.
+    pub target_migration_tag: u32,
+    /// Staged repository SQLite path (`<common_storage>/libra.db.tmp`).
+    pub git_tmp_path: PathBuf,
+    /// Staged capture SQLite path (`<common_storage>/private/capture.db.tmp`).
+    pub capture_tmp_path: PathBuf,
+    /// Exact row count exported for every one of the 61 Git source tables.
+    pub git_table_counts: BTreeMap<&'static str, u64>,
+    /// Exact row count exported for every one of the 25 Capture source tables
+    /// (prior to unreconciled intent replay and pending queue ingest).
+    pub capture_table_counts: BTreeMap<&'static str, u64>,
+    /// Maximum single batch size observed across all streaming commits (`<= 500`).
+    pub max_batch_rows: usize,
+    /// Total streaming batches committed across Git, Capture, intents, and queue.
+    pub total_streaming_batches: u64,
+    /// Unreconciled `META_CROSS_STORE_INTENT` direct replay summary.
+    pub intent_replay: CrossStoreIntentReplayReport,
+    /// Strictly read-only `capture-queue/{priority,normal}/` direct ingest summary.
+    pub queue_ingest: QueueDirectIngestReport,
+}
+
+/// Verified byte-for-byte backup receipt for one frozen source `.redb` file (`RB-11p` AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedbFileBackupReceipt {
+    /// Final durably published path inside `.libra/redb-backup/<gen>/`.
+    pub backup_path: PathBuf,
+    /// Lowercase 64-hex SHA-256 verified against an independent read-back of the backup file.
+    pub sha256: String,
+    /// Verified byte length.
+    pub byte_len: u64,
+}
+
+/// Verified byte-for-byte backup receipt for one `capture-queue` file (`RB-11p` AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueBackupFileReceipt {
+    /// Lane/quarantine subdirectory name (`"priority"`, `"normal"`, or `"quarantine"`).
+    pub subdir: &'static str,
+    /// Entry filename inside the subdirectory.
+    pub file_name: String,
+    /// Verified byte length.
+    pub byte_len: u64,
+    /// Lowercase 64-hex SHA-256 verified by independent read-back.
+    pub sha256: String,
+}
+
+/// Summary report returned after copying `capture-queue/{priority,normal,quarantine}/`
+/// into `.libra/redb-backup/<gen>/capture-queue/` while leaving source dirs and
+/// `append.lock` untouched in place (`RB-11p` AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueBackupReport {
+    /// Target backup directory `<common_storage>/redb-backup/<gen>/capture-queue`.
+    pub backup_queue_dir: PathBuf,
+    /// Verified receipts for every copied file across `{priority, normal, quarantine}`.
+    pub files: Vec<QueueBackupFileReceipt>,
+    /// Deterministic read-only manifest SHA-256 of the source `capture-queue/`.
+    pub queue_manifest_sha256: String,
+}
+
+/// Complete reverse Phase 1 backup and digest bundle (`RB-11p` AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReversePhase1BackupReport {
+    /// Source redb generation (`>= 1`).
+    pub generation: u64,
+    /// Relative backup directory under `<common_storage>` (e.g. `"redb-backup/00000001"`).
+    pub backup_rel_dir: String,
+    /// Absolute backup directory path.
+    pub backup_dir: PathBuf,
+    /// Verified backup receipt for frozen `git.gen-<id>.redb`.
+    pub git_redb_backup: RedbFileBackupReceipt,
+    /// Verified backup receipt for frozen `capture.gen-<id>.redb`.
+    pub capture_redb_backup: RedbFileBackupReceipt,
+    /// Verified backup report for `capture-queue/{priority,normal,quarantine}/`.
+    pub queue_backup: QueueBackupReport,
+    /// Deterministic read-only manifest SHA-256 of `capture-spool/`.
+    pub spool_manifest_sha256: String,
+    /// Populated `SourceDigests` ready for Phase 2 `storage-format.json`.
+    pub source_digests: SourceDigests,
+    /// Ordered durability audit receipt (`FileFsync`, `AtomicPublish`, `DirFsync`).
+    pub durability: Phase1DurabilityReceipt,
+}
+
+/// Verification report confirming both staged SQLite `.tmp` targets passed
+/// `PRAGMA integrity_check == "ok"`, carry the expected `PRAGMA application_id`,
+/// and completed `fsync` (`RB-11p` AC1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReversePhase1VerificationReport {
+    /// `true` once `libra.db.tmp` returned a single `"ok"` row from `PRAGMA integrity_check`.
+    pub git_tmp_integrity_ok: bool,
+    /// `true` once `capture.db.tmp` returned a single `"ok"` row from `PRAGMA integrity_check`.
+    pub capture_tmp_integrity_ok: bool,
+    /// Verified non-zero `PRAGMA application_id` read back from `libra.db.tmp`.
+    pub git_tmp_application_id: u32,
+    /// Verified non-zero `PRAGMA application_id` read back from `capture.db.tmp`.
+    pub capture_tmp_application_id: u32,
+    /// Durability receipt covering `.tmp` `FileFsync` and parent `DirFsync`.
+    pub durability: Phase1DurabilityReceipt,
+}
+
+/// Deterministic unique non-zero 31-bit `PRAGMA application_id` generator for
+/// reverse migration targets (`RB-11i` AC4 & AC5).
+///
+/// Restricting to `1..=i32::MAX as u32` keeps SQLite's signed 32-bit header
+/// `PRAGMA application_id` value identical across `i64` and `u32` queries with
+/// zero sign-extension ambiguity.
+fn allocate_reverse_target_migration_tag(generation: u64) -> u32 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(b"LIBRA_REVERSE_TARGET_MIGRATION_TAG_V1\0");
+    hasher.update(generation.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(seq.to_le_bytes());
+    hasher.update(now_ns.to_le_bytes());
+    let digest = hasher.finalize();
+    let raw = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) & 0x7FFF_FFFF;
+    if raw == 0 { 1 } else { raw }
+}
+
+/// RAII cleanup guard for staged reverse Phase 1 artifacts (`libra.db.tmp`,
+/// `capture.db.tmp`, `.libra/redb-backup/<gen>/`, and newly-created
+/// `.libra/redb-backup/`). Armed by default so any error, panic, or explicit
+/// Phase 1 abort removes all staged artifacts while leaving source `git.redb`,
+/// `capture.redb`, and `capture-queue/` 100% byte-for-byte untouched (`RB-11p` AC3 & AC4).
+#[derive(Debug)]
+struct ReversePhase1ArtifactGuard {
+    common_storage: PathBuf,
+    git_tmp_path: Option<PathBuf>,
+    capture_tmp_path: Option<PathBuf>,
+    backup_gen_dir: Option<PathBuf>,
+    created_backup_root: bool,
+    armed: bool,
+}
+
+impl ReversePhase1ArtifactGuard {
+    fn new(common_storage: &Path) -> Self {
+        Self {
+            common_storage: common_storage.to_path_buf(),
+            git_tmp_path: None,
+            capture_tmp_path: None,
+            backup_gen_dir: None,
+            created_backup_root: false,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn cleanup_now(&mut self) -> StorageResult<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        let mut errs: Vec<String> = Vec::new();
+        for path in [self.capture_tmp_path.take(), self.git_tmp_path.take()]
+            .into_iter()
+            .flatten()
+        {
+            remove_sqlite_tmp_and_sidecars(&path, &mut errs);
+            if let Some(parent) = path.parent() {
+                let _ = fsync_dir_best_effort(parent);
+            }
+        }
+        if let Some(gen_dir) = self.backup_gen_dir.take() {
+            if gen_dir.exists()
+                && let Err(err) = fs::remove_dir_all(&gen_dir)
+            {
+                errs.push(format!("remove staged redb-backup generation dir: {err}"));
+            }
+            let backup_root = self.common_storage.join(REDB_BACKUP_SUBDIR);
+            if self.created_backup_root {
+                let _ = fs::remove_dir(&backup_root);
+            }
+            let _ = fsync_dir_best_effort(&self.common_storage);
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration Phase 1 abort cleanup failed: {}",
+                    errs.join("; ")
+                ),
+            })
+        }
+    }
+}
+
+impl Drop for ReversePhase1ArtifactGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup_now();
+    }
+}
+
+fn remove_sqlite_tmp_and_sidecars(path: &Path, errs: &mut Vec<String>) {
+    let base = path.as_os_str();
+    let mut candidates = vec![path.to_path_buf()];
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut os = base.to_os_string();
+        os.push(suffix);
+        candidates.push(PathBuf::from(os));
+    }
+    for cand in candidates {
+        match fs::symlink_metadata(&cand) {
+            Ok(meta) if meta.file_type().is_file() => {
+                if let Err(err) = fs::remove_file(&cand)
+                    && err.kind() != io::ErrorKind::NotFound
+                {
+                    errs.push(format!("unlink staged sqlite tmp artifact: {err}"));
+                }
+            }
+            Ok(_) => {
+                errs.push("refused to unlink non-regular staged sqlite tmp artifact".to_string());
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => errs.push(format!("stat staged sqlite tmp artifact: {err}")),
+        }
+    }
+}
+
+fn fsync_dir_best_effort(dir: &Path) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        let fd = open_readonly_root_dir_unix(dir)?;
+        fsync_dir_fd_unix(&fd, "sync directory")
+    }
+    #[cfg(windows)]
+    {
+        fsync_dir_durable_windows(dir, "sync directory")
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Prepared reverse migration Phase 1 state holding all 8 quiescence locks
+/// (`migration.lock .. capture.redb WriteTransaction`), verified staged SQLite
+/// `.tmp` targets, verified `.libra/redb-backup/<gen>/`, and an armed RAII
+/// cleanup guard (`RB-11q`, `RB-11i`, `RB-11p`).
+///
+/// Field declaration order guarantees `artifacts` cleans staged files BEFORE
+/// `guard` aborts uncommitted `(capture_wtx, git_wtx)` and releases all 6
+/// advisory locks.
+pub struct ReversePhase1Prepared {
+    artifacts: ReversePhase1ArtifactGuard,
+    export: ReversePhase1ExportReport,
+    verification: ReversePhase1VerificationReport,
+    backup: ReversePhase1BackupReport,
+    guard: ReversePhase1QuiesceGuard,
+}
+
+impl std::fmt::Debug for ReversePhase1Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReversePhase1Prepared")
+            .field("export", &self.export)
+            .field("verification", &self.verification)
+            .field("backup", &self.backup)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReversePhase1Prepared {
+    /// Borrow the Phase 1 streaming export, intent replay, and queue ingest report.
+    #[must_use]
+    pub fn export(&self) -> &ReversePhase1ExportReport {
+        &self.export
+    }
+
+    /// Borrow the Phase 1 `.tmp` `PRAGMA integrity_check` & `fsync` verification report.
+    #[must_use]
+    pub fn verification(&self) -> &ReversePhase1VerificationReport {
+        &self.verification
+    }
+
+    /// Borrow the Phase 1 SHA-256 verified `redb-backup/<gen>/` report.
+    #[must_use]
+    pub fn backup(&self) -> &ReversePhase1BackupReport {
+        &self.backup
+    }
+
+    /// Borrow the still-held quiescence guard (`migration.lock .. capture_wtx`).
+    #[must_use]
+    pub fn guard(&self) -> &ReversePhase1QuiesceGuard {
+        &self.guard
+    }
+
+    /// Explicitly abort Phase 1: remove staged `.tmp` targets and
+    /// `.libra/redb-backup/<gen>/`, abort uncommitted `(capture_wtx, git_wtx)`
+    /// without writing a single byte to source `.redb` or `capture-queue/`, and
+    /// release all 6 advisory locks (`RB-11p` AC3 & AC4).
+    pub fn abort_and_cleanup(mut self) -> StorageResult<()> {
+        let cleanup_res = self.artifacts.cleanup_now();
+        let release_res = self.guard.abort_and_release();
+        cleanup_res?;
+        release_res
+    }
+}
+
+fn list_existing_redb_tables(wtx: &redb::WriteTransaction) -> StorageResult<BTreeSet<String>> {
+    let mut set = BTreeSet::new();
+    let handles = wtx
+        .list_tables()
+        .map_err(|err| map_redb_storage_err(err, "list redb tables for reverse export"))?;
+    for h in handles {
+        set.insert(h.name().to_string());
+    }
+    Ok(set)
+}
+
+async fn open_reverse_sqlite_tmp_conn_async(
+    path: &Path,
+    role: DatabaseRole,
+    read_only: bool,
+) -> StorageResult<SqliteConnection> {
+    let mut opts = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(read_only)
+        .foreign_keys(false)
+        .busy_timeout(Duration::from_secs(5));
+    if !read_only {
+        opts = opts
+            .journal_mode(sea_orm::sqlx::sqlite::SqliteJournalMode::Delete)
+            .synchronous(sea_orm::sqlx::sqlite::SqliteSynchronous::Full)
+            .pragma("cache_size", "-4096");
+    }
+    opts.connect()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("reverse migration Phase 1 failed opening {role} sqlite tmp: {err}"),
+        })
+}
+
+/// Create a fresh staged SQLite `.tmp` file via `O_CREAT | O_EXCL | O_NOFOLLOW`
+/// with strict ownership and permission checks (`0600` for Capture inside `0700`
+/// `.libra/private`, non-group/world-writable `0644` for Repository).
+fn create_empty_sqlite_tmp_file_nofollow(
+    common_storage: &Path,
+    subdir: Option<&'static str>,
+    file_name: &str,
+    file_mode: u32,
+    require_private_dir: bool,
+) -> StorageResult<PathBuf> {
+    let target_path = match subdir {
+        Some(sub) => common_storage.join(sub).join(file_name),
+        None => common_storage.join(file_name),
+    };
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        };
+        let root_fd = open_readonly_root_dir_unix(common_storage)?;
+        let parent_fd = if let Some(sub) = subdir {
+            let c_sub = CString::new(sub).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "invalid reverse sqlite tmp parent subdir".to_string(),
+            })?;
+            let forbidden = if require_private_dir { 0o077 } else { 0o022 };
+            let Some((fd, _)) = open_readonly_subdir_unix(
+                &root_fd,
+                &c_sub,
+                forbidden,
+                "reverse sqlite tmp parent",
+            )?
+            else {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Phase 1 missing staging parent directory"
+                        .to_string(),
+                });
+            };
+            fd
+        } else {
+            root_fd
+        };
+        let c_file = CString::new(file_name).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "invalid reverse sqlite tmp filename".to_string(),
+        })?;
+        // SAFETY: `parent_fd` is valid and `c_file` is NUL-terminated.
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_file.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                file_mode as libc::mode_t as libc::c_uint,
+            )
+        };
+        if raw < 0 {
+            return Err(StorageBackendError::io(
+                "create staged sqlite tmp file",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `raw >= 0` is exclusively owned here.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Explicitly apply mode to bypass umask for `0600` private capture tmp.
+        // SAFETY: `fd` is valid and exclusively created by this process.
+        if unsafe { libc::fchmod(fd.as_raw_fd(), file_mode as libc::mode_t) } != 0 {
+            let err = io::Error::last_os_error();
+            drop(fd);
+            let _ = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), c_file.as_ptr(), 0) };
+            return Err(StorageBackendError::io(
+                "set staged sqlite tmp permissions",
+                err,
+            ));
+        }
+        drop(fd);
+        Ok(target_path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file_mode, require_private_dir);
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target_path)
+            .map_err(|err| StorageBackendError::io("create staged sqlite tmp file", err))?;
+        Ok(target_path)
+    }
+}
+
+/// Bootstrap `libra.db.tmp` with the canonical Repository schema (including
+/// lazy bridge publication tables) and return a single `SqliteConnection`.
+async fn bootstrap_reverse_git_sqlite_tmp(
+    common_storage: &Path,
+) -> StorageResult<(PathBuf, SqliteConnection)> {
+    let git_tmp = git_sqlite_tmp_path(common_storage);
+    // Validate storage root before letting `create_database_for_role` create `libra.db.tmp`
+    // via `OpenOptions::create_new(true)`.
+    if !validate_existing_dir_no_mutate(
+        common_storage,
+        false,
+        ForwardPhase1QuiesceStage::StorageRoot,
+    )
+    .map_err(normalize_reverse_quiesce_err)?
+    {
+        return Err(StorageBackendError::NotFound {
+            resource: "repository storage directory".to_string(),
+        });
+    }
+    let git_tmp_str = git_tmp
+        .to_str()
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "reverse migration Phase 1 staged libra.db.tmp path is not valid UTF-8"
+                .to_string(),
+        })?;
+    let db_conn = crate::internal::db::schema::create_database_for_role(
+        git_tmp_str,
+        DatabaseRole::Repository,
+    )
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!("reverse migration Phase 1 failed bootstrapping libra.db.tmp: {err}"),
+    })?;
+    db_conn
+        .close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed closing bootstrap libra.db.tmp handle: {err}"
+            ),
+        })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let meta = fs::symlink_metadata(&git_tmp)
+            .map_err(|err| StorageBackendError::io("stat bootstrapped libra.db.tmp", err))?;
+        if !meta.file_type().is_file() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "reverse migration Phase 1 rejected non-regular libra.db.tmp".to_string(),
+            });
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if (mode & 0o022) != 0 {
+            fs::set_permissions(&git_tmp, fs::Permissions::from_mode(mode & !0o022))
+                .map_err(|err| StorageBackendError::io("tighten libra.db.tmp permissions", err))?;
+        }
+    }
+
+    let mut conn =
+        open_reverse_sqlite_tmp_conn_async(&git_tmp, DatabaseRole::Repository, false).await?;
+    // Ensure lazy bridge publication tables exist before streaming tables 60 & 61.
+    for ddl in [
+        "CREATE TABLE IF NOT EXISTS agent_bridge_publication (\
+             operation_id TEXT PRIMARY KEY,\
+             commit_oid TEXT NOT NULL,\
+             phase TEXT NOT NULL DEFAULT 'published'\
+         )",
+        "CREATE TABLE IF NOT EXISTS agent_bridge_index_publication (\
+             operation_id TEXT PRIMARY KEY,\
+             index_digest TEXT NOT NULL,\
+             phase TEXT NOT NULL DEFAULT 'prepared'\
+         )",
+    ] {
+        sea_orm::sqlx::query(ddl)
+            .execute(&mut conn)
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration Phase 1 failed creating bridge publication table in libra.db.tmp: {err}"
+                ),
+            })?;
+    }
+    Ok((git_tmp, conn))
+}
+
+/// Bootstrap `.libra/private/capture.db.tmp` (`0600`) with canonical
+/// `CAPTURE_DATABASE_SQL` and default schema receipt.
+async fn bootstrap_reverse_capture_sqlite_tmp(
+    common_storage: &Path,
+) -> StorageResult<(PathBuf, SqliteConnection)> {
+    let cap_tmp = create_empty_sqlite_tmp_file_nofollow(
+        common_storage,
+        Some(PRIVATE_SUBDIR),
+        "capture.db.tmp",
+        0o600,
+        true,
+    )?;
+    let mut conn =
+        open_reverse_sqlite_tmp_conn_async(&cap_tmp, DatabaseRole::Capture, false).await?;
+    sea_orm::sqlx::raw_sql(crate::internal::db::schema::CAPTURE_DATABASE_SQL)
+        .execute(&mut conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed applying CAPTURE_DATABASE_SQL to capture.db.tmp: {err}"
+            ),
+        })?;
+    sea_orm::sqlx::query(
+        "INSERT OR IGNORE INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+    )
+    .bind(crate::internal::db::schema::CAPTURE_SCHEMA_VERSION)
+    .bind(crate::internal::db::schema::CAPTURE_SCHEMA_NAME)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&mut conn)
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!(
+            "reverse migration Phase 1 failed seeding capture schema_versions in capture.db.tmp: {err}"
+        ),
+    })?;
+    Ok((cap_tmp, conn))
+}
+
+/// Generate O(N) cursor-paged batch readers over an uncommitted
+/// `&redb::WriteTransaction` (`<= 500` rows AND `<= 2 MiB` payload per page),
+/// dropping the `redb::Table` / `redb::Range` BEFORE returning so async SQLite
+/// commits never hold any redb table guard across `.await`.
+macro_rules! define_redb_page_reader {
+    ($fn_name:ident, $key_ty:ty, $owned_ty:ty, |$k_pat:ident| $to_owned:expr, |$c_pat:ident| $as_ref:expr) => {
+        fn $fn_name(
+            wtx: &redb::WriteTransaction,
+            existing_tables: &BTreeSet<String>,
+            def: redb::TableDefinition<'static, $key_ty, &[u8]>,
+            cursor: &mut Option<$owned_ty>,
+            max_rows: usize,
+        ) -> StorageResult<Vec<($owned_ty, Vec<u8>)>> {
+            use redb::ReadableTable as _;
+            use std::ops::Bound;
+
+            if !existing_tables.contains(def.name()) {
+                return Ok(Vec::new());
+            }
+            let limit = max_rows.clamp(1, FORWARD_MIGRATION_STREAM_BATCH_ROWS);
+            let tbl = wtx
+                .open_table(def)
+                .map_err(|err| map_redb_table_err(err, "open source redb table for reverse export"))?;
+            let mut out: Vec<($owned_ty, Vec<u8>)> = Vec::new();
+            let mut bytes_acc = 0usize;
+            let mut last_key: Option<$owned_ty> = None;
+
+            macro_rules! drain_iter {
+                ($iter:expr) => {
+                    for entry in $iter {
+                        let (k_guard, v_guard) = entry.map_err(|err| {
+                            map_redb_storage_err(err, "iterate source redb table for reverse export")
+                        })?;
+                        let v_slice = v_guard.value();
+                        if v_slice.len() > FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "reverse migration Phase 1 row in `{}` exceeds {} byte single-row budget",
+                                    def.name(),
+                                    FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES
+                                ),
+                            });
+                        }
+                        if !out.is_empty()
+                            && (out.len() >= limit
+                                || bytes_acc.saturating_add(v_slice.len())
+                                    > FORWARD_MIGRATION_STREAM_BATCH_MAX_BYTES)
+                        {
+                            break;
+                        }
+                        let $k_pat = k_guard.value();
+                        let owned_k: $owned_ty = $to_owned;
+                        bytes_acc = bytes_acc.saturating_add(v_slice.len());
+                        last_key = Some(owned_k.clone());
+                        out.push((owned_k, v_slice.to_vec()));
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                };
+            }
+
+            if let Some($c_pat) = cursor.as_ref() {
+                let lower = $as_ref;
+                let range = tbl
+                    .range((Bound::Excluded(lower), Bound::Unbounded))
+                    .map_err(|err| {
+                        map_redb_storage_err(err, "range source redb table for reverse export")
+                    })?;
+                drain_iter!(range);
+            } else {
+                let iter = tbl.iter().map_err(|err| {
+                    map_redb_storage_err(err, "iter source redb table for reverse export")
+                })?;
+                drain_iter!(iter);
+            }
+
+            if let Some(lk) = last_key {
+                *cursor = Some(lk);
+            }
+            Ok(out)
+        }
+    };
+}
+
+define_redb_page_reader!(read_redb_page_i64, i64, i64, |k| k, |c| *c);
+define_redb_page_reader!(read_redb_page_u64, u64, u64, |k| k, |c| *c);
+define_redb_page_reader!(
+    read_redb_page_str,
+    &'static str,
+    String,
+    |k| k.to_string(),
+    |c| c.as_str()
+);
+define_redb_page_reader!(
+    read_redb_page_str2,
+    (&'static str, &'static str),
+    (String, String),
+    |k| (k.0.to_string(), k.1.to_string()),
+    |c| (c.0.as_str(), c.1.as_str())
+);
+define_redb_page_reader!(
+    read_redb_page_str_i64,
+    (&'static str, i64),
+    (String, i64),
+    |k| (k.0.to_string(), k.1),
+    |c| (c.0.as_str(), c.1)
+);
+define_redb_page_reader!(
+    read_redb_page_str_bytes,
+    (&'static str, &'static [u8]),
+    (String, Vec<u8>),
+    |k| (k.0.to_string(), k.1.to_vec()),
+    |c| (c.0.as_str(), c.1.as_slice())
+);
+define_redb_page_reader!(
+    read_redb_page_str3,
+    (&'static str, &'static str, &'static str),
+    (String, String, String),
+    |k| (k.0.to_string(), k.1.to_string(), k.2.to_string()),
+    |c| (c.0.as_str(), c.1.as_str(), c.2.as_str())
+);
+define_redb_page_reader!(
+    read_redb_page_u8_str2,
+    (u8, &'static str, &'static str),
+    (u8, String, String),
+    |k| (k.0, k.1.to_string(), k.2.to_string()),
+    |c| (c.0, c.1.as_str(), c.2.as_str())
+);
+define_redb_page_reader!(
+    read_redb_page_str2_i64,
+    (&'static str, &'static str, i64),
+    (String, String, i64),
+    |k| (k.0.to_string(), k.1.to_string(), k.2),
+    |c| (c.0.as_str(), c.1.as_str(), c.2)
+);
+define_redb_page_reader!(
+    read_redb_page_str2_i64_2,
+    (&'static str, &'static str, i64, i64),
+    (String, String, i64, i64),
+    |k| (k.0.to_string(), k.1.to_string(), k.2, k.3),
+    |c| (c.0.as_str(), c.1.as_str(), c.2, c.3)
+);
+define_redb_page_reader!(
+    read_redb_page_str3_i64,
+    (&'static str, &'static str, &'static str, i64),
+    (String, String, String, i64),
+    |k| (k.0.to_string(), k.1.to_string(), k.2.to_string(), k.3),
+    |c| (c.0.as_str(), c.1.as_str(), c.2.as_str(), c.3)
+);
+define_redb_page_reader!(
+    read_redb_page_str3_i64_2,
+    (&'static str, &'static str, &'static str, i64, i64),
+    (String, String, String, i64, i64),
+    |k| (k.0.to_string(), k.1.to_string(), k.2.to_string(), k.3, k.4),
+    |c| (c.0.as_str(), c.1.as_str(), c.2.as_str(), c.3, c.4)
+);
+
+fn map_reverse_sqlite_write_err(
+    role: DatabaseRole,
+    table: &'static str,
+    err: sea_orm::sqlx::Error,
+) -> StorageBackendError {
+    StorageBackendError::BackendInternal {
+        detail: format!(
+            "reverse migration Phase 1 failed inserting into {role} sqlite table `{table}`: {err}"
+        ),
+    }
+}
+
+async fn begin_reverse_sqlite_batch(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    table: &'static str,
+) -> StorageResult<()> {
+    sea_orm::sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| map_reverse_sqlite_write_err(role, table, err))?;
+    Ok(())
+}
+
+async fn commit_reverse_sqlite_batch(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    table: &'static str,
+) -> StorageResult<()> {
+    sea_orm::sqlx::query("COMMIT")
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| map_reverse_sqlite_write_err(role, table, err))?;
+    Ok(())
+}
+
+async fn rollback_reverse_sqlite_batch_best_effort(conn: &mut SqliteConnection) {
+    let _ = sea_orm::sqlx::query("ROLLBACK").execute(&mut *conn).await;
+}
+
+/// Synchronize `sqlite_sequence` highwater for an `AUTOINCREMENT` table when
+/// redb holds a higher sequence counter (e.g. empty-after-delete continuity).
+async fn sync_reverse_sqlite_sequence(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    table: &'static str,
+    seq_val: i64,
+) -> StorageResult<()> {
+    if seq_val <= 0 {
+        return Ok(());
+    }
+    let has_seq_table = sqlite_table_exists_on_conn(conn, role, "sqlite_sequence").await?;
+    if !has_seq_table {
+        return Ok(());
+    }
+    let existing: Option<i64> =
+        sea_orm::sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = ?")
+            .bind(table)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| map_reverse_sqlite_write_err(role, "sqlite_sequence", err))?;
+    match existing {
+        Some(cur) if cur >= seq_val => {}
+        Some(_) => {
+            sea_orm::sqlx::query("UPDATE sqlite_sequence SET seq = ? WHERE name = ?")
+                .bind(seq_val)
+                .bind(table)
+                .execute(&mut *conn)
+                .await
+                .map_err(|err| map_reverse_sqlite_write_err(role, "sqlite_sequence", err))?;
+        }
+        None => {
+            sea_orm::sqlx::query("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)")
+                .bind(table)
+                .bind(seq_val)
+                .execute(&mut *conn)
+                .await
+                .map_err(|err| map_reverse_sqlite_write_err(role, "sqlite_sequence", err))?;
+        }
+    }
+    Ok(())
+}
+
+fn read_redb_seq_u64(
+    wtx: &redb::WriteTransaction,
+    existing_tables: &BTreeSet<String>,
+    def: redb::TableDefinition<'static, &str, &[u8]>,
+    key: &str,
+    codec_version: u16,
+) -> StorageResult<Option<i64>> {
+    if !existing_tables.contains(def.name()) {
+        return Ok(None);
+    }
+    let tbl = wtx
+        .open_table(def)
+        .map_err(|err| map_redb_table_err(err, "open sequence table for reverse export"))?;
+    let Some(raw) = tbl
+        .get(key)
+        .map_err(|err| map_redb_storage_err(err, "read sequence value for reverse export"))?
+    else {
+        return Ok(None);
+    };
+    let val: MigConfigSequenceValue = decode_versioned(raw.value(), codec_version)?;
+    let seq = i64::try_from(val.last_id).map_err(|_| StorageBackendError::BackendInternal {
+        detail: format!("reverse export sequence counter for `{key}` exceeds i64::MAX"),
+    })?;
+    Ok(Some(seq))
+}
+
+fn read_redb_seq_i64(
+    wtx: &redb::WriteTransaction,
+    existing_tables: &BTreeSet<String>,
+    def: redb::TableDefinition<'static, &str, &[u8]>,
+    key: &str,
+    codec_version: u16,
+) -> StorageResult<Option<i64>> {
+    if !existing_tables.contains(def.name()) {
+        return Ok(None);
+    }
+    let tbl = wtx
+        .open_table(def)
+        .map_err(|err| map_redb_table_err(err, "open i64 sequence table for reverse export"))?;
+    let Some(raw) = tbl
+        .get(key)
+        .map_err(|err| map_redb_storage_err(err, "read i64 sequence value for reverse export"))?
+    else {
+        return Ok(None);
+    };
+    let val: MigSeqCounter = decode_versioned(raw.value(), codec_version)?;
+    Ok(Some(val.last_id))
+}
+
+/// Stream a single redb table from a held `&redb::WriteTransaction` into SQLite
+/// in `<= 500` row / `<= 2 MiB` cursor-paged batches (`RB-11i` AC1 & AC6).
+macro_rules! stream_redb_to_sqlite {
+    (
+        $wtx:expr,
+        $existing:expr,
+        $conn:expr,
+        $role:expr,
+        $telemetry:expr,
+        $counts:expr,
+        $table_name:expr,
+        $page_reader:ident,
+        $table_def:expr,
+        |$key_pat:ident, $val_pat:ident, $c_pat:ident| $insert_body:block
+    ) => {{
+        let mut cursor = None;
+        let mut total_rows = 0u64;
+        loop {
+            let page = $page_reader(
+                $wtx,
+                $existing,
+                $table_def,
+                &mut cursor,
+                FORWARD_MIGRATION_STREAM_BATCH_ROWS,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            let batch_len = page.len();
+            begin_reverse_sqlite_batch($conn, $role, $table_name).await?;
+            let batch_res: StorageResult<()> = async {
+                let $c_pat: &mut SqliteConnection = &mut *$conn;
+                for ($key_pat, $val_pat) in page {
+                    $insert_body
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(err) = batch_res {
+                rollback_reverse_sqlite_batch_best_effort($conn).await;
+                return Err(err);
+            }
+            commit_reverse_sqlite_batch($conn, $role, $table_name).await?;
+            $telemetry.record_batch($table_name, batch_len)?;
+            total_rows = total_rows.saturating_add(batch_len as u64);
+        }
+        $counts.insert($table_name, total_rows);
+        total_rows
+    }};
+}
+
+type DecodedSqliteRefRow = (
+    Option<String>,
+    &'static str,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn decode_mig_ref_row(
+    key: (u8, String, String),
+    stored: MigRefTargetStored,
+) -> StorageResult<DecodedSqliteRefRow> {
+    let (tag, part1, part2) = key;
+    match tag {
+        MIG_REF_TAG_LOCAL_HEAD_MAIN => match stored.target {
+            RefTarget::Symbolic(sym) => Ok((Some(sym), "Head", None, None, None)),
+            RefTarget::Direct(oid) => Ok((None, "Head", Some(oid), None, None)),
+        },
+        MIG_REF_TAG_LOCAL_HEAD_LINKED => match stored.target {
+            RefTarget::Symbolic(sym) => Ok((Some(sym), "Head", None, None, Some(part1))),
+            RefTarget::Direct(oid) => Ok((None, "Head", Some(oid), None, Some(part1))),
+        },
+        MIG_REF_TAG_REMOTE_HEAD => match stored.target {
+            RefTarget::Symbolic(sym) => Ok((Some(sym), "Head", None, Some(part1), None)),
+            RefTarget::Direct(oid) => Ok((None, "Head", Some(oid), Some(part1), None)),
+        },
+        MIG_REF_TAG_LOCAL_BRANCH => match stored.target {
+            RefTarget::Direct(oid) => Ok((Some(part2), "Branch", Some(oid), None, None)),
+            RefTarget::Symbolic(_) => Err(StorageBackendError::BackendInternal {
+                detail: "reverse export rejected symbolic local branch row in redb".to_string(),
+            }),
+        },
+        MIG_REF_TAG_REMOTE_BRANCH => match stored.target {
+            RefTarget::Direct(oid) => Ok((Some(part2), "Branch", Some(oid), Some(part1), None)),
+            RefTarget::Symbolic(_) => Err(StorageBackendError::BackendInternal {
+                detail: "reverse export rejected symbolic remote branch row in redb".to_string(),
+            }),
+        },
+        MIG_REF_TAG_TAG => match stored.target {
+            RefTarget::Direct(oid) => Ok((Some(part2), "Tag", Some(oid), None, None)),
+            RefTarget::Symbolic(_) => Err(StorageBackendError::BackendInternal {
+                detail: "reverse export rejected symbolic tag row in redb".to_string(),
+            }),
+        },
+        _ => Err(StorageBackendError::BackendInternal {
+            detail: format!("reverse export encountered unknown reference key tag {tag}"),
+        }),
+    }
+}
+
+/// Export all 61 Repository source tables directly from the held uncommitted
+/// `&git_wtx` into `libra.db.tmp` (`RB-11i` AC1 & AC6).
+#[allow(clippy::too_many_lines)]
+async fn export_reverse_git_tables_to_sqlite(
+    git_wtx: &redb::WriteTransaction,
+    conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<BTreeMap<&'static str, u64>> {
+    let existing = list_existing_redb_tables(git_wtx)?;
+    let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let r = DatabaseRole::Repository;
+    let cv_state = redb_state::GIT_STATE_CODEC_VERSION;
+
+    // 1. schema_versions (replace pre-seeded rows only when git.redb has explicit receipts)
+    {
+        let mut has_any_receipt = false;
+        if existing.contains(redb_cfg::SCHEMA_VERSIONS_TABLE.name()) {
+            let tbl = git_wtx
+                .open_table(redb_cfg::SCHEMA_VERSIONS_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open git schema_versions"))?;
+            has_any_receipt = tbl
+                .len()
+                .map_err(|e| map_redb_storage_err(e, "len git schema_versions"))?
+                > 0;
+        }
+        if has_any_receipt {
+            sea_orm::sqlx::query("DELETE FROM schema_versions")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+            stream_redb_to_sqlite!(
+                git_wtx,
+                &existing,
+                conn,
+                r,
+                telemetry,
+                counts,
+                "schema_versions",
+                read_redb_page_i64,
+                redb_cfg::SCHEMA_VERSIONS_TABLE,
+                |version, raw, c| {
+                    let row: MigSchemaReceiptStoredRow =
+                        decode_versioned(&raw, redb_cfg::SCHEMA_RECEIPT_CODEC_VERSION)?;
+                    sea_orm::sqlx::query(
+                        "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+                    )
+                    .bind(version)
+                    .bind(&row.name)
+                    .bind(&row.applied_at)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+                }
+            );
+        } else {
+            let seeded: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM schema_versions")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+            counts.insert("schema_versions", u64::try_from(seeded).unwrap_or(0));
+        }
+    }
+
+    // 2. config
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "config",
+        read_redb_page_u64,
+        redb_cfg::CONFIG_LEGACY_TABLE,
+        |id, raw, c| {
+            let id_i64 = i64::try_from(id).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "reverse export config.id exceeds i64::MAX".to_string(),
+            })?;
+            let rec: LegacyConfigEntry =
+                decode_versioned(&raw, redb_cfg::CONFIG_LEGACY_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO config (id, configuration, name, key, value) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id_i64)
+            .bind(&rec.configuration)
+            .bind(&rec.name)
+            .bind(&rec.key)
+            .bind(&rec.value)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "config", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_u64(
+        git_wtx,
+        &existing,
+        redb_cfg::CONFIG_SEQ_TABLE,
+        MIG_SEQ_KEY_CONFIG_LEGACY,
+        redb_cfg::CONFIG_SEQ_CODEC_VERSION,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "config", seq).await?;
+    }
+
+    // 3. config_kv
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "config_kv",
+        read_redb_page_u64,
+        redb_cfg::CONFIG_KV_TABLE,
+        |id, raw, c| {
+            let id_i64 = i64::try_from(id).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "reverse export config_kv.id exceeds i64::MAX".to_string(),
+            })?;
+            let rec: MigConfigKvStoredRow =
+                decode_versioned(&raw, redb_cfg::CONFIG_KV_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO config_kv (id, key, value, encrypted) VALUES (?, ?, ?, ?)",
+            )
+            .bind(id_i64)
+            .bind(&rec.key)
+            .bind(&rec.value)
+            .bind(i64::from(rec.encrypted))
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "config_kv", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_u64(
+        git_wtx,
+        &existing,
+        redb_cfg::CONFIG_SEQ_TABLE,
+        MIG_SEQ_KEY_CONFIG_KV,
+        redb_cfg::CONFIG_SEQ_CODEC_VERSION,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "config_kv", seq).await?;
+    }
+
+    // 4. metadata_kv
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "metadata_kv",
+        read_redb_page_str3,
+        redb_cfg::METADATA_KV_TABLE,
+        |key, raw, c| {
+            let (scope, target, k) = key;
+            let rec: MigMetadataStoredRow =
+                decode_versioned(&raw, redb_cfg::METADATA_KV_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO metadata_kv (scope, target, key, value, value_type, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&scope)
+            .bind(&target)
+            .bind(&k)
+            .bind(&rec.value)
+            .bind(&rec.value_type)
+            .bind(&rec.created_at)
+            .bind(&rec.updated_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "metadata_kv", e))?;
+        }
+    );
+
+    // 5. reference
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "reference",
+        read_redb_page_u8_str2,
+        redb_git::REFERENCE_TABLE,
+        |key, raw, c| {
+            let stored: MigRefTargetStored =
+                decode_versioned(&raw, redb_git::GIT_REF_CODEC_VERSION)?;
+            let (name, kind, commit, remote, worktree_id) = decode_mig_ref_row(key, stored)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO reference (name, kind, \"commit\", remote, worktree_id) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&name)
+            .bind(kind)
+            .bind(&commit)
+            .bind(&remote)
+            .bind(&worktree_id)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "reference", e))?;
+        }
+    );
+
+    // 6. reflog
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "reflog",
+        read_redb_page_u64,
+        redb_git::REFLOG_TABLE,
+        |id, raw, c| {
+            let id_i64 = i64::try_from(id).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "reverse export reflog.id exceeds i64::MAX".to_string(),
+            })?;
+            let rec: MigReflogStoredRow =
+                decode_versioned(&raw, redb_git::GIT_REFLOG_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO reflog (id, ref_name, old_oid, new_oid, committer_name, committer_email, timestamp, action, message, worktree_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id_i64)
+            .bind(&rec.ref_name)
+            .bind(&rec.old_oid)
+            .bind(&rec.new_oid)
+            .bind(&rec.committer_name)
+            .bind(&rec.committer_email)
+            .bind(rec.timestamp)
+            .bind(&rec.action)
+            .bind(&rec.message)
+            .bind(&rec.worktree_id)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "reflog", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_u64(
+        git_wtx,
+        &existing,
+        redb_git::GIT_SEQ_TABLE,
+        MIG_SEQ_KEY_REFLOG,
+        redb_git::GIT_SEQ_CODEC_VERSION,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "reflog", seq).await?;
+    }
+
+    // 7. notes
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "notes",
+        read_redb_page_str2,
+        redb_git::NOTES_TABLE,
+        |key, raw, c| {
+            let (notes_ref, object) = key;
+            let rec: MigNoteStoredRow = decode_versioned(&raw, redb_git::GIT_NOTES_CODEC_VERSION)?;
+            sea_orm::sqlx::query("INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)")
+                .bind(&notes_ref)
+                .bind(&object)
+                .bind(&rec.blob)
+                .execute(&mut *c)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "notes", e))?;
+        }
+    );
+
+    // 8. object_index
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "object_index",
+        read_redb_page_str2,
+        redb_git::OBJECT_INDEX_TABLE,
+        |key, raw, c| {
+            let (repo_id, o_id) = key;
+            let rec: MigObjectIndexStoredRow =
+                decode_versioned(&raw, redb_git::GIT_OBJECT_INDEX_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO object_index (repo_id, o_id, o_type, o_size, created_at, is_synced) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&repo_id)
+            .bind(&o_id)
+            .bind(&rec.o_type)
+            .bind(rec.o_size)
+            .bind(rec.created_at)
+            .bind(i64::from(rec.is_synced))
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "object_index", e))?;
+        }
+    );
+
+    // 9. object_obliteration
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "object_obliteration",
+        read_redb_page_str2,
+        redb_git::OBJECT_OBLITERATION_TABLE,
+        |key, raw, c| {
+            let (oid, hash_kind) = key;
+            let rec: MigObjectObliterationStoredRow =
+                decode_versioned(&raw, redb_git::GIT_OBJECT_OBLITERATION_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO object_obliteration \
+                 (oid, hash_kind, state, reason, actor, approval_source, requested_at, tombstone_written_at, payload_deleted_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&oid)
+            .bind(&hash_kind)
+            .bind(rec.state.as_str())
+            .bind(&rec.reason)
+            .bind(&rec.actor)
+            .bind(&rec.approval_source)
+            .bind(&rec.requested_at)
+            .bind(&rec.tombstone_written_at)
+            .bind(&rec.payload_deleted_at)
+            .bind(&rec.updated_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "object_obliteration", e))?;
+        }
+    );
+
+    // 10. revision_ordinal
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "revision_ordinal",
+        read_redb_page_str_i64,
+        redb_git::REVISION_ORDINAL_TABLE,
+        |key, raw, c| {
+            let (ref_name, ordinal) = key;
+            let rec: MigRevisionOrdinalStoredRow =
+                decode_versioned(&raw, redb_git::GIT_REVISION_ORDINAL_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO revision_ordinal (ref_name, ordinal, oid) VALUES (?, ?, ?)",
+            )
+            .bind(&ref_name)
+            .bind(ordinal)
+            .bind(&rec.oid)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "revision_ordinal", e))?;
+        }
+    );
+
+    // 11. revision_ordinal_meta
+    stream_redb_to_sqlite!(
+        git_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "revision_ordinal_meta",
+        read_redb_page_str,
+        redb_git::REVISION_ORDINAL_META_TABLE,
+        |ref_name, raw, c| {
+            let rec: MigRevisionOrdinalMetaStoredRow =
+                decode_versioned(&raw, redb_git::GIT_REVISION_ORDINAL_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO revision_ordinal_meta (ref_name, tip_oid, replace_sig, max_ordinal, built_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&ref_name)
+            .bind(&rec.tip_oid)
+            .bind(&rec.replace_sig)
+            .bind(rec.max_ordinal)
+            .bind(&rec.built_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "revision_ordinal_meta", e))?;
+        }
+    );
+
+    // 12..32: RB-05 workflow state tables
+    export_reverse_rb05_state_tables(git_wtx, &existing, conn, telemetry, &mut counts, cv_state)
+        .await?;
+
+    // 33..61: RB-05b AI / memory / governance / bridge tables
+    export_reverse_rb05b_state_tables(git_wtx, &existing, conn, telemetry, &mut counts, cv_state)
+        .await?;
+
+    Ok(counts)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn export_reverse_rb05_state_tables(
+    git_wtx: &redb::WriteTransaction,
+    existing: &BTreeSet<String>,
+    conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    counts: &mut BTreeMap<&'static str, u64>,
+    cv: u16,
+) -> StorageResult<()> {
+    let r = DatabaseRole::Repository;
+
+    // 12. sequence_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "sequence_state",
+        read_redb_page_str,
+        redb_state::SEQUENCE_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: SequenceStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO sequence_state (worktree_id, kind, head_name, head_orig, current_oid, todo, payload, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.kind).bind(&rec.head_name).bind(&rec.head_orig)
+            .bind(&rec.current_oid).bind(&rec.todo).bind(&rec.payload).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "sequence_state", e))?;
+        }
+    );
+
+    // 13. rebase_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "rebase_state",
+        read_redb_page_str,
+        redb_state::REBASE_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: RebaseStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO rebase_state (worktree_id, head_name, onto, orig_head, current_head, todo, todo_actions, done, stopped_sha, autosquash, empty_mode) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.head_name).bind(&rec.onto).bind(&rec.orig_head)
+            .bind(&rec.current_head).bind(&rec.todo).bind(&rec.todo_actions).bind(&rec.done)
+            .bind(&rec.stopped_sha).bind(i64::from(rec.autosquash)).bind(&rec.empty_mode)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "rebase_state", e))?;
+        }
+    );
+
+    // 14. bisect_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "bisect_state",
+        read_redb_page_str,
+        redb_state::BISECT_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: BisectStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO bisect_state (worktree_id, orig_head, orig_head_name, bad, good, current, skipped, steps, completed, first_parent) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.orig_head).bind(&rec.orig_head_name).bind(&rec.bad)
+            .bind(&rec.good).bind(&rec.current).bind(&rec.skipped).bind(rec.steps)
+            .bind(i64::from(rec.completed)).bind(i64::from(rec.first_parent))
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "bisect_state", e))?;
+        }
+    );
+
+    // 15. worktree_registry_capability (clear pre-seeded capabilities if redb has explicit rows)
+    {
+        let has_cap_rows =
+            if existing.contains(redb_state::WORKTREE_REGISTRY_CAPABILITY_TABLE.name()) {
+                let tbl = git_wtx
+                    .open_table(redb_state::WORKTREE_REGISTRY_CAPABILITY_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open worktree_registry_capability"))?;
+                tbl.len()
+                    .map_err(|e| map_redb_storage_err(e, "len worktree_registry_capability"))?
+                    > 0
+            } else {
+                false
+            };
+        if has_cap_rows {
+            sea_orm::sqlx::query("DELETE FROM worktree_registry_capability")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "worktree_registry_capability", e))?;
+            stream_redb_to_sqlite!(
+                git_wtx,
+                existing,
+                conn,
+                r,
+                telemetry,
+                counts,
+                "worktree_registry_capability",
+                read_redb_page_i64,
+                redb_state::WORKTREE_REGISTRY_CAPABILITY_TABLE,
+                |ver, _raw, c| {
+                    sea_orm::sqlx::query(
+                        "INSERT INTO worktree_registry_capability (version) VALUES (?)",
+                    )
+                    .bind(ver)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| {
+                        map_reverse_sqlite_write_err(r, "worktree_registry_capability", e)
+                    })?;
+                }
+            );
+        } else {
+            let seeded: i64 =
+                sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM worktree_registry_capability")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        map_reverse_sqlite_write_err(r, "worktree_registry_capability", e)
+                    })?;
+            counts.insert(
+                "worktree_registry_capability",
+                u64::try_from(seeded).unwrap_or(0),
+            );
+        }
+    }
+
+    // 16. worktree_lifecycle
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "worktree_lifecycle",
+        read_redb_page_str,
+        redb_state::WORKTREE_LIFECYCLE_TABLE,
+        |_k, raw, c| {
+            let rec: WorktreeLifecycleRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO worktree_lifecycle (worktree_id, state, path, reason, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(rec.state.as_str()).bind(&rec.path)
+            .bind(&rec.reason).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "worktree_lifecycle", e))?;
+        }
+    );
+
+    // 17. worktree_intent_journal
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "worktree_intent_journal",
+        read_redb_page_i64,
+        redb_state::WORKTREE_INTENT_JOURNAL_TABLE,
+        |_k, raw, c| {
+            let rec: WorktreeIntentRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO worktree_intent_journal (id, op, worktree_id, payload, stage, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(rec.id).bind(rec.op.as_str()).bind(&rec.worktree_id)
+            .bind(&rec.payload).bind(&rec.stage).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "worktree_intent_journal", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_i64(
+        git_wtx,
+        existing,
+        redb_state::GIT_STATE_SEQ_TABLE,
+        MIG_SEQ_KEY_WORKTREE_INTENT,
+        cv,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "worktree_intent_journal", seq).await?;
+    }
+
+    // 18. workspace_record
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "workspace_record",
+        read_redb_page_str,
+        redb_state::WORKSPACE_RECORD_TABLE,
+        |_k, raw, c| {
+            let rec: WorkspaceRecordRow = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO workspace_record \
+                 (workspace_id, repo_id, kind, worktree_id, path, owner_kind, owner_id, task_id, session_id, \
+                  base_commit, branch, state, lease_owner, lease_fence, lease_expires_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.workspace_id).bind(&rec.repo_id).bind(rec.kind.as_str())
+            .bind(&rec.worktree_id).bind(&rec.path).bind(rec.owner_kind.as_str())
+            .bind(&rec.owner_id).bind(&rec.task_id).bind(&rec.session_id)
+            .bind(&rec.base_commit).bind(&rec.branch).bind(rec.state.as_str())
+            .bind(&rec.lease_owner).bind(rec.lease_fence).bind(rec.lease_expires_at)
+            .bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "workspace_record", e))?;
+        }
+    );
+
+    // 19. operation
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "operation",
+        read_redb_page_str,
+        redb_state::OPERATION_TABLE,
+        |_k, raw, c| {
+            let rec: OperationRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO operation \
+                 (op_id, repo_id, format_version, kind, status, command_name, description, args_digest, actor, \
+                  worktree_id, scope_kind, scope_provenance, pre_view_oid, post_view_oid, restores_op_id, \
+                  reverts_op_id, predecessor_map_oid, causal_context_id, restorable, control_slot, claim_owner, start_ts, end_ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.op_id).bind(&rec.repo_id).bind(rec.format_version).bind(&rec.kind)
+            .bind(&rec.status).bind(&rec.command_name).bind(&rec.description).bind(&rec.args_digest)
+            .bind(&rec.actor).bind(&rec.worktree_id).bind(rec.scope_kind.as_str())
+            .bind(rec.scope_provenance.as_str()).bind(&rec.pre_view_oid).bind(&rec.post_view_oid)
+            .bind(&rec.restores_op_id).bind(&rec.reverts_op_id).bind(&rec.predecessor_map_oid)
+            .bind(&rec.causal_context_id).bind(i64::from(rec.restorable)).bind(&rec.control_slot)
+            .bind(&rec.claim_owner).bind(rec.start_ts).bind(rec.end_ts)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "operation", e))?;
+        }
+    );
+
+    // 20. operation_parent
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "operation_parent",
+        read_redb_page_str_i64,
+        redb_state::OPERATION_PARENT_TABLE,
+        |key, raw, c| {
+            let (op_id, ordinal) = key;
+            let parent: MigStringValue = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO operation_parent (op_id, parent_op_id, ordinal) VALUES (?, ?, ?)",
+            )
+            .bind(&op_id)
+            .bind(&parent.value)
+            .bind(ordinal)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "operation_parent", e))?;
+        }
+    );
+
+    // 21. operation_head
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "operation_head",
+        read_redb_page_str3,
+        redb_state::OPERATION_HEAD_TABLE,
+        |key, raw, c| {
+            let (repo_id, scope_key, op_id) = key;
+            let gen_val: MigU64Value = decode_versioned(&raw, cv)?;
+            let gen_i64 =
+                i64::try_from(gen_val.value).map_err(|_| StorageBackendError::BackendInternal {
+                    detail: "reverse export operation_head.generation exceeds i64::MAX".to_string(),
+                })?;
+            sea_orm::sqlx::query(
+                "INSERT INTO operation_head (repo_id, scope_key, op_id, generation) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&repo_id).bind(&scope_key).bind(&op_id).bind(gen_i64)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "operation_head", e))?;
+        }
+    );
+
+    // 22. operation_journal
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "operation_journal",
+        read_redb_page_str,
+        redb_state::OPERATION_JOURNAL_TABLE,
+        |_k, raw, c| {
+            let rec: OperationJournalRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO operation_journal (journal_id, op_id, phase, pre_view_oid, target_view_oid, owner, updated_at, recovery_payload) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.journal_id).bind(&rec.op_id).bind(&rec.phase).bind(&rec.pre_view_oid)
+            .bind(&rec.target_view_oid).bind(&rec.owner).bind(rec.updated_at).bind(&rec.recovery_payload)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "operation_journal", e))?;
+        }
+    );
+
+    // 23. change_identity
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "change_identity",
+        read_redb_page_str,
+        redb_state::CHANGE_IDENTITY_TABLE,
+        |_k, raw, c| {
+            let rec: ChangeIdentityRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO change_identity (change_id, repo_id, origin, created_op_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.change_id).bind(&rec.repo_id).bind(&rec.origin)
+            .bind(&rec.created_op_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "change_identity", e))?;
+        }
+    );
+
+    // 24. change_revision
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "change_revision",
+        read_redb_page_str2,
+        redb_state::CHANGE_REVISION_TABLE,
+        |_k, raw, c| {
+            let rec: ChangeRevisionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO change_revision (change_id, commit_oid, created_op_id, visibility, revision_ordinal) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.change_id).bind(&rec.commit_oid).bind(&rec.created_op_id)
+            .bind(&rec.visibility).bind(rec.revision_ordinal)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "change_revision", e))?;
+        }
+    );
+
+    // 25. change_predecessor
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "change_predecessor",
+        read_redb_page_str3,
+        redb_state::CHANGE_PREDECESSOR_TABLE,
+        |_k, raw, c| {
+            let rec: ChangePredecessorRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO change_predecessor (successor_oid, predecessor_oid, op_id, relation_kind, ordinal) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.successor_oid).bind(&rec.predecessor_oid).bind(&rec.op_id)
+            .bind(&rec.relation_kind).bind(rec.ordinal)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "change_predecessor", e))?;
+        }
+    );
+
+    // 26. ai_operation_link
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_operation_link",
+        read_redb_page_str,
+        redb_state::AI_OPERATION_LINK_TABLE,
+        |_k, raw, c| {
+            let rec: AiOperationLinkRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_operation_link \
+                 (operation_id, session_id, run_id, tool_invocation_id, intent_id, repo_id, worktree_id, \
+                  workspace_id, lease_generation, config_provenance_digest, redaction_version, change_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.operation_id).bind(&rec.session_id).bind(&rec.run_id)
+            .bind(&rec.tool_invocation_id).bind(&rec.intent_id).bind(&rec.repo_id)
+            .bind(&rec.worktree_id).bind(&rec.workspace_id).bind(rec.lease_generation)
+            .bind(&rec.config_provenance_digest).bind(&rec.redaction_version).bind(&rec.change_id)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_operation_link", e))?;
+        }
+    );
+
+    // 27. working_dirty
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "working_dirty",
+        read_redb_page_str3,
+        redb_state::WORKING_DIRTY_TABLE,
+        |_k, raw, c| {
+            let rec: WorkingDirtyEntryRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO working_dirty (worktree_id, path, kind, source, marked_at, verified_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.path).bind(&rec.kind)
+            .bind(&rec.source).bind(rec.marked_at).bind(rec.verified_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "working_dirty", e))?;
+        }
+    );
+
+    // 28. working_dirty_meta
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "working_dirty_meta",
+        read_redb_page_str,
+        redb_state::WORKING_DIRTY_META_TABLE,
+        |_k, raw, c| {
+            let rec: WorkingDirtyMetaRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO working_dirty_meta (worktree_id, state, index_fingerprint, head_oid, scanned_at, scan_lock_pid, scan_lock_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.state).bind(&rec.index_fingerprint)
+            .bind(&rec.head_oid).bind(rec.scanned_at).bind(rec.scan_lock_pid).bind(rec.scan_lock_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "working_dirty_meta", e))?;
+        }
+    );
+
+    // 29. layer
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "layer",
+        read_redb_page_str2,
+        redb_state::LAYER_TABLE,
+        |_k, raw, c| {
+            let rec: LayerRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO layer (worktree_id, name, source, priority, enabled, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.name).bind(&rec.source).bind(rec.priority)
+            .bind(i64::from(rec.enabled)).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "layer", e))?;
+        }
+    );
+
+    // 30. layer_path
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "layer_path",
+        read_redb_page_str2,
+        redb_state::LAYER_PATH_TABLE,
+        |_k, raw, c| {
+            let rec: LayerPathRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash, materialized_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.worktree_id).bind(&rec.layer_name).bind(&rec.path)
+            .bind(&rec.content_hash).bind(rec.materialized_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "layer_path", e))?;
+        }
+    );
+
+    // 31. sparse_view
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "sparse_view",
+        read_redb_page_str_i64,
+        redb_state::SPARSE_VIEW_TABLE,
+        |key, raw, c| {
+            let (worktree_id, ordinal) = key;
+            let pattern: MigStringValue = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
+            )
+            .bind(&worktree_id)
+            .bind(&pattern.value)
+            .bind(ordinal)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "sparse_view", e))?;
+        }
+    );
+
+    // 32. sparse_view_meta
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "sparse_view_meta",
+        read_redb_page_str,
+        redb_state::SPARSE_VIEW_META_TABLE,
+        |worktree_id, raw, c| {
+            let enabled: MigBoolValue = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?)",
+            )
+            .bind(&worktree_id)
+            .bind(i64::from(enabled.value))
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "sparse_view_meta", e))?;
+        }
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn export_reverse_rb05b_state_tables(
+    git_wtx: &redb::WriteTransaction,
+    existing: &BTreeSet<String>,
+    conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    counts: &mut BTreeMap<&'static str, u64>,
+    cv: u16,
+) -> StorageResult<()> {
+    let r = DatabaseRole::Repository;
+
+    // 33. ai_thread
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_thread",
+        read_redb_page_str,
+        redb_state::AI_THREAD_TABLE,
+        |_k, raw, c| {
+            let rec: AiThreadRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_thread (thread_id, title, owner_kind, owner_id, owner_display_name, current_intent_id, latest_intent_id, metadata_json, archived, version, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.title).bind(&rec.owner_kind).bind(&rec.owner_id)
+            .bind(&rec.owner_display_name).bind(&rec.current_intent_id).bind(&rec.latest_intent_id)
+            .bind(&rec.metadata_json).bind(i64::from(rec.archived)).bind(rec.version)
+            .bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_thread", e))?;
+        }
+    );
+
+    // 34. ai_thread_participant
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_thread_participant",
+        read_redb_page_str3,
+        redb_state::AI_THREAD_PARTICIPANT_TABLE,
+        |_k, raw, c| {
+            let rec: AiThreadParticipantRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_thread_participant (thread_id, actor_kind, actor_id, actor_display_name, role, joined_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.actor_kind).bind(&rec.actor_id)
+            .bind(&rec.actor_display_name).bind(&rec.role).bind(rec.joined_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_thread_participant", e))?;
+        }
+    );
+
+    // 35. ai_thread_intent
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_thread_intent",
+        read_redb_page_str2,
+        redb_state::AI_THREAD_INTENT_TABLE,
+        |_k, raw, c| {
+            let rec: AiThreadIntentRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_thread_intent (thread_id, intent_id, ordinal, is_head, linked_at, link_reason) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.intent_id).bind(rec.ordinal)
+            .bind(i64::from(rec.is_head)).bind(rec.linked_at).bind(&rec.link_reason)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_thread_intent", e))?;
+        }
+    );
+
+    // 36. ai_thread_provider_metadata
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_thread_provider_metadata",
+        read_redb_page_str,
+        redb_state::AI_THREAD_PROVIDER_METADATA_TABLE,
+        |_k, raw, c| {
+            let rec: AiThreadProviderMetadataRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_thread_provider_metadata (thread_id, legacy_session_id, provider_thread_id, provider_kind, metadata_json, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.legacy_session_id).bind(&rec.provider_thread_id)
+            .bind(&rec.provider_kind).bind(&rec.metadata_json).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_thread_provider_metadata", e))?;
+        }
+    );
+
+    // 37. ai_scheduler_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_scheduler_state",
+        read_redb_page_str,
+        redb_state::AI_SCHEDULER_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: AiSchedulerStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_scheduler_state (thread_id, selected_plan_id, active_task_id, active_run_id, metadata_json, version, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.selected_plan_id).bind(&rec.active_task_id)
+            .bind(&rec.active_run_id).bind(&rec.metadata_json).bind(rec.version).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_scheduler_state", e))?;
+        }
+    );
+
+    // 38. ai_scheduler_plan_head
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_scheduler_plan_head",
+        read_redb_page_str2,
+        redb_state::AI_SCHEDULER_PLAN_HEAD_TABLE,
+        |_k, raw, c| {
+            let rec: AiSchedulerPlanHeadRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_scheduler_plan_head (thread_id, plan_id, ordinal) VALUES (?, ?, ?)",
+            )
+            .bind(&rec.thread_id)
+            .bind(&rec.plan_id)
+            .bind(rec.ordinal)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "ai_scheduler_plan_head", e))?;
+        }
+    );
+
+    // 39. ai_scheduler_selected_plan
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_scheduler_selected_plan",
+        read_redb_page_str2,
+        redb_state::AI_SCHEDULER_SELECTED_PLAN_TABLE,
+        |_k, raw, c| {
+            let rec: AiSchedulerSelectedPlanRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_scheduler_selected_plan (thread_id, plan_id, ordinal) VALUES (?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.plan_id).bind(rec.ordinal)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_scheduler_selected_plan", e))?;
+        }
+    );
+
+    // 40. ai_live_context_window
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_live_context_window",
+        read_redb_page_str2,
+        redb_state::AI_LIVE_CONTEXT_WINDOW_TABLE,
+        |_k, raw, c| {
+            let rec: AiLiveContextWindowRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_live_context_window (thread_id, context_frame_id, position, source_kind, pin_kind, inserted_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.thread_id).bind(&rec.context_frame_id).bind(rec.position)
+            .bind(&rec.source_kind).bind(&rec.pin_kind).bind(rec.inserted_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_live_context_window", e))?;
+        }
+    );
+
+    // 41. ai_index_intent_plan
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_intent_plan",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_INTENT_PLAN_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexIntentPlanRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_intent_plan (intent_id, plan_id, created_at) VALUES (?, ?, ?)",
+            )
+            .bind(&rec.intent_id).bind(&rec.plan_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_intent_plan", e))?;
+        }
+    );
+
+    // 42. ai_index_intent_task
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_intent_task",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_INTENT_TASK_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexIntentTaskRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_intent_task (intent_id, task_id, parent_task_id, origin_step_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.intent_id).bind(&rec.task_id).bind(&rec.parent_task_id)
+            .bind(&rec.origin_step_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_intent_task", e))?;
+        }
+    );
+
+    // 43. ai_index_plan_step_task
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_plan_step_task",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_PLAN_STEP_TASK_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexPlanStepTaskRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_plan_step_task (plan_id, task_id, step_id, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&rec.plan_id).bind(&rec.task_id).bind(&rec.step_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_plan_step_task", e))?;
+        }
+    );
+
+    // 44. ai_index_task_run
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_task_run",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_TASK_RUN_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexTaskRunRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_task_run (task_id, run_id, is_latest, created_at, base_commit_ref) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.task_id).bind(&rec.run_id).bind(i64::from(rec.is_latest))
+            .bind(rec.created_at).bind(&rec.base_commit_ref)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_task_run", e))?;
+        }
+    );
+
+    // 45. ai_index_run_event
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_run_event",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_RUN_EVENT_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexRunEventRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_run_event (run_id, event_id, event_kind, is_latest, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.run_id).bind(&rec.event_id).bind(&rec.event_kind)
+            .bind(i64::from(rec.is_latest)).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_run_event", e))?;
+        }
+    );
+
+    // 46. ai_index_run_patchset
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_run_patchset",
+        read_redb_page_str2,
+        redb_state::AI_INDEX_RUN_PATCHSET_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexRunPatchsetRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_run_patchset (run_id, patchset_id, sequence, is_latest, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.run_id).bind(&rec.patchset_id).bind(rec.sequence)
+            .bind(i64::from(rec.is_latest)).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_run_patchset", e))?;
+        }
+    );
+
+    // 47. ai_index_intent_context_frame
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_index_intent_context_frame",
+        read_redb_page_str3,
+        redb_state::AI_INDEX_INTENT_CONTEXT_FRAME_TABLE,
+        |_k, raw, c| {
+            let rec: AiIndexIntentContextFrameRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_index_intent_context_frame (intent_id, context_frame_id, relation_kind, created_at) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&rec.intent_id).bind(&rec.context_frame_id)
+            .bind(&rec.relation_kind).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_index_intent_context_frame", e))?;
+        }
+    );
+
+    // 48. ai_validation_report
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_validation_report",
+        read_redb_page_str,
+        redb_state::AI_VALIDATION_REPORT_TABLE,
+        |_k, raw, c| {
+            let rec: AiValidationReportRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_validation_report (report_id, thread_id, run_id, policy_version, stale, is_latest, summary_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.report_id).bind(&rec.thread_id).bind(&rec.run_id).bind(&rec.policy_version)
+            .bind(i64::from(rec.stale)).bind(i64::from(rec.is_latest)).bind(&rec.summary_json)
+            .bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_validation_report", e))?;
+        }
+    );
+
+    // 49. ai_risk_score_breakdown
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_risk_score_breakdown",
+        read_redb_page_str,
+        redb_state::AI_RISK_SCORE_BREAKDOWN_TABLE,
+        |_k, raw, c| {
+            let rec: AiRiskScoreBreakdownRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_risk_score_breakdown (breakdown_id, thread_id, validation_report_id, policy_version, stale, is_latest, summary_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.breakdown_id).bind(&rec.thread_id).bind(&rec.validation_report_id)
+            .bind(&rec.policy_version).bind(i64::from(rec.stale)).bind(i64::from(rec.is_latest))
+            .bind(&rec.summary_json).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_risk_score_breakdown", e))?;
+        }
+    );
+
+    // 50. ai_decision_proposal
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_decision_proposal",
+        read_redb_page_str,
+        redb_state::AI_DECISION_PROPOSAL_TABLE,
+        |_k, raw, c| {
+            let rec: AiDecisionProposalRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_decision_proposal (proposal_id, thread_id, validation_report_id, risk_score_breakdown_id, policy_version, stale, is_latest, summary_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.proposal_id).bind(&rec.thread_id).bind(&rec.validation_report_id)
+            .bind(&rec.risk_score_breakdown_id).bind(&rec.policy_version)
+            .bind(i64::from(rec.stale)).bind(i64::from(rec.is_latest))
+            .bind(&rec.summary_json).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_decision_proposal", e))?;
+        }
+    );
+
+    // 51. ai_final_decision
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "ai_final_decision",
+        read_redb_page_str,
+        redb_state::AI_FINAL_DECISION_TABLE,
+        |_k, raw, c| {
+            let rec: AiFinalDecisionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO ai_final_decision (decision_id, thread_id, decision_proposal_id, validation_report_id, policy_version, verdict, stale, is_latest, summary_json, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.decision_id).bind(&rec.thread_id).bind(&rec.decision_proposal_id)
+            .bind(&rec.validation_report_id).bind(&rec.policy_version).bind(&rec.verdict)
+            .bind(i64::from(rec.stale)).bind(i64::from(rec.is_latest))
+            .bind(&rec.summary_json).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "ai_final_decision", e))?;
+        }
+    );
+
+    // 52. approved_permission
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "approved_permission",
+        read_redb_page_str3,
+        redb_state::APPROVED_PERMISSION_TABLE,
+        |_k, raw, c| {
+            let rec: ApprovedPermissionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO approved_permission (project_id, permission, pattern, created_at, source_worktree_id, source_session_id, source_workspace_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.project_id).bind(&rec.permission).bind(&rec.pattern).bind(rec.created_at)
+            .bind(&rec.source_worktree_id).bind(&rec.source_session_id).bind(&rec.source_workspace_id)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "approved_permission", e))?;
+        }
+    );
+
+    // 53. automation_log
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "automation_log",
+        read_redb_page_str,
+        redb_state::AUTOMATION_LOG_TABLE,
+        |_k, raw, c| {
+            let rec: AutomationLogRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO automation_log (id, rule_id, trigger_kind, action_kind, status, message, started_at, finished_at, details_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.id).bind(&rec.rule_id).bind(&rec.trigger_kind).bind(&rec.action_kind)
+            .bind(&rec.status).bind(&rec.message).bind(&rec.started_at)
+            .bind(&rec.finished_at).bind(&rec.details_json)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "automation_log", e))?;
+        }
+    );
+
+    // 54. source_call_log
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "source_call_log",
+        read_redb_page_str,
+        redb_state::SOURCE_CALL_LOG_TABLE,
+        |_k, raw, c| {
+            let rec: SourceCallLogRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO source_call_log (id, session_id, source_slug, tool_name, registered_tool_name, tool_call_id, credential_ref, latency_ms, input_bytes, output_bytes, cost_estimate_micros, approval_decision, state_namespace, success, created_at, agent_run_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.id).bind(&rec.session_id).bind(&rec.source_slug).bind(&rec.tool_name)
+            .bind(&rec.registered_tool_name).bind(&rec.tool_call_id).bind(&rec.credential_ref)
+            .bind(rec.latency_ms).bind(rec.input_bytes).bind(rec.output_bytes)
+            .bind(rec.cost_estimate_micros).bind(&rec.approval_decision).bind(&rec.state_namespace)
+            .bind(i64::from(rec.success)).bind(&rec.created_at).bind(&rec.agent_run_id)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "source_call_log", e))?;
+        }
+    );
+
+    // 55. memory_episode
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_episode",
+        read_redb_page_str,
+        redb_state::MEMORY_EPISODE_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryEpisodeRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_episode (episode_id, repo_id, source_kind, source_key, outcome, actor, started_at, ended_at, anchor_commit, change_id, title, body, content_digest, producer, rules_version) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.episode_id).bind(&rec.repo_id).bind(rec.source_kind.as_str())
+            .bind(&rec.source_key).bind(rec.outcome.as_str()).bind(&rec.actor)
+            .bind(rec.started_at).bind(rec.ended_at).bind(&rec.anchor_commit)
+            .bind(&rec.change_id).bind(&rec.title).bind(&rec.body)
+            .bind(&rec.content_digest).bind(&rec.producer).bind(rec.rules_version)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_episode", e))?;
+        }
+    );
+
+    // 56. memory_episode_evidence
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_episode_evidence",
+        read_redb_page_str_i64,
+        redb_state::MEMORY_EPISODE_EVIDENCE_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryEpisodeEvidenceRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_episode_evidence (episode_id, ordinal, kind, ref_id, link_confidence, resolution_status) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.episode_id).bind(rec.ordinal).bind(rec.kind.as_str())
+            .bind(&rec.ref_id).bind(rec.link_confidence.as_str())
+            .bind(rec.resolution_status.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_episode_evidence", e))?;
+        }
+    );
+
+    // 57. memory_projection_state
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_projection_state",
+        read_redb_page_str2,
+        redb_state::MEMORY_PROJECTION_STATE_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryProjectionStateRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_projection_state (repo_id, source_kind, cursor_json, fingerprint, rules_version, schema_version, horizon_truncated, revoked_count, aged_out_count, rebuilt_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.repo_id).bind(rec.source_kind.as_str()).bind(&rec.cursor_json)
+            .bind(&rec.fingerprint).bind(rec.rules_version).bind(rec.schema_version)
+            .bind(i64::from(rec.horizon_truncated)).bind(rec.revoked_count)
+            .bind(rec.aged_out_count).bind(rec.rebuilt_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_projection_state", e))?;
+        }
+    );
+
+    // 58. memory_episode_path
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_episode_path",
+        read_redb_page_str_bytes,
+        redb_state::MEMORY_EPISODE_PATH_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryEpisodePathRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_episode_path (episode_id, code_path, change_kind, blob_oid_at_end, ended_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.episode_id).bind(&rec.code_path).bind(rec.change_kind.as_str())
+            .bind(&rec.blob_oid_at_end).bind(rec.ended_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_episode_path", e))?;
+        }
+    );
+
+    // 59. memory_episode_search_doc (FTS5 virtual table)
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "memory_episode_search_doc",
+        read_redb_page_i64,
+        redb_state::MEMORY_EPISODE_SEARCH_DOC_TABLE,
+        |_k, raw, c| {
+            let rec: MemoryEpisodeSearchDocRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO memory_episode_search_doc (rowid, episode_id, title, body, paths_text) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(rec.rowid).bind(&rec.episode_id).bind(&rec.title)
+            .bind(&rec.body).bind(&rec.paths_text)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "memory_episode_search_doc", e))?;
+        }
+    );
+
+    // 60. agent_bridge_publication
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_publication",
+        read_redb_page_str,
+        redb_git::BRIDGE_PUBLICATION_TABLE,
+        |op_id, raw, c| {
+            let rec: MigBridgePublicationStoredRow =
+                decode_versioned(&raw, redb_git::GIT_BRIDGE_PUB_CODEC_VERSION)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_publication (operation_id, commit_oid, phase) VALUES (?, ?, ?)",
+            )
+            .bind(&op_id).bind(&rec.commit_oid).bind(rec.phase.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_publication", e))?;
+        }
+    );
+
+    // 61. agent_bridge_index_publication
+    stream_redb_to_sqlite!(
+        git_wtx,
+        existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_index_publication",
+        read_redb_page_str,
+        redb_state::AGENT_BRIDGE_INDEX_PUBLICATION_TABLE,
+        |op_id, raw, c| {
+            let rec: MigBridgeIndexPublicationStoredRow = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_index_publication (operation_id, index_digest, phase) VALUES (?, ?, ?)",
+            )
+            .bind(&op_id).bind(&rec.index_digest).bind(rec.phase.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_index_publication", e))?;
+        }
+    );
+
+    Ok(())
+}
+
+/// Export all 25 Capture source tables directly from the held uncommitted
+/// `&capture_wtx` into `capture.db.tmp` (`RB-11i` AC1 & AC6).
+#[allow(clippy::too_many_lines)]
+async fn export_reverse_capture_tables_to_sqlite(
+    cap_wtx: &redb::WriteTransaction,
+    conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<BTreeMap<&'static str, u64>> {
+    let existing = list_existing_redb_tables(cap_wtx)?;
+    let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let r = DatabaseRole::Capture;
+    let cv = redb_cap::CAPTURE_CODEC_VERSION;
+
+    // 1. schema_versions
+    {
+        let has_cap_receipts = if existing.contains(redb_cap::SCHEMA_VERSIONS_TABLE.name()) {
+            let tbl = cap_wtx
+                .open_table(redb_cap::SCHEMA_VERSIONS_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open capture schema_versions"))?;
+            tbl.len()
+                .map_err(|e| map_redb_storage_err(e, "len capture schema_versions"))?
+                > 0
+        } else {
+            false
+        };
+        if has_cap_receipts {
+            sea_orm::sqlx::query("DELETE FROM schema_versions")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+            stream_redb_to_sqlite!(
+                cap_wtx,
+                &existing,
+                conn,
+                r,
+                telemetry,
+                counts,
+                "schema_versions",
+                read_redb_page_i64,
+                redb_cap::SCHEMA_VERSIONS_TABLE,
+                |_k, raw, c| {
+                    let rec: CaptureSchemaVersionRecord = decode_versioned(&raw, cv)?;
+                    sea_orm::sqlx::query(
+                        "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+                    )
+                    .bind(rec.version)
+                    .bind(&rec.name)
+                    .bind(&rec.applied_at)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+                }
+            );
+        } else {
+            let seeded: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM schema_versions")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "schema_versions", e))?;
+            counts.insert("schema_versions", u64::try_from(seeded).unwrap_or(0));
+        }
+    }
+
+    // 2. capture_catalog_copy_receipt
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "capture_catalog_copy_receipt",
+        read_redb_page_i64,
+        redb_cap::CAPTURE_CATALOG_COPY_RECEIPT_TABLE,
+        |_k, raw, c| {
+            let rec: CaptureCatalogCopyReceiptRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO capture_catalog_copy_receipt (id, copied_at) VALUES (?, ?)",
+            )
+            .bind(rec.id)
+            .bind(&rec.copied_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "capture_catalog_copy_receipt", e))?;
+        }
+    );
+
+    // 3. agent_audit_log
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_audit_log",
+        read_redb_page_str,
+        redb_cap::AGENT_AUDIT_LOG_TABLE,
+        |_k, raw, c| {
+            let rec: AgentAuditLogRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_audit_log (audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.audit_id).bind(&rec.timestamp).bind(&rec.user_id).bind(&rec.user_name)
+            .bind(&rec.action).bind(&rec.checkpoint_id).bind(&rec.scope).bind(&rec.export_path)
+            .bind(&rec.justification).bind(i64::from(rec.granted))
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_audit_log", e))?;
+        }
+    );
+
+    // 4. agent_bridge_session
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_session",
+        read_redb_page_str,
+        redb_cap::AGENT_BRIDGE_SESSION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeSessionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_session (bridge_session_id, source, repository_id, worktree_id, workspace_id, parent_session_id, agent_id, session_state, schema_version, last_event_seq, last_acked_seq, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.bridge_session_id).bind(&rec.source).bind(&rec.repository_id)
+            .bind(&rec.worktree_id).bind(&rec.workspace_id).bind(&rec.parent_session_id)
+            .bind(&rec.agent_id).bind(rec.session_state.as_str()).bind(rec.schema_version)
+            .bind(rec.last_event_seq).bind(rec.last_acked_seq).bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_session", e))?;
+        }
+    );
+
+    // 5. agent_bridge_checkpoint
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_checkpoint",
+        read_redb_page_str,
+        redb_cap::AGENT_BRIDGE_CHECKPOINT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeCheckpointRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_checkpoint (checkpoint_id, bridge_session_id, agent_checkpoint_id, target_oid, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.checkpoint_id).bind(&rec.bridge_session_id).bind(&rec.agent_checkpoint_id)
+            .bind(&rec.target_oid).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_checkpoint", e))?;
+        }
+    );
+
+    // 6. agent_bridge_event
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_event",
+        read_redb_page_i64,
+        redb_cap::AGENT_BRIDGE_EVENT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeEventRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_event (event_id, bridge_session_id, event_seq, event_type, payload_sha256, payload, operation_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(rec.event_id).bind(&rec.bridge_session_id).bind(rec.event_seq)
+            .bind(&rec.event_type).bind(&rec.payload_sha256).bind(&rec.payload)
+            .bind(&rec.operation_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_event", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_i64(
+        cap_wtx,
+        &existing,
+        redb_cap::CAPTURE_SEQUENCES_TABLE,
+        MIG_SEQ_KEY_BRIDGE_EVENT,
+        cv,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "agent_bridge_event", seq).await?;
+    }
+
+    // 7. agent_bridge_link
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_link",
+        read_redb_page_i64,
+        redb_cap::AGENT_BRIDGE_LINK_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeLinkRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_link (link_id, bridge_session_id, source_type, source_id, target_type, target_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(rec.link_id).bind(&rec.bridge_session_id).bind(rec.source_type.as_str())
+            .bind(&rec.source_id).bind(&rec.target_type).bind(&rec.target_id).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_link", e))?;
+        }
+    );
+    if let Some(seq) = read_redb_seq_i64(
+        cap_wtx,
+        &existing,
+        redb_cap::CAPTURE_SEQUENCES_TABLE,
+        MIG_SEQ_KEY_BRIDGE_LINK,
+        cv,
+    )? {
+        sync_reverse_sqlite_sequence(conn, r, "agent_bridge_link", seq).await?;
+    }
+
+    // 8. agent_bridge_operation
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_bridge_operation",
+        read_redb_page_str,
+        redb_cap::AGENT_BRIDGE_OPERATION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentBridgeOperationRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_bridge_operation (operation_id, bridge_session_id, method, params_digest, repository_id, workspace_id, status, result_digest, created_at, completed_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.operation_id).bind(&rec.bridge_session_id).bind(&rec.method)
+            .bind(&rec.params_digest).bind(&rec.repository_id).bind(&rec.workspace_id)
+            .bind(rec.status.as_str()).bind(&rec.result_digest).bind(rec.created_at).bind(rec.completed_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_bridge_operation", e))?;
+        }
+    );
+
+    // 9. agent_capture_cloud_base
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_capture_cloud_base",
+        read_redb_page_str,
+        redb_cap::AGENT_CAPTURE_CLOUD_BASE_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCaptureCloudBaseRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_capture_cloud_base (repo_id, remote_generation, updated_at) VALUES (?, ?, ?)",
+            )
+            .bind(&rec.repo_id).bind(rec.remote_generation).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_capture_cloud_base", e))?;
+        }
+    );
+
+    // 10. agent_capture_incarnation
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_capture_incarnation",
+        read_redb_page_str2,
+        redb_cap::AGENT_CAPTURE_INCARNATION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCaptureIncarnationRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_capture_incarnation (agent_kind, provider_session_id, next_session_sync_revision, source_namespace, updated_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.agent_kind).bind(&rec.provider_session_id)
+            .bind(rec.next_session_sync_revision).bind(&rec.source_namespace).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_capture_incarnation", e))?;
+        }
+    );
+
+    // 11. agent_import_tombstone (exported BEFORE agent_session/agent_checkpoint so
+    //     SQLite tombstone triggers protect all subsequent intent & queue writes!)
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_import_tombstone",
+        read_redb_page_str,
+        redb_cap::AGENT_IMPORT_TOMBSTONE_TABLE,
+        |_k, raw, c| {
+            let rec: AgentImportTombstoneRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_import_tombstone (tombstone_id, agent_kind, provider_session_id, erased_session_id, source_fingerprint, erased_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.tombstone_id).bind(&rec.agent_kind).bind(&rec.provider_session_id)
+            .bind(&rec.erased_session_id).bind(&rec.source_fingerprint).bind(rec.erased_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+        }
+    );
+
+    // 12. agent_session
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_session",
+        read_redb_page_str,
+        redb_cap::AGENT_SESSION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentSessionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_session \
+                 (session_id, agent_kind, provider_session_id, thread_id, state, working_dir, worktree_id, \
+                  parent_commit, parent_session_id, metadata_json, redaction_report, started_at, last_event_at, \
+                  stopped_at, schema_version, sync_revision, repo_id, workspace_id, workspace_fence, scope_state) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.session_id).bind(rec.agent_kind.as_str()).bind(&rec.provider_session_id)
+            .bind(&rec.thread_id).bind(rec.state.as_str()).bind(&rec.working_dir)
+            .bind(&rec.worktree_id).bind(&rec.parent_commit).bind(&rec.parent_session_id)
+            .bind(&rec.metadata_json).bind(&rec.redaction_report).bind(rec.started_at)
+            .bind(rec.last_event_at).bind(rec.stopped_at).bind(rec.schema_version)
+            .bind(rec.sync_revision).bind(&rec.repo_id).bind(&rec.workspace_id)
+            .bind(rec.workspace_fence).bind(rec.scope_state.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+        }
+    );
+
+    // 13. agent_checkpoint
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_checkpoint",
+        read_redb_page_str,
+        redb_cap::AGENT_CHECKPOINT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCheckpointRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_checkpoint \
+                 (checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit, tree_oid, \
+                  metadata_blob_oid, traces_commit, tool_use_id, subagent_session_id, description, created_at, sync_revision) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.checkpoint_id).bind(&rec.session_id).bind(&rec.parent_checkpoint_id)
+            .bind(rec.scope.as_str()).bind(&rec.parent_commit).bind(&rec.tree_oid)
+            .bind(&rec.metadata_blob_oid).bind(&rec.traces_commit).bind(&rec.tool_use_id)
+            .bind(&rec.subagent_session_id).bind(&rec.description).bind(rec.created_at)
+            .bind(rec.sync_revision)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_checkpoint", e))?;
+        }
+    );
+
+    // 14. agent_checkpoint_prune_tombstone
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_checkpoint_prune_tombstone",
+        read_redb_page_str,
+        redb_cap::AGENT_CHECKPOINT_PRUNE_TOMBSTONE_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCheckpointPruneTombstoneRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_checkpoint_prune_tombstone (checkpoint_id, session_id, pruned_at) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&rec.checkpoint_id).bind(&rec.session_id).bind(rec.pruned_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_checkpoint_prune_tombstone", e))?;
+        }
+    );
+
+    // 15. agent_coverage_claim
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_coverage_claim",
+        read_redb_page_str2_i64,
+        redb_cap::AGENT_COVERAGE_CLAIM_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCoverageClaimRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_coverage_claim \
+                 (session_id, logical_turn_key, coverage_schema_version, coverage_digest, completeness, revision, \
+                  state, attempt_checkpoint_id, owner, lease_expires_at, fence_token, checkpoint_id, traces_commit, \
+                  source_channel, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.session_id).bind(&rec.logical_turn_key).bind(rec.coverage_schema_version)
+            .bind(&rec.coverage_digest).bind(rec.completeness.as_str()).bind(rec.revision)
+            .bind(rec.state.as_str()).bind(&rec.attempt_checkpoint_id).bind(&rec.owner)
+            .bind(rec.lease_expires_at).bind(rec.fence_token).bind(&rec.checkpoint_id)
+            .bind(&rec.traces_commit).bind(rec.source_channel.as_str())
+            .bind(rec.created_at).bind(rec.updated_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_coverage_claim", e))?;
+        }
+    );
+
+    // 16. agent_coverage_conflict
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_coverage_conflict",
+        read_redb_page_str2_i64,
+        redb_cap::AGENT_COVERAGE_CONFLICT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCoverageConflictRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_coverage_conflict \
+                 (session_id, logical_turn_key, coverage_schema_version, incumbent_revision, incumbent_digest, \
+                  incumbent_checkpoint_id, incoming_digest, incoming_source_channel, incoming_observed_at, \
+                  incoming_canonical_json, incoming_redaction_report_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.session_id).bind(&rec.logical_turn_key).bind(rec.coverage_schema_version)
+            .bind(rec.incumbent_revision).bind(&rec.incumbent_digest).bind(&rec.incumbent_checkpoint_id)
+            .bind(&rec.incoming_digest).bind(rec.incoming_source_channel.as_str())
+            .bind(rec.incoming_observed_at).bind(&rec.incoming_canonical_json)
+            .bind(&rec.incoming_redaction_report_json)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_coverage_conflict", e))?;
+        }
+    );
+
+    // 17. agent_coverage_revision
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_coverage_revision",
+        read_redb_page_str2_i64_2,
+        redb_cap::AGENT_COVERAGE_REVISION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentCoverageRevisionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_coverage_revision \
+                 (session_id, logical_turn_key, coverage_schema_version, revision, checkpoint_id, coverage_digest, completeness, source_channel, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.session_id).bind(&rec.logical_turn_key).bind(rec.coverage_schema_version)
+            .bind(rec.revision).bind(&rec.checkpoint_id).bind(&rec.coverage_digest)
+            .bind(rec.completeness.as_str()).bind(rec.source_channel.as_str()).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_coverage_revision", e))?;
+        }
+    );
+
+    // 18. agent_export_job
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_export_job",
+        read_redb_page_str,
+        redb_cap::AGENT_EXPORT_JOB_TABLE,
+        |_k, raw, c| {
+            let rec: AgentExportJobRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_export_job \
+                 (job_id, agent_kind, provider_session_id, owner, lease_expires_at, fence_token, \
+                  observed_generation, processed_generation, state, last_error_code, created_at, updated_at, \
+                  ttl_expires_at, repo_id, worktree_id, workspace_id, workspace_fence, scope_state) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.job_id).bind(&rec.agent_kind).bind(&rec.provider_session_id).bind(&rec.owner)
+            .bind(rec.lease_expires_at).bind(rec.fence_token).bind(rec.observed_generation)
+            .bind(rec.processed_generation).bind(rec.state.as_str()).bind(&rec.last_error_code)
+            .bind(rec.created_at).bind(rec.updated_at).bind(rec.ttl_expires_at).bind(&rec.repo_id)
+            .bind(&rec.worktree_id).bind(&rec.workspace_id).bind(rec.workspace_fence)
+            .bind(rec.scope_state.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_export_job", e))?;
+        }
+    );
+
+    // 19. agent_import_identity
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_import_identity",
+        read_redb_page_str,
+        redb_cap::AGENT_IMPORT_IDENTITY_TABLE,
+        |_k, raw, c| {
+            let rec: AgentImportIdentityRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_import_identity \
+                 (identity_id, agent_kind, provider_session_id, source_kind, source_id, schema_version, \
+                  observed_digest, committed_digest, attempt_id, attempt_checkpoint_id, next_ordinal, state, \
+                  owner, lease_expires_at, fence_token, last_error_code, created_at, updated_at, repo_id, \
+                  worktree_id, workspace_id, workspace_fence, scope_state) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.identity_id).bind(&rec.agent_kind).bind(&rec.provider_session_id)
+            .bind(&rec.source_kind).bind(&rec.source_id).bind(rec.schema_version)
+            .bind(&rec.observed_digest).bind(&rec.committed_digest).bind(&rec.attempt_id)
+            .bind(&rec.attempt_checkpoint_id).bind(rec.next_ordinal).bind(rec.state.as_str())
+            .bind(&rec.owner).bind(rec.lease_expires_at).bind(rec.fence_token)
+            .bind(&rec.last_error_code).bind(rec.created_at).bind(rec.updated_at)
+            .bind(&rec.repo_id).bind(&rec.worktree_id).bind(&rec.workspace_id)
+            .bind(rec.workspace_fence).bind(rec.scope_state.as_str())
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_identity", e))?;
+        }
+    );
+
+    // 20. agent_session_commit (stored as MarkerValue keyed by (session_id, hash_kind, commit_oid))
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_session_commit",
+        read_redb_page_str3,
+        redb_cap::AGENT_SESSION_COMMIT_TABLE,
+        |key, _raw, c| {
+            let (session_id, hash_kind, commit_oid) = key;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_session_commit (session_id, hash_kind, commit_oid) VALUES (?, ?, ?)",
+            )
+            .bind(&session_id).bind(&hash_kind).bind(&commit_oid)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_session_commit", e))?;
+        }
+    );
+
+    // 21. agent_subagent_content_claim
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_subagent_content_claim",
+        read_redb_page_str3_i64,
+        redb_cap::AGENT_SUBAGENT_CONTENT_CLAIM_TABLE,
+        |_k, raw, c| {
+            let rec: AgentSubagentContentClaimRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_subagent_content_claim \
+                 (parent_session_id, provider_kind, source_key, content_schema_version, current_revision, \
+                  current_checkpoint_id, current_digest, state, attempt_digest, attempt_checkpoint_id, owner, \
+                  lease_expires_at, fence_token, created_at, updated_at, revision_cursor, sync_revision) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.parent_session_id).bind(&rec.provider_kind).bind(&rec.source_key)
+            .bind(rec.content_schema_version).bind(rec.current_revision)
+            .bind(&rec.current_checkpoint_id).bind(&rec.current_digest).bind(rec.state.as_str())
+            .bind(&rec.attempt_digest).bind(&rec.attempt_checkpoint_id).bind(&rec.owner)
+            .bind(rec.lease_expires_at).bind(rec.fence_token).bind(rec.created_at)
+            .bind(rec.updated_at).bind(rec.revision_cursor).bind(rec.sync_revision)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_subagent_content_claim", e))?;
+        }
+    );
+
+    // 22. agent_subagent_content_revision
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_subagent_content_revision",
+        read_redb_page_str3_i64_2,
+        redb_cap::AGENT_SUBAGENT_CONTENT_REVISION_TABLE,
+        |_k, raw, c| {
+            let rec: AgentSubagentContentRevisionRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_subagent_content_revision \
+                 (parent_session_id, provider_kind, source_key, content_schema_version, revision, \
+                  checkpoint_id, content_digest, source_channel, partial, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.parent_session_id)
+            .bind(&rec.provider_kind)
+            .bind(&rec.source_key)
+            .bind(rec.content_schema_version)
+            .bind(rec.revision)
+            .bind(&rec.checkpoint_id)
+            .bind(&rec.content_digest)
+            .bind(rec.source_channel.as_str())
+            .bind(i64::from(rec.partial))
+            .bind(rec.created_at)
+            .execute(&mut *c)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_subagent_content_revision", e))?;
+        }
+    );
+
+    // 23. agent_subagent_link
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_subagent_link",
+        read_redb_page_str,
+        redb_cap::AGENT_SUBAGENT_LINK_TABLE,
+        |_k, raw, c| {
+            let rec: AgentSubagentLinkRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_subagent_link \
+                 (content_checkpoint_id, parent_session_id, link_state, boundary_checkpoint_id, stable_subagent_id, created_at, updated_at, sync_revision) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.content_checkpoint_id).bind(&rec.parent_session_id)
+            .bind(rec.link_state.as_str()).bind(&rec.boundary_checkpoint_id)
+            .bind(&rec.stable_subagent_id).bind(rec.created_at).bind(rec.updated_at)
+            .bind(rec.sync_revision)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_subagent_link", e))?;
+        }
+    );
+
+    // 24. agent_usage_stats
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_usage_stats",
+        read_redb_page_str,
+        redb_cap::AGENT_USAGE_STATS_TABLE,
+        |_k, raw, c| {
+            let rec: AgentUsageStatsRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_usage_stats \
+                 (id, session_id, thread_id, agent_run_id, run_id, provider, model, request_kind, intent, \
+                  prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, \
+                  tool_call_count, wall_clock_ms, provider_latency_ms, cost_estimate_micro_dollars, cost_usd, \
+                  usage_estimated, started_at, finished_at, success, error_kind, schema_version, created_at, \
+                  agent_name, repo_id, turn_id, event_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.id).bind(&rec.session_id).bind(&rec.thread_id).bind(&rec.agent_run_id)
+            .bind(&rec.run_id).bind(&rec.provider).bind(&rec.model).bind(&rec.request_kind)
+            .bind(&rec.intent).bind(rec.prompt_tokens).bind(rec.completion_tokens)
+            .bind(rec.cached_tokens).bind(rec.reasoning_tokens).bind(rec.total_tokens)
+            .bind(rec.tool_call_count).bind(rec.wall_clock_ms).bind(rec.provider_latency_ms)
+            .bind(rec.cost_estimate_micro_dollars).bind(rec.cost_usd)
+            .bind(i64::from(rec.usage_estimated)).bind(&rec.started_at).bind(&rec.finished_at)
+            .bind(i64::from(rec.success)).bind(&rec.error_kind).bind(rec.schema_version)
+            .bind(&rec.created_at).bind(&rec.agent_name).bind(&rec.repo_id)
+            .bind(&rec.turn_id).bind(&rec.event_id)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_usage_stats", e))?;
+        }
+    );
+
+    // 25. agent_workspace_scope_audit
+    stream_redb_to_sqlite!(
+        cap_wtx,
+        &existing,
+        conn,
+        r,
+        telemetry,
+        counts,
+        "agent_workspace_scope_audit",
+        read_redb_page_str,
+        redb_cap::AGENT_WORKSPACE_SCOPE_AUDIT_TABLE,
+        |_k, raw, c| {
+            let rec: AgentWorkspaceScopeAuditRecord = decode_versioned(&raw, cv)?;
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_workspace_scope_audit \
+                 (audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id, workspace_id, workspace_fence, actor, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rec.audit_id).bind(&rec.action).bind(&rec.agent_kind)
+            .bind(&rec.provider_session_id).bind(&rec.repo_id).bind(&rec.worktree_id)
+            .bind(&rec.workspace_id).bind(rec.workspace_fence).bind(&rec.actor).bind(rec.created_at)
+            .execute(&mut *c).await.map_err(|e| map_reverse_sqlite_write_err(r, "agent_workspace_scope_audit", e))?;
+        }
+    );
+
+    Ok(counts)
+}
+
+fn cap_wtx_has_dedup_key(
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    dedup_key: &str,
+) -> StorageResult<bool> {
+    if !existing_cap_tables.contains(redb_cap::CAPTURE_DEDUP_KEYS_TABLE.name()) {
+        return Ok(false);
+    }
+    let tbl = cap_wtx
+        .open_table(redb_cap::CAPTURE_DEDUP_KEYS_TABLE)
+        .map_err(|e| map_redb_table_err(e, "open capture_dedup_keys in reverse export"))?;
+    Ok(tbl
+        .get(dedup_key)
+        .map_err(|e| map_redb_storage_err(e, "lookup capture_dedup_keys in reverse export"))?
+        .is_some())
+}
+
+async fn apply_capture_batch_items_to_sqlite_tmp(
+    conn: &mut SqliteConnection,
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    items: &[CaptureBatchItem],
+) -> StorageResult<(u64, u64)> {
+    let r = DatabaseRole::Capture;
+    for item in items {
+        validate_capture_batch_item(item)?;
+    }
+    if items.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Pre-check source `capture.redb`'s `capture_dedup_keys` synchronously before
+    // opening the SQLite write transaction so no redb table guard crosses `.await`.
+    let mut pre_deduped = Vec::with_capacity(items.len());
+    for item in items {
+        pre_deduped.push(cap_wtx_has_dedup_key(
+            cap_wtx,
+            existing_cap_tables,
+            &item.dedup_key,
+        )?);
+    }
+
+    begin_reverse_sqlite_batch(conn, r, "capture_batch_replay").await?;
+    let res: StorageResult<(u64, u64)> = async {
+        let mut applied = 0u64;
+        let mut deduped = 0u64;
+
+        for (item, already_in_redb) in items.iter().zip(pre_deduped.into_iter()) {
+            if already_in_redb {
+                deduped = deduped.saturating_add(1);
+                continue;
+            }
+            let inserted = sea_orm::sqlx::query(
+                "INSERT OR IGNORE INTO temp._rev_mig_dedup_keys (dedup_key) VALUES (?)",
+            )
+            .bind(&item.dedup_key)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "_rev_mig_dedup_keys", e))?;
+            if inserted.rows_affected() == 0 {
+                deduped = deduped.saturating_add(1);
+                continue;
+            }
+
+            match &item.payload {
+                CaptureBatchPayload::UpsertSession(rec) => {
+                    let tomb: Option<i64> = sea_orm::sqlx::query_scalar(
+                        "SELECT 1 FROM agent_import_tombstone \
+                         WHERE (agent_kind = ? AND provider_session_id = ?) OR erased_session_id = ? \
+                         LIMIT 1",
+                    )
+                    .bind(rec.agent_kind.as_str())
+                    .bind(&rec.provider_session_id)
+                    .bind(&rec.session_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                    if tomb.is_some() {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "{CAPTURE_TOMBSTONE_ERROR_PREFIX}: agent session is protected by an erasure tombstone"
+                            ),
+                        });
+                    }
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_session \
+                         (session_id, agent_kind, provider_session_id, thread_id, state, working_dir, \
+                          worktree_id, parent_commit, parent_session_id, metadata_json, redaction_report, \
+                          started_at, last_event_at, stopped_at, schema_version, sync_revision, \
+                          repo_id, workspace_id, workspace_fence, scope_state) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(session_id) DO UPDATE SET \
+                          agent_kind = excluded.agent_kind, \
+                          provider_session_id = excluded.provider_session_id, \
+                          thread_id = excluded.thread_id, \
+                          state = excluded.state, \
+                          working_dir = excluded.working_dir, \
+                          worktree_id = excluded.worktree_id, \
+                          parent_commit = excluded.parent_commit, \
+                          parent_session_id = excluded.parent_session_id, \
+                          metadata_json = excluded.metadata_json, \
+                          redaction_report = excluded.redaction_report, \
+                          started_at = excluded.started_at, \
+                          last_event_at = excluded.last_event_at, \
+                          stopped_at = excluded.stopped_at, \
+                          schema_version = excluded.schema_version, \
+                          sync_revision = excluded.sync_revision, \
+                          repo_id = excluded.repo_id, \
+                          workspace_id = excluded.workspace_id, \
+                          workspace_fence = excluded.workspace_fence, \
+                          scope_state = excluded.scope_state",
+                    )
+                    .bind(&rec.session_id).bind(rec.agent_kind.as_str()).bind(&rec.provider_session_id)
+                    .bind(&rec.thread_id).bind(rec.state.as_str()).bind(&rec.working_dir)
+                    .bind(&rec.worktree_id).bind(&rec.parent_commit).bind(&rec.parent_session_id)
+                    .bind(&rec.metadata_json).bind(&rec.redaction_report).bind(rec.started_at)
+                    .bind(rec.last_event_at).bind(rec.stopped_at).bind(rec.schema_version)
+                    .bind(rec.sync_revision).bind(&rec.repo_id).bind(&rec.workspace_id)
+                    .bind(rec.workspace_fence).bind(rec.scope_state.as_str())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+                }
+                CaptureBatchPayload::UpsertCheckpoint(rec) => {
+                    let tomb: Option<i64> = sea_orm::sqlx::query_scalar(
+                        "SELECT 1 FROM agent_import_tombstone WHERE erased_session_id = ? LIMIT 1",
+                    )
+                    .bind(&rec.session_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                    if tomb.is_some() {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "{CAPTURE_TOMBSTONE_ERROR_PREFIX}: agent checkpoint is protected by an erasure tombstone"
+                            ),
+                        });
+                    }
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_checkpoint \
+                         (checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit, \
+                          tree_oid, metadata_blob_oid, traces_commit, tool_use_id, subagent_session_id, \
+                          description, created_at, sync_revision) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(checkpoint_id) DO UPDATE SET \
+                          session_id = excluded.session_id, \
+                          parent_checkpoint_id = excluded.parent_checkpoint_id, \
+                          scope = excluded.scope, \
+                          parent_commit = excluded.parent_commit, \
+                          tree_oid = excluded.tree_oid, \
+                          metadata_blob_oid = excluded.metadata_blob_oid, \
+                          traces_commit = excluded.traces_commit, \
+                          tool_use_id = excluded.tool_use_id, \
+                          subagent_session_id = excluded.subagent_session_id, \
+                          description = excluded.description, \
+                          created_at = excluded.created_at, \
+                          sync_revision = excluded.sync_revision",
+                    )
+                    .bind(&rec.checkpoint_id).bind(&rec.session_id).bind(&rec.parent_checkpoint_id)
+                    .bind(rec.scope.as_str()).bind(&rec.parent_commit).bind(&rec.tree_oid)
+                    .bind(&rec.metadata_blob_oid).bind(&rec.traces_commit).bind(&rec.tool_use_id)
+                    .bind(&rec.subagent_session_id).bind(&rec.description).bind(rec.created_at)
+                    .bind(rec.sync_revision)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_checkpoint", e))?;
+                }
+                CaptureBatchPayload::UpsertSessionCommit(rec) => {
+                    sea_orm::sqlx::query(
+                        "INSERT OR IGNORE INTO agent_session_commit (session_id, hash_kind, commit_oid) \
+                         VALUES (?, ?, ?)",
+                    )
+                    .bind(&rec.session_id).bind(rec.hash_kind.as_str()).bind(&rec.commit_oid)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session_commit", e))?;
+                }
+                CaptureBatchPayload::InsertUsageStats(rec) => {
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_usage_stats \
+                         (id, session_id, thread_id, agent_run_id, run_id, provider, model, request_kind, \
+                          intent, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, \
+                          total_tokens, tool_call_count, wall_clock_ms, provider_latency_ms, \
+                          cost_estimate_micro_dollars, cost_usd, usage_estimated, started_at, finished_at, \
+                          success, error_kind, schema_version, created_at, agent_name, repo_id, turn_id, event_id) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT(id) DO UPDATE SET \
+                          session_id = excluded.session_id, \
+                          thread_id = excluded.thread_id, \
+                          agent_run_id = excluded.agent_run_id, \
+                          run_id = excluded.run_id, \
+                          provider = excluded.provider, \
+                          model = excluded.model, \
+                          request_kind = excluded.request_kind, \
+                          intent = excluded.intent, \
+                          prompt_tokens = excluded.prompt_tokens, \
+                          completion_tokens = excluded.completion_tokens, \
+                          cached_tokens = excluded.cached_tokens, \
+                          reasoning_tokens = excluded.reasoning_tokens, \
+                          total_tokens = excluded.total_tokens, \
+                          tool_call_count = excluded.tool_call_count, \
+                          wall_clock_ms = excluded.wall_clock_ms, \
+                          provider_latency_ms = excluded.provider_latency_ms, \
+                          cost_estimate_micro_dollars = excluded.cost_estimate_micro_dollars, \
+                          cost_usd = excluded.cost_usd, \
+                          usage_estimated = excluded.usage_estimated, \
+                          started_at = excluded.started_at, \
+                          finished_at = excluded.finished_at, \
+                          success = excluded.success, \
+                          error_kind = excluded.error_kind, \
+                          schema_version = excluded.schema_version, \
+                          created_at = excluded.created_at, \
+                          agent_name = excluded.agent_name, \
+                          repo_id = excluded.repo_id, \
+                          turn_id = excluded.turn_id, \
+                          event_id = excluded.event_id",
+                    )
+                    .bind(&rec.id).bind(&rec.session_id).bind(&rec.thread_id).bind(&rec.agent_run_id)
+                    .bind(&rec.run_id).bind(&rec.provider).bind(&rec.model).bind(&rec.request_kind)
+                    .bind(&rec.intent).bind(rec.prompt_tokens).bind(rec.completion_tokens)
+                    .bind(rec.cached_tokens).bind(rec.reasoning_tokens).bind(rec.total_tokens)
+                    .bind(rec.tool_call_count).bind(rec.wall_clock_ms).bind(rec.provider_latency_ms)
+                    .bind(rec.cost_estimate_micro_dollars).bind(rec.cost_usd)
+                    .bind(i64::from(rec.usage_estimated)).bind(&rec.started_at).bind(&rec.finished_at)
+                    .bind(i64::from(rec.success)).bind(&rec.error_kind).bind(rec.schema_version)
+                    .bind(&rec.created_at).bind(&rec.agent_name).bind(&rec.repo_id)
+                    .bind(&rec.turn_id).bind(&rec.event_id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_usage_stats", e))?;
+                }
+                CaptureBatchPayload::AppendAuditLog(rec) => {
+                    let existing_row = sea_orm::sqlx::query(
+                        "SELECT timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted \
+                         FROM agent_audit_log WHERE audit_id = ?",
+                    )
+                    .bind(&rec.audit_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_audit_log", e))?;
+                    if let Some(row) = existing_row {
+                        let same = row.try_get::<String, _>(0).ok().as_deref()
+                            == Some(rec.timestamp.as_str())
+                            && row.try_get::<Option<String>, _>(1).ok() == Some(rec.user_id.clone())
+                            && row.try_get::<Option<String>, _>(2).ok()
+                                == Some(rec.user_name.clone())
+                            && row.try_get::<String, _>(3).ok().as_deref()
+                                == Some(rec.action.as_str())
+                            && row.try_get::<String, _>(4).ok().as_deref()
+                                == Some(rec.checkpoint_id.as_str())
+                            && row.try_get::<String, _>(5).ok().as_deref()
+                                == Some(rec.scope.as_str())
+                            && row.try_get::<Option<String>, _>(6).ok()
+                                == Some(rec.export_path.clone())
+                            && row.try_get::<Option<String>, _>(7).ok()
+                                == Some(rec.justification.clone())
+                            && row.try_get::<i64, _>(8).ok() == Some(i64::from(rec.granted));
+                        if same {
+                            deduped = deduped.saturating_add(1);
+                            continue;
+                        }
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "{CAPTURE_APPEND_ONLY_ERROR_PREFIX}: conflicting agent_audit_log overwrite rejected"
+                            ),
+                        });
+                    }
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_audit_log \
+                         (audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&rec.audit_id).bind(&rec.timestamp).bind(&rec.user_id).bind(&rec.user_name)
+                    .bind(&rec.action).bind(&rec.checkpoint_id).bind(&rec.scope)
+                    .bind(&rec.export_path).bind(&rec.justification).bind(i64::from(rec.granted))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_audit_log", e))?;
+                }
+                CaptureBatchPayload::AppendWorkspaceScopeAudit(rec) => {
+                    let existing_row = sea_orm::sqlx::query(
+                        "SELECT action, agent_kind, provider_session_id, repo_id, worktree_id, workspace_id, workspace_fence, actor, created_at \
+                         FROM agent_workspace_scope_audit WHERE audit_id = ?",
+                    )
+                    .bind(&rec.audit_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_workspace_scope_audit", e))?;
+                    if let Some(row) = existing_row {
+                        let same = row.try_get::<String, _>(0).ok().as_deref()
+                            == Some(rec.action.as_str())
+                            && row.try_get::<String, _>(1).ok().as_deref()
+                                == Some(rec.agent_kind.as_str())
+                            && row.try_get::<String, _>(2).ok().as_deref()
+                                == Some(rec.provider_session_id.as_str())
+                            && row.try_get::<String, _>(3).ok().as_deref()
+                                == Some(rec.repo_id.as_str())
+                            && row.try_get::<String, _>(4).ok().as_deref()
+                                == Some(rec.worktree_id.as_str())
+                            && row.try_get::<Option<String>, _>(5).ok()
+                                == Some(rec.workspace_id.clone())
+                            && row.try_get::<Option<i64>, _>(6).ok() == Some(rec.workspace_fence)
+                            && row.try_get::<Option<String>, _>(7).ok() == Some(rec.actor.clone())
+                            && row.try_get::<i64, _>(8).ok() == Some(rec.created_at);
+                        if same {
+                            deduped = deduped.saturating_add(1);
+                            continue;
+                        }
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "{CAPTURE_APPEND_ONLY_ERROR_PREFIX}: conflicting agent_workspace_scope_audit overwrite rejected"
+                            ),
+                        });
+                    }
+                    sea_orm::sqlx::query(
+                        "INSERT INTO agent_workspace_scope_audit \
+                         (audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id, workspace_id, workspace_fence, actor, created_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&rec.audit_id).bind(&rec.action).bind(&rec.agent_kind)
+                    .bind(&rec.provider_session_id).bind(&rec.repo_id).bind(&rec.worktree_id)
+                    .bind(&rec.workspace_id).bind(rec.workspace_fence).bind(&rec.actor)
+                    .bind(rec.created_at)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_workspace_scope_audit", e))?;
+                }
+            }
+            applied = applied.saturating_add(1);
+        }
+
+        Ok((applied, deduped))
+    }
+    .await;
+
+    match res {
+        Ok(counts) => {
+            commit_reverse_sqlite_batch(conn, r, "capture_batch_replay").await?;
+            Ok(counts)
+        }
+        Err(err) => {
+            rollback_reverse_sqlite_batch_best_effort(conn).await;
+            Err(err)
+        }
+    }
+}
+
+/// Replay all unreconciled `META_CROSS_STORE_INTENT` entries (`gen > cap_gen`)
+/// directly from the held uncommitted `git_wtx` into `capture.db.tmp` in
+/// strictly ascending `gen` order without opening any nested `WriteTransaction`
+/// (`ADR-RB-06`, `ADR-RB-07` #2, `RB-11i` AC2).
+async fn replay_unreconciled_cross_store_intents_to_sqlite(
+    git_wtx: &redb::WriteTransaction,
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    cap_conn: &mut SqliteConnection,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<CrossStoreIntentReplayReport> {
+    let git_gen = RedbGitStore::read_cross_store_generation_in_wtx(git_wtx)?;
+    let cap_gen = RedbCaptureStore::read_cross_store_generation_in_wtx(cap_wtx)?;
+    if cap_gen > git_gen {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 rejected capture generation ({cap_gen}) exceeding git generation ({git_gen})"
+            ),
+        });
+    }
+    RedbGitStore::ensure_no_orphan_cross_store_intents_in_wtx(git_wtx, git_gen)?;
+
+    let mut report = CrossStoreIntentReplayReport {
+        git_generation: git_gen,
+        capture_generation: cap_gen,
+        ..CrossStoreIntentReplayReport::default()
+    };
+    if cap_gen == git_gen {
+        return Ok(report);
+    }
+
+    let pending_raw = RedbGitStore::read_pending_cross_store_intents_in_wtx(git_wtx, cap_gen)?;
+    let expected_count =
+        usize::try_from(git_gen - cap_gen).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "reverse migration pending cross-store generation gap exceeds platform bounds"
+                .to_string(),
+        })?;
+    if pending_raw.len() < expected_count {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration cross-store outbox is missing pending intent(s) between generation {} and {git_gen}",
+                cap_gen + 1
+            ),
+        });
+    }
+
+    let mut expected_gen =
+        cap_gen
+            .checked_add(1)
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "reverse migration cross-store generation overflow".to_string(),
+            })?;
+
+    for (key_gen, raw_bytes) in pending_raw {
+        if key_gen > git_gen {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration cross-store outbox contains orphan intent generation {key_gen} beyond git generation {git_gen}"
+                ),
+            });
+        }
+        if key_gen != expected_gen {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration cross-store outbox generation gap: expected {expected_gen}, found {key_gen}"
+                ),
+            });
+        }
+        let intent: CrossStoreIntentRecord =
+            decode_versioned(&raw_bytes, CROSS_STORE_INTENT_CODEC_VERSION)?;
+        if intent.generation != key_gen {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration cross-store intent payload generation ({}) does not match key ({key_gen})",
+                    intent.generation
+                ),
+            });
+        }
+        // Apply items in bounded `<= 500` item chunks to honor the batch/heap budget.
+        for chunk in intent.items.chunks(FORWARD_MIGRATION_STREAM_BATCH_ROWS) {
+            let (applied, deduped) = apply_capture_batch_items_to_sqlite_tmp(
+                cap_conn,
+                cap_wtx,
+                existing_cap_tables,
+                chunk,
+            )
+            .await?;
+            report.applied_items = report.applied_items.saturating_add(applied);
+            report.deduplicated_items = report.deduplicated_items.saturating_add(deduped);
+            report.batches_committed = report.batches_committed.saturating_add(1);
+            telemetry.record_batch("meta_cross_store_intent", chunk.len())?;
+        }
+        report.replayed_generations.push(key_gen);
+        expected_gen = expected_gen.saturating_add(1);
+    }
+
+    if report.replayed_generations.len() != expected_count {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration cross-store intent replay incomplete: replayed {} of {expected_count}",
+                report.replayed_generations.len()
+            ),
+        });
+    }
+    Ok(report)
+}
+
+async fn stream_queue_segment_range_to_sqlite(
+    file: File,
+    slice: QueueSegmentSlice,
+    cap_conn: &mut SqliteConnection,
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    outcome: &mut LaneIngestOutcome,
+) -> StorageResult<File> {
+    use std::io::{BufReader, Seek as _, SeekFrom};
+    let QueueSegmentSlice {
+        lane,
+        start_offset,
+        end_offset,
+        committed_seg_hw,
+    } = slice;
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(start_offset)).map_err(|err| {
+        StorageBackendError::io("seek capture-queue segment for reverse decode", err)
+    })?;
+    let mut decoder = FrameStreamDecoder::with_known_len(reader, start_offset, end_offset);
+
+    let mut batch: Vec<CaptureBatchItem> = Vec::new();
+    let mut batch_bytes = 0usize;
+    let label = match lane {
+        CaptureQueueLane::Priority => "capture_queue_priority",
+        CaptureQueueLane::Normal => "capture_queue_normal",
+    };
+
+    loop {
+        match decoder.next_frame() {
+            Ok(FrameStreamItem::Frame { offset, frame, .. }) => {
+                let frame_bytes = frame.dedup_key.len().saturating_add(frame.payload.len());
+                let payload: CaptureBatchPayload =
+                    decode_postcard_payload(&frame, CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION)?;
+                let item = CaptureBatchItem {
+                    dedup_key: frame.dedup_key,
+                    payload,
+                };
+                validate_capture_batch_item(&item)?;
+                outcome.frames_read = outcome.frames_read.saturating_add(1);
+
+                if !batch.is_empty()
+                    && (batch.len() >= FORWARD_MIGRATION_QUEUE_INGEST_BATCH_ITEMS
+                        || batch_bytes.saturating_add(frame_bytes)
+                            > FORWARD_MIGRATION_INGEST_BATCH_MAX_BYTES)
+                {
+                    let (a, d) = apply_capture_batch_items_to_sqlite_tmp(
+                        cap_conn,
+                        cap_wtx,
+                        existing_cap_tables,
+                        &batch,
+                    )
+                    .await?;
+                    telemetry.record_batch(label, batch.len())?;
+                    outcome.applied_frames = outcome.applied_frames.saturating_add(a);
+                    outcome.deduplicated_frames = outcome.deduplicated_frames.saturating_add(d);
+                    outcome.batches_committed = outcome.batches_committed.saturating_add(1);
+                    if let Some((segment_id, _)) = committed_seg_hw {
+                        outcome.highwater = CaptureQueueHighwater {
+                            segment_id,
+                            byte_offset: offset,
+                        };
+                    }
+                    batch.clear();
+                    batch_bytes = 0;
+                }
+
+                batch_bytes = batch_bytes.saturating_add(frame_bytes);
+                batch.push(item);
+            }
+            Ok(FrameStreamItem::CleanEof { offset }) => {
+                if committed_seg_hw.is_some() && offset != end_offset {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail: "committed capture-queue segment ended before LTM2 boundary"
+                            .to_string(),
+                    });
+                }
+                break;
+            }
+            Err(decode_err) => {
+                if committed_seg_hw.is_some() {
+                    return Err(decode_err.into_storage_error());
+                }
+                match decode_err {
+                    FrameDecodeError::Io { .. } => return Err(decode_err.into_storage_error()),
+                    FrameDecodeError::CorruptHeader { .. }
+                    | FrameDecodeError::CorruptPayload { .. }
+                    | FrameDecodeError::TruncatedTail { .. } => break,
+                }
+            }
+        }
+    }
+
+    if !batch.is_empty() {
+        let (a, d) =
+            apply_capture_batch_items_to_sqlite_tmp(cap_conn, cap_wtx, existing_cap_tables, &batch)
+                .await?;
+        telemetry.record_batch(label, batch.len())?;
+        outcome.applied_frames = outcome.applied_frames.saturating_add(a);
+        outcome.deduplicated_frames = outcome.deduplicated_frames.saturating_add(d);
+        outcome.batches_committed = outcome.batches_committed.saturating_add(1);
+        if let Some((_, end_hw)) = committed_seg_hw {
+            outcome.highwater = end_hw;
+        }
+    } else if let Some((_, end_hw)) = committed_seg_hw
+        && outcome.highwater < end_hw
+    {
+        outcome.highwater = end_hw;
+    }
+
+    Ok(decoder.into_inner().into_inner())
+}
+
+/// Strictly read-only direct ingestion of pending `capture-queue/{priority,normal}/`
+/// frames (`priority/` first, then `normal/`) into `capture.db.tmp` (`RB-11i` AC3).
+/// Never mutates a single byte in `capture-queue/`.
+async fn ingest_capture_queue_readonly_to_sqlite(
+    common_storage: &Path,
+    cap_conn: &mut SqliteConnection,
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<QueueDirectIngestReport> {
+    let queue_root = capture_queue_dir_path(common_storage);
+    ingest_capture_queue_root_readonly_to_sqlite(
+        &queue_root,
+        cap_conn,
+        cap_wtx,
+        existing_cap_tables,
+        telemetry,
+    )
+    .await
+}
+
+/// Strictly read-only direct ingestion of pending `priority/` then `normal/`
+/// queue frames from an arbitrary `queue_root` (live `capture-queue/` OR backed-up
+/// `.libra/redb-backup/<gen>/capture-queue/`) into `capture.db.tmp` (`RB-11i`, `RB-11m`).
+async fn ingest_capture_queue_root_readonly_to_sqlite(
+    queue_root: &Path,
+    cap_conn: &mut SqliteConnection,
+    cap_wtx: &redb::WriteTransaction,
+    existing_cap_tables: &BTreeSet<String>,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<QueueDirectIngestReport> {
+    let mut priority = LaneIngestOutcome::default();
+    let mut normal = LaneIngestOutcome::default();
+
+    for (lane, lane_name, out) in [
+        (
+            CaptureQueueLane::Priority,
+            QUEUE_LANE_PRIORITY_DIR,
+            &mut priority,
+        ),
+        (CaptureQueueLane::Normal, QUEUE_LANE_NORMAL_DIR, &mut normal),
+    ] {
+        let lane_dir = queue_root.join(lane_name);
+        let meta_fs = match fs::symlink_metadata(&lane_dir) {
+            Ok(m) => m,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture-queue lane for reverse ingest",
+                    err,
+                ));
+            }
+        };
+        if meta_fs.file_type().is_symlink() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "reverse migration Phase 1 rejected symlinked capture-queue lane"
+                    .to_string(),
+            });
+        }
+        if meta_fs.file_type().is_file() {
+            // Already fenced `0400` tombstone: nothing pending to ingest.
+            continue;
+        }
+        if !meta_fs.file_type().is_dir() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "reverse migration Phase 1 rejected non-directory capture-queue lane"
+                    .to_string(),
+            });
+        }
+
+        // Open and verify segments strictly read-only.
+        #[cfg(unix)]
+        let lane_fd = {
+            let q_fd = open_readonly_root_dir_unix(queue_root)?;
+            let c_lane = match lane {
+                CaptureQueueLane::Priority => c"priority",
+                CaptureQueueLane::Normal => c"normal",
+            };
+            let Some((l_fd, _)) =
+                open_readonly_subdir_unix(&q_fd, c_lane, 0o022, "capture-queue lane")?
+            else {
+                continue;
+            };
+            l_fd
+        };
+
+        let mut segments = BTreeSet::new();
+        let mut has_meta_replica = false;
+        #[cfg(unix)]
+        {
+            let names = list_sorted_dir_names_bounded_unix(
+                &lane_fd,
+                MAX_SPOOL_BACKUP_FILES,
+                MAX_SPOOL_BACKUP_NAME_BYTES,
+                "capture-queue lane",
+            )?;
+            for name in &names {
+                if name == QUEUE_TAIL_META_FILE || name == QUEUE_TAIL_META_BAK_FILE {
+                    has_meta_replica = true;
+                } else if let Some(seg_id) = parse_segment_log_file_name(name.as_bytes()) {
+                    segments.insert(seg_id);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            for entry in fs::read_dir(&lane_dir)
+                .map_err(|err| StorageBackendError::io("list capture-queue lane", err))?
+            {
+                let entry = entry
+                    .map_err(|err| StorageBackendError::io("read capture-queue lane entry", err))?;
+                let name = entry.file_name().into_string().map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: "non-UTF-8 entry in capture-queue lane".to_string(),
+                    }
+                })?;
+                if name == QUEUE_TAIL_META_FILE || name == QUEUE_TAIL_META_BAK_FILE {
+                    has_meta_replica = true;
+                } else if let Some(seg_id) = parse_segment_log_file_name(name.as_bytes()) {
+                    segments.insert(seg_id);
+                }
+            }
+        }
+        if segments.is_empty() && !has_meta_replica {
+            continue;
+        }
+
+        #[cfg(unix)]
+        let meta = read_converged_lane_tail_meta_unix_protected(&lane_fd, &[], lane)?;
+        #[cfg(not(unix))]
+        let meta = read_converged_lane_tail_meta(&lane_dir)?;
+        validate_queue_lane_meta_against_segments(&meta, &segments, lane)?;
+
+        let open_seg = |seg_id: u32, subject: &'static str| -> StorageResult<(File, u64)> {
+            let seg_name = segment_log_file_name(seg_id);
+            #[cfg(unix)]
+            {
+                let c_name = std::ffi::CString::new(seg_name.as_bytes()).map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: "invalid capture-queue segment filename".to_string(),
+                    }
+                })?;
+                open_readonly_regular_file_at_unix(&lane_fd, &c_name, 0o022, None, subject)
+            }
+            #[cfg(not(unix))]
+            {
+                let path = lane_dir.join(&seg_name);
+                let f = File::open(&path).map_err(|e| StorageBackendError::io(subject, e))?;
+                let len = f
+                    .metadata()
+                    .map_err(|e| StorageBackendError::io(subject, e))?
+                    .len();
+                Ok((f, len))
+            }
+        };
+
+        if meta.is_initial_empty() {
+            if segments.contains(&0) {
+                let (file, actual_len) = open_seg(0, "capture-queue initial segment")?;
+                if actual_len > 0 {
+                    let _ = stream_queue_segment_range_to_sqlite(
+                        file,
+                        QueueSegmentSlice {
+                            lane,
+                            start_offset: 0,
+                            end_offset: actual_len,
+                            committed_seg_hw: None,
+                        },
+                        cap_conn,
+                        cap_wtx,
+                        existing_cap_tables,
+                        telemetry,
+                        out,
+                    )
+                    .await?;
+                }
+            }
+            continue;
+        }
+
+        for sealed in &meta.sealed {
+            let (mut file, actual_len) = open_seg(sealed.seg_id, "capture-queue sealed segment")?;
+            if actual_len != sealed.sealed_len {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: format!(
+                        "capture-queue {} sealed segment {:08x} length mismatch",
+                        lane.as_str(),
+                        sealed.seg_id
+                    ),
+                });
+            }
+            let crc = compute_file_prefix_crc32c(&mut file, sealed.sealed_len)?;
+            if crc != sealed.sealed_crc32c {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: format!(
+                        "capture-queue {} sealed segment {:08x} CRC32C mismatch",
+                        lane.as_str(),
+                        sealed.seg_id
+                    ),
+                });
+            }
+            let end_hw = CaptureQueueHighwater {
+                segment_id: sealed.seg_id.saturating_add(1),
+                byte_offset: 0,
+            };
+            let _ = stream_queue_segment_range_to_sqlite(
+                file,
+                QueueSegmentSlice {
+                    lane,
+                    start_offset: 0,
+                    end_offset: sealed.sealed_len,
+                    committed_seg_hw: Some((sealed.seg_id, end_hw)),
+                },
+                cap_conn,
+                cap_wtx,
+                existing_cap_tables,
+                telemetry,
+                out,
+            )
+            .await?;
+        }
+
+        {
+            let (mut file, actual_len) = open_seg(meta.active_seg, "capture-queue active segment")?;
+            if actual_len < meta.committed_len {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: format!(
+                        "capture-queue {} active segment {:08x} shorter than LTM2 committed_len",
+                        lane.as_str(),
+                        meta.active_seg
+                    ),
+                });
+            }
+            let crc = compute_file_prefix_crc32c(&mut file, meta.committed_len)?;
+            if crc != meta.prefix_crc32c {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: format!(
+                        "capture-queue {} active segment {:08x} prefix CRC32C mismatch",
+                        lane.as_str(),
+                        meta.active_seg
+                    ),
+                });
+            }
+            let committed_hw = CaptureQueueHighwater {
+                segment_id: meta.active_seg,
+                byte_offset: meta.committed_len,
+            };
+            let file = stream_queue_segment_range_to_sqlite(
+                file,
+                QueueSegmentSlice {
+                    lane,
+                    start_offset: 0,
+                    end_offset: meta.committed_len,
+                    committed_seg_hw: Some((meta.active_seg, committed_hw)),
+                },
+                cap_conn,
+                cap_wtx,
+                existing_cap_tables,
+                telemetry,
+                out,
+            )
+            .await?;
+            if actual_len > meta.committed_len {
+                let _ = stream_queue_segment_range_to_sqlite(
+                    file,
+                    QueueSegmentSlice {
+                        lane,
+                        start_offset: meta.committed_len,
+                        end_offset: actual_len,
+                        committed_seg_hw: None,
+                    },
+                    cap_conn,
+                    cap_wtx,
+                    existing_cap_tables,
+                    telemetry,
+                    out,
+                )
+                .await?;
+            }
+        }
+
+        let orphan_seg = meta.active_seg.saturating_add(1);
+        if segments.contains(&orphan_seg) {
+            let (file, actual_len) =
+                open_seg(orphan_seg, "capture-queue orphan successor segment")?;
+            if actual_len > 0 {
+                let _ = stream_queue_segment_range_to_sqlite(
+                    file,
+                    QueueSegmentSlice {
+                        lane,
+                        start_offset: 0,
+                        end_offset: actual_len,
+                        committed_seg_hw: None,
+                    },
+                    cap_conn,
+                    cap_wtx,
+                    existing_cap_tables,
+                    telemetry,
+                    out,
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(QueueDirectIngestReport {
+        priority_frames_read: priority.frames_read,
+        normal_frames_read: normal.frames_read,
+        applied_frames: priority
+            .applied_frames
+            .saturating_add(normal.applied_frames),
+        deduplicated_frames: priority
+            .deduplicated_frames
+            .saturating_add(normal.deduplicated_frames),
+        priority_highwater: priority.highwater,
+        normal_highwater: normal.highwater,
+        batches_committed: priority
+            .batches_committed
+            .saturating_add(normal.batches_committed),
+    })
+}
+
+/// Stamp `PRAGMA application_id = target_migration_tag` on an open staged SQLite
+/// `.tmp` connection (`RB-11i` AC4 & AC5).
+async fn stamp_sqlite_tmp_application_id(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    tag: u32,
+) -> StorageResult<()> {
+    if tag == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration Phase 1 target_migration_tag must be non-zero".to_string(),
+        });
+    }
+    let sql = format!("PRAGMA application_id = {tag};");
+    sea_orm::sqlx::query(AssertSqlSafe(sql))
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed setting PRAGMA application_id on {role} tmp: {err}"
+            ),
+        })?;
+    let read_back: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed verifying PRAGMA application_id on {role} tmp: {err}"
+            ),
+        })?;
+    if read_back != i64::from(tag) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA application_id mismatch on {role} tmp (expected {tag}, got {read_back})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Reverse migration Phase 1 single-pass streaming export, direct
+/// `META_CROSS_STORE_INTENT` replay, read-only `capture-queue/` ingest, and
+/// `PRAGMA application_id = target_migration_tag` tagging (`RB-11i`).
+pub async fn export_reverse_phase1_to_sqlite_tmp(
+    guard: &ReversePhase1QuiesceGuard,
+    common_storage: &Path,
+) -> StorageResult<ReversePhase1ExportReport> {
+    let mut telemetry = ExportStreamTelemetry::new();
+    let mut artifacts = ReversePhase1ArtifactGuard::new(common_storage);
+    let report = export_reverse_phase1_to_sqlite_tmp_inner(
+        guard,
+        common_storage,
+        &mut telemetry,
+        &mut artifacts,
+    )
+    .await?;
+    artifacts.disarm();
+    Ok(report)
+}
+
+async fn export_reverse_phase1_to_sqlite_tmp_inner(
+    guard: &ReversePhase1QuiesceGuard,
+    common_storage: &Path,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    artifacts: &mut ReversePhase1ArtifactGuard,
+) -> StorageResult<ReversePhase1ExportReport> {
+    let generation = guard.redb().generation();
+    let target_migration_tag = allocate_reverse_target_migration_tag(generation);
+
+    // Stage `libra.db.tmp` and `capture.db.tmp` under RAII cleanup ownership.
+    let (git_tmp_path, mut git_conn) = bootstrap_reverse_git_sqlite_tmp(common_storage).await?;
+    artifacts.git_tmp_path = Some(git_tmp_path.clone());
+
+    let (capture_tmp_path, mut cap_conn) =
+        bootstrap_reverse_capture_sqlite_tmp(common_storage).await?;
+    artifacts.capture_tmp_path = Some(capture_tmp_path.clone());
+
+    let git_wtx = guard.redb().git_wtx();
+    let cap_wtx = guard.redb().capture_wtx();
+    let existing_cap_tables = list_existing_redb_tables(cap_wtx)?;
+
+    // 1. Stream all 61 Git tables from held `git_wtx` -> `libra.db.tmp`.
+    let git_table_counts =
+        export_reverse_git_tables_to_sqlite(git_wtx, &mut git_conn, telemetry).await?;
+
+    // 2. Stream all 25 Capture tables from held `cap_wtx` -> `capture.db.tmp`.
+    let capture_table_counts =
+        export_reverse_capture_tables_to_sqlite(cap_wtx, &mut cap_conn, telemetry).await?;
+
+    // Create connection-local temporary dedup table (leaves `capture.db.tmp`
+    // 100% pure canonical 25-table schema on close while guaranteeing O(1) heap
+    // dedup across intent replay and queue direct ingest).
+    sea_orm::sqlx::query(
+        "CREATE TEMP TABLE _rev_mig_dedup_keys (dedup_key TEXT NOT NULL PRIMARY KEY)",
+    )
+    .execute(&mut cap_conn)
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!(
+            "reverse migration Phase 1 failed creating temp dedup table on capture.db.tmp: {err}"
+        ),
+    })?;
+
+    // 3. Direct deadlock-free replay of unreconciled `META_CROSS_STORE_INTENT`
+    //    (`gen > cap_gen`) in strictly ascending order directly into `capture.db.tmp`.
+    let intent_replay = replay_unreconciled_cross_store_intents_to_sqlite(
+        git_wtx,
+        cap_wtx,
+        &existing_cap_tables,
+        &mut cap_conn,
+        telemetry,
+    )
+    .await?;
+
+    // 4. Strictly read-only direct ingestion of pending `capture-queue/{priority,normal}/`
+    //    frames (`priority/` before `normal/`) into `capture.db.tmp`.
+    let queue_ingest = ingest_capture_queue_readonly_to_sqlite(
+        common_storage,
+        &mut cap_conn,
+        cap_wtx,
+        &existing_cap_tables,
+        telemetry,
+    )
+    .await?;
+
+    // 4b. Fresh Redb repo live `capture-spool/ready/` read-only direct ingestion
+    //     by semantic dedup key (`RB-11h` AC1).
+    let live_spool_ready_dir =
+        capture_spool_dir_path(common_storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+    let _ = ingest_capture_spool_ready_dir_to_sqlite_tmp(
+        &live_spool_ready_dir,
+        common_storage,
+        &mut cap_conn,
+        Some((cap_wtx, &existing_cap_tables)),
+        telemetry,
+    )
+    .await?;
+
+    // 5. Stamp identical unique non-zero `PRAGMA application_id = target_migration_tag`
+    //    on BOTH `capture.db.tmp` and `libra.db.tmp` BEFORE closing & fsyncing.
+    stamp_sqlite_tmp_application_id(&mut cap_conn, DatabaseRole::Capture, target_migration_tag)
+        .await?;
+    stamp_sqlite_tmp_application_id(
+        &mut git_conn,
+        DatabaseRole::Repository,
+        target_migration_tag,
+    )
+    .await?;
+
+    cap_conn
+        .close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("reverse migration Phase 1 failed closing capture.db.tmp: {err}"),
+        })?;
+    git_conn
+        .close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("reverse migration Phase 1 failed closing libra.db.tmp: {err}"),
+        })?;
+
+    // Flush both `.tmp` files durably to disk before returning (`RB-11i` AC4 & AC5).
+    fsync_regular_file_nofollow(&capture_tmp_path, "sync capture.db.tmp")?;
+    fsync_regular_file_nofollow(&git_tmp_path, "sync libra.db.tmp")?;
+    fsync_dir_best_effort(&common_storage.join(PRIVATE_SUBDIR))?;
+    fsync_dir_best_effort(common_storage)?;
+
+    Ok(ReversePhase1ExportReport {
+        generation,
+        target_migration_tag,
+        git_tmp_path,
+        capture_tmp_path,
+        git_table_counts,
+        capture_table_counts,
+        max_batch_rows: telemetry.max_batch_rows,
+        total_streaming_batches: telemetry.total_batches,
+        intent_replay,
+        queue_ingest,
+    })
+}
+
+fn fsync_regular_file_nofollow(path: &Path, context: &'static str) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            os::unix::{
+                ffi::OsStrExt as _,
+                io::{FromRawFd as _, OwnedFd},
+            },
+        };
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: format!("invalid file path for {context}"),
+            }
+        })?;
+        // SAFETY: `c_path` is NUL-terminated.
+        let raw = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+        }
+        // SAFETY: `raw >= 0` is exclusively owned here.
+        let file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        file.sync_all()
+            .map_err(|err| StorageBackendError::io(context, err))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let file = File::open(path).map_err(|err| StorageBackendError::io(context, err))?;
+        file.sync_all()
+            .map_err(|err| StorageBackendError::io(context, err))?;
+        Ok(())
+    }
+}
+
+async fn verify_one_sqlite_tmp_integrity_and_tag(
+    path: &Path,
+    role: DatabaseRole,
+    expected_tag: u32,
+    target_label: &'static str,
+    durability: &mut Phase1DurabilityReceipt,
+) -> StorageResult<u32> {
+    let mut conn = open_reverse_sqlite_tmp_conn_async(path, role, true).await?;
+    let rows: Vec<String> = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_all(&mut conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA integrity_check failed for {role}: {err}"
+            ),
+        })?;
+    if rows.len() != 1 || rows[0] != "ok" {
+        let _ = conn.close().await;
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA integrity_check failed for {role} (rows={})",
+                rows.len()
+            ),
+        });
+    }
+    let app_id: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA application_id read failed for {role}: {err}"
+            ),
+        })?;
+    conn.close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 failed closing verified {role} sqlite tmp: {err}"
+            ),
+        })?;
+    if app_id <= 0 || app_id != i64::from(expected_tag) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 PRAGMA application_id mismatch on {role} tmp (expected {expected_tag}, got {app_id})"
+            ),
+        });
+    }
+    fsync_regular_file_nofollow(path, "fsync verified reverse sqlite tmp")?;
+    durability.record(Phase1DurabilityOpKind::FileFsync, target_label);
+    Ok(expected_tag)
+}
+
+/// Verify `PRAGMA integrity_check == "ok"`, exact non-zero
+/// `PRAGMA application_id == export.target_migration_tag`, and `fsync` on BOTH
+/// `libra.db.tmp` and `capture.db.tmp` (`RB-11p` AC1).
+pub async fn verify_reverse_phase1_sqlite_tmp(
+    common_storage: &Path,
+    export: &ReversePhase1ExportReport,
+) -> StorageResult<ReversePhase1VerificationReport> {
+    let mut durability = Phase1DurabilityReceipt::new();
+    let capture_tmp_application_id = verify_one_sqlite_tmp_integrity_and_tag(
+        &export.capture_tmp_path,
+        DatabaseRole::Capture,
+        export.target_migration_tag,
+        "private/capture.db.tmp",
+        &mut durability,
+    )
+    .await?;
+    let git_tmp_application_id = verify_one_sqlite_tmp_integrity_and_tag(
+        &export.git_tmp_path,
+        DatabaseRole::Repository,
+        export.target_migration_tag,
+        "libra.db.tmp",
+        &mut durability,
+    )
+    .await?;
+    fsync_dir_best_effort(&common_storage.join(PRIVATE_SUBDIR))?;
+    durability.record(Phase1DurabilityOpKind::DirFsync, PRIVATE_SUBDIR);
+    fsync_dir_best_effort(common_storage)?;
+    durability.record(Phase1DurabilityOpKind::DirFsync, ".");
+
+    Ok(ReversePhase1VerificationReport {
+        git_tmp_integrity_ok: true,
+        capture_tmp_integrity_ok: true,
+        git_tmp_application_id,
+        capture_tmp_application_id,
+        durability,
+    })
+}
+
+/// Stream-copy a single regular source file into `dest_dir/dest_name` via a
+/// sibling `.tmp` file in O(1) RAM (`64 KiB` buffer), `sync_all()`, verify
+/// independent read-back SHA-256 == source SHA-256, atomically rename, and
+/// record durability ops (`RB-11p` AC2).
+fn stream_copy_and_verify_backup_file(
+    src_path: &Path,
+    dest_dir: &Path,
+    dest_name: &str,
+    dest_mode: u32,
+    rel_label: String,
+    durability: &mut Phase1DurabilityReceipt,
+) -> StorageResult<(PathBuf, String, u64)> {
+    use std::io::{Read as _, Write as _};
+
+    let src_file = {
+        #[cfg(unix)]
+        {
+            use std::{
+                ffi::CString,
+                os::unix::{
+                    ffi::OsStrExt as _,
+                    io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+                },
+            };
+            let c_src = CString::new(src_path.as_os_str().as_bytes()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "invalid source backup path".to_string(),
+                }
+            })?;
+            // SAFETY: `c_src` is NUL-terminated.
+            let raw = unsafe {
+                libc::open(
+                    c_src.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                return Err(StorageBackendError::io(
+                    "open source file for reverse backup",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `raw >= 0` is exclusively owned.
+            let f = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+            let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `f` is valid.
+            if unsafe { libc::fstat(f.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+                return Err(StorageBackendError::io(
+                    "stat source file for reverse backup",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `fstat` succeeded.
+            let st = unsafe { st.assume_init() };
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Phase 1 backup rejected non-regular source file"
+                        .to_string(),
+                });
+            }
+            f
+        }
+        #[cfg(not(unix))]
+        {
+            File::open(src_path).map_err(|err| {
+                StorageBackendError::io("open source file for reverse backup", err)
+            })?
+        }
+    };
+
+    let tmp_name = format!(".{dest_name}.tmp");
+    let tmp_path = dest_dir.join(&tmp_name);
+    let final_path = dest_dir.join(dest_name);
+
+    let mut dst_file = {
+        #[cfg(unix)]
+        {
+            use std::{
+                ffi::CString,
+                os::unix::{
+                    ffi::OsStrExt as _,
+                    io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+                },
+            };
+            let c_tmp = CString::new(tmp_path.as_os_str().as_bytes()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "invalid backup tmp path".to_string(),
+                }
+            })?;
+            // SAFETY: `c_tmp` is NUL-terminated.
+            let raw = unsafe {
+                libc::open(
+                    c_tmp.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    dest_mode as libc::mode_t as libc::c_uint,
+                )
+            };
+            if raw < 0 {
+                return Err(StorageBackendError::io(
+                    "create reverse backup tmp file",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `raw >= 0` is exclusively owned.
+            let f = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+            // SAFETY: `f` is valid.
+            if unsafe { libc::fchmod(f.as_raw_fd(), dest_mode as libc::mode_t) } != 0 {
+                let err = io::Error::last_os_error();
+                drop(f);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(StorageBackendError::io(
+                    "set reverse backup tmp permissions",
+                    err,
+                ));
+            }
+            f
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dest_mode;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|err| StorageBackendError::io("create reverse backup tmp file", err))?
+        }
+    };
+
+    let mut buf = vec![0u8; BACKUP_STREAM_BUF_BYTES];
+    let mut src_hasher = Sha256::new();
+    let mut copied_len = 0u64;
+    let mut src_reader = src_file;
+    loop {
+        let n = match src_reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(err) => {
+                drop(dst_file);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(StorageBackendError::io(
+                    "read source file during reverse backup",
+                    err,
+                ));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        src_hasher.update(&buf[..n]);
+        if let Err(err) = dst_file.write_all(&buf[..n]) {
+            drop(dst_file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(StorageBackendError::io(
+                "write backup file during reverse backup",
+                err,
+            ));
+        }
+        copied_len = copied_len.saturating_add(n as u64);
+    }
+    if let Err(err) = dst_file.sync_all() {
+        drop(dst_file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(StorageBackendError::io(
+            "fsync reverse backup tmp file",
+            err,
+        ));
+    }
+    drop(dst_file);
+    durability.record(Phase1DurabilityOpKind::FileFsync, rel_label.clone());
+
+    // Independent read-back SHA-256 verification of the synced backup file.
+    let src_sha = sha256_hex_from_hasher(src_hasher);
+    let mut verify_file = File::open(&tmp_path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        StorageBackendError::io("reopen reverse backup file for SHA-256 verify", err)
+    })?;
+    let mut dst_hasher = Sha256::new();
+    let mut verified_len = 0u64;
+    loop {
+        let n = verify_file.read(&mut buf).map_err(|err| {
+            let _ = fs::remove_file(&tmp_path);
+            StorageBackendError::io("read reverse backup file for SHA-256 verify", err)
+        })?;
+        if n == 0 {
+            break;
+        }
+        dst_hasher.update(&buf[..n]);
+        verified_len = verified_len.saturating_add(n as u64);
+    }
+    drop(verify_file);
+    let dst_sha = sha256_hex_from_hasher(dst_hasher);
+    if verified_len != copied_len || dst_sha != src_sha {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 backup SHA-256 verification mismatch for `{rel_label}`"
+            ),
+        });
+    }
+
+    // Non-overwriting publish into final backup path.
+    if fs::symlink_metadata(&final_path).is_ok() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 1 backup target already exists (`{rel_label}`)"
+            ),
+        });
+    }
+    fs::rename(&tmp_path, &final_path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        StorageBackendError::io("publish reverse backup file", err)
+    })?;
+    durability.record(Phase1DurabilityOpKind::AtomicPublish, rel_label);
+    Ok((final_path, dst_sha, verified_len))
+}
+
+fn compute_capture_spool_manifest_sha256_readonly(common_storage: &Path) -> StorageResult<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0");
+    let spool_root = capture_spool_dir_path(common_storage);
+    for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+        hash_len_prefixed_bytes(&mut hasher, sub.as_bytes());
+        let p = spool_root.join(sub);
+        match fs::symlink_metadata(&p) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => hasher.update([0u8]),
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture-spool entry for reverse manifest digest",
+                    err,
+                ));
+            }
+            Ok(meta) if meta.file_type().is_file() => hasher.update([2u8]),
+            Ok(meta) if meta.file_type().is_dir() => {
+                hasher.update([1u8]);
+                let mut names = Vec::new();
+                for entry in fs::read_dir(&p).map_err(|err| {
+                    StorageBackendError::io("list capture-spool dir for reverse manifest", err)
+                })? {
+                    let entry = entry.map_err(|err| {
+                        StorageBackendError::io(
+                            "read capture-spool entry for reverse manifest",
+                            err,
+                        )
+                    })?;
+                    if let Ok(name) = entry.file_name().into_string() {
+                        names.push(name);
+                    }
+                }
+                names.sort();
+                for name in names {
+                    hash_len_prefixed_bytes(&mut hasher, name.as_bytes());
+                    let entry_path = p.join(&name);
+                    if let Ok(em) = fs::symlink_metadata(&entry_path)
+                        && em.file_type().is_file()
+                    {
+                        let file_sha = compute_file_sha256_streaming(&entry_path)?;
+                        hash_len_prefixed_bytes(&mut hasher, file_sha.as_bytes());
+                    }
+                }
+            }
+            Ok(_) => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Phase 1 rejected unsafe capture-spool entry"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(sha256_hex_from_hasher(hasher))
+}
+
+/// Create SHA-256 verified, `fsync`-durable backups of frozen `git.redb`,
+/// `capture.redb`, and `capture-queue/{priority,normal,quarantine}/` (leaving
+/// source directories and `append.lock` untouched in place) under
+/// `.libra/redb-backup/<gen>/` (`RB-11p` AC2).
+pub fn create_reverse_phase1_backups(
+    guard: &ReversePhase1QuiesceGuard,
+    common_storage: &Path,
+) -> StorageResult<ReversePhase1BackupReport> {
+    let mut artifacts = ReversePhase1ArtifactGuard::new(common_storage);
+    let report = create_reverse_phase1_backups_inner(guard, common_storage, &mut artifacts)?;
+    artifacts.disarm();
+    Ok(report)
+}
+
+fn create_reverse_phase1_backups_inner(
+    guard: &ReversePhase1QuiesceGuard,
+    common_storage: &Path,
+    artifacts: &mut ReversePhase1ArtifactGuard,
+) -> StorageResult<ReversePhase1BackupReport> {
+    let generation = guard.redb().generation();
+    let backup_rel_dir = canonical_redb_backup_rel_dir(generation);
+    let backup_root = common_storage.join(REDB_BACKUP_SUBDIR);
+    let backup_dir = redb_backup_dir_path(common_storage, generation);
+    let mut durability = Phase1DurabilityReceipt::new();
+
+    let created_root = match fs::create_dir(&backup_root) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o700))
+                    .map_err(|err| StorageBackendError::io("chmod redb-backup root", err))?;
+            }
+            true
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let meta = fs::symlink_metadata(&backup_root)
+                .map_err(|e| StorageBackendError::io("stat existing redb-backup root", e))?;
+            if !meta.file_type().is_dir() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Phase 1 rejected non-directory redb-backup root"
+                        .to_string(),
+                });
+            }
+            false
+        }
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "create redb-backup root directory",
+                err,
+            ));
+        }
+    };
+    artifacts.created_backup_root = created_root;
+
+    fs::create_dir(&backup_dir)
+        .map_err(|err| StorageBackendError::io("create generation redb-backup directory", err))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|err| StorageBackendError::io("chmod generation redb-backup dir", err))?;
+    }
+    artifacts.backup_gen_dir = Some(backup_dir.clone());
+
+    let git_file_name = format!("git.gen-{}.redb", format_generation_id(generation));
+    let cap_file_name = format!("capture.gen-{}.redb", format_generation_id(generation));
+
+    let (git_backup_path, git_sha256, git_byte_len) = stream_copy_and_verify_backup_file(
+        guard.redb().git_redb_path(),
+        &backup_dir,
+        &git_file_name,
+        0o600,
+        format!("{backup_rel_dir}/{git_file_name}"),
+        &mut durability,
+    )?;
+    let (cap_backup_path, cap_sha256, cap_byte_len) = stream_copy_and_verify_backup_file(
+        guard.redb().capture_redb_path(),
+        &backup_dir,
+        &cap_file_name,
+        0o600,
+        format!("{backup_rel_dir}/{cap_file_name}"),
+        &mut durability,
+    )?;
+
+    // Backup `capture-queue/{priority,normal,quarantine}/` while leaving the live
+    // source directory and `append.lock` / `writer.lock` 100% untouched in place.
+    let backup_queue_dir = redb_backup_capture_queue_dir_path(common_storage, generation);
+    fs::create_dir(&backup_queue_dir)
+        .map_err(|err| StorageBackendError::io("create redb-backup capture-queue dir", err))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&backup_queue_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|err| StorageBackendError::io("chmod redb-backup capture-queue dir", err))?;
+    }
+
+    let live_queue_root = capture_queue_dir_path(common_storage);
+    let mut queue_files = Vec::new();
+    for subdir in [
+        QUEUE_LANE_PRIORITY_DIR,
+        QUEUE_LANE_NORMAL_DIR,
+        QUEUE_QUARANTINE_DIR,
+    ] {
+        let src_sub = live_queue_root.join(subdir);
+        let dst_sub = backup_queue_dir.join(subdir);
+        fs::create_dir(&dst_sub).map_err(|err| {
+            StorageBackendError::io("create redb-backup capture-queue subdir", err)
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&dst_sub, fs::Permissions::from_mode(0o700)).map_err(|err| {
+                StorageBackendError::io("chmod redb-backup capture-queue subdir", err)
+            })?;
+        }
+
+        let meta_opt = match fs::symlink_metadata(&src_sub) {
+            Ok(m) => Some(m),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "stat live capture-queue subdir for reverse backup",
+                    err,
+                ));
+            }
+        };
+        if let Some(meta) = meta_opt {
+            if meta.file_type().is_symlink() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "reverse migration Phase 1 backup rejected symlinked capture-queue subdir"
+                            .to_string(),
+                });
+            }
+            if meta.file_type().is_dir() {
+                let mut names = Vec::new();
+                for entry in fs::read_dir(&src_sub).map_err(|err| {
+                    StorageBackendError::io(
+                        "list live capture-queue subdir for reverse backup",
+                        err,
+                    )
+                })? {
+                    let entry = entry.map_err(|err| {
+                        StorageBackendError::io(
+                            "read live capture-queue subdir entry for reverse backup",
+                            err,
+                        )
+                    })?;
+                    let name = entry.file_name().into_string().map_err(|_| {
+                        StorageBackendError::BackendInternal {
+                            detail: "non-UTF-8 entry in capture-queue subdir".to_string(),
+                        }
+                    })?;
+                    names.push(name);
+                }
+                names.sort();
+                for name in names {
+                    let src_entry = src_sub.join(&name);
+                    let entry_meta = fs::symlink_metadata(&src_entry).map_err(|err| {
+                        StorageBackendError::io(
+                            "stat live capture-queue entry for reverse backup",
+                            err,
+                        )
+                    })?;
+                    if !entry_meta.file_type().is_file() {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "reverse migration Phase 1 backup rejected non-regular entry in capture-queue subdir"
+                                .to_string(),
+                        });
+                    }
+                    let rel_label =
+                        format!("{backup_rel_dir}/{CAPTURE_QUEUE_SUBDIR}/{subdir}/{name}");
+                    let (_dst_path, sha256, byte_len) = stream_copy_and_verify_backup_file(
+                        &src_entry,
+                        &dst_sub,
+                        &name,
+                        0o600,
+                        rel_label,
+                        &mut durability,
+                    )?;
+                    queue_files.push(QueueBackupFileReceipt {
+                        subdir,
+                        file_name: name,
+                        byte_len,
+                        sha256,
+                    });
+                }
+            }
+        }
+        fsync_dir_best_effort(&dst_sub)?;
+        durability.record(
+            Phase1DurabilityOpKind::DirFsync,
+            format!("{backup_rel_dir}/{CAPTURE_QUEUE_SUBDIR}/{subdir}"),
+        );
+    }
+
+    fsync_dir_best_effort(&backup_queue_dir)?;
+    durability.record(
+        Phase1DurabilityOpKind::DirFsync,
+        format!("{backup_rel_dir}/{CAPTURE_QUEUE_SUBDIR}"),
+    );
+
+    // Archive any pre-existing live `capture-spool/ready/` files (fresh Redb repo,
+    // `RB-11h` AC1) into `.libra/redb-backup/<gen>/capture-spool/ready/`, leaving
+    // live `capture-spool/ready/` untouched in Phase 1.
+    let live_spool_ready = capture_spool_dir_path(common_storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+    if let Ok(meta) = fs::symlink_metadata(&live_spool_ready)
+        && meta.file_type().is_dir()
+    {
+        let backup_spool_root = backup_dir.join(CAPTURE_SPOOL_SUBDIR);
+        let backup_spool_ready = backup_spool_root.join(CAPTURE_SPOOL_READY_SUBDIR);
+        fs::create_dir(&backup_spool_root)
+            .map_err(|err| StorageBackendError::io("create redb-backup capture-spool dir", err))?;
+        fs::create_dir(&backup_spool_ready).map_err(|err| {
+            StorageBackendError::io("create redb-backup capture-spool/ready dir", err)
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&backup_spool_root, fs::Permissions::from_mode(0o700)).map_err(
+                |err| StorageBackendError::io("chmod redb-backup capture-spool dir", err),
+            )?;
+            fs::set_permissions(&backup_spool_ready, fs::Permissions::from_mode(0o700)).map_err(
+                |err| StorageBackendError::io("chmod redb-backup capture-spool/ready dir", err),
+            )?;
+        }
+        let mut ready_names = Vec::new();
+        for entry in fs::read_dir(&live_spool_ready).map_err(|err| {
+            StorageBackendError::io("list live capture-spool/ready for reverse backup", err)
+        })? {
+            let entry = entry.map_err(|err| {
+                StorageBackendError::io("read live capture-spool/ready entry", err)
+            })?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "non-UTF-8 entry in capture-spool/ready".to_string(),
+                }
+            })?;
+            ready_names.push(name);
+        }
+        ready_names.sort();
+        for name in ready_names {
+            let src_entry = live_spool_ready.join(&name);
+            let entry_meta = fs::symlink_metadata(&src_entry).map_err(|err| {
+                StorageBackendError::io("stat live capture-spool/ready entry for backup", err)
+            })?;
+            if !entry_meta.file_type().is_file() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "reverse migration Phase 1 backup rejected non-regular entry in capture-spool/ready"
+                            .to_string(),
+                });
+            }
+            let rel_label = format!(
+                "{backup_rel_dir}/{CAPTURE_SPOOL_SUBDIR}/{CAPTURE_SPOOL_READY_SUBDIR}/{name}"
+            );
+            let _ = stream_copy_and_verify_backup_file(
+                &src_entry,
+                &backup_spool_ready,
+                &name,
+                0o600,
+                rel_label,
+                &mut durability,
+            )?;
+        }
+        fsync_dir_best_effort(&backup_spool_ready)?;
+        fsync_dir_best_effort(&backup_spool_root)?;
+        durability.record(
+            Phase1DurabilityOpKind::DirFsync,
+            format!("{backup_rel_dir}/{CAPTURE_SPOOL_SUBDIR}/{CAPTURE_SPOOL_READY_SUBDIR}"),
+        );
+    }
+
+    fsync_dir_best_effort(&backup_dir)?;
+    durability.record(Phase1DurabilityOpKind::DirFsync, backup_rel_dir.clone());
+    fsync_dir_best_effort(&backup_root)?;
+    durability.record(Phase1DurabilityOpKind::DirFsync, REDB_BACKUP_SUBDIR);
+
+    let queue_manifest_sha256 = compute_capture_queue_manifest_sha256_readonly(common_storage)?;
+    let spool_manifest_sha256 = compute_capture_spool_manifest_sha256_readonly(common_storage)?;
+    let source_digests = SourceDigests {
+        git_redb_sha256: Some(git_sha256.clone()),
+        cap_redb_sha256: Some(cap_sha256.clone()),
+        queue_manifest_sha256: Some(queue_manifest_sha256.clone()),
+        spool_manifest_sha256: Some(spool_manifest_sha256.clone()),
+        ..SourceDigests::default()
+    };
+
+    Ok(ReversePhase1BackupReport {
+        generation,
+        backup_rel_dir,
+        backup_dir,
+        git_redb_backup: RedbFileBackupReceipt {
+            backup_path: git_backup_path,
+            sha256: git_sha256,
+            byte_len: git_byte_len,
+        },
+        capture_redb_backup: RedbFileBackupReceipt {
+            backup_path: cap_backup_path,
+            sha256: cap_sha256,
+            byte_len: cap_byte_len,
+        },
+        queue_backup: QueueBackupReport {
+            backup_queue_dir,
+            files: queue_files,
+            queue_manifest_sha256,
+        },
+        spool_manifest_sha256,
+        source_digests,
+        durability,
+    })
+}
+
+/// Full orchestrated reverse migration Phase 1 (`RB-11q` + `RB-11i` + `RB-11p`):
+/// 1. Quiesce all 8 locks in strict `ADR-RB-07` #2 order (`migration.lock .. capture_wtx`).
+/// 2. Stream-export all 61 Git + 25 Capture tables, replay unreconciled
+///    `META_CROSS_STORE_INTENT`, ingest pending `capture-queue/{priority,normal}/`
+///    read-only, and stamp `PRAGMA application_id = target_migration_tag`.
+/// 3. Verify `PRAGMA integrity_check == "ok"` + `fsync` on both `.tmp` targets.
+/// 4. Stream-backup frozen `git.redb`, `capture.redb`, and
+///    `capture-queue/{priority,normal,quarantine}/` to `.libra/redb-backup/<gen>/`
+///    with SHA-256 verification and `fsync`.
+///
+/// Any failure or subsequent abort cleans up `.tmp` targets and staged backups
+/// while leaving source `git.redb`, `capture.redb`, and `capture-queue/` 100%
+/// byte-for-byte identical.
+pub async fn prepare_reverse_phase1(common_storage: &Path) -> StorageResult<ReversePhase1Prepared> {
+    prepare_reverse_phase1_for_role(DatabaseRole::Repository, common_storage).await
+}
+
+/// Role-validated variant of [`prepare_reverse_phase1`] enforcing `GC-13`
+/// isolation (rejects `GlobalConfig`, `SystemConfig`, and `Derived`).
+pub async fn prepare_reverse_phase1_for_role(
+    role: DatabaseRole,
+    common_storage: &Path,
+) -> StorageResult<ReversePhase1Prepared> {
+    prepare_reverse_phase1_inner(
+        role,
+        common_storage,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+enum ReversePhase1FaultPoint {
+    AfterExportBeforeVerify,
+    AfterVerifyBeforeBackup,
+    AfterBackupBeforeReturn,
+}
+
+async fn prepare_reverse_phase1_inner(
+    role: DatabaseRole,
+    common_storage: &Path,
+    #[cfg(test)] fault: Option<ReversePhase1FaultPoint>,
+) -> StorageResult<ReversePhase1Prepared> {
+    validate_forward_migration_role(role).map_err(normalize_reverse_quiesce_err)?;
+    let guard = quiesce_reverse_repository_phase1(common_storage)?;
+    let mut artifacts = ReversePhase1ArtifactGuard::new(common_storage);
+    let mut telemetry = ExportStreamTelemetry::new();
+
+    let result: StorageResult<(
+        ReversePhase1ExportReport,
+        ReversePhase1VerificationReport,
+        ReversePhase1BackupReport,
+    )> = async {
+        let export = export_reverse_phase1_to_sqlite_tmp_inner(
+            &guard,
+            common_storage,
+            &mut telemetry,
+            &mut artifacts,
+        )
+        .await?;
+        #[cfg(test)]
+        if fault == Some(ReversePhase1FaultPoint::AfterExportBeforeVerify) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "injected reverse Phase 1 fault after export before integrity verify"
+                    .to_string(),
+            });
+        }
+        let verification = verify_reverse_phase1_sqlite_tmp(common_storage, &export).await?;
+        #[cfg(test)]
+        if fault == Some(ReversePhase1FaultPoint::AfterVerifyBeforeBackup) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "injected reverse Phase 1 fault after verify before redb-backup"
+                    .to_string(),
+            });
+        }
+        let backup = create_reverse_phase1_backups_inner(&guard, common_storage, &mut artifacts)?;
+        #[cfg(test)]
+        if fault == Some(ReversePhase1FaultPoint::AfterBackupBeforeReturn) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "injected reverse Phase 1 fault after redb-backup before return"
+                    .to_string(),
+            });
+        }
+        Ok((export, verification, backup))
+    }
+    .await;
+
+    match result {
+        Ok((export, verification, backup)) => Ok(ReversePhase1Prepared {
+            artifacts,
+            export,
+            verification,
+            backup,
+            guard,
+        }),
+        Err(primary) => {
+            let _ = artifacts.cleanup_now();
+            let _ = guard.abort_and_release();
+            Err(primary)
+        }
+    }
+}
+
+// ============================================================================
+// Symmetric Reverse Migration Phase 2: Manifest Publish, Redb `META_SCHEMA`
+// Fencing, Post-Unlink Persistence, In-Place Queue & Active Spool Tombstones,
+// Non-Overwriting `hard_link` Publish, Competing `capture.db` Single-Conn
+// Reconcile/Fence/Replace & Step 2.5-2.6 Finalize/Unfence (`ADR-RB-07` #2,
+// `RB-11d`, `RB-11x`, `RB-11j`, `RB-11y`, `RB-11l`)
+// ============================================================================
+
+/// Intermediate Phase 2 state returned after Step 2.1–2.2 (`RB-11d`): in-progress
+/// SQLite manifest published, both `git.redb` and `capture.redb` fenced via
+/// `META_SCHEMA min_reader_version = u32::MAX` and durably unlinked with
+/// persisted `fenced_ready_to_unlink -> unlinked` progress, while all 6 advisory
+/// locks remain continuously held.
+#[derive(Debug)]
+pub struct ReversePhase2FencedState {
+    common_storage: PathBuf,
+    manifest: StorageFormatManifest,
+    export: ReversePhase1ExportReport,
+    verification: ReversePhase1VerificationReport,
+    backup: ReversePhase1BackupReport,
+    durability: Phase2DurabilityReceipt,
+    locks: ReversePhase1Locks,
+}
+
+impl ReversePhase2FencedState {
+    /// Current persisted `storage-format.json` (`finalized = false`).
+    #[must_use]
+    pub fn manifest(&self) -> &StorageFormatManifest {
+        &self.manifest
+    }
+
+    /// Phase 1 export report carried forward into Step 2.3–2.6.
+    #[must_use]
+    pub fn export(&self) -> &ReversePhase1ExportReport {
+        &self.export
+    }
+
+    /// Phase 1 verification report.
+    #[must_use]
+    pub fn verification(&self) -> &ReversePhase1VerificationReport {
+        &self.verification
+    }
+
+    /// Phase 1 backup report.
+    #[must_use]
+    pub fn backup(&self) -> &ReversePhase1BackupReport {
+        &self.backup
+    }
+
+    /// Durability audit trail across Step 2.1–2.2.
+    #[must_use]
+    pub fn durability(&self) -> &Phase2DurabilityReceipt {
+        &self.durability
+    }
+}
+
+/// Summary report returned after Step 2.3 installs in-place `0400` tombstones
+/// on `capture-queue/{priority,normal,quarantine}` and actively establishes
+/// `capture-spool/{tmp,ready,quarantine}` `0400` tombstones (`RB-11x`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReversePhase2TombstoneReceipt {
+    /// Number of `capture-queue` entries fenced as `0400` regular tombstones (`3`).
+    pub queue_tombstones_installed: usize,
+    /// Number of `capture-spool` entries verified/installed as `0400` regular tombstones (`3`).
+    pub spool_tombstones_installed: usize,
+}
+
+/// Complete final report returned once symmetric reverse migration (`redb -> SQLite`)
+/// completes Step 2.1–2.6 (`finalized = true`, `spool_unfenced = true`, `RB-11l`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReversePhase2FinalizedReport {
+    /// Source redb generation that was migrated back to SQLite.
+    pub generation: u64,
+    /// Unique non-zero `PRAGMA application_id` stamped on both published SQLite targets.
+    pub target_migration_tag: u32,
+    /// Final persisted manifest (`backend = Sqlite`, `finalized = true`, `spool_unfenced = true`).
+    pub manifest: StorageFormatManifest,
+    /// Final published `.libra/libra.db` path.
+    pub git_sqlite_path: PathBuf,
+    /// Final published `.libra/private/capture.db` path.
+    pub capture_sqlite_path: PathBuf,
+    /// `true` if a competing `application_id == 0` `capture.db` was reconciled, fenced, and replaced.
+    pub reconciled_competing_capture_db: bool,
+    /// Number of tombstoned rows skipped during competing `capture.db` reconciliation.
+    pub competing_tombstoned_rows_skipped: u64,
+    /// Number of `capture-spool` `is_file()` tombstones removed during Step 2.6.
+    pub spool_tombstones_unfenced: usize,
+    /// Durability receipt recorded across Phase 2.
+    pub durability: Phase2DurabilityReceipt,
+}
+
+#[cfg(test)]
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReversePhase2ObserverStage {
+    AfterInProgressManifestPublish,
+    AfterGitRedbFenceCommitBeforeUnlink,
+    AfterGitRedbFencedStatePersisted,
+    AfterGitRedbUnlinkedPersisted,
+    AfterCapRedbFenceCommitBeforeUnlink,
+    AfterCapRedbFencedStatePersisted,
+    AfterCapRedbUnlinkedPersisted,
+    AfterQueueTombstonesPersisted,
+    AfterSpoolTombstonesPersisted,
+    AfterTargetsStagedPersisted,
+    AfterCompetingCaptureFencedBeforeRename,
+    AfterCapturePublishedBeforeLibra,
+    AfterFinalizedBeforeSpoolUnfence,
+    AfterSpoolUnfencedPersisted,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReverseHardLinkFault {
+    Unsupported,
+    CrossDevice,
+}
+
+#[cfg(test)]
+trait ReversePhase2TestObserver: Send {
+    fn on_stage(
+        &mut self,
+        stage: ReversePhase2ObserverStage,
+        manifest: &StorageFormatManifest,
+    ) -> StorageResult<()> {
+        let _ = (stage, manifest);
+        Ok(())
+    }
+
+    fn hard_link_fault(&mut self, _dst: &Path) -> Option<ReverseHardLinkFault> {
+        None
+    }
+}
+
+fn unlink_regular_file_nofollow(
+    path: &Path,
+    parent_dir: &Path,
+    context: &'static str,
+) -> StorageResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {
+            fs::remove_file(path).map_err(|err| StorageBackendError::io(context, err))?;
+            fsync_dir_best_effort(parent_dir)?;
+            Ok(())
+        }
+        Ok(_) => Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 2 refused to unlink non-regular file ({context})"
+            ),
+        }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fsync_dir_best_effort(parent_dir)?;
+            Ok(())
+        }
+        Err(err) => Err(StorageBackendError::io(context, err)),
+    }
+}
+
+fn verify_is_valid_0400_tombstone(path: &Path, context: &'static str) -> StorageResult<bool> {
+    use std::io::Read as _;
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(StorageBackendError::io(context, err)),
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        // SAFETY: `geteuid` has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid || meta.nlink() != 1 || (meta.permissions().mode() & 0o777) != 0o400 {
+            return Ok(false);
+        }
+    }
+    if meta.len() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() as u64 {
+        return Ok(false);
+    }
+    let mut f = File::open(path).map_err(|err| StorageBackendError::io(context, err))?;
+    let mut buf = Vec::with_capacity(CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1);
+    f.read_to_end(&mut buf)
+        .map_err(|err| StorageBackendError::io(context, err))?;
+    Ok(buf.as_slice() == CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+}
+
+/// Replace an absent or empty/backed-up directory at `target_path` in place
+/// with a `0400` regular tombstone sentinel file (`CAPTURE_SPOOL_TOMBSTONE_SENTINEL`)
+/// without touching sibling lock files (`append.lock`, `capacity.lock`, `RB-11x`).
+fn install_inplace_0400_tombstone_entry(
+    target_path: &Path,
+    remove_existing_dir_contents: bool,
+    context: &'static str,
+) -> StorageResult<()> {
+    use std::io::Write as _;
+
+    if verify_is_valid_0400_tombstone(target_path, context)? {
+        return Ok(());
+    }
+
+    match fs::symlink_metadata(target_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration Phase 2 rejected symlink while installing tombstone ({context})"
+                ),
+            });
+        }
+        Ok(meta) if meta.file_type().is_dir() => {
+            if remove_existing_dir_contents {
+                fs::remove_dir_all(target_path)
+                    .map_err(|err| StorageBackendError::io(context, err))?;
+            } else {
+                fs::remove_dir(target_path).map_err(|err| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "reverse migration Phase 2 refused to replace non-empty directory with tombstone ({context}): {err}"
+                        ),
+                    }
+                })?;
+            }
+        }
+        Ok(_) => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration Phase 2 rejected unexpected non-tombstone file ({context})"
+                ),
+            });
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(StorageBackendError::io(context, err)),
+    }
+
+    let mut file = {
+        #[cfg(unix)]
+        {
+            use std::{
+                ffi::CString,
+                os::unix::{
+                    ffi::OsStrExt as _,
+                    io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+                },
+            };
+            let c_path = CString::new(target_path.as_os_str().as_bytes()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: format!("invalid tombstone path ({context})"),
+                }
+            })?;
+            // SAFETY: `c_path` is NUL-terminated.
+            let raw = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600 as libc::mode_t as libc::c_uint,
+                )
+            };
+            if raw < 0 {
+                return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+            }
+            // SAFETY: `raw >= 0` is exclusively owned.
+            let f = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+            // Ensure initial write mode `0600`, then tighten to `0400` after `sync_all`.
+            let _ = unsafe { libc::fchmod(f.as_raw_fd(), 0o600 as libc::mode_t) };
+            f
+        }
+        #[cfg(not(unix))]
+        {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target_path)
+                .map_err(|err| StorageBackendError::io(context, err))?
+        }
+    };
+
+    file.write_all(CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+        .map_err(|err| StorageBackendError::io(context, err))?;
+    file.sync_all()
+        .map_err(|err| StorageBackendError::io(context, err))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: `file` is valid and exclusively created by this process.
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o400 as libc::mode_t) } != 0 {
+            return Err(StorageBackendError::io(
+                "chmod 0400 reverse tombstone",
+                io::Error::last_os_error(),
+            ));
+        }
+        file.sync_all()
+            .map_err(|err| StorageBackendError::io(context, err))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut perms = file
+            .metadata()
+            .map_err(|err| StorageBackendError::io(context, err))?
+            .permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(target_path, perms)
+            .map_err(|err| StorageBackendError::io(context, err))?;
+    }
+    drop(file);
+    Ok(())
+}
+
+/// Step 2.1–2.2 (`RB-11d`): publish in-progress `storage-format.json(backend="sqlite",
+/// finalized=false, spool_unfenced=false, targets_staged_for_rename=false)`,
+/// commit `META_SCHEMA min_reader_version = u32::MAX` fence to `git.redb` and
+/// `capture.redb`, and persist `fenced_ready_to_unlink -> unlink + fsync_dir -> unlinked`
+/// for each redb database while retaining all 6 advisory locks.
+pub fn execute_reverse_phase2_fence_and_unlink(
+    prepared: ReversePhase1Prepared,
+) -> StorageResult<ReversePhase2FencedState> {
+    execute_reverse_phase2_fence_and_unlink_inner(
+        prepared,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn execute_reverse_phase2_fence_and_unlink_inner(
+    mut prepared: ReversePhase1Prepared,
+    #[cfg(test)] mut observer: Option<&mut dyn ReversePhase2TestObserver>,
+) -> StorageResult<ReversePhase2FencedState> {
+    // Enforce Phase 1 verification & backup prerequisites before entering Phase 2 (`RB-11d` AC1).
+    if !prepared.verification.git_tmp_integrity_ok
+        || !prepared.verification.capture_tmp_integrity_ok
+        || prepared.verification.git_tmp_application_id != prepared.export.target_migration_tag
+        || prepared.verification.capture_tmp_application_id != prepared.export.target_migration_tag
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration Phase 2 rejected unverified Phase 1 .tmp artifacts"
+                .to_string(),
+        });
+    }
+    if prepared.backup.source_digests.git_redb_sha256.is_none()
+        || prepared.backup.source_digests.cap_redb_sha256.is_none()
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration Phase 2 rejected missing redb-backup digests".to_string(),
+        });
+    }
+
+    let common_storage = prepared.artifacts.common_storage.clone();
+    // Point of no return into Phase 2: disarm Phase 1 abort cleanup so staged
+    // `.tmp` files and `redb-backup/<gen>/` survive any crash for recovery!
+    prepared.artifacts.disarm();
+
+    let ReversePhase1Prepared {
+        artifacts: _disarmed_artifacts,
+        export,
+        verification,
+        backup,
+        guard,
+    } = prepared;
+    let ReversePhase1QuiesceGuard { redb, locks } = guard;
+    let mut durability = Phase2DurabilityReceipt::default();
+
+    // Step 2.1: Publish `storage-format.json(backend="sqlite", finalized=false,
+    // spool_unfenced=false, targets_staged_for_rename=false, ...)`.
+    let mut manifest = StorageFormatManifest::new_sqlite_in_progress(
+        export.generation,
+        export.target_migration_tag,
+        Some(backup.backup_rel_dir.clone()),
+        Phase2Progress {
+            git_redb: Some(Phase2DbState::Pending),
+            cap_redb: Some(Phase2DbState::Pending),
+            queue_fenced: false,
+            spool_fenced: false,
+            ..Phase2Progress::default()
+        },
+        backup.source_digests.clone(),
+    )?;
+    publish_storage_manifest(&common_storage, &manifest)?;
+    durability.record(
+        Phase2DurabilityOpKind::PublishManifestPending,
+        None,
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterInProgressManifestPublish,
+            &manifest,
+        )?;
+    }
+
+    // Destructure `QuiescedRepositoryRedbSources` so we fence & close `git.redb`
+    // FIRST, then `capture.redb` SECOND (never dropping `locks`!).
+    let QuiescedRepositoryRedbSources {
+        generation: _,
+        git_redb_path,
+        capture_redb_path,
+        capture_wtx,
+        git_wtx,
+        capture_db,
+        git_db,
+        #[cfg(any(unix, windows))]
+        capture_backend_ctrl,
+        #[cfg(any(unix, windows))]
+        git_backend_ctrl,
+    } = redb;
+
+    // Step 2.2a: Fence `git.redb` with `META_SCHEMA min_reader_version = u32::MAX`
+    // -> persist `fenced_ready_to_unlink` -> `unlink` + `fsync_dir` -> persist `unlinked`.
+    #[cfg(any(unix, windows))]
+    git_backend_ctrl.enable_phase2_writes_and_flush()?;
+    write_migration_tombstone(&git_wtx, DatabaseRole::Repository)?;
+    git_wtx.commit().map_err(|err| {
+        map_redb_commit_err(err, "commit reverse Phase 2 git.redb META_SCHEMA fence")
+    })?;
+    drop(git_db);
+    durability.record(
+        Phase2DurabilityOpKind::FenceCommit,
+        Some(DatabaseRole::Repository),
+        "redb/git.redb",
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterGitRedbFenceCommitBeforeUnlink,
+            &manifest,
+        )?;
+    }
+
+    manifest.phase2_progress.git_redb = Some(Phase2DbState::FencedReadyToUnlink);
+    publish_storage_manifest(&common_storage, &manifest)?;
+    durability.record(
+        Phase2DurabilityOpKind::PublishManifestFencedReadyToUnlink,
+        Some(DatabaseRole::Repository),
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterGitRedbFencedStatePersisted,
+            &manifest,
+        )?;
+    }
+
+    unlink_regular_file_nofollow(
+        &git_redb_path,
+        &common_storage.join(REDB_SUBDIR),
+        "unlink fenced git.redb",
+    )?;
+    durability.record(
+        Phase2DurabilityOpKind::UnlinkSource,
+        Some(DatabaseRole::Repository),
+        "redb/git.redb",
+    );
+    durability.record(
+        Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+        Some(DatabaseRole::Repository),
+        REDB_SUBDIR,
+    );
+
+    manifest.phase2_progress.git_redb = Some(Phase2DbState::Unlinked);
+    publish_storage_manifest(&common_storage, &manifest)?;
+    durability.record(
+        Phase2DurabilityOpKind::PublishManifestUnlinked,
+        Some(DatabaseRole::Repository),
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterGitRedbUnlinkedPersisted,
+            &manifest,
+        )?;
+    }
+
+    // Step 2.2b: Fence `capture.redb` with `META_SCHEMA min_reader_version = u32::MAX`
+    // -> persist `fenced_ready_to_unlink` -> `unlink` + `fsync_dir` -> persist `unlinked`.
+    #[cfg(any(unix, windows))]
+    capture_backend_ctrl.enable_phase2_writes_and_flush()?;
+    write_migration_tombstone(&capture_wtx, DatabaseRole::Capture)?;
+    capture_wtx.commit().map_err(|err| {
+        map_redb_commit_err(err, "commit reverse Phase 2 capture.redb META_SCHEMA fence")
+    })?;
+    drop(capture_db);
+    durability.record(
+        Phase2DurabilityOpKind::FenceCommit,
+        Some(DatabaseRole::Capture),
+        "private/capture.redb",
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterCapRedbFenceCommitBeforeUnlink,
+            &manifest,
+        )?;
+    }
+
+    manifest.phase2_progress.cap_redb = Some(Phase2DbState::FencedReadyToUnlink);
+    publish_storage_manifest(&common_storage, &manifest)?;
+    durability.record(
+        Phase2DurabilityOpKind::PublishManifestFencedReadyToUnlink,
+        Some(DatabaseRole::Capture),
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterCapRedbFencedStatePersisted,
+            &manifest,
+        )?;
+    }
+
+    unlink_regular_file_nofollow(
+        &capture_redb_path,
+        &common_storage.join(PRIVATE_SUBDIR),
+        "unlink fenced capture.redb",
+    )?;
+    durability.record(
+        Phase2DurabilityOpKind::UnlinkSource,
+        Some(DatabaseRole::Capture),
+        "private/capture.redb",
+    );
+    durability.record(
+        Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+        Some(DatabaseRole::Capture),
+        PRIVATE_SUBDIR,
+    );
+
+    manifest.phase2_progress.cap_redb = Some(Phase2DbState::Unlinked);
+    publish_storage_manifest(&common_storage, &manifest)?;
+    durability.record(
+        Phase2DurabilityOpKind::PublishManifestUnlinked,
+        Some(DatabaseRole::Capture),
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterCapRedbUnlinkedPersisted,
+            &manifest,
+        )?;
+    }
+
+    Ok(ReversePhase2FencedState {
+        common_storage,
+        manifest,
+        export,
+        verification,
+        backup,
+        durability,
+        locks,
+    })
+}
+
+/// Step 2.3 (`RB-11x`): under continuously held in-place `capture-queue/append.lock`,
+/// `capture-spool-consumer.lock`, and `capture-spool/capacity.lock`, replace
+/// `capture-queue/{priority,normal,quarantine}` with `0400` regular file tombstones
+/// and `fsync_dir`, AND actively verify/install `capture-spool/{tmp,ready,quarantine}`
+/// `0400` regular file tombstones with `fsync_dir`, persisting `queue_fenced = true`
+/// and `spool_fenced = true`.
+pub fn install_reverse_phase2_queue_and_spool_tombstones(
+    state: &mut ReversePhase2FencedState,
+) -> StorageResult<ReversePhase2TombstoneReceipt> {
+    #[cfg(test)]
+    let mut no_obs: Option<&mut dyn ReversePhase2TestObserver> = None;
+    install_reverse_phase2_queue_and_spool_tombstones_inner(
+        state,
+        #[cfg(test)]
+        &mut no_obs,
+    )
+}
+
+fn install_reverse_phase2_queue_and_spool_tombstones_inner(
+    state: &mut ReversePhase2FencedState,
+    #[cfg(test)] observer: &mut Option<&mut dyn ReversePhase2TestObserver>,
+) -> StorageResult<ReversePhase2TombstoneReceipt> {
+    let common_storage = state.common_storage.clone();
+    let queue_dir = capture_queue_dir_path(&common_storage);
+    let spool_dir = capture_spool_dir_path(&common_storage);
+
+    // Ensure `capture-queue/` exists (leaving `append.lock` & `writer.lock` untouched in place).
+    ensure_private_dir_nofollow(
+        &queue_dir,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    for sub in [
+        QUEUE_LANE_PRIORITY_DIR,
+        QUEUE_LANE_NORMAL_DIR,
+        QUEUE_QUARANTINE_DIR,
+    ] {
+        install_inplace_0400_tombstone_entry(
+            &queue_dir.join(sub),
+            true,
+            "install reverse capture-queue 0400 tombstone",
+        )?;
+    }
+    fsync_dir_best_effort(&queue_dir)?;
+    state.durability.record(
+        Phase2DurabilityOpKind::SpoolDirFsync,
+        Some(DatabaseRole::Capture),
+        "private/capture-queue",
+    );
+
+    state.manifest.phase2_progress.queue_fenced = true;
+    publish_storage_manifest(&common_storage, &state.manifest)?;
+    state.durability.record(
+        Phase2DurabilityOpKind::ManifestAtomicPublish,
+        Some(DatabaseRole::Capture),
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterQueueTombstonesPersisted,
+            &state.manifest,
+        )?;
+    }
+
+    // Actively verify/establish all 3 `capture-spool/{tmp,ready,quarantine}`
+    // `0400` tombstones in place under held `capture-spool-consumer.lock` +
+    // `capture-spool/capacity.lock` (covering both migrated and fresh Redb repos).
+    ensure_private_dir_nofollow(
+        &spool_dir,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+        install_inplace_0400_tombstone_entry(
+            &spool_dir.join(sub),
+            sub == CAPTURE_SPOOL_READY_SUBDIR,
+            "install reverse capture-spool 0400 tombstone",
+        )?;
+    }
+    fsync_dir_best_effort(&spool_dir)?;
+    state.durability.record(
+        Phase2DurabilityOpKind::SpoolDirFsync,
+        Some(DatabaseRole::Capture),
+        "private/capture-spool",
+    );
+
+    state.manifest.phase2_progress.spool_fenced = true;
+    publish_storage_manifest(&common_storage, &state.manifest)?;
+    state.durability.record(
+        Phase2DurabilityOpKind::PublishManifestSpoolFenced,
+        Some(DatabaseRole::Capture),
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterSpoolTombstonesPersisted,
+            &state.manifest,
+        )?;
+    }
+
+    Ok(ReversePhase2TombstoneReceipt {
+        queue_tombstones_installed: 3,
+        spool_tombstones_installed: 3,
+    })
+}
+
+async fn read_sqlite_application_id_readonly(
+    path: &Path,
+    role: DatabaseRole,
+) -> StorageResult<u32> {
+    let mut conn = open_reverse_sqlite_tmp_conn_async(path, role, true).await?;
+    let raw: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Phase 2 failed reading PRAGMA application_id from {role}: {err}"
+            ),
+        })?;
+    conn.close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("reverse migration Phase 2 failed closing {role} tag probe: {err}"),
+        })?;
+    Ok(u32::try_from(raw).unwrap_or(raw as u32))
+}
+
+async fn is_sqlite_file_migrated_fenced(path: &Path, role: DatabaseRole) -> StorageResult<bool> {
+    let mut conn = open_reverse_sqlite_tmp_conn_async(path, role, true).await?;
+    let probe = sea_orm::sqlx::query_scalar::<_, i64>("SELECT 1 FROM sqlite_master LIMIT 1;")
+        .persistent(false)
+        .fetch_optional(&mut conn)
+        .await;
+    match probe {
+        Ok(_) => {
+            let _ = conn.close().await;
+            Ok(false)
+        }
+        Err(err) => {
+            let msg = err.to_string().to_ascii_lowercase();
+            let looks_fenced = msg.contains("malformed database schema")
+                && msg.contains(SQLITE_MIGRATED_FENCE_TABLE);
+            if !looks_fenced {
+                let _ = conn.close().await;
+                return Ok(false);
+            }
+            let _ = sea_orm::sqlx::query("PRAGMA writable_schema = ON;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await;
+            let row: Result<Option<(String, String)>, _> = sea_orm::sqlx::query_as(
+                "SELECT name, sql FROM sqlite_master WHERE name = ?1 LIMIT 1;",
+            )
+            .bind(SQLITE_MIGRATED_FENCE_TABLE)
+            .persistent(false)
+            .fetch_optional(&mut conn)
+            .await;
+            let _ = sea_orm::sqlx::query("PRAGMA writable_schema = OFF;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await;
+            let _ = conn.close().await;
+            Ok(matches!(
+                row,
+                Ok(Some((name, sql)))
+                    if name == SQLITE_MIGRATED_FENCE_TABLE && sql == SQLITE_MIGRATED_FENCE_SQL
+            ))
+        }
+    }
+}
+
+fn is_hard_link_unsupported_err(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = err.raw_os_error()
+        && matches!(
+            code,
+            libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV | libc::EPERM | libc::EMLINK
+        )
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    if let Some(code) = err.raw_os_error()
+        && matches!(code, 1 | 17 | 50)
+    {
+        return true;
+    }
+    false
+}
+
+/// Reconcile all legitimate rows from a competing `application_id == 0`
+/// `capture.db` (created by a racing `capture::store::open`) into `capture.db.tmp`
+/// under a single exclusive `c_mig` connection while strictly respecting
+/// `agent_import_tombstone` (`RB-11y` AC1–AC2, `RB-11s` AC1).
+#[allow(clippy::too_many_lines)]
+async fn reconcile_competing_capture_db_into_tmp(
+    competing: &mut QuiescedSqliteConnection,
+    tmp_path: &Path,
+) -> StorageResult<u64> {
+    let r = DatabaseRole::Capture;
+    let mut dst = open_reverse_sqlite_tmp_conn_async(tmp_path, r, false).await?;
+    let mut tombstoned_skipped = 0u64;
+
+    // 1. Merge any tombstones from competing DB first.
+    if sqlite_table_exists_on_conn(&mut competing.conn, r, "agent_import_tombstone").await? {
+        let mut last_rowid = 0i64;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT _rowid_, tombstone_id, agent_kind, provider_session_id, erased_session_id, source_fingerprint, erased_at \
+                 FROM agent_import_tombstone WHERE _rowid_ > ? ORDER BY _rowid_ ASC LIMIT 500",
+            )
+            .bind(last_rowid)
+            .fetch_all(&mut competing.conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut dst, r, "agent_import_tombstone").await?;
+            for row in &rows {
+                last_rowid = row.try_get::<i64, _>(0).unwrap_or(last_rowid);
+                let tombstone_id: String = row
+                    .try_get(1)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                let agent_kind: String = row
+                    .try_get(2)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                let provider_session_id: String = row
+                    .try_get(3)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                let erased_session_id: String = row
+                    .try_get(4)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                let source_fingerprint: Option<String> = row
+                    .try_get(5)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                let erased_at: i64 = row
+                    .try_get(6)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                sea_orm::sqlx::query(
+                    "INSERT OR IGNORE INTO agent_import_tombstone \
+                     (tombstone_id, agent_kind, provider_session_id, erased_session_id, source_fingerprint, erased_at) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&tombstone_id)
+                .bind(&agent_kind)
+                .bind(&provider_session_id)
+                .bind(&erased_session_id)
+                .bind(&source_fingerprint)
+                .bind(erased_at)
+                .execute(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+            }
+            commit_reverse_sqlite_batch(&mut dst, r, "agent_import_tombstone").await?;
+        }
+    }
+
+    // 2. Merge `agent_session` strictly respecting `agent_import_tombstone`.
+    if sqlite_table_exists_on_conn(&mut competing.conn, r, "agent_session").await? {
+        let mut last_rowid = 0i64;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT _rowid_, session_id, agent_kind, provider_session_id, thread_id, state, working_dir, \
+                        worktree_id, parent_commit, parent_session_id, metadata_json, redaction_report, \
+                        started_at, last_event_at, stopped_at, schema_version, sync_revision, \
+                        repo_id, workspace_id, workspace_fence, scope_state \
+                 FROM agent_session WHERE _rowid_ > ? ORDER BY _rowid_ ASC LIMIT 500",
+            )
+            .bind(last_rowid)
+            .fetch_all(&mut competing.conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut dst, r, "agent_session").await?;
+            for row in &rows {
+                last_rowid = row.try_get::<i64, _>(0).unwrap_or(last_rowid);
+                let session_id: String = row
+                    .try_get(1)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+                let agent_kind: String = row
+                    .try_get(2)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+                let provider_session_id: String = row
+                    .try_get(3)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+                let blocked: Option<i64> = sea_orm::sqlx::query_scalar(
+                    "SELECT 1 FROM agent_import_tombstone \
+                     WHERE (agent_kind = ? AND provider_session_id = ?) OR erased_session_id = ? LIMIT 1",
+                )
+                .bind(&agent_kind)
+                .bind(&provider_session_id)
+                .bind(&session_id)
+                .fetch_optional(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                if blocked.is_some() {
+                    tombstoned_skipped = tombstoned_skipped.saturating_add(1);
+                    continue;
+                }
+                sea_orm::sqlx::query(
+                    "INSERT OR IGNORE INTO agent_session \
+                     (session_id, agent_kind, provider_session_id, thread_id, state, working_dir, \
+                      worktree_id, parent_commit, parent_session_id, metadata_json, redaction_report, \
+                      started_at, last_event_at, stopped_at, schema_version, sync_revision, \
+                      repo_id, workspace_id, workspace_fence, scope_state) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&session_id)
+                .bind(&agent_kind)
+                .bind(&provider_session_id)
+                .bind(row.try_get::<Option<String>, _>(4).ok().flatten())
+                .bind(row.try_get::<String, _>(5).unwrap_or_default())
+                .bind(row.try_get::<String, _>(6).unwrap_or_default())
+                .bind(row.try_get::<Option<String>, _>(7).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(8).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(9).ok().flatten())
+                .bind(row.try_get::<String, _>(10).unwrap_or_else(|_| "{}".to_string()))
+                .bind(row.try_get::<String, _>(11).unwrap_or_else(|_| "{}".to_string()))
+                .bind(row.try_get::<i64, _>(12).unwrap_or(0))
+                .bind(row.try_get::<i64, _>(13).unwrap_or(0))
+                .bind(row.try_get::<Option<i64>, _>(14).ok().flatten())
+                .bind(row.try_get::<i64, _>(15).unwrap_or(1))
+                .bind(row.try_get::<i64, _>(16).unwrap_or(1))
+                .bind(row.try_get::<Option<String>, _>(17).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(18).ok().flatten())
+                .bind(row.try_get::<Option<i64>, _>(19).ok().flatten())
+                .bind(row.try_get::<String, _>(20).unwrap_or_else(|_| "legacy_unknown".to_string()))
+                .execute(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+            }
+            commit_reverse_sqlite_batch(&mut dst, r, "agent_session").await?;
+        }
+    }
+
+    // 3. Merge `agent_checkpoint` strictly respecting `agent_import_tombstone`.
+    if sqlite_table_exists_on_conn(&mut competing.conn, r, "agent_checkpoint").await? {
+        let mut last_rowid = 0i64;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT _rowid_, checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit, \
+                        tree_oid, metadata_blob_oid, traces_commit, tool_use_id, subagent_session_id, \
+                        description, created_at, sync_revision \
+                 FROM agent_checkpoint WHERE _rowid_ > ? ORDER BY _rowid_ ASC LIMIT 500",
+            )
+            .bind(last_rowid)
+            .fetch_all(&mut competing.conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_checkpoint", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut dst, r, "agent_checkpoint").await?;
+            for row in &rows {
+                last_rowid = row.try_get::<i64, _>(0).unwrap_or(last_rowid);
+                let session_id: String = row
+                    .try_get(2)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_checkpoint", e))?;
+                let blocked: Option<i64> = sea_orm::sqlx::query_scalar(
+                    "SELECT 1 FROM agent_import_tombstone WHERE erased_session_id = ? LIMIT 1",
+                )
+                .bind(&session_id)
+                .fetch_optional(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                if blocked.is_some() {
+                    tombstoned_skipped = tombstoned_skipped.saturating_add(1);
+                    continue;
+                }
+                sea_orm::sqlx::query(
+                    "INSERT OR IGNORE INTO agent_checkpoint \
+                     (checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit, tree_oid, \
+                      metadata_blob_oid, traces_commit, tool_use_id, subagent_session_id, description, created_at, sync_revision) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(row.try_get::<String, _>(1).unwrap_or_default())
+                .bind(&session_id)
+                .bind(row.try_get::<Option<String>, _>(3).ok().flatten())
+                .bind(row.try_get::<String, _>(4).unwrap_or_default())
+                .bind(row.try_get::<Option<String>, _>(5).ok().flatten())
+                .bind(row.try_get::<String, _>(6).unwrap_or_default())
+                .bind(row.try_get::<String, _>(7).unwrap_or_default())
+                .bind(row.try_get::<String, _>(8).unwrap_or_default())
+                .bind(row.try_get::<Option<String>, _>(9).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(10).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(11).ok().flatten())
+                .bind(row.try_get::<i64, _>(12).unwrap_or(0))
+                .bind(row.try_get::<i64, _>(13).unwrap_or(1))
+                .execute(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_checkpoint", e))?;
+            }
+            commit_reverse_sqlite_batch(&mut dst, r, "agent_checkpoint").await?;
+        }
+    }
+
+    // 4. Merge `agent_session_commit` (skipping tombstoned sessions).
+    if sqlite_table_exists_on_conn(&mut competing.conn, r, "agent_session_commit").await? {
+        let mut last_rowid = 0i64;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT _rowid_, session_id, hash_kind, commit_oid \
+                 FROM agent_session_commit WHERE _rowid_ > ? ORDER BY _rowid_ ASC LIMIT 500",
+            )
+            .bind(last_rowid)
+            .fetch_all(&mut competing.conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session_commit", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut dst, r, "agent_session_commit").await?;
+            for row in &rows {
+                last_rowid = row.try_get::<i64, _>(0).unwrap_or(last_rowid);
+                let session_id: String = row
+                    .try_get(1)
+                    .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session_commit", e))?;
+                let blocked: Option<i64> = sea_orm::sqlx::query_scalar(
+                    "SELECT 1 FROM agent_import_tombstone WHERE erased_session_id = ? LIMIT 1",
+                )
+                .bind(&session_id)
+                .fetch_optional(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+                if blocked.is_some() {
+                    tombstoned_skipped = tombstoned_skipped.saturating_add(1);
+                    continue;
+                }
+                sea_orm::sqlx::query(
+                    "INSERT OR IGNORE INTO agent_session_commit (session_id, hash_kind, commit_oid) VALUES (?, ?, ?)",
+                )
+                .bind(&session_id)
+                .bind(row.try_get::<String, _>(2).unwrap_or_default())
+                .bind(row.try_get::<String, _>(3).unwrap_or_default())
+                .execute(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session_commit", e))?;
+            }
+            commit_reverse_sqlite_batch(&mut dst, r, "agent_session_commit").await?;
+        }
+    }
+
+    // 5. Merge `agent_audit_log`, `agent_usage_stats`, `agent_workspace_scope_audit`,
+    //    and `agent_bridge_session` (append-only / idempotent `INSERT OR IGNORE`).
+    if sqlite_table_exists_on_conn(&mut competing.conn, r, "agent_audit_log").await? {
+        let mut last_rowid = 0i64;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT _rowid_, audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted \
+                 FROM agent_audit_log WHERE _rowid_ > ? ORDER BY _rowid_ ASC LIMIT 500",
+            )
+            .bind(last_rowid)
+            .fetch_all(&mut competing.conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_audit_log", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut dst, r, "agent_audit_log").await?;
+            for row in &rows {
+                last_rowid = row.try_get::<i64, _>(0).unwrap_or(last_rowid);
+                sea_orm::sqlx::query(
+                    "INSERT OR IGNORE INTO agent_audit_log \
+                     (audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(row.try_get::<String, _>(1).unwrap_or_default())
+                .bind(row.try_get::<String, _>(2).unwrap_or_default())
+                .bind(row.try_get::<Option<String>, _>(3).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(4).ok().flatten())
+                .bind(row.try_get::<String, _>(5).unwrap_or_default())
+                .bind(row.try_get::<String, _>(6).unwrap_or_default())
+                .bind(row.try_get::<String, _>(7).unwrap_or_default())
+                .bind(row.try_get::<Option<String>, _>(8).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(9).ok().flatten())
+                .bind(row.try_get::<i64, _>(10).unwrap_or(1))
+                .execute(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_audit_log", e))?;
+            }
+            commit_reverse_sqlite_batch(&mut dst, r, "agent_audit_log").await?;
+        }
+    }
+
+    if sqlite_table_exists_on_conn(&mut competing.conn, r, "agent_usage_stats").await? {
+        let mut last_rowid = 0i64;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT _rowid_, id, session_id, thread_id, agent_run_id, run_id, provider, model, request_kind, intent, \
+                        prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, \
+                        tool_call_count, wall_clock_ms, provider_latency_ms, cost_estimate_micro_dollars, cost_usd, \
+                        usage_estimated, started_at, finished_at, success, error_kind, schema_version, created_at, \
+                        agent_name, repo_id, turn_id, event_id \
+                 FROM agent_usage_stats WHERE _rowid_ > ? ORDER BY _rowid_ ASC LIMIT 500",
+            )
+            .bind(last_rowid)
+            .fetch_all(&mut competing.conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_usage_stats", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut dst, r, "agent_usage_stats").await?;
+            for row in &rows {
+                last_rowid = row.try_get::<i64, _>(0).unwrap_or(last_rowid);
+                sea_orm::sqlx::query(
+                    "INSERT OR IGNORE INTO agent_usage_stats \
+                     (id, session_id, thread_id, agent_run_id, run_id, provider, model, request_kind, intent, \
+                      prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, \
+                      tool_call_count, wall_clock_ms, provider_latency_ms, cost_estimate_micro_dollars, cost_usd, \
+                      usage_estimated, started_at, finished_at, success, error_kind, schema_version, created_at, \
+                      agent_name, repo_id, turn_id, event_id) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(row.try_get::<String, _>(1).unwrap_or_default())
+                .bind(row.try_get::<Option<String>, _>(2).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(3).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(4).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(5).ok().flatten())
+                .bind(row.try_get::<String, _>(6).unwrap_or_default())
+                .bind(row.try_get::<String, _>(7).unwrap_or_default())
+                .bind(row.try_get::<String, _>(8).unwrap_or_else(|_| "completion".to_string()))
+                .bind(row.try_get::<Option<String>, _>(9).ok().flatten())
+                .bind(row.try_get::<i64, _>(10).unwrap_or(0))
+                .bind(row.try_get::<i64, _>(11).unwrap_or(0))
+                .bind(row.try_get::<i64, _>(12).unwrap_or(0))
+                .bind(row.try_get::<i64, _>(13).unwrap_or(0))
+                .bind(row.try_get::<i64, _>(14).unwrap_or(0))
+                .bind(row.try_get::<i64, _>(15).unwrap_or(0))
+                .bind(row.try_get::<i64, _>(16).unwrap_or(0))
+                .bind(row.try_get::<Option<i64>, _>(17).ok().flatten())
+                .bind(row.try_get::<Option<i64>, _>(18).ok().flatten())
+                .bind(row.try_get::<Option<f64>, _>(19).ok().flatten())
+                .bind(row.try_get::<i64, _>(20).unwrap_or(0))
+                .bind(row.try_get::<Option<String>, _>(21).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(22).ok().flatten())
+                .bind(row.try_get::<i64, _>(23).unwrap_or(1))
+                .bind(row.try_get::<Option<String>, _>(24).ok().flatten())
+                .bind(row.try_get::<i64, _>(25).unwrap_or(1))
+                .bind(row.try_get::<String, _>(26).unwrap_or_default())
+                .bind(row.try_get::<Option<String>, _>(27).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(28).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(29).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(30).ok().flatten())
+                .execute(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_usage_stats", e))?;
+            }
+            commit_reverse_sqlite_batch(&mut dst, r, "agent_usage_stats").await?;
+        }
+    }
+
+    if sqlite_table_exists_on_conn(&mut competing.conn, r, "agent_workspace_scope_audit").await? {
+        let mut last_rowid = 0i64;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT _rowid_, audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id, workspace_id, workspace_fence, actor, created_at \
+                 FROM agent_workspace_scope_audit WHERE _rowid_ > ? ORDER BY _rowid_ ASC LIMIT 500",
+            )
+            .bind(last_rowid)
+            .fetch_all(&mut competing.conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_workspace_scope_audit", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut dst, r, "agent_workspace_scope_audit").await?;
+            for row in &rows {
+                last_rowid = row.try_get::<i64, _>(0).unwrap_or(last_rowid);
+                sea_orm::sqlx::query(
+                    "INSERT OR IGNORE INTO agent_workspace_scope_audit \
+                     (audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id, workspace_id, workspace_fence, actor, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(row.try_get::<String, _>(1).unwrap_or_default())
+                .bind(row.try_get::<String, _>(2).unwrap_or_default())
+                .bind(row.try_get::<String, _>(3).unwrap_or_default())
+                .bind(row.try_get::<String, _>(4).unwrap_or_default())
+                .bind(row.try_get::<String, _>(5).unwrap_or_default())
+                .bind(row.try_get::<String, _>(6).unwrap_or_default())
+                .bind(row.try_get::<Option<String>, _>(7).ok().flatten())
+                .bind(row.try_get::<Option<i64>, _>(8).ok().flatten())
+                .bind(row.try_get::<Option<String>, _>(9).ok().flatten())
+                .bind(row.try_get::<i64, _>(10).unwrap_or(0))
+                .execute(&mut dst)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(r, "agent_workspace_scope_audit", e))?;
+            }
+            commit_reverse_sqlite_batch(&mut dst, r, "agent_workspace_scope_audit").await?;
+        }
+    }
+
+    dst.close()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration Step 2.4 failed closing reconciled capture.db.tmp: {err}"
+            ),
+        })?;
+    fsync_regular_file_nofollow(tmp_path, "fsync reconciled capture.db.tmp")?;
+    Ok(tombstoned_skipped)
+}
+
+fn try_hard_link_no_overwrite(
+    src: &Path,
+    dst: &Path,
+    #[cfg(test)] observer: &mut Option<&mut dyn ReversePhase2TestObserver>,
+) -> Result<(), io::Error> {
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut()
+        && let Some(fault) = obs.hard_link_fault(dst)
+    {
+        return match fault {
+            ReverseHardLinkFault::Unsupported => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "injected hard_link Unsupported (ENOSYS)",
+            )),
+            ReverseHardLinkFault::CrossDevice => {
+                #[cfg(unix)]
+                {
+                    Err(io::Error::from_raw_os_error(libc::EXDEV))
+                }
+                #[cfg(not(unix))]
+                {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "injected hard_link EXDEV",
+                    ))
+                }
+            }
+        };
+    }
+    fs::hard_link(src, dst)
+}
+
+/// Publish `.libra/private/capture.db` via non-overwriting `std::fs::hard_link`,
+/// handling:
+/// - Clean `Ok(())` -> `unlink(capture.db.tmp)` + `fsync_dir` (`RB-11j` AC2)
+/// - `Unsupported`/`ENOSYS`/`EXDEV` -> fail-closed `LBR-IO-001` (`RB-11j` AC3)
+/// - `AlreadyExists`:
+///   - Fenced competing `capture.db` -> verify `capture.db.tmp` tag + integrity -> atomic `rename` (`RB-11s` AC4)
+///   - Same `target_migration_tag` -> unlink duplicate `.tmp` without overwriting (`RB-11e` AC1)
+///   - `application_id == 0` -> single-conn `c_mig` reconcile (respecting `agent_import_tombstone`)
+///     + `__libra_migrated_fence__` + atomic `rename` (`RB-11y`, `RB-11s`)
+///   - Foreign non-zero tag -> fail-closed `LBR-IO-001`
+/// - `NotFound` (`capture.db.tmp` already unlinked) -> verify `capture.db` has `target_migration_tag` (`RB-11e` AC2/AC3)
+async fn publish_reverse_capture_db_step24(
+    common_storage: &Path,
+    #[cfg_attr(not(test), allow(unused_variables))] manifest: &StorageFormatManifest,
+    target_migration_tag: u32,
+    durability: &mut Phase2DurabilityReceipt,
+    #[cfg(test)] observer: &mut Option<&mut dyn ReversePhase2TestObserver>,
+) -> StorageResult<(bool, u64)> {
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let tmp_path = capture_sqlite_tmp_path(common_storage);
+    let dst_path = capture_sqlite_db_path(common_storage);
+
+    match try_hard_link_no_overwrite(
+        &tmp_path,
+        &dst_path,
+        #[cfg(test)]
+        observer,
+    ) {
+        Ok(()) => {
+            fs::remove_file(&tmp_path)
+                .map_err(|err| StorageBackendError::io("unlink published capture.db.tmp", err))?;
+            fsync_dir_best_effort(&private_dir)?;
+            durability.record(
+                Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+                Some(DatabaseRole::Capture),
+                PRIVATE_SUBDIR,
+            );
+            Ok((false, 0))
+        }
+        Err(err) if is_hard_link_unsupported_err(&err) => {
+            Err(StorageBackendError::BackendInternal {
+                detail: "reverse migration Step 2.4 failed closed: filesystem does not support non-overwriting hard_link for capture.db"
+                    .to_string(),
+            })
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            if is_sqlite_file_migrated_fenced(&dst_path, DatabaseRole::Capture).await? {
+                // Post-fence crash before atomic `rename` (`RB-11s` AC4): verify
+                // `capture.db.tmp` integrity & tag, then complete atomic replacement.
+                let mut tmp_dur = Phase1DurabilityReceipt::new();
+                verify_one_sqlite_tmp_integrity_and_tag(
+                    &tmp_path,
+                    DatabaseRole::Capture,
+                    target_migration_tag,
+                    "private/capture.db.tmp",
+                    &mut tmp_dur,
+                )
+                .await?;
+                fs::rename(&tmp_path, &dst_path).map_err(|e| {
+                    StorageBackendError::io("atomic rename capture.db.tmp over fenced capture.db", e)
+                })?;
+                fsync_dir_best_effort(&private_dir)?;
+                durability.record(
+                    Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+                    Some(DatabaseRole::Capture),
+                    PRIVATE_SUBDIR,
+                );
+                return Ok((true, 0));
+            }
+
+            let existing_tag =
+                read_sqlite_application_id_readonly(&dst_path, DatabaseRole::Capture).await?;
+            if existing_tag == target_migration_tag {
+                // Already published by this same migration (`RB-11e` AC1): remove
+                // redundant `.tmp` link without overwriting `capture.db`.
+                fs::remove_file(&tmp_path).map_err(|e| {
+                    StorageBackendError::io("unlink duplicate capture.db.tmp", e)
+                })?;
+                fsync_dir_best_effort(&private_dir)?;
+                durability.record(
+                    Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+                    Some(DatabaseRole::Capture),
+                    PRIVATE_SUBDIR,
+                );
+                return Ok((false, 0));
+            }
+            if existing_tag != 0 {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "reverse migration Step 2.4 refused to overwrite foreign capture.db (application_id={existing_tag}, expected {target_migration_tag})"
+                    ),
+                });
+            }
+
+            // Competing `application_id == 0` `capture.db` created by racing
+            // `capture::store::open` (`RB-11y` & `RB-11s`): single-connection
+            // exclusive reconcile + `__libra_migrated_fence__` + atomic `rename`.
+            let mut competing = quiesce_sqlite_source(&dst_path, DatabaseRole::Capture).await?;
+            let tombstoned_skipped =
+                reconcile_competing_capture_db_into_tmp(&mut competing, &tmp_path).await?;
+            let mut tmp_dur = Phase1DurabilityReceipt::new();
+            verify_one_sqlite_tmp_integrity_and_tag(
+                &tmp_path,
+                DatabaseRole::Capture,
+                target_migration_tag,
+                "private/capture.db.tmp",
+                &mut tmp_dur,
+            )
+            .await?;
+
+            // Commit atomic rollback-journal fence on competing `capture.db` over
+            // the SAME single `c_mig` connection (`RB-11y` AC3, `RB-11s` AC2).
+            #[cfg(test)]
+            let mut no_fwd_hook: Option<&mut dyn Phase2TestObserver> = None;
+            let _fence_receipt = fence_sqlite_connection_journaled_inner(
+                &mut competing,
+                #[cfg(test)]
+                &mut no_fwd_hook,
+            )
+            .await?;
+            competing
+                .conn
+                .close()
+                .await
+                .map_err(|e| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "reverse migration Step 2.4 failed closing fenced competing capture.db: {e}"
+                    ),
+                })?;
+            durability.record(
+                Phase2DurabilityOpKind::FenceCommit,
+                Some(DatabaseRole::Capture),
+                "private/capture.db",
+            );
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_stage(
+                    ReversePhase2ObserverStage::AfterCompetingCaptureFencedBeforeRename,
+                    manifest,
+                )?;
+            }
+
+            fs::rename(&tmp_path, &dst_path).map_err(|e| {
+                StorageBackendError::io("atomic rename capture.db.tmp over competing capture.db", e)
+            })?;
+            fsync_dir_best_effort(&private_dir)?;
+            durability.record(
+                Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+                Some(DatabaseRole::Capture),
+                PRIVATE_SUBDIR,
+            );
+            Ok((true, tombstoned_skipped))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if !dst_path.is_file() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Step 2.4 missing both capture.db.tmp and capture.db"
+                        .to_string(),
+                });
+            }
+            let existing_tag =
+                read_sqlite_application_id_readonly(&dst_path, DatabaseRole::Capture).await?;
+            if existing_tag != target_migration_tag {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "reverse migration Step 2.4 capture.db tag mismatch after tmp absent (found {existing_tag}, expected {target_migration_tag})"
+                    ),
+                });
+            }
+            Ok((false, 0))
+        }
+        Err(err) => Err(StorageBackendError::io(
+            "hard_link capture.db.tmp to capture.db",
+            err,
+        )),
+    }
+}
+
+/// Publish `.libra/libra.db` SECOND via non-overwriting `std::fs::hard_link`
+/// (`RB-11j` AC4–AC5, `RB-11m` AC4, `RB-11e`).
+async fn publish_reverse_libra_db_step24(
+    common_storage: &Path,
+    target_migration_tag: u32,
+    durability: &mut Phase2DurabilityReceipt,
+    #[cfg(test)] observer: &mut Option<&mut dyn ReversePhase2TestObserver>,
+) -> StorageResult<()> {
+    let tmp_path = git_sqlite_tmp_path(common_storage);
+    let dst_path = git_sqlite_db_path(common_storage);
+
+    match try_hard_link_no_overwrite(
+        &tmp_path,
+        &dst_path,
+        #[cfg(test)]
+        observer,
+    ) {
+        Ok(()) => {
+            fs::remove_file(&tmp_path)
+                .map_err(|err| StorageBackendError::io("unlink published libra.db.tmp", err))?;
+            fsync_dir_best_effort(common_storage)?;
+            durability.record(
+                Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+                Some(DatabaseRole::Repository),
+                ".",
+            );
+            Ok(())
+        }
+        Err(err) if is_hard_link_unsupported_err(&err) => {
+            Err(StorageBackendError::BackendInternal {
+                detail: "reverse migration Step 2.4 failed closed: filesystem does not support non-overwriting hard_link for libra.db"
+                    .to_string(),
+            })
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let existing_tag =
+                read_sqlite_application_id_readonly(&dst_path, DatabaseRole::Repository).await?;
+            if existing_tag == target_migration_tag {
+                fs::remove_file(&tmp_path).map_err(|e| {
+                    StorageBackendError::io("unlink duplicate libra.db.tmp", e)
+                })?;
+                fsync_dir_best_effort(common_storage)?;
+                durability.record(
+                    Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+                    Some(DatabaseRole::Repository),
+                    ".",
+                );
+                return Ok(());
+            }
+            Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration Step 2.4 refused to overwrite foreign libra.db (application_id={existing_tag}, expected {target_migration_tag})"
+                ),
+            })
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if !dst_path.is_file() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Step 2.4 missing both libra.db.tmp and libra.db"
+                        .to_string(),
+                });
+            }
+            let existing_tag =
+                read_sqlite_application_id_readonly(&dst_path, DatabaseRole::Repository).await?;
+            if existing_tag != target_migration_tag {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "reverse migration Step 2.4 libra.db tag mismatch after tmp absent (found {existing_tag}, expected {target_migration_tag})"
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(err) => Err(StorageBackendError::io(
+            "hard_link libra.db.tmp to libra.db",
+            err,
+        )),
+    }
+}
+
+/// Step 2.6 (`RB-11l` AC2, `RB-11u`): strictly AFTER `finalized = true` is
+/// durable on disk and BEFORE releasing `migration.lock`, `capture-spool-consumer.lock`,
+/// and `capture-spool/capacity.lock`, remove ONLY `symlink_metadata().is_file()`
+/// tombstones in `capture-spool/{tmp,ready,quarantine}` + `fsync_dir` (leaving
+/// any live directories untouched) and persist `spool_unfenced = true`.
+fn unfence_reverse_spool_tombstones_step26(
+    common_storage: &Path,
+    manifest: &mut StorageFormatManifest,
+    durability: &mut Phase2DurabilityReceipt,
+) -> StorageResult<usize> {
+    if !manifest.finalized || manifest.backend != StorageBackendKind::Sqlite {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "reverse migration Step 2.6 refused to unfence capture-spool before finalized=true"
+                    .to_string(),
+        });
+    }
+    let spool_dir = capture_spool_dir_path(common_storage);
+    let mut removed = 0usize;
+    for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+        let p = spool_dir.join(sub);
+        match fs::symlink_metadata(&p) {
+            Ok(meta) if meta.file_type().is_file() => {
+                // Only remove regular file tombstones (NEVER directories!).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+                }
+                #[cfg(not(unix))]
+                {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&p, perms);
+                }
+                fs::remove_file(&p).map_err(|err| {
+                    StorageBackendError::io("unlink capture-spool tombstone in Step 2.6", err)
+                })?;
+                removed += 1;
+            }
+            Ok(meta) if meta.file_type().is_dir() => {
+                // Step 2.6 Reachable State B: live spool directory already created
+                // after tombstone removal — preserve untouched!
+            }
+            Ok(_) => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "reverse migration Step 2.6 rejected unsafe non-regular/non-dir capture-spool entry"
+                        .to_string(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture-spool entry in Step 2.6",
+                    err,
+                ));
+            }
+        }
+    }
+    if spool_dir.is_dir() {
+        fsync_dir_best_effort(&spool_dir)?;
+        durability.record(
+            Phase2DurabilityOpKind::SpoolDirFsync,
+            Some(DatabaseRole::Capture),
+            "private/capture-spool",
+        );
+    }
+
+    manifest.spool_unfenced = true;
+    publish_storage_manifest(common_storage, manifest)?;
+    durability.record(
+        Phase2DurabilityOpKind::ManifestAtomicPublish,
+        None,
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    Ok(removed)
+}
+
+/// Complete Step 2.3–2.6 from a [`ReversePhase2FencedState`]: install in-place
+/// `capture-queue` & active `capture-spool` `0400` tombstones (`RB-11x`),
+/// persist `targets_staged_for_rename = true`, publish `capture.db` then
+/// `libra.db` via non-overwriting `hard_link` with competing `capture.db`
+/// single-connection reconcile/fence/replace (`RB-11j`, `RB-11y`), publish
+/// `finalized = true, spool_unfenced = false`, and execute Step 2.6 spool
+/// tombstone unfencing + `spool_unfenced = true` before releasing locks (`RB-11l`).
+pub async fn finalize_reverse_phase2_publish_and_unfence(
+    state: ReversePhase2FencedState,
+) -> StorageResult<ReversePhase2FinalizedReport> {
+    finalize_reverse_phase2_publish_and_unfence_inner(
+        state,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn finalize_reverse_phase2_publish_and_unfence_inner(
+    mut state: ReversePhase2FencedState,
+    #[cfg(test)] mut observer: Option<&mut dyn ReversePhase2TestObserver>,
+) -> StorageResult<ReversePhase2FinalizedReport> {
+    // Step 2.3: In-place `capture-queue` & active `capture-spool` `0400` tombstones.
+    if !state.manifest.phase2_progress.queue_fenced || !state.manifest.phase2_progress.spool_fenced
+    {
+        install_reverse_phase2_queue_and_spool_tombstones_inner(
+            &mut state,
+            #[cfg(test)]
+            &mut observer,
+        )?;
+    }
+
+    let common_storage = state.common_storage.clone();
+    let target_migration_tag = state.export.target_migration_tag;
+
+    // Step 2.4 precondition: atomically persist `targets_staged_for_rename = true` + `fsync(.libra/)`.
+    state.manifest.targets_staged_for_rename = true;
+    publish_storage_manifest(&common_storage, &state.manifest)?;
+    state.durability.record(
+        Phase2DurabilityOpKind::ManifestAtomicPublish,
+        None,
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterTargetsStagedPersisted,
+            &state.manifest,
+        )?;
+    }
+
+    // Step 2.4a: Publish `.libra/private/capture.db` FIRST via non-overwriting `hard_link`.
+    let (reconciled_competing_capture_db, competing_tombstoned_rows_skipped) =
+        publish_reverse_capture_db_step24(
+            &common_storage,
+            &state.manifest,
+            target_migration_tag,
+            &mut state.durability,
+            #[cfg(test)]
+            &mut observer,
+        )
+        .await?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterCapturePublishedBeforeLibra,
+            &state.manifest,
+        )?;
+    }
+
+    // Step 2.4b: Publish `.libra/libra.db` SECOND via non-overwriting `hard_link`.
+    publish_reverse_libra_db_step24(
+        &common_storage,
+        target_migration_tag,
+        &mut state.durability,
+        #[cfg(test)]
+        &mut observer,
+    )
+    .await?;
+
+    // Step 2.5: Publish `storage-format.json(backend="sqlite", finalized=true, spool_unfenced=false)`
+    // while STILL holding `migration.lock`, `capture-spool-consumer.lock`, and `capacity.lock`.
+    let mut finalized_manifest = state.manifest.into_finalized()?;
+    finalized_manifest.spool_unfenced = false;
+    publish_storage_manifest(&common_storage, &finalized_manifest)?;
+    state.durability.record(
+        Phase2DurabilityOpKind::PublishManifestFinalized,
+        None,
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterFinalizedBeforeSpoolUnfence,
+            &finalized_manifest,
+        )?;
+    }
+
+    // Step 2.6: Unlink ONLY `is_file()` `capture-spool/{tmp,ready,quarantine}` tombstones
+    // + `fsync_dir`, then persist `spool_unfenced = true` BEFORE releasing locks.
+    let spool_tombstones_unfenced = unfence_reverse_spool_tombstones_step26(
+        &common_storage,
+        &mut finalized_manifest,
+        &mut state.durability,
+    )?;
+    #[cfg(test)]
+    if let Some(obs) = observer {
+        obs.on_stage(
+            ReversePhase2ObserverStage::AfterSpoolUnfencedPersisted,
+            &finalized_manifest,
+        )?;
+    }
+
+    // Release all 6 advisory locks strictly AFTER `spool_unfenced = true` is durable on disk.
+    drop(state.locks);
+
+    Ok(ReversePhase2FinalizedReport {
+        generation: state.export.generation,
+        target_migration_tag,
+        manifest: finalized_manifest,
+        git_sqlite_path: git_sqlite_db_path(&common_storage),
+        capture_sqlite_path: capture_sqlite_db_path(&common_storage),
+        reconciled_competing_capture_db,
+        competing_tombstoned_rows_skipped,
+        spool_tombstones_unfenced,
+        durability: state.durability,
+    })
+}
+
+/// Full end-to-end symmetric reverse migration (`redb -> SQLite`) executing
+/// Phase 1 (`RB-11q`, `RB-11i`, `RB-11p`) and Phase 2 Step 2.1–2.6
+/// (`RB-11d`, `RB-11x`, `RB-11j`, `RB-11y`, `RB-11l`) for a repository.
+pub async fn execute_reverse_migration(
+    common_storage: &Path,
+) -> StorageResult<ReversePhase2FinalizedReport> {
+    execute_reverse_migration_for_role(DatabaseRole::Repository, common_storage).await
+}
+
+/// Role-validated variant of [`execute_reverse_migration`] enforcing `GC-13`
+/// isolation (rejects `GlobalConfig`, `SystemConfig`, and `Derived`).
+pub async fn execute_reverse_migration_for_role(
+    role: DatabaseRole,
+    common_storage: &Path,
+) -> StorageResult<ReversePhase2FinalizedReport> {
+    let prepared = prepare_reverse_phase1_for_role(role, common_storage).await?;
+    let fenced = execute_reverse_phase2_fence_and_unlink(prepared)?;
+    finalize_reverse_phase2_publish_and_unfence(fenced).await
+}
+
+// ============================================================================
+// Reverse Migration Live Spool Ingestion & Phase 2 Crash Recovery Engine
+// (`ADR-RB-07` #2, `RB-11a`, `RB-11r`, `RB-11m`, `RB-11e`, `RB-11s`, `RB-11h`,
+// `RB-11u`)
+// ============================================================================
+
+/// Streaming O(1)-RAM SHA-256 digest of a regular file on disk.
+fn compute_file_sha256_streaming(path: &Path) -> StorageResult<String> {
+    use std::io::Read as _;
+    let mut file = open_regular_file_readonly_nofollow(path, "open file for SHA-256")?;
+    let mut buf = vec![0u8; BACKUP_STREAM_BUF_BYTES];
+    let mut hasher = Sha256::new();
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|err| StorageBackendError::io("read file for SHA-256", err))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(sha256_hex_from_hasher(hasher))
+}
+
+fn open_regular_file_readonly_nofollow(path: &Path, context: &'static str) -> StorageResult<File> {
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            os::unix::{
+                ffi::OsStrExt as _,
+                io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+            },
+        };
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: format!("invalid file path for {context}"),
+            }
+        })?;
+        // SAFETY: `c_path` is NUL-terminated.
+        let raw = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+        }
+        // SAFETY: `raw >= 0` is exclusively owned.
+        let file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `file` is valid.
+        if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+        }
+        // SAFETY: `fstat` succeeded.
+        let st = unsafe { st.assume_init() };
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("rejected non-regular file during {context}"),
+            });
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let meta =
+            fs::symlink_metadata(path).map_err(|err| StorageBackendError::io(context, err))?;
+        if !meta.file_type().is_file() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("rejected non-regular file during {context}"),
+            });
+        }
+        File::open(path).map_err(|err| StorageBackendError::io(context, err))
+    }
+}
+
+/// Strictly read-only direct ingestion of live (or backed-up) `capture-spool/ready/`
+/// envelopes into SQLite `capture.db.tmp` by semantic dedup key (`RB-11h` AC1 & AC4),
+/// respecting `agent_import_tombstone` and never mutating source spool files.
+async fn ingest_capture_spool_ready_dir_to_sqlite_tmp(
+    ready_dir: &Path,
+    expected_storage: &Path,
+    cap_conn: &mut SqliteConnection,
+    opt_cap_wtx: Option<(&redb::WriteTransaction, &BTreeSet<String>)>,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<(u64, u64)> {
+    let meta = match fs::symlink_metadata(ready_dir) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "inspect capture-spool/ready for reverse sqlite ingest",
+                err,
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration rejected symlinked capture-spool/ready".to_string(),
+        });
+    }
+    if meta.file_type().is_file() {
+        // Installed `0400` tombstone: nothing to ingest.
+        return Ok((0, 0));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration rejected non-directory capture-spool/ready".to_string(),
+        });
+    }
+
+    let mut names = Vec::new();
+    for entry in fs::read_dir(ready_dir).map_err(|err| {
+        StorageBackendError::io("list capture-spool/ready for reverse ingest", err)
+    })? {
+        let entry = entry.map_err(|err| {
+            StorageBackendError::io("read capture-spool/ready entry for reverse ingest", err)
+        })?;
+        let name =
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| StorageBackendError::BackendInternal {
+                    detail: "non-UTF-8 entry in capture-spool/ready".to_string(),
+                })?;
+        names.push(name);
+    }
+    names.sort();
+    if names.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let r = DatabaseRole::Capture;
+    let mut applied = 0u64;
+    let mut deduplicated = 0u64;
+    let mut pending: Vec<DecodedSpoolReadyEvent> = Vec::new();
+
+    for name in names {
+        let path = ready_dir.join(&name);
+        let mut file = open_regular_file_readonly_nofollow(&path, "open capture-spool/ready file")?;
+        let size = file
+            .metadata()
+            .map_err(|err| StorageBackendError::io("stat capture-spool/ready file", err))?
+            .len();
+        let ev = decode_spool_ready_envelope_reader(&mut file, size, expected_storage)?;
+        pending.push(ev);
+        if pending.len() >= FORWARD_MIGRATION_STREAM_BATCH_ROWS {
+            let (a, d) =
+                apply_decoded_spool_events_to_sqlite_tmp(cap_conn, opt_cap_wtx, &pending, r)
+                    .await?;
+            telemetry.record_batch("capture_spool_ready", pending.len())?;
+            applied = applied.saturating_add(a);
+            deduplicated = deduplicated.saturating_add(d);
+            pending.clear();
+        }
+    }
+
+    if !pending.is_empty() {
+        let (a, d) =
+            apply_decoded_spool_events_to_sqlite_tmp(cap_conn, opt_cap_wtx, &pending, r).await?;
+        telemetry.record_batch("capture_spool_ready", pending.len())?;
+        applied = applied.saturating_add(a);
+        deduplicated = deduplicated.saturating_add(d);
+    }
+
+    Ok((applied, deduplicated))
+}
+
+async fn apply_decoded_spool_events_to_sqlite_tmp(
+    cap_conn: &mut SqliteConnection,
+    opt_cap_wtx: Option<(&redb::WriteTransaction, &BTreeSet<String>)>,
+    batch: &[DecodedSpoolReadyEvent],
+    r: DatabaseRole,
+) -> StorageResult<(u64, u64)> {
+    use sea_orm::sqlx::Row as _;
+
+    // Pre-check `capture_dedup_keys` synchronously if `cap_wtx` is available.
+    let mut pre_deduped = Vec::with_capacity(batch.len());
+    for ev in batch {
+        let already = match opt_cap_wtx {
+            Some((wtx, tables)) => cap_wtx_has_dedup_key(wtx, tables, &ev.dedup_key)?,
+            None => false,
+        };
+        pre_deduped.push(already);
+    }
+
+    begin_reverse_sqlite_batch(cap_conn, r, "capture_spool_ready").await?;
+    let res: StorageResult<(u64, u64)> = async {
+        let mut applied = 0u64;
+        let mut deduped = 0u64;
+
+        for (ev, already_in_redb) in batch.iter().zip(pre_deduped.into_iter()) {
+            if already_in_redb {
+                deduped = deduped.saturating_add(1);
+                continue;
+            }
+            let inserted = sea_orm::sqlx::query(
+                "INSERT OR IGNORE INTO temp._rev_mig_dedup_keys (dedup_key) VALUES (?)",
+            )
+            .bind(&ev.dedup_key)
+            .execute(&mut *cap_conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "_rev_mig_dedup_keys", e))?;
+            if inserted.rows_affected() == 0 {
+                deduped = deduped.saturating_add(1);
+                continue;
+            }
+
+            // Look up existing session by `(agent_kind, provider_session_id)`.
+            let existing_by_provider: Option<String> = sea_orm::sqlx::query_scalar(
+                "SELECT session_id FROM agent_session \
+                 WHERE agent_kind = ? AND provider_session_id = ? LIMIT 1",
+            )
+            .bind(ev.agent_kind.as_str())
+            .bind(&ev.provider_session_id)
+            .fetch_optional(&mut *cap_conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+
+            let target_session_id =
+                existing_by_provider.unwrap_or_else(|| resolve_new_spool_session_id(ev));
+
+            // Respect `agent_import_tombstone` without resurrecting erased sessions.
+            let tomb: Option<i64> = sea_orm::sqlx::query_scalar(
+                "SELECT 1 FROM agent_import_tombstone \
+                 WHERE (agent_kind = ? AND provider_session_id = ?) OR erased_session_id = ? \
+                 LIMIT 1",
+            )
+            .bind(ev.agent_kind.as_str())
+            .bind(&ev.provider_session_id)
+            .bind(&target_session_id)
+            .fetch_optional(&mut *cap_conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_import_tombstone", e))?;
+            if tomb.is_some() {
+                deduped = deduped.saturating_add(1);
+                continue;
+            }
+
+            let existing_row = sea_orm::sqlx::query(
+                "SELECT session_id, agent_kind, provider_session_id, thread_id, state, working_dir, \
+                        worktree_id, parent_commit, parent_session_id, metadata_json, redaction_report, \
+                        started_at, last_event_at, stopped_at, schema_version, sync_revision, \
+                        repo_id, workspace_id, workspace_fence, scope_state \
+                 FROM agent_session WHERE session_id = ? LIMIT 1",
+            )
+            .bind(&target_session_id)
+            .fetch_optional(&mut *cap_conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+
+            let merged = if let Some(row) = existing_row {
+                let existing_kind_str: String = row.try_get(1).unwrap_or_default();
+                let existing_kind = CaptureAgentKind::parse(&existing_kind_str)?;
+                let existing_prov: String = row.try_get(2).unwrap_or_default();
+                if existing_kind != ev.agent_kind || existing_prov != ev.provider_session_id {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "reverse migration rejected capture-spool event whose session_id collides with a different provider session"
+                            .to_string(),
+                    });
+                }
+                let existing_state_str: String = row.try_get(4).unwrap_or_default();
+                let existing_state = CaptureSessionState::parse(&existing_state_str)?;
+                let existing_working_dir: String = row.try_get(5).unwrap_or_default();
+                let existing_meta: String = row.try_get(9).unwrap_or_else(|_| "{}".to_string());
+                let existing_redact: String = row.try_get(10).unwrap_or_else(|_| "{}".to_string());
+                let existing_started: i64 = row.try_get(11).unwrap_or(ev.event_ts);
+                let existing_last: i64 = row.try_get(12).unwrap_or(ev.event_ts);
+                let existing_stopped: Option<i64> = row.try_get(13).ok().flatten();
+                let existing_schema_ver: i64 = row.try_get(14).unwrap_or(1);
+                let existing_sync_rev: i64 = row.try_get(15).unwrap_or(1);
+                let existing_scope_str: String = row
+                    .try_get::<String, _>(19)
+                    .unwrap_or_else(|_| "legacy_unknown".to_string());
+                let existing_scope = CaptureScopeState::parse(&existing_scope_str)
+                    .unwrap_or(CaptureScopeState::LegacyUnknown);
+
+                let state = if existing_state == CaptureSessionState::Stopped || ev.is_session_end {
+                    CaptureSessionState::Stopped
+                } else {
+                    existing_state
+                };
+                let stopped_at = if ev.is_session_end {
+                    Some(existing_stopped.map_or(ev.event_ts, |prev| prev.max(ev.event_ts)))
+                } else {
+                    existing_stopped
+                };
+                let working_dir = if existing_working_dir.is_empty() {
+                    ev.working_dir.clone()
+                } else {
+                    existing_working_dir
+                };
+                let (metadata_json, incoming_is_latest) =
+                    merge_spool_session_metadata(&existing_meta, Some(existing_last), ev);
+                let redaction_report = if incoming_is_latest {
+                    ev.redaction_report.clone()
+                } else {
+                    existing_redact
+                };
+                AgentSessionRecord {
+                    session_id: target_session_id,
+                    agent_kind: existing_kind,
+                    provider_session_id: existing_prov,
+                    thread_id: row.try_get(3).ok().flatten(),
+                    state,
+                    working_dir,
+                    worktree_id: row.try_get(6).ok().flatten(),
+                    parent_commit: row.try_get(7).ok().flatten(),
+                    parent_session_id: row.try_get(8).ok().flatten(),
+                    metadata_json,
+                    redaction_report,
+                    started_at: existing_started.min(ev.event_ts),
+                    last_event_at: existing_last.max(ev.event_ts),
+                    stopped_at,
+                    schema_version: existing_schema_ver,
+                    sync_revision: existing_sync_rev.saturating_add(1),
+                    repo_id: row.try_get(16).ok().flatten(),
+                    workspace_id: row.try_get(17).ok().flatten(),
+                    workspace_fence: row.try_get(18).ok().flatten(),
+                    scope_state: existing_scope,
+                }
+            } else {
+                let (metadata_json, _) = merge_spool_session_metadata("{}", None, ev);
+                AgentSessionRecord {
+                    session_id: target_session_id,
+                    agent_kind: ev.agent_kind,
+                    provider_session_id: ev.provider_session_id.clone(),
+                    thread_id: None,
+                    state: if ev.is_session_end {
+                        CaptureSessionState::Stopped
+                    } else {
+                        CaptureSessionState::Active
+                    },
+                    working_dir: ev.working_dir.clone(),
+                    worktree_id: None,
+                    parent_commit: None,
+                    parent_session_id: None,
+                    metadata_json,
+                    redaction_report: ev.redaction_report.clone(),
+                    started_at: ev.event_ts,
+                    last_event_at: ev.event_ts,
+                    stopped_at: if ev.is_session_end {
+                        Some(ev.event_ts)
+                    } else {
+                        None
+                    },
+                    schema_version: 1,
+                    sync_revision: 1,
+                    repo_id: None,
+                    workspace_id: None,
+                    workspace_fence: None,
+                    scope_state: CaptureScopeState::LegacyUnknown,
+                }
+            };
+
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_session \
+                 (session_id, agent_kind, provider_session_id, thread_id, state, working_dir, \
+                  worktree_id, parent_commit, parent_session_id, metadata_json, redaction_report, \
+                  started_at, last_event_at, stopped_at, schema_version, sync_revision, \
+                  repo_id, workspace_id, workspace_fence, scope_state) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(session_id) DO UPDATE SET \
+                  agent_kind = excluded.agent_kind, \
+                  provider_session_id = excluded.provider_session_id, \
+                  thread_id = excluded.thread_id, \
+                  state = excluded.state, \
+                  working_dir = excluded.working_dir, \
+                  worktree_id = excluded.worktree_id, \
+                  parent_commit = excluded.parent_commit, \
+                  parent_session_id = excluded.parent_session_id, \
+                  metadata_json = excluded.metadata_json, \
+                  redaction_report = excluded.redaction_report, \
+                  started_at = excluded.started_at, \
+                  last_event_at = excluded.last_event_at, \
+                  stopped_at = excluded.stopped_at, \
+                  schema_version = excluded.schema_version, \
+                  sync_revision = excluded.sync_revision, \
+                  repo_id = excluded.repo_id, \
+                  workspace_id = excluded.workspace_id, \
+                  workspace_fence = excluded.workspace_fence, \
+                  scope_state = excluded.scope_state",
+            )
+            .bind(&merged.session_id)
+            .bind(merged.agent_kind.as_str())
+            .bind(&merged.provider_session_id)
+            .bind(&merged.thread_id)
+            .bind(merged.state.as_str())
+            .bind(&merged.working_dir)
+            .bind(&merged.worktree_id)
+            .bind(&merged.parent_commit)
+            .bind(&merged.parent_session_id)
+            .bind(&merged.metadata_json)
+            .bind(&merged.redaction_report)
+            .bind(merged.started_at)
+            .bind(merged.last_event_at)
+            .bind(merged.stopped_at)
+            .bind(merged.schema_version)
+            .bind(merged.sync_revision)
+            .bind(&merged.repo_id)
+            .bind(&merged.workspace_id)
+            .bind(merged.workspace_fence)
+            .bind(merged.scope_state.as_str())
+            .execute(&mut *cap_conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(r, "agent_session", e))?;
+            applied = applied.saturating_add(1);
+        }
+
+        Ok((applied, deduped))
+    }
+    .await;
+
+    match res {
+        Ok(counts) => {
+            commit_reverse_sqlite_batch(cap_conn, r, "capture_spool_ready").await?;
+            Ok(counts)
+        }
+        Err(err) => {
+            rollback_reverse_sqlite_batch_best_effort(cap_conn).await;
+            Err(err)
+        }
+    }
+}
+
+/// Classification of a source redb database (`git.redb` or `capture.redb`)
+/// during reverse Phase 2 crash recovery (`RB-11a`, `RB-11r`, `RB-11m`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReverseRecoveryRedbState {
+    /// Live `.redb` file is present, unfenced, and its SHA-256 matches
+    /// `manifest.source_digests`.
+    CleanMatchedPending,
+    /// Live `.redb` file is present, unfenced, and an external process wrote
+    /// new commits/events before the fence — requires re-export and backup refresh.
+    DriftedLivePending,
+    /// Live `.redb` file is present and already fenced (`META_SCHEMA u32::MAX`)
+    /// awaiting unlink; verified backup matches `source_digests`.
+    FencedPreUnlink,
+    /// Live `.redb` file was legally unlinked (`FencedReadyToUnlink | Unlinked`)
+    /// and its backup in `.libra/redb-backup/<gen>/` passed real SHA-256 verification.
+    LegallyUnlinkedVerifiedBackup,
+    /// Skipped source classification because recovery resumed in Step 2.4+
+    /// (`targets_staged_for_rename == true`) or Step 2.6 (`finalized == true`).
+    PostStageOrFinalized,
+}
+
+/// Summary report returned after [`resume_reverse_migration`] converges an
+/// interrupted reverse migration (`RB-11a`..`RB-11u`).
+#[derive(Debug, Clone)]
+pub struct ReversePhase2ResumeReport {
+    /// Generation carried by `storage-format.json`.
+    pub generation: u64,
+    /// Unique non-zero `target_migration_tag` stamped on SQLite targets.
+    pub target_migration_tag: u32,
+    /// Final persisted `storage-format.json` (`backend="sqlite", finalized=true, spool_unfenced=true`).
+    pub manifest: StorageFormatManifest,
+    /// Classified recovery state of `git.redb`.
+    pub git_state: ReverseRecoveryRedbState,
+    /// Classified recovery state of `capture.redb`.
+    pub capture_state: ReverseRecoveryRedbState,
+    /// `true` if `libra.db.tmp` was regenerated during recovery.
+    pub reexported_git_tmp: bool,
+    /// `true` if `capture.db.tmp` was regenerated during recovery.
+    pub reexported_capture_tmp: bool,
+    /// `true` if recovery performed the `backup ∪ live` `capture-queue/` union re-export (`RB-11m` AC3).
+    pub queue_union_reexported: bool,
+    /// Number of live `capture-spool/ready/` events merged during recovery (`RB-11h` AC4).
+    pub live_spool_events_merged: u64,
+    /// `true` if Step 2.4 reconciled a competing `application_id == 0` `capture.db` (`RB-11s`).
+    pub reconciled_competing_capture_db: bool,
+    /// Count of tombstoned rows skipped during competing `capture.db` reconciliation.
+    pub competing_tombstoned_rows_skipped: u64,
+    /// Number of `capture-spool` `is_file()` tombstones unlinked in Step 2.6.
+    pub spool_tombstones_unfenced: usize,
+    /// `true` if manifest was already `finalized = true && spool_unfenced = true`.
+    pub already_finalized: bool,
+    /// Durability audit trail for this resume invocation.
+    pub durability: Phase2DurabilityReceipt,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum ClassifiedReverseRecoveryRedb {
+    LiveUnfenced {
+        state: ReverseRecoveryRedbState,
+        path: PathBuf,
+        backup_path: PathBuf,
+        new_sha256: String,
+        db: RedbDatabase,
+        #[cfg(any(unix, windows))]
+        ctrl: std::sync::Arc<ReverseNonBlockingFileBackendInner>,
+        wtx: redb::WriteTransaction,
+    },
+    FencedPreUnlink {
+        path: PathBuf,
+        backup_path: PathBuf,
+    },
+    LegallyUnlinkedVerifiedBackup {
+        backup_path: PathBuf,
+    },
+}
+
+impl ClassifiedReverseRecoveryRedb {
+    fn state(&self) -> ReverseRecoveryRedbState {
+        match self {
+            Self::LiveUnfenced { state, .. } => *state,
+            Self::FencedPreUnlink { .. } => ReverseRecoveryRedbState::FencedPreUnlink,
+            Self::LegallyUnlinkedVerifiedBackup { .. } => {
+                ReverseRecoveryRedbState::LegallyUnlinkedVerifiedBackup
+            }
+        }
+    }
+}
+
+/// Acquire the 6 advisory locks for reverse migration crash recovery in strict
+/// `ADR-RB-07` #2 canonical order (`migration.lock -> maintenance.lock ->
+/// capture-spool-consumer.lock -> capture-queue/writer.lock ->
+/// capture-queue/append.lock -> capture-spool/capacity.lock`).
+fn acquire_reverse_recovery_locks(common_storage: &Path) -> StorageResult<ReversePhase1Locks> {
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let queue_dir = capture_queue_dir_path(common_storage);
+    let spool_dir = capture_spool_dir_path(common_storage);
+    let mig_lock_path = migration_lock_path(common_storage);
+    let maint_lock_path = common_storage.join("maintenance.lock");
+    let consumer_lock_path = capture_spool_consumer_lock_path(common_storage);
+    let writer_lock_path = capture_queue_writer_lock_path(common_storage);
+    let append_lock_path = capture_queue_append_lock_path(common_storage);
+    let capacity_lock_path = capture_spool_capacity_lock_path(common_storage);
+
+    let migration_lock = open_and_try_lock_inplace(
+        &mig_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::MigrationLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let maintenance_lock = open_and_try_lock_inplace(
+        &maint_lock_path,
+        0o600,
+        false,
+        ForwardPhase1QuiesceStage::MaintenanceLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    ensure_private_dir_nofollow(
+        &private_dir,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let capture_spool_consumer_lock = open_and_try_lock_inplace(
+        &consumer_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    ensure_private_dir_nofollow(
+        &queue_dir,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let capture_queue_writer_lock = open_and_try_lock_inplace(
+        &writer_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let capture_queue_append_lock = open_and_try_lock_inplace(
+        &append_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    ensure_private_dir_nofollow(
+        &spool_dir,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let capture_spool_capacity_lock = open_and_try_lock_inplace(
+        &capacity_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+
+    Ok(ReversePhase1Locks {
+        _spool_capacity_lock: capture_spool_capacity_lock,
+        _queue_append_lock: capture_queue_append_lock,
+        _queue_writer_lock: capture_queue_writer_lock,
+        _spool_consumer_lock: capture_spool_consumer_lock,
+        _maintenance_lock: maintenance_lock,
+        _migration_lock: migration_lock,
+    })
+}
+
+fn verify_reverse_backup_file_sha256(
+    backup_path: &Path,
+    expected_sha256: &str,
+    label: &'static str,
+) -> StorageResult<()> {
+    match fs::symlink_metadata(backup_path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration recovery rejected non-regular redb-backup file for {label}"
+                ),
+            });
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration recovery failed closed: missing redb-backup file for {label}"
+                ),
+            });
+        }
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "stat redb-backup file during reverse recovery",
+                err,
+            ));
+        }
+    }
+    let actual_sha = compute_file_sha256_streaming(backup_path)?;
+    if actual_sha != expected_sha256 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration recovery failed closed: redb-backup SHA-256 mismatch for {label}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Atomically replace an existing backup `.redb` file during drift re-export
+/// recovery (`RB-11a` AC4, `RB-11r` AC1) with O(1)-RAM SHA-256 verification.
+fn stream_copy_and_replace_backup_file(
+    src_path: &Path,
+    dest_dir: &Path,
+    dest_name: &str,
+    expected_sha256: &str,
+) -> StorageResult<()> {
+    use std::io::{Read as _, Write as _};
+
+    let mut src_file =
+        open_regular_file_readonly_nofollow(src_path, "open drifted redb for backup")?;
+    let tmp_path = dest_dir.join(format!(".{dest_name}.refresh.tmp"));
+    let final_path = dest_dir.join(dest_name);
+    let _ = fs::remove_file(&tmp_path);
+
+    let mut dst_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|err| StorageBackendError::io("create refreshed reverse backup tmp", err))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| StorageBackendError::io("chmod refreshed reverse backup tmp", err))?;
+    }
+
+    let mut buf = vec![0u8; BACKUP_STREAM_BUF_BYTES];
+    let mut hasher = Sha256::new();
+    loop {
+        let n = src_file
+            .read(&mut buf)
+            .map_err(|err| StorageBackendError::io("read drifted redb for backup refresh", err))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        dst_file.write_all(&buf[..n]).map_err(|err| {
+            let _ = fs::remove_file(&tmp_path);
+            StorageBackendError::io("write refreshed reverse backup tmp", err)
+        })?;
+    }
+    dst_file.sync_all().map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        StorageBackendError::io("fsync refreshed reverse backup tmp", err)
+    })?;
+    drop(dst_file);
+
+    let copied_sha = sha256_hex_from_hasher(hasher);
+    let verified_sha = compute_file_sha256_streaming(&tmp_path)?;
+    if copied_sha != expected_sha256 || verified_sha != expected_sha256 {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration recovery backup refresh SHA-256 mismatch".to_string(),
+        });
+    }
+
+    fs::rename(&tmp_path, &final_path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        StorageBackendError::io("atomic replace refreshed reverse backup", err)
+    })?;
+    fsync_dir_best_effort(dest_dir)?;
+    Ok(())
+}
+
+/// Open a verified backup `.redb` file via `ReverseNonBlockingFileBackend`
+/// (which physically blocks all writes/syncs/set_len) and start a read-only
+/// `WriteTransaction` that will be aborted on drop — enabling 100% reuse of
+/// the streaming SQLite table exporter with zero disk mutation.
+#[cfg(any(unix, windows))]
+fn open_verified_backup_redb_readonly_wtx(
+    backup_path: &Path,
+    role: DatabaseRole,
+) -> StorageResult<(RedbDatabase, redb::WriteTransaction)> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(backup_path)
+        .map_err(|err| {
+            StorageBackendError::io("open verified redb-backup for recovery export", err)
+        })?;
+    let backend = ReverseNonBlockingFileBackend::new(file);
+    let (db, _ctrl) = open_reverse_redb_with_backend(backend, role)?;
+    let wtx = begin_checked_write_blocking(&db, role, Duration::ZERO)?;
+    Ok((db, wtx))
+}
+
+#[cfg(any(unix, windows))]
+fn classify_reverse_recovery_redb_source(
+    common_storage: &Path,
+    generation: u64,
+    role: DatabaseRole,
+    manifest_state: Phase2DbState,
+    expected_sha256: &str,
+) -> StorageResult<ClassifiedReverseRecoveryRedb> {
+    let (parent_subdir, live_path, backup_path, label) = match role {
+        DatabaseRole::Repository => (
+            REDB_SUBDIR,
+            git_redb_path(common_storage, generation),
+            redb_backup_git_redb_path(common_storage, generation),
+            "git.redb",
+        ),
+        DatabaseRole::Capture => (
+            PRIVATE_SUBDIR,
+            capture_redb_path(common_storage, generation),
+            redb_backup_capture_redb_path(common_storage, generation),
+            "capture.redb",
+        ),
+        _ => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("invalid role {role} in reverse recovery"),
+            });
+        }
+    };
+
+    let live_exists = match fs::symlink_metadata(&live_path) {
+        Ok(meta) if meta.file_type().is_file() => true,
+        Ok(_) => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration recovery rejected unsafe non-regular {label} entry"
+                ),
+            });
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "stat source redb during reverse recovery",
+                err,
+            ));
+        }
+    };
+
+    if !live_exists {
+        match manifest_state {
+            Phase2DbState::Pending => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "reverse migration recovery failed closed: {label} is unexpectedly missing while phase2_progress is `pending`"
+                    ),
+                });
+            }
+            Phase2DbState::FencedReadyToUnlink | Phase2DbState::Unlinked => {
+                verify_reverse_backup_file_sha256(&backup_path, expected_sha256, label)?;
+                return Ok(
+                    ClassifiedReverseRecoveryRedb::LegallyUnlinkedVerifiedBackup { backup_path },
+                );
+            }
+            Phase2DbState::Absent => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "reverse migration recovery rejected invalid `absent` state for {label}"
+                    ),
+                });
+            }
+        }
+    }
+
+    let file_name = live_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: format!("invalid {label} filename during reverse recovery"),
+        })?;
+    let (backend, _fid) = open_verified_existing_redb_backend_for_reverse(
+        common_storage,
+        parent_subdir,
+        file_name,
+        role,
+    )?;
+    let stage = match role {
+        DatabaseRole::Repository => ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+        DatabaseRole::Capture => ReversePhase1QuiesceStage::CaptureRedbWriteTransaction,
+        _ => ReversePhase1QuiesceStage::StorageManifest,
+    };
+    backend.ensure_writer_byte_uncontended(stage)?;
+    let (db, ctrl) = open_reverse_redb_with_backend(backend, role)?;
+
+    match try_begin_reverse_source_write_tx(&db, role) {
+        Ok(wtx) => {
+            let current_sha = compute_file_sha256_streaming(&live_path)?;
+            let state = if current_sha == expected_sha256 {
+                ReverseRecoveryRedbState::CleanMatchedPending
+            } else {
+                ReverseRecoveryRedbState::DriftedLivePending
+            };
+            Ok(ClassifiedReverseRecoveryRedb::LiveUnfenced {
+                state,
+                path: live_path,
+                backup_path,
+                new_sha256: current_sha,
+                db,
+                ctrl,
+                wtx,
+            })
+        }
+        Err(StorageBackendError::RepositoryMigrated { .. }) => {
+            drop(db);
+            verify_reverse_backup_file_sha256(&backup_path, expected_sha256, label)?;
+            Ok(ClassifiedReverseRecoveryRedb::FencedPreUnlink {
+                path: live_path,
+                backup_path,
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn dir_has_any_regular_file(dir: &Path) -> StorageResult<bool> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            for entry in fs::read_dir(dir)
+                .map_err(|err| StorageBackendError::io("scan dir for entries", err))?
+            {
+                let entry = entry.map_err(|err| StorageBackendError::io("read dir entry", err))?;
+                if entry
+                    .file_type()
+                    .map_err(|err| StorageBackendError::io("stat dir entry", err))?
+                    .is_file()
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(StorageBackendError::io("inspect directory", err)),
+    }
+}
+
+fn are_all_tombstone_files(root: &Path, names: &[&str]) -> StorageResult<bool> {
+    for name in names {
+        let p = root.join(name);
+        match fs::symlink_metadata(&p) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => return Ok(false),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(StorageBackendError::io("inspect tombstone file", err));
+            }
+        }
+    }
+    Ok(true)
+}
+
+async fn check_staged_sqlite_tmp_valid(
+    path: &Path,
+    role: DatabaseRole,
+    expected_tag: u32,
+    label: &'static str,
+) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let mut dummy_dur = Phase1DurabilityReceipt::new();
+    verify_one_sqlite_tmp_integrity_and_tag(path, role, expected_tag, label, &mut dummy_dur)
+        .await
+        .is_ok()
+}
+
+/// Resume an interrupted symmetric reverse migration (`redb -> SQLite`) from
+/// ANY reachable crash point (`RB-11a`, `RB-11r`, `RB-11m`, `RB-11e`, `RB-11s`,
+/// `RB-11h`, `RB-11u`) for a repository (`DatabaseRole::Repository`).
+pub async fn resume_reverse_migration(
+    common_storage: &Path,
+) -> StorageResult<ReversePhase2ResumeReport> {
+    resume_reverse_migration_for_role(DatabaseRole::Repository, common_storage).await
+}
+
+/// Role-validated variant of [`resume_reverse_migration`] enforcing `GC-13`
+/// isolation (rejects `GlobalConfig`, `SystemConfig`, and `Derived`).
+pub async fn resume_reverse_migration_for_role(
+    role: DatabaseRole,
+    common_storage: &Path,
+) -> StorageResult<ReversePhase2ResumeReport> {
+    resume_reverse_migration_inner(
+        role,
+        common_storage,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn resume_reverse_migration_inner(
+    role: DatabaseRole,
+    common_storage: &Path,
+    #[cfg(test)] mut observer: Option<&mut dyn ReversePhase2TestObserver>,
+) -> StorageResult<ReversePhase2ResumeReport> {
+    validate_forward_migration_role(role).map_err(normalize_reverse_quiesce_err)?;
+
+    // Pre-flight check before acquiring locks: manifest must be a SQLite reverse manifest.
+    let preflight = read_storage_manifest(common_storage)?.ok_or_else(|| {
+        StorageBackendError::BackendInternal {
+            detail: "reverse migration resume found no storage-format.json manifest".to_string(),
+        }
+    })?;
+    if preflight.backend != StorageBackendKind::Sqlite {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration resume expected backend=sqlite manifest, found {:?}",
+                preflight.backend
+            ),
+        });
+    }
+
+    // Acquire all 6 advisory locks in strict `ADR-RB-07` #2 order.
+    let locks = acquire_reverse_recovery_locks(common_storage)?;
+    let mut durability = Phase2DurabilityReceipt::new();
+
+    // Authoritatively re-read `storage-format.json` under the held locks.
+    let mut manifest = read_storage_manifest(common_storage)?.ok_or_else(|| {
+        StorageBackendError::BackendInternal {
+            detail: "reverse migration resume lost storage-format.json after lock acquisition"
+                .to_string(),
+        }
+    })?;
+    if manifest.backend != StorageBackendKind::Sqlite {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration resume expected backend=sqlite manifest under locks, found {:?}",
+                manifest.backend
+            ),
+        });
+    }
+    let generation = manifest.generation;
+    let target_migration_tag = manifest.target_migration_tag.unwrap_or(0);
+
+    // ------------------------------------------------------------------
+    // Case 1: Post-finalization Step 2.6 recovery (`RB-11u`) or no-op
+    // ------------------------------------------------------------------
+    if manifest.finalized {
+        if manifest.spool_unfenced {
+            drop(locks);
+            return Ok(ReversePhase2ResumeReport {
+                generation,
+                target_migration_tag,
+                manifest,
+                git_state: ReverseRecoveryRedbState::PostStageOrFinalized,
+                capture_state: ReverseRecoveryRedbState::PostStageOrFinalized,
+                reexported_git_tmp: false,
+                reexported_capture_tmp: false,
+                queue_union_reexported: false,
+                live_spool_events_merged: 0,
+                reconciled_competing_capture_db: false,
+                competing_tombstoned_rows_skipped: 0,
+                spool_tombstones_unfenced: 0,
+                already_finalized: true,
+                durability,
+            });
+        }
+        let spool_tombstones_unfenced = unfence_reverse_spool_tombstones_step26(
+            common_storage,
+            &mut manifest,
+            &mut durability,
+        )?;
+        #[cfg(test)]
+        if let Some(obs) = observer {
+            obs.on_stage(
+                ReversePhase2ObserverStage::AfterSpoolUnfencedPersisted,
+                &manifest,
+            )?;
+        }
+        drop(locks);
+        return Ok(ReversePhase2ResumeReport {
+            generation,
+            target_migration_tag,
+            manifest,
+            git_state: ReverseRecoveryRedbState::PostStageOrFinalized,
+            capture_state: ReverseRecoveryRedbState::PostStageOrFinalized,
+            reexported_git_tmp: false,
+            reexported_capture_tmp: false,
+            queue_union_reexported: false,
+            live_spool_events_merged: 0,
+            reconciled_competing_capture_db: false,
+            competing_tombstoned_rows_skipped: 0,
+            spool_tombstones_unfenced,
+            already_finalized: false,
+            durability,
+        });
+    }
+
+    if target_migration_tag == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration resume rejected missing or zero target_migration_tag"
+                .to_string(),
+        });
+    }
+    let expected_backup_rel = canonical_redb_backup_rel_dir(generation);
+    if manifest.backup_dir.as_deref() != Some(expected_backup_rel.as_str()) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration resume rejected non-canonical backup_dir in manifest"
+                .to_string(),
+        });
+    }
+
+    verify_no_inflight_spool_tmp_files(common_storage).map_err(normalize_reverse_quiesce_err)?;
+    verify_no_spool_quarantine_files(common_storage)?;
+
+    let queue_dir = capture_queue_dir_path(common_storage);
+    let spool_dir = capture_spool_dir_path(common_storage);
+    let live_spool_ready_dir = spool_dir.join(CAPTURE_SPOOL_READY_SUBDIR);
+
+    // ------------------------------------------------------------------
+    // Case 2: `targets_staged_for_rename == true` (`RB-11m` AC4, `RB-11e`, `RB-11s`)
+    // ------------------------------------------------------------------
+    if manifest.targets_staged_for_rename {
+        let mut live_spool_events_merged = 0u64;
+        // Defensive `RB-11h` AC4: if spool tombstones were externally cleared
+        // and live spool events arrived before `capture.db` was published,
+        // merge them into `capture.db.tmp` by dedup key before publishing.
+        let cap_tmp_path = capture_sqlite_tmp_path(common_storage);
+        let cap_dst_path = capture_sqlite_db_path(common_storage);
+        if dir_has_any_regular_file(&live_spool_ready_dir)? && cap_tmp_path.is_file() {
+            let cap_already_ours = if cap_dst_path.is_file() {
+                !is_sqlite_file_migrated_fenced(&cap_dst_path, DatabaseRole::Capture).await?
+                    && read_sqlite_application_id_readonly(&cap_dst_path, DatabaseRole::Capture)
+                        .await?
+                        == target_migration_tag
+            } else {
+                false
+            };
+            if !cap_already_ours {
+                let mut cap_conn =
+                    open_reverse_sqlite_tmp_conn_async(&cap_tmp_path, DatabaseRole::Capture, false)
+                        .await?;
+                sea_orm::sqlx::query(
+                    "CREATE TEMP TABLE _rev_mig_dedup_keys (dedup_key TEXT NOT NULL PRIMARY KEY)",
+                )
+                .execute(&mut cap_conn)
+                .await
+                .map_err(|e| {
+                    map_reverse_sqlite_write_err(DatabaseRole::Capture, "_rev_mig_dedup_keys", e)
+                })?;
+                let mut telemetry = ExportStreamTelemetry::new();
+                let (applied, _deduped) = ingest_capture_spool_ready_dir_to_sqlite_tmp(
+                    &live_spool_ready_dir,
+                    common_storage,
+                    &mut cap_conn,
+                    None,
+                    &mut telemetry,
+                )
+                .await?;
+                live_spool_events_merged = applied;
+                stamp_sqlite_tmp_application_id(
+                    &mut cap_conn,
+                    DatabaseRole::Capture,
+                    target_migration_tag,
+                )
+                .await?;
+                cap_conn
+                    .close()
+                    .await
+                    .map_err(|e| StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "reverse recovery failed closing merged capture.db.tmp: {e}"
+                        ),
+                    })?;
+                fsync_regular_file_nofollow(&cap_tmp_path, "sync merged capture.db.tmp")?;
+            }
+        }
+
+        // Re-ensure spool & queue `0400` tombstones across remaining Step 2.4-2.5.
+        for sub in [
+            QUEUE_LANE_PRIORITY_DIR,
+            QUEUE_LANE_NORMAL_DIR,
+            QUEUE_QUARANTINE_DIR,
+        ] {
+            install_inplace_0400_tombstone_entry(
+                &queue_dir.join(sub),
+                true,
+                "re-ensure reverse capture-queue 0400 tombstone",
+            )?;
+        }
+        fsync_dir_best_effort(&queue_dir)?;
+        for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            install_inplace_0400_tombstone_entry(
+                &spool_dir.join(sub),
+                sub == CAPTURE_SPOOL_READY_SUBDIR,
+                "re-ensure reverse capture-spool 0400 tombstone",
+            )?;
+        }
+        fsync_dir_best_effort(&spool_dir)?;
+
+        let (reconciled_competing_capture_db, competing_tombstoned_rows_skipped) =
+            publish_reverse_capture_db_step24(
+                common_storage,
+                &manifest,
+                target_migration_tag,
+                &mut durability,
+                #[cfg(test)]
+                &mut observer,
+            )
+            .await?;
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_stage(
+                ReversePhase2ObserverStage::AfterCapturePublishedBeforeLibra,
+                &manifest,
+            )?;
+        }
+
+        publish_reverse_libra_db_step24(
+            common_storage,
+            target_migration_tag,
+            &mut durability,
+            #[cfg(test)]
+            &mut observer,
+        )
+        .await?;
+
+        let mut finalized_manifest = manifest.into_finalized()?;
+        finalized_manifest.spool_unfenced = false;
+        publish_storage_manifest(common_storage, &finalized_manifest)?;
+        durability.record(
+            Phase2DurabilityOpKind::PublishManifestFinalized,
+            None,
+            STORAGE_FORMAT_MANIFEST_FILE,
+        );
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_stage(
+                ReversePhase2ObserverStage::AfterFinalizedBeforeSpoolUnfence,
+                &finalized_manifest,
+            )?;
+        }
+
+        let spool_tombstones_unfenced = unfence_reverse_spool_tombstones_step26(
+            common_storage,
+            &mut finalized_manifest,
+            &mut durability,
+        )?;
+        #[cfg(test)]
+        if let Some(obs) = observer {
+            obs.on_stage(
+                ReversePhase2ObserverStage::AfterSpoolUnfencedPersisted,
+                &finalized_manifest,
+            )?;
+        }
+        drop(locks);
+
+        return Ok(ReversePhase2ResumeReport {
+            generation,
+            target_migration_tag,
+            manifest: finalized_manifest,
+            git_state: ReverseRecoveryRedbState::PostStageOrFinalized,
+            capture_state: ReverseRecoveryRedbState::PostStageOrFinalized,
+            reexported_git_tmp: false,
+            reexported_capture_tmp: false,
+            queue_union_reexported: false,
+            live_spool_events_merged,
+            reconciled_competing_capture_db,
+            competing_tombstoned_rows_skipped,
+            spool_tombstones_unfenced,
+            already_finalized: false,
+            durability,
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Case 3: Pre-`targets_staged_for_rename` Recovery (`RB-11a`, `RB-11r`, `RB-11m`, `RB-11h`)
+    // ------------------------------------------------------------------
+    let git_manifest_state =
+        manifest
+            .phase2_progress
+            .git_redb
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "unfinalized reverse manifest missing phase2_progress.git_redb".to_string(),
+            })?;
+    let cap_manifest_state =
+        manifest
+            .phase2_progress
+            .cap_redb
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "unfinalized reverse manifest missing phase2_progress.cap_redb".to_string(),
+            })?;
+    let expected_git_sha = manifest
+        .source_digests
+        .git_redb_sha256
+        .clone()
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "unfinalized reverse manifest missing source_digests.git_redb_sha256"
+                .to_string(),
+        })?;
+    let expected_cap_sha = manifest
+        .source_digests
+        .cap_redb_sha256
+        .clone()
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "unfinalized reverse manifest missing source_digests.cap_redb_sha256"
+                .to_string(),
+        })?;
+    let expected_queue_sha = manifest
+        .source_digests
+        .queue_manifest_sha256
+        .clone()
+        .unwrap_or_default();
+
+    #[cfg(any(unix, windows))]
+    let (git_classified, cap_classified) = {
+        let g = classify_reverse_recovery_redb_source(
+            common_storage,
+            generation,
+            DatabaseRole::Repository,
+            git_manifest_state,
+            &expected_git_sha,
+        )?;
+        let c = classify_reverse_recovery_redb_source(
+            common_storage,
+            generation,
+            DatabaseRole::Capture,
+            cap_manifest_state,
+            &expected_cap_sha,
+        )?;
+        (g, c)
+    };
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (
+            git_manifest_state,
+            cap_manifest_state,
+            expected_git_sha,
+            expected_cap_sha,
+            expected_queue_sha,
+        );
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration recovery unsupported on this platform".to_string(),
+        });
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        let git_state = git_classified.state();
+        let cap_state = cap_classified.state();
+
+        let queue_all_tombstones = are_all_tombstone_files(
+            &queue_dir,
+            &[
+                QUEUE_LANE_PRIORITY_DIR,
+                QUEUE_LANE_NORMAL_DIR,
+                QUEUE_QUARANTINE_DIR,
+            ],
+        )?;
+        let current_queue_sha = compute_capture_queue_manifest_sha256_readonly(common_storage)?;
+        let queue_drifted = !queue_all_tombstones
+            && (current_queue_sha != expected_queue_sha || !manifest.phase2_progress.queue_fenced);
+        // Specifically detect tombstone gap / external live queue write (`RB-11m` AC3):
+        // either queue was partially removed/recreated OR live queue digest differs.
+        let queue_has_gap_or_drift = if queue_all_tombstones {
+            false
+        } else {
+            let live_priority_or_normal_dir = queue_dir.join(QUEUE_LANE_PRIORITY_DIR).is_dir()
+                || queue_dir.join(QUEUE_LANE_NORMAL_DIR).is_dir();
+            let any_queue_tombstone_or_missing = [
+                QUEUE_LANE_PRIORITY_DIR,
+                QUEUE_LANE_NORMAL_DIR,
+                QUEUE_QUARANTINE_DIR,
+            ]
+            .iter()
+            .any(|sub| {
+                matches!(
+                    fs::symlink_metadata(queue_dir.join(sub)),
+                    Ok(m) if m.file_type().is_file()
+                ) || fs::symlink_metadata(queue_dir.join(sub))
+                    .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+            });
+            queue_drifted
+                && (current_queue_sha != expected_queue_sha
+                    || (live_priority_or_normal_dir && any_queue_tombstone_or_missing))
+        };
+
+        let live_spool_has_files = dir_has_any_regular_file(&live_spool_ready_dir)?;
+        let expected_spool_sha = manifest
+            .source_digests
+            .spool_manifest_sha256
+            .clone()
+            .unwrap_or_default();
+        let current_spool_sha = compute_capture_spool_manifest_sha256_readonly(common_storage)?;
+        let spool_drifted = live_spool_has_files && current_spool_sha != expected_spool_sha;
+
+        let git_tmp_path = git_sqlite_tmp_path(common_storage);
+        let cap_tmp_path = capture_sqlite_tmp_path(common_storage);
+        let git_tmp_valid = check_staged_sqlite_tmp_valid(
+            &git_tmp_path,
+            DatabaseRole::Repository,
+            target_migration_tag,
+            "libra.db.tmp",
+        )
+        .await;
+        let cap_tmp_valid = check_staged_sqlite_tmp_valid(
+            &cap_tmp_path,
+            DatabaseRole::Capture,
+            target_migration_tag,
+            "private/capture.db.tmp",
+        )
+        .await;
+
+        let need_reexport_git =
+            git_state == ReverseRecoveryRedbState::DriftedLivePending || !git_tmp_valid;
+        let need_reexport_cap = cap_state == ReverseRecoveryRedbState::DriftedLivePending
+            || git_state == ReverseRecoveryRedbState::DriftedLivePending
+            || queue_has_gap_or_drift
+            || spool_drifted
+            || !cap_tmp_valid;
+
+        let mut live_spool_events_merged = 0u64;
+        let backup_dir = redb_backup_dir_path(common_storage, generation);
+        let backup_queue_dir = redb_backup_capture_queue_dir_path(common_storage, generation);
+        let backup_spool_ready_dir = backup_dir
+            .join(CAPTURE_SPOOL_SUBDIR)
+            .join(CAPTURE_SPOOL_READY_SUBDIR);
+
+        if need_reexport_git || need_reexport_cap {
+            let mut telemetry = ExportStreamTelemetry::new();
+
+            // Open backup read-only `WriteTransaction` handles ONLY for non-live sources.
+            let git_backup_handle = match &git_classified {
+                ClassifiedReverseRecoveryRedb::LiveUnfenced { .. } => None,
+                ClassifiedReverseRecoveryRedb::FencedPreUnlink { backup_path, .. }
+                | ClassifiedReverseRecoveryRedb::LegallyUnlinkedVerifiedBackup { backup_path } => {
+                    Some(open_verified_backup_redb_readonly_wtx(
+                        backup_path,
+                        DatabaseRole::Repository,
+                    )?)
+                }
+            };
+            let cap_backup_handle = match &cap_classified {
+                ClassifiedReverseRecoveryRedb::LiveUnfenced { .. } => None,
+                ClassifiedReverseRecoveryRedb::FencedPreUnlink { backup_path, .. }
+                | ClassifiedReverseRecoveryRedb::LegallyUnlinkedVerifiedBackup { backup_path } => {
+                    Some(open_verified_backup_redb_readonly_wtx(
+                        backup_path,
+                        DatabaseRole::Capture,
+                    )?)
+                }
+            };
+
+            let git_wtx_ref: &redb::WriteTransaction = match &git_classified {
+                ClassifiedReverseRecoveryRedb::LiveUnfenced { wtx, .. } => wtx,
+                _ => {
+                    &git_backup_handle
+                        .as_ref()
+                        .ok_or_else(|| StorageBackendError::BackendInternal {
+                            detail: "missing git backup handle during reverse recovery".to_string(),
+                        })?
+                        .1
+                }
+            };
+            let cap_wtx_ref: &redb::WriteTransaction = match &cap_classified {
+                ClassifiedReverseRecoveryRedb::LiveUnfenced { wtx, .. } => wtx,
+                _ => {
+                    &cap_backup_handle
+                        .as_ref()
+                        .ok_or_else(|| StorageBackendError::BackendInternal {
+                            detail: "missing capture backup handle during reverse recovery"
+                                .to_string(),
+                        })?
+                        .1
+                }
+            };
+
+            if need_reexport_git {
+                let _ = fs::remove_file(&git_tmp_path);
+                let (_path, mut git_conn) =
+                    bootstrap_reverse_git_sqlite_tmp(common_storage).await?;
+                let _ =
+                    export_reverse_git_tables_to_sqlite(git_wtx_ref, &mut git_conn, &mut telemetry)
+                        .await?;
+                stamp_sqlite_tmp_application_id(
+                    &mut git_conn,
+                    DatabaseRole::Repository,
+                    target_migration_tag,
+                )
+                .await?;
+                git_conn
+                    .close()
+                    .await
+                    .map_err(|e| StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "reverse recovery failed closing re-exported libra.db.tmp: {e}"
+                        ),
+                    })?;
+                fsync_regular_file_nofollow(&git_tmp_path, "sync re-exported libra.db.tmp")?;
+                let mut vdur = Phase1DurabilityReceipt::new();
+                verify_one_sqlite_tmp_integrity_and_tag(
+                    &git_tmp_path,
+                    DatabaseRole::Repository,
+                    target_migration_tag,
+                    "libra.db.tmp",
+                    &mut vdur,
+                )
+                .await?;
+            }
+
+            if need_reexport_cap {
+                let _ = fs::remove_file(&cap_tmp_path);
+                let (_path, mut cap_conn) =
+                    bootstrap_reverse_capture_sqlite_tmp(common_storage).await?;
+                let existing_cap_tables = list_existing_redb_tables(cap_wtx_ref)?;
+                let _ = export_reverse_capture_tables_to_sqlite(
+                    cap_wtx_ref,
+                    &mut cap_conn,
+                    &mut telemetry,
+                )
+                .await?;
+                sea_orm::sqlx::query(
+                    "CREATE TEMP TABLE _rev_mig_dedup_keys (dedup_key TEXT NOT NULL PRIMARY KEY)",
+                )
+                .execute(&mut cap_conn)
+                .await
+                .map_err(|e| {
+                    map_reverse_sqlite_write_err(DatabaseRole::Capture, "_rev_mig_dedup_keys", e)
+                })?;
+                let _ = replay_unreconciled_cross_store_intents_to_sqlite(
+                    git_wtx_ref,
+                    cap_wtx_ref,
+                    &existing_cap_tables,
+                    &mut cap_conn,
+                    &mut telemetry,
+                )
+                .await?;
+                // Semantic-dedup UNION of backup `capture-queue/` ∪ live `capture-queue/` (`RB-11m` AC3).
+                if backup_queue_dir.is_dir() {
+                    let _ = ingest_capture_queue_root_readonly_to_sqlite(
+                        &backup_queue_dir,
+                        &mut cap_conn,
+                        cap_wtx_ref,
+                        &existing_cap_tables,
+                        &mut telemetry,
+                    )
+                    .await?;
+                }
+                let _ = ingest_capture_queue_readonly_to_sqlite(
+                    common_storage,
+                    &mut cap_conn,
+                    cap_wtx_ref,
+                    &existing_cap_tables,
+                    &mut telemetry,
+                )
+                .await?;
+                // Semantic-dedup UNION of backup `capture-spool/ready/` ∪ live `capture-spool/ready/` (`RB-11h`).
+                if backup_spool_ready_dir.is_dir() {
+                    let (a_bak, _) = ingest_capture_spool_ready_dir_to_sqlite_tmp(
+                        &backup_spool_ready_dir,
+                        common_storage,
+                        &mut cap_conn,
+                        Some((cap_wtx_ref, &existing_cap_tables)),
+                        &mut telemetry,
+                    )
+                    .await?;
+                    live_spool_events_merged = live_spool_events_merged.saturating_add(a_bak);
+                }
+                if live_spool_ready_dir.is_dir() {
+                    let (a_live, _) = ingest_capture_spool_ready_dir_to_sqlite_tmp(
+                        &live_spool_ready_dir,
+                        common_storage,
+                        &mut cap_conn,
+                        Some((cap_wtx_ref, &existing_cap_tables)),
+                        &mut telemetry,
+                    )
+                    .await?;
+                    live_spool_events_merged = live_spool_events_merged.saturating_add(a_live);
+                }
+                stamp_sqlite_tmp_application_id(
+                    &mut cap_conn,
+                    DatabaseRole::Capture,
+                    target_migration_tag,
+                )
+                .await?;
+                cap_conn
+                    .close()
+                    .await
+                    .map_err(|e| StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "reverse recovery failed closing re-exported capture.db.tmp: {e}"
+                        ),
+                    })?;
+                fsync_regular_file_nofollow(&cap_tmp_path, "sync re-exported capture.db.tmp")?;
+                let mut vdur = Phase1DurabilityReceipt::new();
+                verify_one_sqlite_tmp_integrity_and_tag(
+                    &cap_tmp_path,
+                    DatabaseRole::Capture,
+                    target_migration_tag,
+                    "private/capture.db.tmp",
+                    &mut vdur,
+                )
+                .await?;
+            }
+
+            drop(git_backup_handle);
+            drop(cap_backup_handle);
+
+            // Refresh backup files and `source_digests` for any drifted live redb BEFORE fencing!
+            let mut digests_changed = false;
+            if let ClassifiedReverseRecoveryRedb::LiveUnfenced {
+                state: ReverseRecoveryRedbState::DriftedLivePending,
+                path,
+                backup_path,
+                new_sha256,
+                ..
+            } = &git_classified
+            {
+                let file_name = backup_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| StorageBackendError::BackendInternal {
+                        detail: "invalid git backup filename".to_string(),
+                    })?;
+                stream_copy_and_replace_backup_file(path, &backup_dir, file_name, new_sha256)?;
+                manifest.source_digests.git_redb_sha256 = Some(new_sha256.clone());
+                digests_changed = true;
+            }
+            if let ClassifiedReverseRecoveryRedb::LiveUnfenced {
+                state: ReverseRecoveryRedbState::DriftedLivePending,
+                path,
+                backup_path,
+                new_sha256,
+                ..
+            } = &cap_classified
+            {
+                let file_name = backup_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| StorageBackendError::BackendInternal {
+                        detail: "invalid capture backup filename".to_string(),
+                    })?;
+                stream_copy_and_replace_backup_file(path, &backup_dir, file_name, new_sha256)?;
+                manifest.source_digests.cap_redb_sha256 = Some(new_sha256.clone());
+                digests_changed = true;
+            }
+            if digests_changed {
+                publish_storage_manifest(common_storage, &manifest)?;
+                durability.record(
+                    Phase2DurabilityOpKind::ManifestAtomicPublish,
+                    None,
+                    STORAGE_FORMAT_MANIFEST_FILE,
+                );
+            }
+        }
+
+        // Step 2.2a convergence for `git.redb`.
+        match git_classified {
+            ClassifiedReverseRecoveryRedb::LiveUnfenced {
+                path,
+                db,
+                ctrl,
+                wtx,
+                ..
+            } => {
+                ctrl.enable_phase2_writes_and_flush()?;
+                write_migration_tombstone(&wtx, DatabaseRole::Repository)?;
+                wtx.commit().map_err(|err| {
+                    map_redb_commit_err(err, "commit reverse recovery git.redb META_SCHEMA fence")
+                })?;
+                drop(db);
+                durability.record(
+                    Phase2DurabilityOpKind::FenceCommit,
+                    Some(DatabaseRole::Repository),
+                    "redb/git.redb",
+                );
+                manifest.phase2_progress.git_redb = Some(Phase2DbState::FencedReadyToUnlink);
+                publish_storage_manifest(common_storage, &manifest)?;
+                unlink_regular_file_nofollow(
+                    &path,
+                    &common_storage.join(REDB_SUBDIR),
+                    "unlink fenced git.redb during reverse recovery",
+                )?;
+                manifest.phase2_progress.git_redb = Some(Phase2DbState::Unlinked);
+                publish_storage_manifest(common_storage, &manifest)?;
+                durability.record(
+                    Phase2DurabilityOpKind::PublishManifestUnlinked,
+                    Some(DatabaseRole::Repository),
+                    STORAGE_FORMAT_MANIFEST_FILE,
+                );
+            }
+            ClassifiedReverseRecoveryRedb::FencedPreUnlink { path, .. } => {
+                if manifest.phase2_progress.git_redb != Some(Phase2DbState::FencedReadyToUnlink) {
+                    manifest.phase2_progress.git_redb = Some(Phase2DbState::FencedReadyToUnlink);
+                    publish_storage_manifest(common_storage, &manifest)?;
+                }
+                unlink_regular_file_nofollow(
+                    &path,
+                    &common_storage.join(REDB_SUBDIR),
+                    "unlink pre-fenced git.redb during reverse recovery",
+                )?;
+                manifest.phase2_progress.git_redb = Some(Phase2DbState::Unlinked);
+                publish_storage_manifest(common_storage, &manifest)?;
+                durability.record(
+                    Phase2DurabilityOpKind::PublishManifestUnlinked,
+                    Some(DatabaseRole::Repository),
+                    STORAGE_FORMAT_MANIFEST_FILE,
+                );
+            }
+            ClassifiedReverseRecoveryRedb::LegallyUnlinkedVerifiedBackup { .. } => {
+                if manifest.phase2_progress.git_redb != Some(Phase2DbState::Unlinked) {
+                    manifest.phase2_progress.git_redb = Some(Phase2DbState::Unlinked);
+                    publish_storage_manifest(common_storage, &manifest)?;
+                    durability.record(
+                        Phase2DurabilityOpKind::PublishManifestUnlinked,
+                        Some(DatabaseRole::Repository),
+                        STORAGE_FORMAT_MANIFEST_FILE,
+                    );
+                }
+            }
+        }
+
+        // Step 2.2b convergence for `capture.redb`.
+        match cap_classified {
+            ClassifiedReverseRecoveryRedb::LiveUnfenced {
+                path,
+                db,
+                ctrl,
+                wtx,
+                ..
+            } => {
+                ctrl.enable_phase2_writes_and_flush()?;
+                write_migration_tombstone(&wtx, DatabaseRole::Capture)?;
+                wtx.commit().map_err(|err| {
+                    map_redb_commit_err(
+                        err,
+                        "commit reverse recovery capture.redb META_SCHEMA fence",
+                    )
+                })?;
+                drop(db);
+                durability.record(
+                    Phase2DurabilityOpKind::FenceCommit,
+                    Some(DatabaseRole::Capture),
+                    "private/capture.redb",
+                );
+                manifest.phase2_progress.cap_redb = Some(Phase2DbState::FencedReadyToUnlink);
+                publish_storage_manifest(common_storage, &manifest)?;
+                unlink_regular_file_nofollow(
+                    &path,
+                    &common_storage.join(PRIVATE_SUBDIR),
+                    "unlink fenced capture.redb during reverse recovery",
+                )?;
+                manifest.phase2_progress.cap_redb = Some(Phase2DbState::Unlinked);
+                publish_storage_manifest(common_storage, &manifest)?;
+                durability.record(
+                    Phase2DurabilityOpKind::PublishManifestUnlinked,
+                    Some(DatabaseRole::Capture),
+                    STORAGE_FORMAT_MANIFEST_FILE,
+                );
+            }
+            ClassifiedReverseRecoveryRedb::FencedPreUnlink { path, .. } => {
+                if manifest.phase2_progress.cap_redb != Some(Phase2DbState::FencedReadyToUnlink) {
+                    manifest.phase2_progress.cap_redb = Some(Phase2DbState::FencedReadyToUnlink);
+                    publish_storage_manifest(common_storage, &manifest)?;
+                }
+                unlink_regular_file_nofollow(
+                    &path,
+                    &common_storage.join(PRIVATE_SUBDIR),
+                    "unlink pre-fenced capture.redb during reverse recovery",
+                )?;
+                manifest.phase2_progress.cap_redb = Some(Phase2DbState::Unlinked);
+                publish_storage_manifest(common_storage, &manifest)?;
+                durability.record(
+                    Phase2DurabilityOpKind::PublishManifestUnlinked,
+                    Some(DatabaseRole::Capture),
+                    STORAGE_FORMAT_MANIFEST_FILE,
+                );
+            }
+            ClassifiedReverseRecoveryRedb::LegallyUnlinkedVerifiedBackup { .. } => {
+                if manifest.phase2_progress.cap_redb != Some(Phase2DbState::Unlinked) {
+                    manifest.phase2_progress.cap_redb = Some(Phase2DbState::Unlinked);
+                    publish_storage_manifest(common_storage, &manifest)?;
+                    durability.record(
+                        Phase2DurabilityOpKind::PublishManifestUnlinked,
+                        Some(DatabaseRole::Capture),
+                        STORAGE_FORMAT_MANIFEST_FILE,
+                    );
+                }
+            }
+        }
+
+        // Step 2.3: Install / verify all 3 `capture-queue` + all 3 `capture-spool` `0400` tombstones.
+        for sub in [
+            QUEUE_LANE_PRIORITY_DIR,
+            QUEUE_LANE_NORMAL_DIR,
+            QUEUE_QUARANTINE_DIR,
+        ] {
+            install_inplace_0400_tombstone_entry(
+                &queue_dir.join(sub),
+                true,
+                "install reverse recovery capture-queue 0400 tombstone",
+            )?;
+        }
+        fsync_dir_best_effort(&queue_dir)?;
+        manifest.phase2_progress.queue_fenced = true;
+        publish_storage_manifest(common_storage, &manifest)?;
+
+        for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            install_inplace_0400_tombstone_entry(
+                &spool_dir.join(sub),
+                sub == CAPTURE_SPOOL_READY_SUBDIR,
+                "install reverse recovery capture-spool 0400 tombstone",
+            )?;
+        }
+        fsync_dir_best_effort(&spool_dir)?;
+        manifest.phase2_progress.spool_fenced = true;
+        publish_storage_manifest(common_storage, &manifest)?;
+
+        // Step 2.4: Persist `targets_staged_for_rename = true` and publish `capture.db` then `libra.db`.
+        manifest.targets_staged_for_rename = true;
+        publish_storage_manifest(common_storage, &manifest)?;
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_stage(
+                ReversePhase2ObserverStage::AfterTargetsStagedPersisted,
+                &manifest,
+            )?;
+        }
+
+        let (reconciled_competing_capture_db, competing_tombstoned_rows_skipped) =
+            publish_reverse_capture_db_step24(
+                common_storage,
+                &manifest,
+                target_migration_tag,
+                &mut durability,
+                #[cfg(test)]
+                &mut observer,
+            )
+            .await?;
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_stage(
+                ReversePhase2ObserverStage::AfterCapturePublishedBeforeLibra,
+                &manifest,
+            )?;
+        }
+
+        publish_reverse_libra_db_step24(
+            common_storage,
+            target_migration_tag,
+            &mut durability,
+            #[cfg(test)]
+            &mut observer,
+        )
+        .await?;
+
+        // Step 2.5: Publish `finalized = true, spool_unfenced = false`.
+        let mut finalized_manifest = manifest.into_finalized()?;
+        finalized_manifest.spool_unfenced = false;
+        publish_storage_manifest(common_storage, &finalized_manifest)?;
+        durability.record(
+            Phase2DurabilityOpKind::PublishManifestFinalized,
+            None,
+            STORAGE_FORMAT_MANIFEST_FILE,
+        );
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_stage(
+                ReversePhase2ObserverStage::AfterFinalizedBeforeSpoolUnfence,
+                &finalized_manifest,
+            )?;
+        }
+
+        // Step 2.6: Unlink ONLY `is_file()` spool tombstones + `fsync_dir` + `spool_unfenced = true`.
+        let spool_tombstones_unfenced = unfence_reverse_spool_tombstones_step26(
+            common_storage,
+            &mut finalized_manifest,
+            &mut durability,
+        )?;
+        #[cfg(test)]
+        if let Some(obs) = observer {
+            obs.on_stage(
+                ReversePhase2ObserverStage::AfterSpoolUnfencedPersisted,
+                &finalized_manifest,
+            )?;
+        }
+
+        drop(locks);
+
+        Ok(ReversePhase2ResumeReport {
+            generation,
+            target_migration_tag,
+            manifest: finalized_manifest,
+            git_state,
+            capture_state: cap_state,
+            reexported_git_tmp: need_reexport_git,
+            reexported_capture_tmp: need_reexport_cap,
+            queue_union_reexported: queue_has_gap_or_drift,
+            live_spool_events_merged,
+            reconciled_competing_capture_db,
+            competing_tombstoned_rows_skipped,
+            spool_tombstones_unfenced,
+            already_finalized: false,
+            durability,
+        })
+    }
+}
+
+// ============================================================================
+// GlobalConfig & SystemConfig Bidirectional Offline Migration & Crash Recovery
+// (`ADR-RB-02` #2, `ADR-RB-07` #3, `GC-13`, `RB-11b`, `RB-11v`, `RB-11k`,
+// `RB-11w`, `RB-11f`, `RB-11n`, `RB-11g`, `RB-11o`)
+// ============================================================================
+
+/// Direction of a `GlobalConfig` / `SystemConfig` scoped configuration migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigMigrationDirection {
+    /// Forward migration (`config.db` SQLite -> `config.redb` Redb) with
+    /// permanent in-place read-only (`0400`/`0444`) fenced `config.db` tombstone.
+    ForwardSqliteToRedb,
+    /// Reverse migration (`config.redb` Redb -> `config.db` SQLite) replacing
+    /// the in-place tombstone with an authoritative `0600`/`0644` `config.db`.
+    ReverseRedbToSqlite,
+}
+
+/// Summary report returned after [`migrate_global_config`],
+/// [`migrate_system_config`], [`migrate_config_scope`], or
+/// [`resume_config_scope_migration`].
+#[derive(Debug, Clone)]
+pub struct ConfigMigrationReport {
+    /// Migrated configuration role (`GlobalConfig` or `SystemConfig`).
+    pub role: DatabaseRole,
+    /// Direction executed.
+    pub direction: ConfigMigrationDirection,
+    /// Authoritative scope generation recorded in `config-format.json`.
+    pub generation: u64,
+    /// Final persisted `config-format.json` (`finalized = true`).
+    pub manifest: crate::storage::config_store::ConfigFormatManifest,
+    /// Rows transferred in legacy `config` table.
+    pub config_rows_migrated: u64,
+    /// Rows transferred in `config_kv` table.
+    pub config_kv_rows_migrated: u64,
+    /// Rows transferred in `configuration_schema_versions` table.
+    pub schema_version_rows_migrated: u64,
+    /// Path to the verified backup file (if a backup was produced/verified).
+    pub backup_path: Option<PathBuf>,
+    /// Verified streaming SHA-256 of the backup file.
+    pub backup_sha256: Option<String>,
+    /// `true` if execution resumed from an interrupted `finalized = false` manifest.
+    pub resumed_from_unfinalized: bool,
+    /// `true` if SQLite hot rollback journal recovery occurred on `config.db`.
+    pub hot_journal_recovered: bool,
+    /// `true` if scope was already finalized at the requested target backend.
+    pub already_at_target: bool,
+}
+
+#[cfg(test)]
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigMigrationTestStage {
+    AfterExclusiveLockAcquired,
+    AfterForwardPendingManifest,
+    AfterForwardFencedBeforeStaged,
+    AfterForwardStagedBeforeRename,
+    AfterForwardRenamedBeforeFinalize,
+    AfterReversePendingManifest,
+    AfterReverseRedbFencedBeforeUnlink,
+    AfterReverseRedbUnlinkedBeforeStaged,
+    AfterReverseStagedBeforeRename,
+    AfterReverseRenamedBeforeFinalize,
+}
+
+#[cfg(test)]
+trait ConfigMigrationTestObserver {
+    fn on_stage(
+        &mut self,
+        stage: ConfigMigrationTestStage,
+        scope_dir: &Path,
+        role: DatabaseRole,
+    ) -> StorageResult<()>;
+}
+
+fn config_redb_tmp_path_in_scope(scope_dir: &Path) -> PathBuf {
+    scope_dir.join("config.redb.tmp")
+}
+
+fn config_sqlite_tmp_path_in_scope(scope_dir: &Path) -> PathBuf {
+    scope_dir.join("config.db.tmp")
+}
+
+fn config_sqlite_backup_path_in_scope(scope_dir: &Path, generation: u64) -> PathBuf {
+    scope_dir
+        .join(SQLITE_BACKUP_SUBDIR)
+        .join(format!("gen-{}", format_generation_id(generation)))
+        .join(crate::storage::config_store::CONFIG_SQLITE_FILE_NAME)
+}
+
+fn config_redb_backup_path_in_scope(scope_dir: &Path, generation: u64) -> PathBuf {
+    scope_dir
+        .join(REDB_BACKUP_SUBDIR)
+        .join(format!("gen-{}", format_generation_id(generation)))
+        .join(crate::storage::config_store::CONFIG_REDB_FILE_NAME)
+}
+
+fn validate_config_migration_role(role: DatabaseRole) -> StorageResult<()> {
+    match role {
+        DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => Ok(()),
+        other => Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "configuration scope migration rejected role {other}: expected GlobalConfig or SystemConfig"
+            ),
+        }),
+    }
+}
+
+fn apply_config_file_mode(
+    path: &Path,
+    role: DatabaseRole,
+    is_tombstone: bool,
+) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if is_tombstone {
+            crate::storage::config_store::expected_config_tombstone_mode(role)
+        } else {
+            crate::storage::config_store::expected_config_file_mode(role)
+        }
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: format!("no defined POSIX permission mode for {role}"),
+        })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|err| StorageBackendError::io("chmod config scope database file", err))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = role;
+        let mut perms = fs::metadata(path)
+            .map_err(|err| StorageBackendError::io("stat config scope database file", err))?
+            .permissions();
+        perms.set_readonly(is_tombstone);
+        fs::set_permissions(path, perms)
+            .map_err(|err| StorageBackendError::io("set readonly flag on config file", err))?;
+    }
+    Ok(())
+}
+
+fn clear_readonly_if_present(path: &Path, role: DatabaseRole) -> StorageResult<()> {
+    if fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+    apply_config_file_mode(path, role, false)
+}
+
+/// Canonical logical SHA-256 across the 3 configuration SQLite source tables
+/// (`config`, `config_kv`, `configuration_schema_versions`) on `c_mig`.
+async fn compute_config_sqlite_logical_sha256(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+) -> StorageResult<String> {
+    use sea_orm::sqlx::Row as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"LIBRA_CONFIG_SQLITE_LOGICAL_SHA256_V1\0");
+
+    // 1. configuration_schema_versions
+    hash_len_prefixed_bytes(&mut hasher, b"configuration_schema_versions");
+    if sqlite_table_exists_on_conn(conn, role, "configuration_schema_versions").await? {
+        let rows = sea_orm::sqlx::query(
+            "SELECT version, name, applied_at FROM configuration_schema_versions ORDER BY version ASC",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| map_reverse_sqlite_write_err(role, "configuration_schema_versions", e))?;
+        hasher.update((rows.len() as u64).to_le_bytes());
+        for row in rows {
+            let v: i64 = row.try_get(0).unwrap_or(0);
+            let name: String = row.try_get(1).unwrap_or_default();
+            let applied: String = row.try_get(2).unwrap_or_default();
+            hasher.update(v.to_le_bytes());
+            hash_len_prefixed_bytes(&mut hasher, name.as_bytes());
+            hash_len_prefixed_bytes(&mut hasher, applied.as_bytes());
+        }
+    }
+
+    // 2. config (legacy table)
+    hash_len_prefixed_bytes(&mut hasher, b"config");
+    if sqlite_table_exists_on_conn(conn, role, "config").await? {
+        let mut last_id = i64::MIN;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT id, configuration, name, \"key\", value FROM config \
+                 WHERE id > ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(last_id)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let id: i64 = row.try_get(0).unwrap_or(0);
+                last_id = id;
+                let cfg: String = row.try_get(1).unwrap_or_default();
+                let name: Option<String> = row.try_get(2).ok().flatten();
+                let key: String = row.try_get(3).unwrap_or_default();
+                let val: String = row.try_get(4).unwrap_or_default();
+                hasher.update(id.to_le_bytes());
+                hash_len_prefixed_bytes(&mut hasher, cfg.as_bytes());
+                match name {
+                    Some(n) => {
+                        hasher.update([1u8]);
+                        hash_len_prefixed_bytes(&mut hasher, n.as_bytes());
+                    }
+                    None => hasher.update([0u8]),
+                }
+                hash_len_prefixed_bytes(&mut hasher, key.as_bytes());
+                hash_len_prefixed_bytes(&mut hasher, val.as_bytes());
+            }
+        }
+    }
+
+    // 3. config_kv
+    hash_len_prefixed_bytes(&mut hasher, b"config_kv");
+    if sqlite_table_exists_on_conn(conn, role, "config_kv").await? {
+        let mut last_id = i64::MIN;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT id, \"key\", value, encrypted FROM config_kv \
+                 WHERE id > ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(last_id)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config_kv", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let id: i64 = row.try_get(0).unwrap_or(0);
+                last_id = id;
+                let key: String = row.try_get(1).unwrap_or_default();
+                let val: String = row.try_get(2).unwrap_or_default();
+                let enc: i64 = row.try_get(3).unwrap_or(0);
+                hasher.update(id.to_le_bytes());
+                hash_len_prefixed_bytes(&mut hasher, key.as_bytes());
+                hash_len_prefixed_bytes(&mut hasher, val.as_bytes());
+                hasher.update([u8::from(enc != 0)]);
+            }
+        }
+    }
+
+    Ok(sha256_hex_from_hasher(hasher))
+}
+
+/// Stream-export all 3 SQLite configuration tables (`config`, `config_kv`,
+/// `configuration_schema_versions`) from `conn` into staged `config.redb.tmp`
+/// in bounded `<= 500`-row batches with exact `RedbConfigStore` codecs and
+/// role POSIX permissions (`0600` Global / `0644` System).
+async fn export_config_sqlite_to_redb_tmp(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    redb_tmp_path: &Path,
+) -> StorageResult<(u64, u64, u64)> {
+    use sea_orm::sqlx::Row as _;
+
+    let _ = fs::remove_file(redb_tmp_path);
+    let mut builder = redb::Builder::new();
+    builder
+        .set_concurrency_mode(redb::ConcurrencyMode::MultiWriter)
+        .set_cache_size(FORWARD_MIGRATION_REDB_CACHE_BYTES);
+    let db = builder
+        .create(redb_tmp_path)
+        .map_err(|e| map_redb_database_err(e, role, "create staged config.redb.tmp"))?;
+    apply_config_file_mode(redb_tmp_path, role, false)?;
+
+    // Initialize `META_SCHEMA(role)` and all required tables in a single initial tx.
+    {
+        let wtx = begin_write_bounded_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+        init_meta_schema(&wtx, role)?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_LEGACY_TABLE)
+            .map_err(|e| map_redb_table_err(e, "init config table"))?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_KV_TABLE)
+            .map_err(|e| map_redb_table_err(e, "init config_kv table"))?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_KV_BY_KEY_INDEX)
+            .map_err(|e| map_redb_table_err(e, "init config_kv_by_key table"))?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_SCHEMA_VERSIONS_TABLE)
+            .map_err(|e| map_redb_table_err(e, "init configuration_schema_versions table"))?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_SEQ_TABLE)
+            .map_err(|e| map_redb_table_err(e, "init config_sequences table"))?;
+        wtx.commit()
+            .map_err(|e| map_redb_commit_err(e, "commit config.redb.tmp schema init"))?;
+    }
+
+    // 1. Stream `configuration_schema_versions`
+    let mut schema_count = 0u64;
+    if sqlite_table_exists_on_conn(conn, role, "configuration_schema_versions").await? {
+        let mut last_ver = i64::MIN;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT version, name, applied_at FROM configuration_schema_versions \
+                 WHERE version > ? ORDER BY version ASC LIMIT ?",
+            )
+            .bind(last_ver)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "configuration_schema_versions", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            let wtx = begin_checked_write_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+            {
+                let mut tbl = wtx
+                    .open_table(redb_cfg::CONFIG_SCHEMA_VERSIONS_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open configuration_schema_versions"))?;
+                for row in &rows {
+                    let version: i64 = row.try_get(0).map_err(|e| {
+                        map_reverse_sqlite_write_err(role, "configuration_schema_versions", e)
+                    })?;
+                    last_ver = version;
+                    let stored = MigSchemaReceiptStoredRow {
+                        name: row.try_get(1).unwrap_or_default(),
+                        applied_at: row.try_get(2).unwrap_or_default(),
+                    };
+                    let bytes = encode_versioned(redb_cfg::SCHEMA_RECEIPT_CODEC_VERSION, &stored)?;
+                    tbl.insert(version, bytes.as_slice()).map_err(|e| {
+                        map_redb_storage_err(e, "insert configuration_schema_versions")
+                    })?;
+                    schema_count = schema_count.saturating_add(1);
+                }
+            }
+            wtx.commit().map_err(|e| {
+                map_redb_commit_err(e, "commit configuration_schema_versions batch")
+            })?;
+        }
+    }
+
+    // 2. Stream `config` (legacy 3-column table)
+    let mut config_count = 0u64;
+    let mut config_max_id =
+        u64::try_from(read_sqlite_sequence_highwater(conn, role, "config").await?).unwrap_or(0);
+    if sqlite_table_exists_on_conn(conn, role, "config").await? {
+        let mut last_id = i64::MIN;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT id, configuration, name, \"key\", value FROM config \
+                 WHERE id > ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(last_id)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            let wtx = begin_checked_write_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+            {
+                let mut tbl = wtx
+                    .open_table(redb_cfg::CONFIG_LEGACY_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open config table"))?;
+                for row in &rows {
+                    let id_i64: i64 = row
+                        .try_get(0)
+                        .map_err(|e| map_reverse_sqlite_write_err(role, "config", e))?;
+                    last_id = id_i64;
+                    let id = u64::try_from(id_i64).map_err(|_| {
+                        StorageBackendError::BackendInternal {
+                            detail: "negative id in sqlite `config` table".to_string(),
+                        }
+                    })?;
+                    config_max_id = config_max_id.max(id);
+                    let entry = LegacyConfigEntry {
+                        configuration: row.try_get(1).unwrap_or_default(),
+                        name: row.try_get(2).ok().flatten(),
+                        key: row.try_get(3).unwrap_or_default(),
+                        value: row.try_get(4).unwrap_or_default(),
+                    };
+                    let bytes = encode_versioned(redb_cfg::CONFIG_LEGACY_CODEC_VERSION, &entry)?;
+                    tbl.insert(id, bytes.as_slice())
+                        .map_err(|e| map_redb_storage_err(e, "insert config"))?;
+                    config_count = config_count.saturating_add(1);
+                }
+            }
+            wtx.commit()
+                .map_err(|e| map_redb_commit_err(e, "commit config batch"))?;
+        }
+    }
+
+    // 3. Stream `config_kv` + `config_kv_by_key`
+    let mut kv_count = 0u64;
+    let mut kv_max_id =
+        u64::try_from(read_sqlite_sequence_highwater(conn, role, "config_kv").await?).unwrap_or(0);
+    if sqlite_table_exists_on_conn(conn, role, "config_kv").await? {
+        let mut last_id = i64::MIN;
+        let marker = encode_versioned(
+            redb_cfg::CONFIG_KV_INDEX_CODEC_VERSION,
+            &MigConfigKvIndexMarker {},
+        )?;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT id, \"key\", value, encrypted FROM config_kv \
+                 WHERE id > ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(last_id)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config_kv", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            let wtx = begin_checked_write_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+            {
+                let mut tbl = wtx
+                    .open_table(redb_cfg::CONFIG_KV_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open config_kv"))?;
+                let mut idx = wtx
+                    .open_table(redb_cfg::CONFIG_KV_BY_KEY_INDEX)
+                    .map_err(|e| map_redb_table_err(e, "open config_kv_by_key"))?;
+                for row in &rows {
+                    let id_i64: i64 = row
+                        .try_get(0)
+                        .map_err(|e| map_reverse_sqlite_write_err(role, "config_kv", e))?;
+                    last_id = id_i64;
+                    let id = u64::try_from(id_i64).map_err(|_| {
+                        StorageBackendError::BackendInternal {
+                            detail: "negative id in sqlite `config_kv` table".to_string(),
+                        }
+                    })?;
+                    kv_max_id = kv_max_id.max(id);
+                    let enc_i64: i64 = row.try_get(3).unwrap_or(0);
+                    let entry = MigConfigKvStoredRow {
+                        key: row.try_get(1).unwrap_or_default(),
+                        value: row.try_get(2).unwrap_or_default(),
+                        encrypted: enc_i64 != 0,
+                    };
+                    let bytes = encode_versioned(redb_cfg::CONFIG_KV_CODEC_VERSION, &entry)?;
+                    tbl.insert(id, bytes.as_slice())
+                        .map_err(|e| map_redb_storage_err(e, "insert config_kv"))?;
+                    idx.insert((entry.key.as_str(), id), marker.as_slice())
+                        .map_err(|e| map_redb_storage_err(e, "insert config_kv_by_key"))?;
+                    kv_count = kv_count.saturating_add(1);
+                }
+            }
+            wtx.commit()
+                .map_err(|e| map_redb_commit_err(e, "commit config_kv batch"))?;
+        }
+    }
+
+    // Persist monotonic sequence highwaters.
+    {
+        let wtx = begin_checked_write_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+        {
+            let mut seq = wtx
+                .open_table(redb_cfg::CONFIG_SEQ_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open config_sequences"))?;
+            let legacy_seq = encode_versioned(
+                redb_cfg::CONFIG_SEQ_CODEC_VERSION,
+                &MigConfigSequenceValue {
+                    last_id: config_max_id,
+                },
+            )?;
+            let kv_seq = encode_versioned(
+                redb_cfg::CONFIG_SEQ_CODEC_VERSION,
+                &MigConfigSequenceValue { last_id: kv_max_id },
+            )?;
+            seq.insert(MIG_SEQ_KEY_CONFIG_LEGACY, legacy_seq.as_slice())
+                .map_err(|e| map_redb_storage_err(e, "write config seq"))?;
+            seq.insert(MIG_SEQ_KEY_CONFIG_KV, kv_seq.as_slice())
+                .map_err(|e| map_redb_storage_err(e, "write config_kv seq"))?;
+        }
+        wtx.commit()
+            .map_err(|e| map_redb_commit_err(e, "commit config sequences"))?;
+    }
+
+    drop(db);
+    fsync_regular_file_nofollow(redb_tmp_path, "fsync staged config.redb.tmp")?;
+    // Verify staged `config.redb.tmp` opens cleanly as `RedbConfigStore`.
+    let _verify =
+        crate::storage::redb::config_store::RedbConfigStore::open_read_only(redb_tmp_path, role)?;
+    Ok((config_count, kv_count, schema_count))
+}
+
+/// Stream-export all 3 configuration tables (`config`, `config_kv`,
+/// `configuration_schema_versions`) from held `wtx` into staged SQLite
+/// `config.db.tmp` in bounded `<= 500`-row batches, verify `PRAGMA integrity_check == "ok"`,
+/// and `fsync`.
+async fn export_config_redb_to_sqlite_tmp(
+    wtx: &redb::WriteTransaction,
+    role: DatabaseRole,
+    sqlite_tmp_path: &Path,
+) -> StorageResult<(u64, u64, u64)> {
+    let _ = fs::remove_file(sqlite_tmp_path);
+    fs::write(sqlite_tmp_path, b"")
+        .map_err(|err| StorageBackendError::io("create staged config.db.tmp", err))?;
+    apply_config_file_mode(sqlite_tmp_path, role, false)?;
+
+    let mut conn = open_reverse_sqlite_tmp_conn_async(sqlite_tmp_path, role, false).await?;
+    let ddl = format!(
+        "{}\n{}\n{}",
+        crate::internal::db::schema::CONFIG_KV_SQL,
+        include_str!("../../sql/migrations/2026090601_legacy_config_table.sql"),
+        "CREATE TABLE IF NOT EXISTS configuration_schema_versions (\n\
+            version INTEGER PRIMARY KEY,\n\
+            name TEXT NOT NULL,\n\
+            applied_at TEXT NOT NULL\n\
+        );"
+    );
+    for stmt in ddl.split(';') {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        sea_orm::sqlx::query(AssertSqlSafe(trimmed.to_string()))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config_ddl", e))?;
+    }
+
+    let existing_tables = list_existing_redb_tables(wtx)?;
+
+    // 1. Export `configuration_schema_versions`
+    let mut schema_count = 0u64;
+    if existing_tables.contains("configuration_schema_versions") {
+        let mut cursor: Option<i64> = None;
+        loop {
+            let mut batch: Vec<(i64, MigSchemaReceiptStoredRow)> = Vec::new();
+            {
+                let tbl = wtx
+                    .open_table(redb_cfg::CONFIG_SCHEMA_VERSIONS_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open configuration_schema_versions"))?;
+                let iter = match cursor {
+                    None => tbl.iter(),
+                    Some(last) => {
+                        tbl.range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                    }
+                }
+                .map_err(|e| map_redb_storage_err(e, "scan configuration_schema_versions"))?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(|e| {
+                        map_redb_storage_err(e, "read configuration_schema_versions")
+                    })?;
+                    let ver = k.value();
+                    let row: MigSchemaReceiptStoredRow =
+                        decode_versioned(v.value(), redb_cfg::SCHEMA_RECEIPT_CODEC_VERSION)?;
+                    cursor = Some(ver);
+                    batch.push((ver, row));
+                    if batch.len() >= FORWARD_MIGRATION_STREAM_BATCH_ROWS {
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut conn, role, "configuration_schema_versions").await?;
+            for (ver, row) in &batch {
+                sea_orm::sqlx::query(
+                    "INSERT INTO configuration_schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+                )
+                .bind(*ver)
+                .bind(&row.name)
+                .bind(&row.applied_at)
+                .execute(&mut conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(role, "configuration_schema_versions", e))?;
+                schema_count = schema_count.saturating_add(1);
+            }
+            commit_reverse_sqlite_batch(&mut conn, role, "configuration_schema_versions").await?;
+        }
+    }
+
+    // 2. Export `config` (legacy 3-column table)
+    let mut config_count = 0u64;
+    if existing_tables.contains("config") {
+        let mut cursor: Option<u64> = None;
+        loop {
+            let mut batch: Vec<(u64, LegacyConfigEntry)> = Vec::new();
+            {
+                let tbl = wtx
+                    .open_table(redb_cfg::CONFIG_LEGACY_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open config"))?;
+                let iter = match cursor {
+                    None => tbl.iter(),
+                    Some(last) => {
+                        tbl.range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                    }
+                }
+                .map_err(|e| map_redb_storage_err(e, "scan config"))?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(|e| map_redb_storage_err(e, "read config"))?;
+                    let id = k.value();
+                    let row: LegacyConfigEntry =
+                        decode_versioned(v.value(), redb_cfg::CONFIG_LEGACY_CODEC_VERSION)?;
+                    cursor = Some(id);
+                    batch.push((id, row));
+                    if batch.len() >= FORWARD_MIGRATION_STREAM_BATCH_ROWS {
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut conn, role, "config").await?;
+            for (id, row) in &batch {
+                let id_i64 =
+                    i64::try_from(*id).map_err(|_| StorageBackendError::BackendInternal {
+                        detail: "config id exceeds i64".to_string(),
+                    })?;
+                sea_orm::sqlx::query(
+                    "INSERT INTO config (id, configuration, name, \"key\", value) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(id_i64)
+                .bind(&row.configuration)
+                .bind(&row.name)
+                .bind(&row.key)
+                .bind(&row.value)
+                .execute(&mut conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(role, "config", e))?;
+                config_count = config_count.saturating_add(1);
+            }
+            commit_reverse_sqlite_batch(&mut conn, role, "config").await?;
+        }
+    }
+
+    // 3. Export `config_kv`
+    let mut kv_count = 0u64;
+    if existing_tables.contains("config_kv") {
+        let mut cursor: Option<u64> = None;
+        loop {
+            let mut batch: Vec<(u64, MigConfigKvStoredRow)> = Vec::new();
+            {
+                let tbl = wtx
+                    .open_table(redb_cfg::CONFIG_KV_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open config_kv"))?;
+                let iter = match cursor {
+                    None => tbl.iter(),
+                    Some(last) => {
+                        tbl.range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                    }
+                }
+                .map_err(|e| map_redb_storage_err(e, "scan config_kv"))?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(|e| map_redb_storage_err(e, "read config_kv"))?;
+                    let id = k.value();
+                    let row: MigConfigKvStoredRow =
+                        decode_versioned(v.value(), redb_cfg::CONFIG_KV_CODEC_VERSION)?;
+                    cursor = Some(id);
+                    batch.push((id, row));
+                    if batch.len() >= FORWARD_MIGRATION_STREAM_BATCH_ROWS {
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut conn, role, "config_kv").await?;
+            for (id, row) in &batch {
+                let id_i64 =
+                    i64::try_from(*id).map_err(|_| StorageBackendError::BackendInternal {
+                        detail: "config_kv id exceeds i64".to_string(),
+                    })?;
+                sea_orm::sqlx::query(
+                    "INSERT INTO config_kv (id, \"key\", value, encrypted) VALUES (?, ?, ?, ?)",
+                )
+                .bind(id_i64)
+                .bind(&row.key)
+                .bind(&row.value)
+                .bind(i64::from(row.encrypted))
+                .execute(&mut conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(role, "config_kv", e))?;
+                kv_count = kv_count.saturating_add(1);
+            }
+            commit_reverse_sqlite_batch(&mut conn, role, "config_kv").await?;
+        }
+    }
+
+    // Sync `sqlite_sequence` from redb `config_sequences`.
+    if existing_tables.contains("config_sequences") {
+        let mut seq_pairs: Vec<(&'static str, i64)> = Vec::new();
+        {
+            let seq_tbl = wtx
+                .open_table(redb_cfg::CONFIG_SEQ_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open config_sequences"))?;
+            for key in [MIG_SEQ_KEY_CONFIG_LEGACY, MIG_SEQ_KEY_CONFIG_KV] {
+                if let Some(raw) = seq_tbl
+                    .get(key)
+                    .map_err(|e| map_redb_storage_err(e, "read config_sequences"))?
+                {
+                    let seq_val: MigConfigSequenceValue =
+                        decode_versioned(raw.value(), redb_cfg::CONFIG_SEQ_CODEC_VERSION)?;
+                    if let Ok(v) = i64::try_from(seq_val.last_id) {
+                        seq_pairs.push((key, v));
+                    }
+                }
+            }
+        }
+        for (tbl_name, seq_val) in seq_pairs {
+            sync_reverse_sqlite_sequence(&mut conn, role, tbl_name, seq_val).await?;
+        }
+    }
+
+    let ic_rows: Vec<String> = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_all(&mut conn)
+        .await
+        .map_err(|e| map_reverse_sqlite_write_err(role, "integrity_check", e))?;
+    if ic_rows.len() != 1 || ic_rows[0] != "ok" {
+        let _ = conn.close().await;
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("reverse config migration PRAGMA integrity_check failed for {role}"),
+        });
+    }
+    conn.close()
+        .await
+        .map_err(|e| StorageBackendError::BackendInternal {
+            detail: format!("reverse config migration failed closing config.db.tmp: {e}"),
+        })?;
+    fsync_regular_file_nofollow(sqlite_tmp_path, "fsync staged config.db.tmp")?;
+    Ok((config_count, kv_count, schema_count))
+}
+
+async fn verify_config_sqlite_file_integrity(path: &Path, role: DatabaseRole) -> StorageResult<()> {
+    let mut conn = open_reverse_sqlite_tmp_conn_async(path, role, true).await?;
+    let rows: Vec<String> = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_all(&mut conn)
+        .await
+        .map_err(|e| map_reverse_sqlite_write_err(role, "integrity_check", e))?;
+    let _ = conn.close().await;
+    if rows.len() != 1 || rows[0] != "ok" {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("config SQLite file failed PRAGMA integrity_check for {role}"),
+        });
+    }
+    Ok(())
+}
+
+/// Migrate `GlobalConfig` inside `scope_dir` to `target` (`Redb` or `Sqlite`),
+/// automatically resuming if an unfinalized `config-format.json` for `target`
+/// already exists (`RB-11b`, `RB-11k`, `RB-11f`, `RB-11n`, `RB-11g`, `RB-11o`).
+pub async fn migrate_global_config(
+    scope_dir: &Path,
+    target: StorageBackendKind,
+) -> StorageResult<ConfigMigrationReport> {
+    migrate_config_scope(DatabaseRole::GlobalConfig, scope_dir, target).await
+}
+
+/// Migrate `SystemConfig` inside `scope_dir` to `target` (`Redb` or `Sqlite`),
+/// automatically resuming if an unfinalized `config-format.json` for `target`
+/// already exists (`RB-11v`, `RB-11k`, `RB-11f`, `RB-11n`, `RB-11g`, `RB-11o`).
+pub async fn migrate_system_config(
+    scope_dir: &Path,
+    target: StorageBackendKind,
+) -> StorageResult<ConfigMigrationReport> {
+    migrate_config_scope(DatabaseRole::SystemConfig, scope_dir, target).await
+}
+
+/// Role-validated configuration scope migration entrypoint (`GC-13`).
+/// Rejects `Repository`, `Capture`, and `Derived` fail-closed.
+pub async fn migrate_config_scope(
+    role: DatabaseRole,
+    scope_dir: &Path,
+    target: StorageBackendKind,
+) -> StorageResult<ConfigMigrationReport> {
+    migrate_config_scope_inner(
+        role,
+        scope_dir,
+        target,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+/// Explicitly resume an interrupted `GlobalConfig` or `SystemConfig` migration
+/// recorded in `<scope_dir>/config-format.json` (`finalized == false`).
+pub async fn resume_config_scope_migration(
+    role: DatabaseRole,
+    scope_dir: &Path,
+) -> StorageResult<ConfigMigrationReport> {
+    validate_config_migration_role(role)?;
+    let manifest = crate::storage::config_store::read_config_format_manifest(scope_dir, role)?
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: format!("config scope migration resume found no config-format.json for {role}"),
+        })?;
+    migrate_config_scope_inner(
+        role,
+        scope_dir,
+        manifest.backend,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn migrate_config_scope_inner(
+    role: DatabaseRole,
+    scope_dir: &Path,
+    target: StorageBackendKind,
+    #[cfg(test)] mut observer: Option<&mut dyn ConfigMigrationTestObserver>,
+) -> StorageResult<ConfigMigrationReport> {
+    use crate::storage::config_store::{
+        ConfigFormatManifest, ConfigInitPhase, ConfigScopeLock, config_redb_path_in_scope_dir,
+        config_sqlite_path_in_scope_dir, is_config_sqlite_fenced_tombstone,
+        is_config_sqlite_tombstone_sentinel, publish_config_format_manifest,
+        read_config_format_manifest,
+    };
+
+    validate_config_migration_role(role)?;
+    if !scope_dir.is_dir() {
+        return Err(StorageBackendError::NotFound {
+            resource: format!("{role} scope directory"),
+        });
+    }
+
+    // Hold exclusive `LOCK_EX` on `<scope_dir>/config-migration.lock` for the
+    // ENTIRE migration / crash recovery duration (`ADR-RB-02` #2, `ADR-RB-07` #3).
+    let _scope_lock = ConfigScopeLock::try_lock_exclusive_bounded(scope_dir, role, Duration::ZERO)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ConfigMigrationTestStage::AfterExclusiveLockAcquired,
+            scope_dir,
+            role,
+        )?;
+    }
+
+    let existing_manifest = read_config_format_manifest(scope_dir, role)?;
+
+    // Check if already finalized at target backend (idempotent no-op).
+    if let Some(ref m) = existing_manifest
+        && m.finalized
+        && m.backend == target
+    {
+        return Ok(ConfigMigrationReport {
+            role,
+            direction: match target {
+                StorageBackendKind::Redb => ConfigMigrationDirection::ForwardSqliteToRedb,
+                StorageBackendKind::Sqlite => ConfigMigrationDirection::ReverseRedbToSqlite,
+            },
+            generation: m.generation,
+            manifest: m.clone(),
+            config_rows_migrated: 0,
+            config_kv_rows_migrated: 0,
+            schema_version_rows_migrated: 0,
+            backup_path: None,
+            backup_sha256: None,
+            resumed_from_unfinalized: false,
+            hot_journal_recovered: false,
+            already_at_target: true,
+        });
+    }
+
+    if let Some(ref m) = existing_manifest
+        && !m.finalized
+        && m.backend != target
+    {
+        return Err(StorageBackendError::ManifestNotFinalized {
+            detail: format!(
+                "{role} has unfinalized config-format.json targeting {:?}; cannot start migration to {target:?}",
+                m.backend
+            ),
+        });
+    }
+
+    let sqlite_path = config_sqlite_path_in_scope_dir(scope_dir);
+    let redb_path = config_redb_path_in_scope_dir(scope_dir);
+    let redb_tmp_path = config_redb_tmp_path_in_scope(scope_dir);
+    let sqlite_tmp_path = config_sqlite_tmp_path_in_scope(scope_dir);
+
+    match target {
+        StorageBackendKind::Redb => {
+            // ================================================================
+            // Forward Config Migration (`Sqlite -> Redb`: `RB-11b`, `RB-11v`, `RB-11f`, `RB-11n`)
+            // ================================================================
+            let resumed = existing_manifest.as_ref().is_some_and(|m| !m.finalized);
+            let generation = match existing_manifest.as_ref() {
+                Some(m) if !m.finalized => m.generation,
+                Some(m) => m.generation.saturating_add(1),
+                None => 1,
+            };
+            let backup_path = config_sqlite_backup_path_in_scope(scope_dir, generation);
+            let mut hot_journal_recovered = false;
+
+            if let Some(mut m) = existing_manifest.filter(|m| !m.finalized) {
+                // --- Forward Crash Recovery (`RB-11f`, `RB-11n`) ---
+                if m.targets_staged_for_rename {
+                    // `RB-11f` AC3 & AC4: if `config.redb` is already in place, NEVER overwrite it!
+                    if !sqlite_path.is_file()
+                        || !(is_config_sqlite_fenced_tombstone(&sqlite_path)?
+                            || is_sqlite_file_migrated_fenced(&sqlite_path, role).await?)
+                    {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward config recovery rejected missing or unfenced config.db tombstone for {role}"
+                            ),
+                        });
+                    }
+                    apply_config_file_mode(&sqlite_path, role, true)?;
+
+                    if redb_path.is_file() {
+                        let _verify =
+                            crate::storage::redb::config_store::RedbConfigStore::open_read_only(
+                                &redb_path, role,
+                            )?;
+                        apply_config_file_mode(&redb_path, role, false)?;
+                        if redb_tmp_path.is_file() {
+                            let _ = fs::remove_file(&redb_tmp_path);
+                        }
+                        fsync_dir_best_effort(scope_dir)?;
+                    } else if redb_tmp_path.is_file() {
+                        let _verify =
+                            crate::storage::redb::config_store::RedbConfigStore::open_read_only(
+                                &redb_tmp_path,
+                                role,
+                            )?;
+                        fs::rename(&redb_tmp_path, &redb_path).map_err(|e| {
+                            StorageBackendError::io(
+                                "atomic rename config.redb.tmp to config.redb",
+                                e,
+                            )
+                        })?;
+                        apply_config_file_mode(&redb_path, role, false)?;
+                        fsync_dir_best_effort(scope_dir)?;
+                    } else {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward config recovery missing both config.redb and config.redb.tmp for {role}"
+                            ),
+                        });
+                    }
+
+                    let final_manifest =
+                        ConfigFormatManifest::new_redb_finalized(generation, true, role)?;
+                    publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+                    return Ok(ConfigMigrationReport {
+                        role,
+                        direction: ConfigMigrationDirection::ForwardSqliteToRedb,
+                        generation,
+                        manifest: final_manifest,
+                        config_rows_migrated: 0,
+                        config_kv_rows_migrated: 0,
+                        schema_version_rows_migrated: 0,
+                        backup_path: Some(backup_path),
+                        backup_sha256: m.backup_sha256,
+                        resumed_from_unfinalized: true,
+                        hot_journal_recovered: false,
+                        already_at_target: false,
+                    });
+                }
+
+                // Pre-`targets_staged_for_rename` forward recovery:
+                let src_state = m.source_db_state.unwrap_or(Phase2DbState::Pending);
+                if !sqlite_path.is_file() {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward config recovery failed closed: config.db is missing while source_db_state={src_state:?} for {role}"
+                        ),
+                    });
+                }
+
+                let journal_path = sqlite_sidecar_path(&sqlite_path, "-journal");
+                let has_hot_journal = path_exists_no_open(&journal_path)?;
+
+                // Check if `config.db` is already fenced cleanly (no hot rollback journal).
+                let already_fenced = if has_hot_journal {
+                    false
+                } else {
+                    is_config_sqlite_fenced_tombstone(&sqlite_path).unwrap_or(false)
+                        || is_sqlite_file_migrated_fenced(&sqlite_path, role)
+                            .await
+                            .unwrap_or(false)
+                };
+
+                let mut config_rows = 0u64;
+                let mut kv_rows = 0u64;
+                let mut schema_rows = 0u64;
+                let expected_backup_sha = m.backup_sha256.clone().ok_or_else(|| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward config recovery missing backup_sha256 in config-format.json for {role}"
+                        ),
+                    }
+                })?;
+
+                if already_fenced || src_state != Phase2DbState::Pending {
+                    // `RB-11n` AC3 & AC4: fenced state MUST verify `sqlite-backup` existence + real SHA-256!
+                    verify_reverse_backup_file_sha256(
+                        &backup_path,
+                        &expected_backup_sha,
+                        "config.db",
+                    )?;
+                    apply_config_file_mode(&sqlite_path, role, true)?;
+                    if !redb_tmp_path.is_file()
+                        || crate::storage::redb::config_store::RedbConfigStore::open_read_only(
+                            &redb_tmp_path,
+                            role,
+                        )
+                        .is_err()
+                    {
+                        let mut bak_conn =
+                            open_reverse_sqlite_tmp_conn_async(&backup_path, role, true).await?;
+                        let counts =
+                            export_config_sqlite_to_redb_tmp(&mut bak_conn, role, &redb_tmp_path)
+                                .await?;
+                        config_rows = counts.0;
+                        kv_rows = counts.1;
+                        schema_rows = counts.2;
+                        let _ = bak_conn.close().await;
+                    }
+                } else {
+                    // `config.db` is still `pending` (possibly with a torn page-1 sector + hot `-journal`!).
+                    clear_readonly_if_present(&sqlite_path, role)?;
+                    let meta = validate_sqlite_file_metadata(&sqlite_path, role)?;
+                    #[cfg(unix)]
+                    let protected_inodes: Vec<(u64, u64)> = Vec::new();
+                    let (prep, had_hot) = prepare_recovery_sqlite_source(
+                        &sqlite_path,
+                        role,
+                        &meta,
+                        #[cfg(unix)]
+                        &protected_inodes,
+                    )
+                    .await?;
+                    hot_journal_recovered = had_hot;
+                    #[cfg(test)]
+                    let mut conn = finalize_prepared_sqlite_quiescence_inner(
+                        prep,
+                        &QuiesceTestHooks::default(),
+                    )
+                    .await?;
+                    #[cfg(not(test))]
+                    let mut conn = finalize_prepared_sqlite_quiescence(prep).await?;
+
+                    // Verify `config.db` rolled back cleanly and matches (or re-export on drift).
+                    let current_logical =
+                        compute_config_sqlite_logical_sha256(&mut conn.conn, role).await?;
+                    let needs_reexport = m.source_logical_sha256.as_deref()
+                        != Some(current_logical.as_str())
+                        || !redb_tmp_path.is_file()
+                        || crate::storage::redb::config_store::RedbConfigStore::open_read_only(
+                            &redb_tmp_path,
+                            role,
+                        )
+                        .is_err();
+                    if needs_reexport {
+                        let counts =
+                            export_config_sqlite_to_redb_tmp(&mut conn.conn, role, &redb_tmp_path)
+                                .await?;
+                        config_rows = counts.0;
+                        kv_rows = counts.1;
+                        schema_rows = counts.2;
+                        m.source_logical_sha256 = Some(current_logical);
+                    }
+
+                    // Commit atomic rollback-journal fence `__libra_migrated_fence__` over `c_mig`.
+                    #[cfg(test)]
+                    let mut no_hook: Option<&mut dyn Phase2TestObserver> = None;
+                    let _ = fence_sqlite_connection_journaled_inner(
+                        &mut conn,
+                        #[cfg(test)]
+                        &mut no_hook,
+                    )
+                    .await?;
+                    conn.conn
+                        .close()
+                        .await
+                        .map_err(|e| StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward config recovery failed closing fenced config.db: {e}"
+                            ),
+                        })?;
+                    apply_config_file_mode(&sqlite_path, role, true)?;
+                    fsync_dir_best_effort(scope_dir)?;
+                }
+
+                // Persist `targets_staged_for_rename = true` -> atomic `rename(config.redb.tmp, config.redb)` -> `finalized = true`.
+                m.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+                m.legacy_sqlite_tombstone = true;
+                m.targets_staged_for_rename = true;
+                publish_config_format_manifest(scope_dir, role, &m)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterForwardStagedBeforeRename,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                fs::rename(&redb_tmp_path, &redb_path).map_err(|e| {
+                    StorageBackendError::io("atomic rename config.redb.tmp to config.redb", e)
+                })?;
+                apply_config_file_mode(&redb_path, role, false)?;
+                fsync_dir_best_effort(scope_dir)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterForwardRenamedBeforeFinalize,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                let final_manifest =
+                    ConfigFormatManifest::new_redb_finalized(generation, true, role)?;
+                publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+                return Ok(ConfigMigrationReport {
+                    role,
+                    direction: ConfigMigrationDirection::ForwardSqliteToRedb,
+                    generation,
+                    manifest: final_manifest,
+                    config_rows_migrated: config_rows,
+                    config_kv_rows_migrated: kv_rows,
+                    schema_version_rows_migrated: schema_rows,
+                    backup_path: Some(backup_path),
+                    backup_sha256: Some(expected_backup_sha),
+                    resumed_from_unfinalized: resumed,
+                    hot_journal_recovered,
+                    already_at_target: false,
+                });
+            }
+
+            // --- Fresh Forward Config Migration (`RB-11b`, `RB-11v`) ---
+            if !sqlite_path.is_file() {
+                return Err(StorageBackendError::NotFound {
+                    resource: format!("{role} config.db"),
+                });
+            }
+            let sqlite_meta = validate_sqlite_file_metadata(&sqlite_path, role)?;
+            let mut quiesced =
+                quiesce_sqlite_connection_only(&sqlite_path, role, &sqlite_meta).await?;
+            let logical_sha =
+                compute_config_sqlite_logical_sha256(&mut quiesced.conn, role).await?;
+            let (config_rows, kv_rows, schema_rows) =
+                export_config_sqlite_to_redb_tmp(&mut quiesced.conn, role, &redb_tmp_path).await?;
+
+            // Lock-safe `VACUUM INTO` backup on the SAME single `c_mig` connection!
+            let backup_parent =
+                backup_path
+                    .parent()
+                    .ok_or_else(|| StorageBackendError::BackendInternal {
+                        detail: "invalid config sqlite-backup path".to_string(),
+                    })?;
+            fs::create_dir_all(backup_parent)
+                .map_err(|e| StorageBackendError::io("create config sqlite-backup dir", e))?;
+            if backup_path.exists() {
+                let _ = fs::remove_file(&backup_path);
+            }
+            let backup_receipt = vacuum_into_lock_safe_backup(&mut quiesced, &backup_path).await?;
+            fsync_dir_best_effort(backup_parent)?;
+            let backup_sha = backup_receipt.backup_sha256;
+
+            // Step 2.1: Publish `config-format.json(backend="redb", finalized=false, init_phase=migration, ...)`.
+            let mut manifest = ConfigFormatManifest {
+                schema_version: crate::storage::config_store::CONFIG_FORMAT_MANIFEST_VERSION,
+                backend: StorageBackendKind::Redb,
+                finalized: false,
+                init_phase: Some(ConfigInitPhase::Migration),
+                generation,
+                legacy_sqlite_tombstone: false,
+                targets_staged_for_rename: false,
+                source_db_state: Some(Phase2DbState::Pending),
+                backup_sha256: Some(backup_sha.clone()),
+                source_logical_sha256: Some(logical_sha),
+            };
+            publish_config_format_manifest(scope_dir, role, &manifest)?;
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_stage(
+                    ConfigMigrationTestStage::AfterForwardPendingManifest,
+                    scope_dir,
+                    role,
+                )?;
+            }
+
+            // Step 2.2: Commit rollback-journal atomic fence `__libra_migrated_fence__` over `c_mig`,
+            // close `c_mig`, and PERMANENTLY RETAIN `config.db` in-place as `0400`/`0444` tombstone!
+            #[cfg(test)]
+            let mut no_hook: Option<&mut dyn Phase2TestObserver> = None;
+            let _ = fence_sqlite_connection_journaled_inner(
+                &mut quiesced,
+                #[cfg(test)]
+                &mut no_hook,
+            )
+            .await?;
+            quiesced
+                .conn
+                .close()
+                .await
+                .map_err(|e| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward config migration failed closing fenced config.db: {e}"
+                    ),
+                })?;
+            apply_config_file_mode(&sqlite_path, role, true)?;
+            fsync_dir_best_effort(scope_dir)?;
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_stage(
+                    ConfigMigrationTestStage::AfterForwardFencedBeforeStaged,
+                    scope_dir,
+                    role,
+                )?;
+            }
+
+            // Persist `targets_staged_for_rename = true` + `legacy_sqlite_tombstone = true`.
+            manifest.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+            manifest.legacy_sqlite_tombstone = true;
+            manifest.targets_staged_for_rename = true;
+            publish_config_format_manifest(scope_dir, role, &manifest)?;
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_stage(
+                    ConfigMigrationTestStage::AfterForwardStagedBeforeRename,
+                    scope_dir,
+                    role,
+                )?;
+            }
+
+            // Step 2.3: Atomic `rename(config.redb.tmp, config.redb)` with `0600`/`0644` permissions.
+            fs::rename(&redb_tmp_path, &redb_path).map_err(|e| {
+                StorageBackendError::io("atomic rename config.redb.tmp to config.redb", e)
+            })?;
+            apply_config_file_mode(&redb_path, role, false)?;
+            fsync_dir_best_effort(scope_dir)?;
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_stage(
+                    ConfigMigrationTestStage::AfterForwardRenamedBeforeFinalize,
+                    scope_dir,
+                    role,
+                )?;
+            }
+
+            // Step 2.4: Publish `finalized = true, legacy_sqlite_tombstone = true`.
+            let final_manifest = ConfigFormatManifest::new_redb_finalized(generation, true, role)?;
+            publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+
+            Ok(ConfigMigrationReport {
+                role,
+                direction: ConfigMigrationDirection::ForwardSqliteToRedb,
+                generation,
+                manifest: final_manifest,
+                config_rows_migrated: config_rows,
+                config_kv_rows_migrated: kv_rows,
+                schema_version_rows_migrated: schema_rows,
+                backup_path: Some(backup_path),
+                backup_sha256: Some(backup_sha),
+                resumed_from_unfinalized: false,
+                hot_journal_recovered: false,
+                already_at_target: false,
+            })
+        }
+
+        StorageBackendKind::Sqlite => {
+            // ================================================================
+            // Reverse Config Migration (`Redb -> Sqlite`: `RB-11k`, `RB-11g`, `RB-11o`)
+            // ================================================================
+            let generation = match existing_manifest.as_ref() {
+                Some(m) if !m.finalized => m.generation,
+                Some(m) => m.generation.saturating_add(1),
+                None => 1,
+            };
+            let backup_path = config_redb_backup_path_in_scope(scope_dir, generation);
+
+            if let Some(mut m) = existing_manifest.filter(|m| !m.finalized) {
+                // --- Reverse Crash Recovery (`RB-11g`, `RB-11o`) ---
+                if m.targets_staged_for_rename {
+                    // Check if `config.db` is ALREADY a valid unfenced SQLite DB
+                    // (`RB-11o` AC1 & AC2: post-rename crash + old binary write protection!).
+                    let already_published_live_sqlite = if sqlite_path.is_file() {
+                        let is_sentinel =
+                            is_config_sqlite_tombstone_sentinel(&sqlite_path).unwrap_or(false);
+                        let is_fenced = is_config_sqlite_fenced_tombstone(&sqlite_path)
+                            .unwrap_or(false)
+                            || is_sqlite_file_migrated_fenced(&sqlite_path, role)
+                                .await
+                                .unwrap_or(false);
+                        !is_sentinel && !is_fenced
+                    } else {
+                        false
+                    };
+
+                    if already_published_live_sqlite {
+                        verify_config_sqlite_file_integrity(&sqlite_path, role).await?;
+                        apply_config_file_mode(&sqlite_path, role, false)?;
+                        if sqlite_tmp_path.is_file() {
+                            let _ = fs::remove_file(&sqlite_tmp_path);
+                        }
+                        fsync_dir_best_effort(scope_dir)?;
+                    } else {
+                        // `RB-11o` AC3 & AC4: `config.db` is still a tombstone (or absent) —
+                        // verify `config.db.tmp`, clear readonly on Windows, and atomically replace!
+                        if !sqlite_tmp_path.is_file() {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "reverse config recovery missing config.db.tmp before tombstone replace for {role}"
+                                ),
+                            });
+                        }
+                        verify_config_sqlite_file_integrity(&sqlite_tmp_path, role).await?;
+                        clear_readonly_if_present(&sqlite_path, role)?;
+                        fs::rename(&sqlite_tmp_path, &sqlite_path).map_err(|e| {
+                            StorageBackendError::io(
+                                "atomic rename config.db.tmp over config.db tombstone",
+                                e,
+                            )
+                        })?;
+                        apply_config_file_mode(&sqlite_path, role, false)?;
+                        fsync_dir_best_effort(scope_dir)?;
+                    }
+
+                    let final_manifest =
+                        ConfigFormatManifest::new_sqlite_finalized(generation, role)?;
+                    publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+                    return Ok(ConfigMigrationReport {
+                        role,
+                        direction: ConfigMigrationDirection::ReverseRedbToSqlite,
+                        generation,
+                        manifest: final_manifest,
+                        config_rows_migrated: 0,
+                        config_kv_rows_migrated: 0,
+                        schema_version_rows_migrated: 0,
+                        backup_path: Some(backup_path),
+                        backup_sha256: m.backup_sha256,
+                        resumed_from_unfinalized: true,
+                        hot_journal_recovered: false,
+                        already_at_target: false,
+                    });
+                }
+
+                // Pre-`targets_staged_for_rename` reverse recovery (`RB-11g`):
+                let src_state = m.source_db_state.unwrap_or(Phase2DbState::Pending);
+                let expected_backup_sha = m.backup_sha256.clone().ok_or_else(|| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "reverse config recovery missing backup_sha256 in config-format.json for {role}"
+                        ),
+                    }
+                })?;
+
+                let mut config_rows = 0u64;
+                let mut kv_rows = 0u64;
+                let mut schema_rows = 0u64;
+
+                if !redb_path.is_file() {
+                    // `RB-11g` AC3 & AC4: `pending` while `config.redb` missing -> fail closed!
+                    if src_state == Phase2DbState::Pending {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "reverse config recovery failed closed: config.redb is unexpectedly missing while source_db_state=pending for {role}"
+                            ),
+                        });
+                    }
+                    // `RB-11g` AC1, AC2, AC5, AC6: legally unlinked -> verify real `redb-backup` SHA-256!
+                    verify_reverse_backup_file_sha256(
+                        &backup_path,
+                        &expected_backup_sha,
+                        "config.redb",
+                    )?;
+                    if !sqlite_tmp_path.is_file()
+                        || verify_config_sqlite_file_integrity(&sqlite_tmp_path, role)
+                            .await
+                            .is_err()
+                    {
+                        #[cfg(any(unix, windows))]
+                        {
+                            let (_bak_db, bak_wtx) =
+                                open_verified_backup_redb_readonly_wtx(&backup_path, role)?;
+                            let counts =
+                                export_config_redb_to_sqlite_tmp(&bak_wtx, role, &sqlite_tmp_path)
+                                    .await?;
+                            config_rows = counts.0;
+                            kv_rows = counts.1;
+                            schema_rows = counts.2;
+                        }
+                    }
+                    if m.source_db_state != Some(Phase2DbState::Unlinked) {
+                        m.source_db_state = Some(Phase2DbState::Unlinked);
+                        publish_config_format_manifest(scope_dir, role, &m)?;
+                    }
+                } else {
+                    #[cfg(any(unix, windows))]
+                    {
+                        let file = fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&redb_path)
+                            .map_err(|e| {
+                                StorageBackendError::io("open config.redb for reverse recovery", e)
+                            })?;
+                        let backend = ReverseNonBlockingFileBackend::new(file);
+                        backend.ensure_writer_byte_uncontended(
+                            ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+                        )?;
+                        let (db, ctrl) = open_reverse_redb_with_backend(backend, role)?;
+                        match begin_checked_write_blocking(&db, role, Duration::ZERO) {
+                            Ok(wtx) => {
+                                let current_sha = compute_file_sha256_streaming(&redb_path)?;
+                                if current_sha != expected_backup_sha
+                                    || !sqlite_tmp_path.is_file()
+                                    || verify_config_sqlite_file_integrity(&sqlite_tmp_path, role)
+                                        .await
+                                        .is_err()
+                                {
+                                    let counts = export_config_redb_to_sqlite_tmp(
+                                        &wtx,
+                                        role,
+                                        &sqlite_tmp_path,
+                                    )
+                                    .await?;
+                                    config_rows = counts.0;
+                                    kv_rows = counts.1;
+                                    schema_rows = counts.2;
+                                    if current_sha != expected_backup_sha {
+                                        let bak_dir = backup_path.parent().ok_or_else(|| {
+                                            StorageBackendError::BackendInternal {
+                                                detail: "invalid config redb-backup dir"
+                                                    .to_string(),
+                                            }
+                                        })?;
+                                        fs::create_dir_all(bak_dir).map_err(|e| {
+                                            StorageBackendError::io(
+                                                "create config redb-backup dir",
+                                                e,
+                                            )
+                                        })?;
+                                        stream_copy_and_replace_backup_file(
+                                            &redb_path,
+                                            bak_dir,
+                                            crate::storage::config_store::CONFIG_REDB_FILE_NAME,
+                                            &current_sha,
+                                        )?;
+                                        m.backup_sha256 = Some(current_sha.clone());
+                                        m.source_logical_sha256 = Some(current_sha);
+                                        publish_config_format_manifest(scope_dir, role, &m)?;
+                                    }
+                                }
+                                ctrl.enable_phase2_writes_and_flush()?;
+                                write_migration_tombstone(&wtx, role)?;
+                                wtx.commit().map_err(|e| {
+                                    map_redb_commit_err(
+                                        e,
+                                        "commit reverse recovery config.redb fence",
+                                    )
+                                })?;
+                                drop(db);
+                                m.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+                                publish_config_format_manifest(scope_dir, role, &m)?;
+                                unlink_regular_file_nofollow(
+                                    &redb_path,
+                                    scope_dir,
+                                    "unlink fenced config.redb",
+                                )?;
+                                m.source_db_state = Some(Phase2DbState::Unlinked);
+                                publish_config_format_manifest(scope_dir, role, &m)?;
+                            }
+                            Err(StorageBackendError::RepositoryMigrated { .. }) => {
+                                drop(db);
+                                verify_reverse_backup_file_sha256(
+                                    &backup_path,
+                                    &expected_backup_sha,
+                                    "config.redb",
+                                )?;
+                                m.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+                                publish_config_format_manifest(scope_dir, role, &m)?;
+                                unlink_regular_file_nofollow(
+                                    &redb_path,
+                                    scope_dir,
+                                    "unlink pre-fenced config.redb",
+                                )?;
+                                m.source_db_state = Some(Phase2DbState::Unlinked);
+                                publish_config_format_manifest(scope_dir, role, &m)?;
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }
+
+                // Step 2.3–2.5 convergence: `targets_staged_for_rename = true` -> replace tombstone -> `finalized = true`.
+                m.targets_staged_for_rename = true;
+                publish_config_format_manifest(scope_dir, role, &m)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseStagedBeforeRename,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                clear_readonly_if_present(&sqlite_path, role)?;
+                fs::rename(&sqlite_tmp_path, &sqlite_path).map_err(|e| {
+                    StorageBackendError::io(
+                        "atomic rename config.db.tmp over config.db tombstone",
+                        e,
+                    )
+                })?;
+                apply_config_file_mode(&sqlite_path, role, false)?;
+                fsync_dir_best_effort(scope_dir)?;
+                #[cfg(test)]
+                if let Some(obs) = observer {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseRenamedBeforeFinalize,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                let final_manifest = ConfigFormatManifest::new_sqlite_finalized(generation, role)?;
+                publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+                return Ok(ConfigMigrationReport {
+                    role,
+                    direction: ConfigMigrationDirection::ReverseRedbToSqlite,
+                    generation,
+                    manifest: final_manifest,
+                    config_rows_migrated: config_rows,
+                    config_kv_rows_migrated: kv_rows,
+                    schema_version_rows_migrated: schema_rows,
+                    backup_path: Some(backup_path),
+                    backup_sha256: m.backup_sha256,
+                    resumed_from_unfinalized: true,
+                    hot_journal_recovered: false,
+                    already_at_target: false,
+                });
+            }
+
+            // --- Fresh Reverse Config Migration (`RB-11k`) ---
+            if !redb_path.is_file() {
+                return Err(StorageBackendError::NotFound {
+                    resource: format!("{role} config.redb"),
+                });
+            }
+            #[cfg(any(unix, windows))]
+            {
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&redb_path)
+                    .map_err(|e| {
+                        StorageBackendError::io("open config.redb for reverse migration", e)
+                    })?;
+                let backend = ReverseNonBlockingFileBackend::new(file);
+                backend.ensure_writer_byte_uncontended(
+                    ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+                )?;
+                let (db, ctrl) = open_reverse_redb_with_backend(backend, role)?;
+                let wtx = match begin_checked_write_blocking(&db, role, Duration::ZERO) {
+                    Ok(wtx) => wtx,
+                    Err(StorageBackendError::WriteLockBusy { .. }) => {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "reverse config migration rejected: active external writer holds {role} config.redb"
+                            ),
+                        });
+                    }
+                    Err(err) => return Err(err),
+                };
+
+                let (config_rows, kv_rows, schema_rows) =
+                    export_config_redb_to_sqlite_tmp(&wtx, role, &sqlite_tmp_path).await?;
+
+                // Backup frozen `config.redb` to `<scope_dir>/redb-backup/gen-<id>/config.redb` + SHA-256 verify.
+                let bak_dir =
+                    backup_path
+                        .parent()
+                        .ok_or_else(|| StorageBackendError::BackendInternal {
+                            detail: "invalid config redb-backup dir".to_string(),
+                        })?;
+                fs::create_dir_all(bak_dir)
+                    .map_err(|e| StorageBackendError::io("create config redb-backup dir", e))?;
+                let backup_sha = compute_file_sha256_streaming(&redb_path)?;
+                stream_copy_and_replace_backup_file(
+                    &redb_path,
+                    bak_dir,
+                    crate::storage::config_store::CONFIG_REDB_FILE_NAME,
+                    &backup_sha,
+                )?;
+
+                // Step 2.1: Publish `config-format.json(backend="sqlite", finalized=false, init_phase=migration, ...)`.
+                let mut manifest = ConfigFormatManifest {
+                    schema_version: crate::storage::config_store::CONFIG_FORMAT_MANIFEST_VERSION,
+                    backend: StorageBackendKind::Sqlite,
+                    finalized: false,
+                    init_phase: Some(ConfigInitPhase::Migration),
+                    generation,
+                    legacy_sqlite_tombstone: false,
+                    targets_staged_for_rename: false,
+                    source_db_state: Some(Phase2DbState::Pending),
+                    backup_sha256: Some(backup_sha.clone()),
+                    source_logical_sha256: Some(backup_sha.clone()),
+                };
+                publish_config_format_manifest(scope_dir, role, &manifest)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReversePendingManifest,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                // Step 2.2: Fence `config.redb` (`META_SCHEMA u32::MAX`) -> persist `fenced_ready_to_unlink`
+                // -> `unlink(config.redb) + fsync_dir` -> persist `unlinked`.
+                ctrl.enable_phase2_writes_and_flush()?;
+                write_migration_tombstone(&wtx, role)?;
+                wtx.commit().map_err(|e| {
+                    map_redb_commit_err(e, "commit reverse config.redb META_SCHEMA fence")
+                })?;
+                drop(db);
+
+                manifest.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+                publish_config_format_manifest(scope_dir, role, &manifest)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseRedbFencedBeforeUnlink,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                unlink_regular_file_nofollow(&redb_path, scope_dir, "unlink fenced config.redb")?;
+                manifest.source_db_state = Some(Phase2DbState::Unlinked);
+                publish_config_format_manifest(scope_dir, role, &manifest)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseRedbUnlinkedBeforeStaged,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                // Step 2.3: Persist `targets_staged_for_rename = true`.
+                manifest.targets_staged_for_rename = true;
+                publish_config_format_manifest(scope_dir, role, &manifest)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseStagedBeforeRename,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                // Step 2.4: Atomically replace `config.db` tombstone with `config.db.tmp` (`0600`/`0644`).
+                clear_readonly_if_present(&sqlite_path, role)?;
+                fs::rename(&sqlite_tmp_path, &sqlite_path).map_err(|e| {
+                    StorageBackendError::io(
+                        "atomic rename config.db.tmp over config.db tombstone",
+                        e,
+                    )
+                })?;
+                apply_config_file_mode(&sqlite_path, role, false)?;
+                fsync_dir_best_effort(scope_dir)?;
+                #[cfg(test)]
+                if let Some(obs) = observer {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseRenamedBeforeFinalize,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                // Step 2.5: Publish `finalized = true, legacy_sqlite_tombstone = false`.
+                let final_manifest = ConfigFormatManifest::new_sqlite_finalized(generation, role)?;
+                publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+
+                Ok(ConfigMigrationReport {
+                    role,
+                    direction: ConfigMigrationDirection::ReverseRedbToSqlite,
+                    generation,
+                    manifest: final_manifest,
+                    config_rows_migrated: config_rows,
+                    config_kv_rows_migrated: kv_rows,
+                    schema_version_rows_migrated: schema_rows,
+                    backup_path: Some(backup_path),
+                    backup_sha256: Some(backup_sha),
+                    resumed_from_unfinalized: false,
+                    hot_journal_recovered: false,
+                    already_at_target: false,
+                })
+            }
+            #[cfg(all(not(unix), not(windows)))]
+            {
+                let _ = (generation, backup_path);
+                Err(StorageBackendError::BackendInternal {
+                    detail: "reverse config migration unsupported on this platform".to_string(),
+                })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -41183,6 +53446,150 @@ mod tests {
                     }
                     Err(fs::TryLockError::Error(err)) => {
                         panic!("unexpected maintenance.lock probe error: {err}")
+                    }
+                }
+                return;
+            }
+            "hold_redb_git_write_tx" => {
+                use crate::storage::RedbGitStore;
+                let store = RedbGitStore::open_read_write(db_path)
+                    .expect("child open RedbGitStore writable")
+                    .with_write_timeout(Duration::ZERO);
+                let wtx = store
+                    .begin_checked_write_tx()
+                    .expect("child acquire RedbGitStore write tx");
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                let _ = wtx.abort();
+                drop(store);
+                return;
+            }
+            "hold_redb_capture_write_tx" => {
+                use crate::storage::{RedbCaptureStore, RedbRepairContext};
+                let store =
+                    RedbCaptureStore::open_read_write(db_path, RedbRepairContext::WriteCommand)
+                        .await
+                        .expect("child open RedbCaptureStore writable")
+                        .with_write_timeout(Duration::ZERO);
+                let wtx = store
+                    .begin_checked_write_tx()
+                    .expect("child acquire RedbCaptureStore write tx");
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                let _ = wtx.abort();
+                drop(store);
+                return;
+            }
+            "preopen_redb_git_then_commit_mid_open" => {
+                use crate::storage::RedbGitStore;
+                let store = RedbGitStore::open_read_write(db_path)
+                    .expect("child pre-open RedbGitStore for mid-open commit")
+                    .with_write_timeout(Duration::from_secs(2));
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                let wtx = store
+                    .begin_checked_write_tx()
+                    .expect("child begin checked write tx in mid-open window");
+                {
+                    let mut refs = wtx
+                        .open_table(redb_git::REFERENCE_TABLE)
+                        .expect("child open REFERENCE_TABLE");
+                    refs.insert(
+                        (0u8, "refs/heads/rb11-mid-open-commit", ""),
+                        b"rb11-committed-mid-open".as_slice(),
+                    )
+                    .expect("child insert mid-open ref");
+                }
+                wtx.commit().expect("child commit mid-open ref");
+                drop(store);
+                return;
+            }
+            "preopen_redb_git_then_probe_busy" => {
+                use crate::storage::RedbGitStore;
+                let store = RedbGitStore::open_read_write(db_path)
+                    .expect("child pre-open RedbGitStore writable")
+                    .with_write_timeout(Duration::ZERO);
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                match store.begin_checked_write_tx() {
+                    Err(StorageBackendError::WriteLockBusy {
+                        role: DatabaseRole::Repository,
+                        ..
+                    }) => {
+                        println!("{RB10_BUSY_MARKER}");
+                        let _ = io::stdout().flush();
+                    }
+                    Ok(wtx) => {
+                        let _ = wtx.abort();
+                        panic!("expected WriteLockBusy on held git.redb write tx");
+                    }
+                    Err(other) => {
+                        panic!("unexpected git.redb busy probe error: {other:?}");
+                    }
+                }
+                drop(store);
+                return;
+            }
+            "preopen_redb_capture_then_probe_busy" => {
+                use crate::storage::{RedbCaptureStore, RedbRepairContext};
+                let store =
+                    RedbCaptureStore::open_read_write(db_path, RedbRepairContext::WriteCommand)
+                        .await
+                        .expect("child pre-open RedbCaptureStore writable")
+                        .with_write_timeout(Duration::ZERO);
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                match store.begin_checked_write_tx() {
+                    Err(StorageBackendError::WriteLockBusy {
+                        role: DatabaseRole::Capture,
+                        ..
+                    }) => {
+                        println!("{RB10_BUSY_MARKER}");
+                        let _ = io::stdout().flush();
+                    }
+                    Ok(wtx) => {
+                        let _ = wtx.abort();
+                        panic!("expected WriteLockBusy on held capture.redb write tx");
+                    }
+                    Err(other) => {
+                        panic!("unexpected capture.redb busy probe error: {other:?}");
+                    }
+                }
+                drop(store);
+                return;
+            }
+            "probe_redb_git_write_busy" | "probe_redb_capture_write_busy" => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(db_path)
+                    .expect("child open redb for non-blocking writer-byte probe");
+                let backend = ReverseNonBlockingFileBackend::new(file);
+                let stage = if mode == "probe_redb_git_write_busy" {
+                    ReversePhase1QuiesceStage::GitRedbWriteTransaction
+                } else {
+                    ReversePhase1QuiesceStage::CaptureRedbWriteTransaction
+                };
+                match backend.ensure_writer_byte_uncontended(stage) {
+                    Err(err) if err.stable_code_str() == "LBR-IO-001" => {
+                        println!("{RB10_BUSY_MARKER}");
+                        let _ = io::stdout().flush();
+                    }
+                    Ok(()) => {
+                        panic!("expected WRITER_BYTE busy for `{mode}`, got uncontended");
+                    }
+                    Err(other) => {
+                        panic!("unexpected `{mode}` probe error: {other:?}");
                     }
                 }
                 return;
@@ -64067,6 +76474,4969 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             )
             .expect_err("deleted snapshot quarantine file must fail closed during union backup");
             assert_eq!(union_q_err.stable_code_str(), "LBR-IO-001");
+        }
+    }
+
+    /// Build a finalized Redb repository fixture (`storage-format.json` with
+    /// `backend = "redb", finalized = true, generation = 1`, `git.gen-00000001.redb`,
+    /// `capture.gen-00000001.redb`, initialized `capture-queue/`, and `capture-spool/`
+    /// tombstones) for reverse migration Phase 1/2 tests (`RB-11`+).
+    async fn build_rb11_finalized_redb_repo_fixture(storage: &Path) -> (PathBuf, PathBuf) {
+        use crate::storage::{
+            RedbCaptureStore, RedbGitStore, StorageFormatManifest, init_capture_queue,
+            init_redb_capture_spool_tombstones, publish_storage_manifest,
+        };
+
+        fs::create_dir_all(storage.join(REDB_SUBDIR)).expect("create .libra/redb");
+        fs::create_dir_all(storage.join(PRIVATE_SUBDIR)).expect("create .libra/private");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(
+                storage.join(PRIVATE_SUBDIR),
+                fs::Permissions::from_mode(0o700),
+            )
+            .expect("chmod 0700 private");
+        }
+
+        let git_path = git_redb_path(storage, 1);
+        let cap_path = capture_redb_path(storage, 1);
+        let git_store = RedbGitStore::create(&git_path).expect("create git.gen-00000001.redb");
+        drop(git_store);
+        let cap_store = RedbCaptureStore::create(&cap_path)
+            .await
+            .expect("create capture.gen-00000001.redb");
+        drop(cap_store);
+        let _q = init_capture_queue(storage).expect("init capture-queue");
+        let _tomb = init_redb_capture_spool_tombstones(storage)
+            .expect("init fresh redb capture-spool tombstones");
+
+        let manifest =
+            StorageFormatManifest::new_redb_finalized(1).expect("new finalized redb manifest");
+        publish_storage_manifest(storage, &manifest).expect("publish finalized redb manifest");
+        (git_path, cap_path)
+    }
+
+    /// `RB-11` AC1–AC5: symmetric reverse migration Phase 1 redb writer
+    /// quiescence gate and strict `ADR-RB-07` #2 global lock order:
+    /// - AC1 + AC2: external OS-process `git.redb` writer -> fail-closed
+    ///   `LBR-IO-001` with exact byte-for-byte unchanged `git.redb` & `capture.redb`.
+    /// - AC3 + AC4: external OS-process `capture.redb` writer -> fail-closed
+    ///   `LBR-IO-001` with exact byte-for-byte unchanged `git.redb` & `capture.redb`.
+    /// - AC5: strict 8-step canonical global lock order
+    ///   `migration.lock -> maintenance.lock -> capture-spool-consumer.lock ->
+    ///    writer.lock -> capture-queue/append.lock -> capture-spool/capacity.lock ->
+    ///    (git_wtx, cap_wtx)`, verified via observer + live OS-child busy probes
+    ///   on all 8 locks + uncontended latency budget `<= 50ms` + `GC-13` role
+    ///   rejection + unfinalized/SQLite manifest rejection.
+    #[tokio::test]
+    async fn reverse_phase1_quiescence_rejects_redb_writers_and_enforces_lock_order() {
+        struct RecordingReverseObserver {
+            stages: Vec<ReversePhase1QuiesceStage>,
+        }
+        impl ReversePhase1LockObserver for RecordingReverseObserver {
+            fn on_stage_acquired(&mut self, stage: ReversePhase1QuiesceStage) {
+                self.stages.push(stage);
+            }
+        }
+
+        let dir = tempdir().expect("rb11 tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let cap_bytes_initial = fs::read(&cap_path).expect("snapshot initial capture.redb");
+
+        // --------------------------------------------------------------------
+        // AC1 + AC2: External OS-process `git.redb` writer returns `LBR-IO-001`
+        // AND preserves BOTH `git.redb` and `capture.redb` byte-for-byte!
+        // --------------------------------------------------------------------
+        {
+            let holder = ChildLockHolder::spawn("hold_redb_git_write_tx", &git_path);
+            let git_bytes_before = fs::read(&git_path).expect("snapshot git.redb before AC1");
+            let cap_bytes_before = fs::read(&cap_path).expect("snapshot capture.redb before AC1");
+            let err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("AC1: active external git.redb writer must fail closed");
+            assert_eq!(
+                err.stable_code_str(),
+                "LBR-IO-001",
+                "AC1: external git.redb writer must return LBR-IO-001, got: {err}"
+            );
+            assert_eq!(
+                fs::read(&git_path).expect("read git.redb after AC1"),
+                git_bytes_before,
+                "AC2: git.redb must remain byte-for-byte identical across AC1 rejection"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("read capture.redb after AC1"),
+                cap_bytes_before,
+                "AC2: capture.redb must remain byte-for-byte identical across AC1 rejection"
+            );
+            assert_eq!(
+                cap_bytes_before, cap_bytes_initial,
+                "AC2: uncontended capture.redb must match initial clean snapshot"
+            );
+            // Also verify preflight created ZERO stray `migration.lock` on rejection!
+            assert!(
+                !migration_lock_path(&storage).exists(),
+                "AC2: rejected preflight must not create migration.lock"
+            );
+            holder.release_and_wait();
+        }
+
+        // Refresh clean resting snapshots after external git child exited cleanly
+        // (redb's own `Database::drop()` on the child commits allocator state).
+        let git_bytes_resting = fs::read(&git_path).expect("snapshot resting git.redb");
+        let cap_bytes_resting = fs::read(&cap_path).expect("snapshot resting capture.redb");
+        assert_eq!(
+            cap_bytes_resting, cap_bytes_initial,
+            "AC2: uncontended capture.redb must stay unchanged after external git writer exits"
+        );
+
+        // --------------------------------------------------------------------
+        // AC3 + AC4: External OS-process `capture.redb` writer returns
+        // `LBR-IO-001` AND preserves BOTH `git.redb` and `capture.redb`
+        // byte-for-byte!
+        // --------------------------------------------------------------------
+        {
+            let holder = ChildLockHolder::spawn("hold_redb_capture_write_tx", &cap_path);
+            let git_bytes_before = fs::read(&git_path).expect("snapshot git.redb before AC3");
+            let cap_bytes_before = fs::read(&cap_path).expect("snapshot capture.redb before AC3");
+            let err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("AC3: active external capture.redb writer must fail closed");
+            assert_eq!(
+                err.stable_code_str(),
+                "LBR-IO-001",
+                "AC3: external capture.redb writer must return LBR-IO-001, got: {err}"
+            );
+            assert_eq!(
+                fs::read(&git_path).expect("read git.redb after AC3"),
+                git_bytes_before,
+                "AC4: git.redb must remain byte-for-byte identical across AC3 rejection"
+            );
+            assert_eq!(
+                git_bytes_before, git_bytes_resting,
+                "AC4: uncontended git.redb must match resting snapshot"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("read capture.redb after AC3"),
+                cap_bytes_before,
+                "AC4: capture.redb must remain byte-for-byte identical across AC3 rejection"
+            );
+            assert!(
+                !migration_lock_path(&storage).exists(),
+                "AC4: rejected preflight must not create migration.lock"
+            );
+            holder.release_and_wait();
+        }
+
+        let git_bytes_clean = fs::read(&git_path).expect("snapshot clean git.redb before AC5");
+        let cap_bytes_clean = fs::read(&cap_path).expect("snapshot clean capture.redb before AC5");
+        assert_eq!(
+            git_bytes_clean, git_bytes_resting,
+            "AC4: uncontended git.redb must stay unchanged after external capture writer exits"
+        );
+
+        // --------------------------------------------------------------------
+        // AC5: Strict global lock order + live OS-process mutual exclusion on
+        // ALL 8 locks + zero-byte-touch Phase 1 CoW + `<= 50ms` uncontended
+        // performance budget!
+        // --------------------------------------------------------------------
+        {
+            // First verify full acquire + hold + abort writes ZERO bytes to
+            // EITHER `git.redb` or `capture.redb` on disk (both while held AND
+            // after `abort_and_release()`)!
+            let mut recorder = RecordingReverseObserver { stages: Vec::new() };
+            let guard = quiesce_reverse_repository_phase1_inner(&storage, Some(&mut recorder))
+                .expect("AC5: uncontended reverse quiescence must succeed");
+            assert_eq!(
+                recorder.stages,
+                vec![
+                    ReversePhase1QuiesceStage::MigrationLock,
+                    ReversePhase1QuiesceStage::MaintenanceLock,
+                    ReversePhase1QuiesceStage::CaptureSpoolConsumerLock,
+                    ReversePhase1QuiesceStage::CaptureQueueWriterLock,
+                    ReversePhase1QuiesceStage::CaptureQueueAppendLock,
+                    ReversePhase1QuiesceStage::CaptureSpoolCapacityLock,
+                    ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+                    ReversePhase1QuiesceStage::CaptureRedbWriteTransaction,
+                ],
+                "AC5: reverse migration MUST acquire all 8 locks in exact ADR-RB-07 #2 order"
+            );
+            assert_eq!(guard.redb().generation(), 1);
+            assert_eq!(guard.redb().git_redb_path(), git_path.as_path());
+            assert_eq!(guard.redb().capture_redb_path(), cap_path.as_path());
+
+            // Even WHILE `(git_wtx, cap_wtx)` are held, disk bytes stay 100%
+            // clean and byte-for-byte identical to pre-quiescence snapshots!
+            assert_eq!(
+                fs::read(&git_path).expect("read git.redb while quiesced"),
+                git_bytes_clean,
+                "Phase 1 CoW overlay must leave git.redb byte-identical while quiesced"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("read capture.redb while quiesced"),
+                cap_bytes_clean,
+                "Phase 1 CoW overlay must leave capture.redb byte-identical while quiesced"
+            );
+
+            // Confirm via real OS child processes that ALL 8 locks are held!
+            run_child_busy_probe("probe_flock_busy", &migration_lock_path(&storage));
+            run_child_busy_probe("probe_maintenance_shared_busy", &storage);
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_spool_consumer_lock_path(&storage),
+            );
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_queue_writer_lock_path(&storage),
+            );
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_queue_append_lock_path(&storage),
+            );
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_spool_capacity_lock_path(&storage),
+            );
+            run_child_busy_probe("probe_redb_git_write_busy", &git_path);
+            run_child_busy_probe("probe_redb_capture_write_busy", &cap_path);
+
+            guard
+                .abort_and_release()
+                .expect("abort and release reverse quiesce guard");
+            assert_eq!(
+                fs::read(&git_path).expect("read git.redb after abort"),
+                git_bytes_clean,
+                "abort_and_release must leave git.redb byte-identical"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("read capture.redb after abort"),
+                cap_bytes_clean,
+                "abort_and_release must leave capture.redb byte-identical"
+            );
+
+            // Second warm uncontended run (all 6 lock files materialized):
+            // verify `<= 50ms` uncontended performance budget!
+            let mut recorder2 = RecordingReverseObserver { stages: Vec::new() };
+            let started = Instant::now();
+            let guard2 = quiesce_reverse_repository_phase1_inner(&storage, Some(&mut recorder2))
+                .expect("warm uncontended reverse quiescence must succeed");
+            let elapsed = started.elapsed();
+            guard2
+                .abort_and_release()
+                .expect("release warm reverse quiesce guard");
+            assert!(
+                elapsed <= Duration::from_millis(50),
+                "RB-11 uncontended quiescence budget exceeded: {elapsed:?} > 50ms"
+            );
+            assert_eq!(recorder2.stages.len(), 8);
+            assert_eq!(fs::read(&git_path).expect("warm git"), git_bytes_clean);
+            assert_eq!(fs::read(&cap_path).expect("warm cap"), cap_bytes_clean);
+
+            // Pre-open real OS child `RedbGitStore` and `RedbCaptureStore`
+            // handles BEFORE quiescence and verify BOTH immediately receive
+            // `StorageBackendError::WriteLockBusy { role }` while `guard` holds
+            // `(git_wtx, cap_wtx)`!
+            let preopen_git = ChildLockHolder::spawn("preopen_redb_git_then_probe_busy", &git_path);
+            let preopen_cap =
+                ChildLockHolder::spawn("preopen_redb_capture_then_probe_busy", &cap_path);
+            let guard3 = quiesce_reverse_repository_phase1(&storage)
+                .expect("quiescence with idle pre-opened external handles must succeed");
+            preopen_git.release_and_wait();
+            preopen_cap.release_and_wait();
+            guard3
+                .abort_and_release()
+                .expect("release guard3 after pre-opened probes");
+
+            // Deterministic regression test for Phase 1 CoW overlay vs peer
+            // commit between `git.redb` open and `git_wtx` acquisition:
+            // a pre-opened external `RedbGitStore` commits a new ref right
+            // after `git_db` opens and drops its open-time `WRITER_BYTE`,
+            // immediately before `try_begin_reverse_source_write_tx(&git_db)`.
+            // The resulting `guard.redb().git_wtx()` MUST see the newly
+            // committed row (never a stale overlaid header snapshot)!
+            {
+                struct MidOpenPeerCommitObserver {
+                    peer: Option<ChildLockHolder>,
+                    fired: bool,
+                }
+                impl ReversePhase1LockObserver for MidOpenPeerCommitObserver {
+                    fn on_stage_acquired(&mut self, _stage: ReversePhase1QuiesceStage) {}
+
+                    fn on_after_git_db_open_before_git_wtx(&mut self) {
+                        if let Some(peer) = self.peer.take() {
+                            peer.release_and_wait();
+                            self.fired = true;
+                        }
+                    }
+                }
+                let peer =
+                    ChildLockHolder::spawn("preopen_redb_git_then_commit_mid_open", &git_path);
+                let mut mid_obs = MidOpenPeerCommitObserver {
+                    peer: Some(peer),
+                    fired: false,
+                };
+                let guard_mid =
+                    quiesce_reverse_repository_phase1_inner(&storage, Some(&mut mid_obs))
+                        .expect("quiescence must reconcile mid-open peer commit");
+                assert!(mid_obs.fired, "mid-open peer commit hook must have fired");
+                {
+                    let refs = guard_mid
+                        .redb()
+                        .git_wtx()
+                        .open_table(redb_git::REFERENCE_TABLE)
+                        .expect("open REFERENCE_TABLE in quiesced git_wtx");
+                    let got = refs
+                        .get((0u8, "refs/heads/rb11-mid-open-commit", ""))
+                        .expect("read mid-open committed ref")
+                        .expect("quiesced git_wtx MUST observe peer commit made between open and write_tx");
+                    assert_eq!(got.value(), b"rb11-committed-mid-open");
+                }
+                guard_mid
+                    .abort_and_release()
+                    .expect("release guard_mid after verifying mid-open peer commit");
+            }
+
+            // Re-verify AC1–AC4 when all 6 lock files already exist (exercises
+            // Phase 1 lock acquisition + zero-write rejection with zero residual
+            // lock held after rejection!).
+            for (mode, target_path, label) in [
+                ("hold_redb_git_write_tx", &git_path, "git.redb post-lock"),
+                (
+                    "hold_redb_capture_write_tx",
+                    &cap_path,
+                    "capture.redb post-lock",
+                ),
+            ] {
+                let holder = ChildLockHolder::spawn(mode, target_path);
+                let git_snap = fs::read(&git_path).expect("git snap before post-lock reject");
+                let cap_snap = fs::read(&cap_path).expect("cap snap before post-lock reject");
+                let err = quiesce_reverse_repository_phase1(&storage)
+                    .expect_err(&format!("{label} writer must fail closed"));
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(fs::read(&git_path).expect("git bytes"), git_snap);
+                assert_eq!(fs::read(&cap_path).expect("cap bytes"), cap_snap);
+                holder.release_and_wait();
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // GC-13 role isolation & manifest authority checks:
+        // --------------------------------------------------------------------
+        for forbidden_role in [
+            DatabaseRole::GlobalConfig,
+            DatabaseRole::SystemConfig,
+            DatabaseRole::Derived,
+        ] {
+            let err = quiesce_reverse_repository_phase1_for_role(&storage, forbidden_role)
+                .expect_err("GC-13 must reject non-repository role");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        }
+
+        // Unfinalized manifest MUST fail closed `LBR-IO-001`.
+        let dummy_sha = "0".repeat(64);
+        let unfinalized = StorageFormatManifest::new_redb_in_progress(
+            1,
+            Some("sqlite-backup/00000001".to_string()),
+            Phase2Progress {
+                git_db: Some(Phase2DbState::FencedReadyToUnlink),
+                capture_db: Some(Phase2DbState::FencedReadyToUnlink),
+                spool_fenced: false,
+                git_redb: None,
+                cap_redb: None,
+                queue_fenced: false,
+            },
+            SourceDigests {
+                git_logical_sha256: Some(dummy_sha.clone()),
+                git_backup_sha256: Some(dummy_sha.clone()),
+                cap_logical_sha256: Some(dummy_sha.clone()),
+                cap_backup_sha256: Some(dummy_sha.clone()),
+                spool_manifest_sha256: Some(dummy_sha.clone()),
+                queue_manifest_sha256: Some(dummy_sha.clone()),
+                git_redb_sha256: None,
+                cap_redb_sha256: None,
+            },
+        )
+        .expect("build unfinalized redb manifest");
+        crate::storage::publish_storage_manifest(&storage, &unfinalized)
+            .expect("write unfinalized manifest");
+        let unfin_err = quiesce_reverse_repository_phase1(&storage)
+            .expect_err("unfinalized manifest must fail closed");
+        assert_eq!(unfin_err.stable_code_str(), "LBR-IO-001");
+
+        // Finalized SQLite manifest MUST fail closed `LBR-IO-001`.
+        let mut sqlite_manifest = StorageFormatManifest::new_sqlite_in_progress(
+            2,
+            0x1234_5678,
+            Some("redb-backup/00000001".to_string()),
+            Phase2Progress {
+                git_redb: Some(Phase2DbState::Unlinked),
+                cap_redb: Some(Phase2DbState::Unlinked),
+                queue_fenced: true,
+                spool_fenced: true,
+                git_db: None,
+                capture_db: None,
+            },
+            SourceDigests {
+                git_redb_sha256: Some(dummy_sha.clone()),
+                cap_redb_sha256: Some(dummy_sha.clone()),
+                queue_manifest_sha256: Some(dummy_sha.clone()),
+                spool_manifest_sha256: Some(dummy_sha),
+                git_logical_sha256: None,
+                git_backup_sha256: None,
+                cap_logical_sha256: None,
+                cap_backup_sha256: None,
+            },
+        )
+        .expect("build reverse sqlite manifest");
+        sqlite_manifest.targets_staged_for_rename = true;
+        let mut sqlite_finalized = sqlite_manifest
+            .into_finalized()
+            .expect("finalize reverse sqlite manifest");
+        sqlite_finalized.spool_unfenced = true;
+        crate::storage::publish_storage_manifest(&storage, &sqlite_finalized)
+            .expect("write finalized sqlite manifest");
+        let sqlite_err = quiesce_reverse_repository_phase1(&storage)
+            .expect_err("sqlite manifest must fail closed for reverse migration");
+        assert_eq!(sqlite_err.stable_code_str(), "LBR-IO-001");
+    }
+
+    /// `RB-11z` AC1–AC8: symmetric reverse migration Phase 1 rejects active
+    /// external queue producers holding in-place `capture-queue/append.lock`
+    /// AND active in-flight `capture-spool/tmp/` publishers (`spool.rs:119-145`),
+    /// returning fail-closed `LBR-IO-001` with 1:1 single-domain byte-identical
+    /// snapshots across source redb (`git.redb`/`capture.redb`),
+    /// `capture-queue/`, and `capture-spool/` (both when all optional lock files
+    /// already exist AND when optional lock files are initially absent).
+    #[tokio::test]
+    async fn reverse_phase1_rejects_queue_producer_and_inflight_spool_tmp() {
+        use crate::storage::{
+            CaptureQueueLane, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, append_frame,
+        };
+
+        /// Seed a finalized Redb repo with real queued frames in BOTH
+        /// `capture-queue/{priority,normal}/` and a populated `capture-spool/`
+        /// (`ready/` + `tmp/` directory mode when `use_active_spool_dirs`, or
+        /// `0400` tombstones otherwise).
+        async fn setup_rb11z_fixture(
+            storage: &Path,
+            create_optional_locks: bool,
+            use_active_spool_dirs: bool,
+        ) -> (PathBuf, PathBuf) {
+            let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(storage).await;
+
+            // Append real capture-queue frames to BOTH `priority` and `normal` lanes!
+            append_frame(
+                storage,
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_PRIORITY,
+                "rb11z-prio-1",
+                b"{\"session\":\"s-prio\",\"event\":\"start\"}",
+            )
+            .expect("append priority queue frame");
+            append_frame(
+                storage,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb11z-norm-1",
+                b"{\"session\":\"s-norm\",\"event\":\"tool\"}",
+            )
+            .expect("append normal queue frame");
+
+            let spool_dir = capture_spool_dir_path(storage);
+            if use_active_spool_dirs {
+                // Replace `0400` tombstones with active legacy `ready/`/`tmp/`/`quarantine/`
+                // directories to simulate an unfenced/in-flight `spool.rs` publisher.
+                for name in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                    let p = spool_dir.join(name);
+                    if p.exists() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt as _;
+                            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+                        }
+                        #[cfg(windows)]
+                        {
+                            if let Ok(mut perms) = fs::metadata(&p).map(|m| m.permissions()) {
+                                perms.set_readonly(false);
+                                let _ = fs::set_permissions(&p, perms);
+                            }
+                        }
+                        fs::remove_file(&p).expect("remove tombstone for active spool dir fixture");
+                    }
+                    fs::create_dir_all(&p).expect("create active spool subdir");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))
+                            .expect("chmod 0700 active spool subdir");
+                    }
+                }
+                fs::write(
+                    spool_dir.join("ready").join("0001-rb11z-ready.json"),
+                    b"{\"event\":\"ready\"}",
+                )
+                .expect("seed ready spool file");
+            }
+
+            let writer_lock = capture_queue_writer_lock_path(storage);
+            let capacity_lock = capture_spool_capacity_lock_path(storage);
+            let consumer_lock = capture_spool_consumer_lock_path(storage);
+            if create_optional_locks {
+                for p in [&writer_lock, &capacity_lock, &consumer_lock] {
+                    if !p.exists() {
+                        fs::write(p, b"").expect("create optional lock file");
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt as _;
+                            fs::set_permissions(p, fs::Permissions::from_mode(0o600))
+                                .expect("chmod 0600 optional lock");
+                        }
+                    }
+                }
+            } else {
+                for p in [&writer_lock, &capacity_lock, &consumer_lock] {
+                    if p.exists() {
+                        fs::remove_file(p).expect("remove optional lock for absent-lock variant");
+                    }
+                }
+            }
+
+            (git_path, cap_path)
+        }
+
+        for (create_optional_locks, variant) in [
+            (true, "all-locks-present"),
+            (false, "optional-locks-absent"),
+        ] {
+            // ================================================================
+            // AC1–AC4: External OS-process queue producer holding in-place
+            // `capture-queue/append.lock` (both exclusive & shared flock).
+            // ================================================================
+            for (lock_mode, mode_label) in [
+                ("hold_flock_exclusive", "exclusive-append-lock"),
+                ("hold_flock_shared", "shared-append-lock"),
+            ] {
+                let dir = tempdir().expect("rb11z append.lock tempdir");
+                let storage = dir.path().join(".libra");
+                let (git_path, cap_path) =
+                    setup_rb11z_fixture(&storage, create_optional_locks, false).await;
+
+                let queue_dir = capture_queue_dir_path(&storage);
+                let spool_dir = capture_spool_dir_path(&storage);
+                let append_lock = capture_queue_append_lock_path(&storage);
+
+                let before_git = fs::read(&git_path).expect("snapshot git.redb before AC1");
+                let before_cap = fs::read(&cap_path).expect("snapshot capture.redb before AC1");
+                let before_queue = snapshot_directory_tree(&queue_dir);
+                let before_spool = snapshot_directory_tree(&spool_dir);
+
+                let holder = ChildLockHolder::spawn(lock_mode, &append_lock);
+
+                // AC1: fail-closed `LBR-IO-001` (and zero private path leak).
+                let err = quiesce_reverse_repository_phase1(&storage).expect_err(&format!(
+                    "AC1 ({variant}/{mode_label}): held append.lock must fail closed"
+                ));
+                assert_eq!(
+                    err.stable_code_str(),
+                    "LBR-IO-001",
+                    "AC1 ({variant}/{mode_label}): expected LBR-IO-001, got {err}"
+                );
+                assert!(
+                    !err.to_string().contains(&storage.display().to_string()),
+                    "AC1 ({variant}/{mode_label}): error message must not leak private path: {err}"
+                );
+
+                // AC2: source redb (`git.redb` & `capture.redb`) byte-identical.
+                assert_eq!(
+                    fs::read(&git_path).expect("read git.redb after AC1"),
+                    before_git,
+                    "AC2 ({variant}/{mode_label}): git.redb must remain byte-identical"
+                );
+                assert_eq!(
+                    fs::read(&cap_path).expect("read capture.redb after AC1"),
+                    before_cap,
+                    "AC2 ({variant}/{mode_label}): capture.redb must remain byte-identical"
+                );
+
+                // AC3: `capture-queue/` ALL files byte-identical (no new locks/files).
+                assert_eq!(
+                    snapshot_directory_tree(&queue_dir),
+                    before_queue,
+                    "AC3 ({variant}/{mode_label}): capture-queue/ must remain byte-identical"
+                );
+
+                // AC4: `capture-spool/` ALL files byte-identical.
+                assert_eq!(
+                    snapshot_directory_tree(&spool_dir),
+                    before_spool,
+                    "AC4 ({variant}/{mode_label}): capture-spool/ must remain byte-identical"
+                );
+                assert!(
+                    !migration_lock_path(&storage).exists(),
+                    "AC1–AC4 ({variant}/{mode_label}): must not create stray migration.lock"
+                );
+
+                holder.release_and_wait();
+            }
+
+            // ================================================================
+            // AC5–AC8: Unexpired in-flight `capture-spool/tmp/` file (and
+            // future-mtime staging file) simulating `spool.rs:119-145`.
+            // ================================================================
+            for (use_future_mtime, tmp_label) in
+                [(false, "fresh-unexpired-tmp"), (true, "future-mtime-tmp")]
+            {
+                let dir = tempdir().expect("rb11z spool tmp tempdir");
+                let storage = dir.path().join(".libra");
+                let (git_path, cap_path) =
+                    setup_rb11z_fixture(&storage, create_optional_locks, true).await;
+
+                let queue_dir = capture_queue_dir_path(&storage);
+                let spool_dir = capture_spool_dir_path(&storage);
+                let inflight_tmp =
+                    capture_spool_tmp_dir_path(&storage).join("1-0000000000000099-0001~inflight");
+                fs::write(&inflight_tmp, b"{\"partial_envelope\":true}")
+                    .expect("write in-flight capture-spool/tmp file");
+                if use_future_mtime {
+                    let f = OpenOptions::new()
+                        .write(true)
+                        .open(&inflight_tmp)
+                        .expect("open inflight tmp for future mtime");
+                    f.set_modified(SystemTime::now() + Duration::from_secs(3600))
+                        .expect("set future mtime on inflight tmp");
+                }
+
+                let before_git = fs::read(&git_path).expect("snapshot git.redb before AC5");
+                let before_cap = fs::read(&cap_path).expect("snapshot capture.redb before AC5");
+                let before_spool = snapshot_directory_tree(&spool_dir);
+                let before_queue = snapshot_directory_tree(&queue_dir);
+
+                // AC5: fail-closed `LBR-IO-001` (and zero private path leak).
+                let err = quiesce_reverse_repository_phase1(&storage).expect_err(&format!(
+                    "AC5 ({variant}/{tmp_label}): in-flight capture-spool/tmp must fail closed"
+                ));
+                assert_eq!(
+                    err.stable_code_str(),
+                    "LBR-IO-001",
+                    "AC5 ({variant}/{tmp_label}): expected LBR-IO-001, got {err}"
+                );
+                assert!(
+                    !err.to_string().contains(&storage.display().to_string()),
+                    "AC5 ({variant}/{tmp_label}): error message must not leak private path: {err}"
+                );
+
+                // AC6: source redb (`git.redb` & `capture.redb`) byte-identical.
+                assert_eq!(
+                    fs::read(&git_path).expect("read git.redb after AC5"),
+                    before_git,
+                    "AC6 ({variant}/{tmp_label}): git.redb must remain byte-identical"
+                );
+                assert_eq!(
+                    fs::read(&cap_path).expect("read capture.redb after AC5"),
+                    before_cap,
+                    "AC6 ({variant}/{tmp_label}): capture.redb must remain byte-identical"
+                );
+
+                // AC7: `capture-spool/` ALL files byte-identical.
+                assert_eq!(
+                    snapshot_directory_tree(&spool_dir),
+                    before_spool,
+                    "AC7 ({variant}/{tmp_label}): capture-spool/ must remain byte-identical"
+                );
+
+                // AC8: `capture-queue/` ALL files byte-identical.
+                assert_eq!(
+                    snapshot_directory_tree(&queue_dir),
+                    before_queue,
+                    "AC8 ({variant}/{tmp_label}): capture-queue/ must remain byte-identical"
+                );
+                assert!(
+                    !migration_lock_path(&storage).exists(),
+                    "AC5–AC8 ({variant}/{tmp_label}): must not create stray migration.lock"
+                );
+            }
+        }
+
+        // ====================================================================
+        // Deterministic post-lock TOCTOU regression: an in-flight publisher
+        // writes a staging file into `capture-spool/tmp/` AFTER Phase 0
+        // preflight passed and AFTER `capacity.lock` was acquired (the real
+        // `spool.rs:119-145` window!). Post-lock `verify_no_inflight_spool_tmp_files`
+        // MUST reject with `LBR-IO-001` before touching redb, preserving all 3
+        // domains and releasing all 6 locks cleanly!
+        // ====================================================================
+        {
+            struct PostLockInflightTmpInjector {
+                tmp_file: PathBuf,
+                injected: bool,
+            }
+            impl ReversePhase1LockObserver for PostLockInflightTmpInjector {
+                fn on_stage_acquired(&mut self, stage: ReversePhase1QuiesceStage) {
+                    if stage == ReversePhase1QuiesceStage::CaptureSpoolCapacityLock {
+                        fs::write(&self.tmp_file, b"{\"late_inflight\":true}")
+                            .expect("inject late in-flight capture-spool/tmp file");
+                        self.injected = true;
+                    }
+                }
+            }
+
+            let dir = tempdir().expect("rb11z post-lock TOCTOU tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_path, cap_path) = setup_rb11z_fixture(&storage, true, true).await;
+            let queue_dir = capture_queue_dir_path(&storage);
+            let late_tmp = capture_spool_tmp_dir_path(&storage).join("2-late-inflight~tmp");
+
+            let before_git = fs::read(&git_path).expect("snapshot git before post-lock TOCTOU");
+            let before_cap = fs::read(&cap_path).expect("snapshot cap before post-lock TOCTOU");
+            let before_queue = snapshot_directory_tree(&queue_dir);
+
+            let mut injector = PostLockInflightTmpInjector {
+                tmp_file: late_tmp.clone(),
+                injected: false,
+            };
+            let err = quiesce_reverse_repository_phase1_inner(&storage, Some(&mut injector))
+                .expect_err("post-lock in-flight tmp must fail closed");
+            assert!(injector.injected, "TOCTOU injector hook must have fired");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(fs::read(&git_path).expect("git after TOCTOU"), before_git);
+            assert_eq!(fs::read(&cap_path).expect("cap after TOCTOU"), before_cap);
+            assert_eq!(snapshot_directory_tree(&queue_dir), before_queue);
+            assert!(
+                late_tmp.exists(),
+                "rejected post-lock check must not delete in-flight tmp file"
+            );
+
+            // Now age the abandoned tmp file past `CAPTURE_SPOOL_TMP_MAX_AGE` (25h)
+            // -> uncontended quiescence MUST succeed within `<= 50ms` budget AND
+            // preserve the expired tmp file untouched across `abort_and_release()`!
+            let f = OpenOptions::new()
+                .write(true)
+                .open(&late_tmp)
+                .expect("open tmp file to age past 24h");
+            f.set_modified(SystemTime::now() - Duration::from_secs(25 * 3600))
+                .expect("set expired mtime > 24h");
+            drop(f);
+
+            let spool_dir = capture_spool_dir_path(&storage);
+            let before_spool_expired = snapshot_directory_tree(&spool_dir);
+            let started = Instant::now();
+            let guard = quiesce_reverse_repository_phase1(&storage)
+                .expect("expired >24h capture-spool/tmp file must allow reverse quiescence");
+            let elapsed = started.elapsed();
+            guard
+                .abort_and_release()
+                .expect("abort and release after expired tmp check");
+            assert!(
+                elapsed <= Duration::from_millis(50),
+                "RB-11z uncontended quiescence budget exceeded: {elapsed:?} > 50ms"
+            );
+            assert_eq!(fs::read(&git_path).expect("git after expired"), before_git);
+            assert_eq!(fs::read(&cap_path).expect("cap after expired"), before_cap);
+            assert_eq!(
+                snapshot_directory_tree(&spool_dir),
+                before_spool_expired,
+                "expired >24h tmp file must be preserved untouched during Phase 1 quiescence"
+            );
+            assert_eq!(snapshot_directory_tree(&queue_dir), before_queue);
+        }
+
+        // ====================================================================
+        // Unix safety regression: tampered / symlinked / hard-linked
+        // `capture-spool/tmp` tombstones MUST fail closed `LBR-IO-001`.
+        // ====================================================================
+        #[cfg(unix)]
+        {
+            let dir = tempdir().expect("rb11z symlink/hardlink tombstone tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = setup_rb11z_fixture(&storage, true, true).await;
+            let tmp_path = capture_spool_tmp_dir_path(&storage);
+            fs::remove_dir(&tmp_path).expect("remove empty tmp dir");
+
+            let decoy = dir.path().join("tombstone-decoy");
+            fs::write(&decoy, CAPTURE_SPOOL_TOMBSTONE_SENTINEL).expect("write decoy tombstone");
+
+            fs::hard_link(&decoy, &tmp_path).expect("plant hard-linked tmp tombstone");
+            let hl_err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("hard-linked capture-spool/tmp tombstone must fail closed");
+            assert_eq!(hl_err.stable_code_str(), "LBR-IO-001");
+            fs::remove_file(&tmp_path).expect("remove hard-linked tmp");
+
+            std::os::unix::fs::symlink(&decoy, &tmp_path).expect("plant symlinked tmp tombstone");
+            let sym_err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("symlinked capture-spool/tmp must fail closed");
+            assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
+        }
+    }
+
+    /// `RB-11q`: Verifies reverse migration Phase 1:
+    /// - AC1–AC3: External OS process holding `capture-spool-consumer.lock`
+    ///   (`drain.rs:87`) fails closed with `LBR-IO-001` while keeping source
+    ///   `git.redb`/`capture.redb` and `capture-spool/` 100% byte-identical;
+    /// - AC4: While reverse migration holds `capture-spool-consumer.lock`,
+    ///   concurrent `drain_storage` sees the busy lock immediately and exits
+    ///   with zero file moves (never moving `ready/` into `quarantine/`);
+    /// - AC5–AC6: Non-empty `capture-spool/quarantine/` fails closed with
+    ///   `LBR-IO-001` within the `<= 20ms` lock-probe + dir-check budget while
+    ///   preserving every quarantined file 100% byte-for-byte intact.
+    #[cfg(all(
+        feature = "storage-sqlite",
+        feature = "storage-redb",
+        feature = "storage-queue"
+    ))]
+    #[tokio::test]
+    async fn reverse_phase1_consumer_lock_excludes_concurrent_drain_and_rejects_quarantine() {
+        use crate::internal::ai::capture::drain;
+
+        async fn setup_rb11q_fixture(
+            storage: &Path,
+            create_optional_locks: bool,
+            use_active_spool_dirs: bool,
+        ) -> (PathBuf, PathBuf) {
+            let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(storage).await;
+
+            let spool_dir = capture_spool_dir_path(storage);
+            if use_active_spool_dirs {
+                for name in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                    let p = spool_dir.join(name);
+                    if p.exists() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt as _;
+                            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+                        }
+                        #[cfg(windows)]
+                        {
+                            if let Ok(mut perms) = fs::metadata(&p).map(|m| m.permissions()) {
+                                perms.set_readonly(false);
+                                let _ = fs::set_permissions(&p, perms);
+                            }
+                        }
+                        fs::remove_file(&p).expect("remove spool tombstone for active dir fixture");
+                    }
+                    fs::create_dir_all(&p).expect("create active spool subdir");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        fs::set_permissions(&p, fs::Permissions::from_mode(0o700))
+                            .expect("chmod 0700 active spool subdir");
+                    }
+                }
+            }
+
+            let consumer_lock = capture_spool_consumer_lock_path(storage);
+            if !consumer_lock.exists() {
+                fs::write(&consumer_lock, b"").expect("create capture-spool-consumer.lock");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&consumer_lock, fs::Permissions::from_mode(0o600))
+                        .expect("chmod 0600 consumer lock");
+                }
+            }
+
+            let writer_lock = capture_queue_writer_lock_path(storage);
+            let capacity_lock = capture_spool_capacity_lock_path(storage);
+            let append_lock = capture_queue_append_lock_path(storage);
+            if create_optional_locks {
+                for p in [&writer_lock, &capacity_lock, &append_lock] {
+                    if !p.exists() {
+                        fs::write(p, b"").expect("create optional lock file");
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt as _;
+                            fs::set_permissions(p, fs::Permissions::from_mode(0o600))
+                                .expect("chmod 0600 optional lock");
+                        }
+                    }
+                }
+            } else {
+                for p in [&writer_lock, &capacity_lock, &append_lock] {
+                    if p.exists() {
+                        fs::remove_file(p).expect("remove optional lock");
+                    }
+                }
+            }
+
+            (git_path, cap_path)
+        }
+
+        // ====================================================================
+        // AC1–AC3: External OS spool consumer holding `capture-spool-consumer.lock`
+        // ====================================================================
+        for (create_optional_locks, variant) in [
+            (true, "all-locks-present"),
+            (false, "optional-locks-absent"),
+        ] {
+            for (lock_mode, mode_label) in [
+                ("hold_flock_exclusive", "exclusive-consumer-lock"),
+                ("hold_flock_shared", "shared-consumer-lock"),
+            ] {
+                let dir = tempdir().expect("rb11q consumer lock tempdir");
+                let storage = dir.path().join(".libra");
+                let (git_path, cap_path) =
+                    setup_rb11q_fixture(&storage, create_optional_locks, true).await;
+
+                let spool_dir = capture_spool_dir_path(&storage);
+                let queue_dir = capture_queue_dir_path(&storage);
+                let consumer_lock = capture_spool_consumer_lock_path(&storage);
+                fs::write(
+                    spool_dir.join("ready").join("0001-ready.json"),
+                    b"{\"event\":\"ready-during-consumer-lock\"}",
+                )
+                .expect("seed ready spool file");
+
+                let before_git = fs::read(&git_path).expect("snapshot git.redb before AC1");
+                let before_cap = fs::read(&cap_path).expect("snapshot capture.redb before AC1");
+                let before_spool = snapshot_directory_tree(&spool_dir);
+                let before_queue = snapshot_directory_tree(&queue_dir);
+
+                let holder = ChildLockHolder::spawn(lock_mode, &consumer_lock);
+
+                let started = Instant::now();
+                let err = quiesce_reverse_repository_phase1(&storage).expect_err(&format!(
+                    "AC1 ({variant}/{mode_label}): held consumer lock must fail closed"
+                ));
+                let elapsed = started.elapsed();
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert!(
+                    !err.to_string().contains(&storage.display().to_string()),
+                    "AC1 ({variant}/{mode_label}): must not leak private path: {err}"
+                );
+                assert!(
+                    elapsed <= Duration::from_millis(20),
+                    "AC1 ({variant}/{mode_label}): lock probe exceeded 20ms budget: {elapsed:?}"
+                );
+
+                // AC2: source redb byte-identical
+                assert_eq!(fs::read(&git_path).expect("git after AC1"), before_git);
+                assert_eq!(fs::read(&cap_path).expect("cap after AC1"), before_cap);
+                // AC3: capture-spool/ (and capture-queue/) byte-identical, no stray migration.lock
+                assert_eq!(snapshot_directory_tree(&spool_dir), before_spool);
+                assert_eq!(snapshot_directory_tree(&queue_dir), before_queue);
+                assert!(!migration_lock_path(&storage).exists());
+
+                holder.release_and_wait();
+            }
+        }
+
+        // ====================================================================
+        // AC4: While reverse quiescence holds `capture-spool-consumer.lock`,
+        // concurrent `drain_storage` exits immediately with zero moves (never
+        // quarantining an unparseable `ready/` file).
+        // ====================================================================
+        {
+            let dir = tempdir().expect("rb11q concurrent drain tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = setup_rb11q_fixture(&storage, true, true).await;
+
+            let spool_dir = capture_spool_dir_path(&storage);
+            let ready_file = spool_dir.join("ready").join("0001-unparseable-ready.json");
+            let ready_bytes = b"{not-valid-envelope-json".to_vec();
+            fs::write(&ready_file, &ready_bytes).expect("seed unparseable ready envelope");
+            let quar_dir = spool_dir.join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+
+            let guard = quiesce_reverse_repository_phase1(&storage)
+                .expect("uncontended reverse quiescence with empty quarantine must succeed");
+
+            let before_spool = snapshot_directory_tree(&spool_dir);
+            let drain_started = Instant::now();
+            drain::drain_storage(&storage, |_| None)
+                .await
+                .expect("concurrent drain_storage must see busy consumer lock and exit Ok");
+            let drain_elapsed = drain_started.elapsed();
+            assert!(
+                drain_elapsed <= Duration::from_millis(20),
+                "AC4: busy drain_storage probe exceeded 20ms budget: {drain_elapsed:?}"
+            );
+            assert_eq!(
+                fs::read(&ready_file).expect("ready file must stay untouched in ready/"),
+                ready_bytes
+            );
+            assert_eq!(
+                fs::read_dir(&quar_dir)
+                    .expect("read quarantine dir")
+                    .count(),
+                0,
+                "AC4: concurrent drain_storage must NEVER move ready/ files into quarantine/"
+            );
+            assert_eq!(snapshot_directory_tree(&spool_dir), before_spool);
+
+            guard
+                .abort_and_release()
+                .expect("abort and release reverse quiescence guard");
+        }
+
+        // ====================================================================
+        // AC5–AC6: Non-empty `capture-spool/quarantine/` fails closed with
+        // `LBR-IO-001` and preserves every quarantined file 100% byte-intact.
+        // ====================================================================
+        for (create_optional_locks, variant) in [
+            (true, "all-locks-present"),
+            (false, "optional-locks-absent"),
+        ] {
+            let dir = tempdir().expect("rb11q non-empty quarantine tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_path, cap_path) =
+                setup_rb11q_fixture(&storage, create_optional_locks, true).await;
+
+            let spool_dir = capture_spool_dir_path(&storage);
+            let queue_dir = capture_queue_dir_path(&storage);
+            let quar_dir = spool_dir.join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+            let quar_file_a = quar_dir.join("0001-corrupt-a.json");
+            let quar_file_b = quar_dir.join("0002-corrupt-b.json");
+            let bytes_a = b"{\"quarantined\":\"event-a\",\"raw\":123}".to_vec();
+            let bytes_b = b"not-json-binary-\x00\xff-payload".to_vec();
+            fs::write(&quar_file_a, &bytes_a).expect("write quarantined file A");
+            fs::write(&quar_file_b, &bytes_b).expect("write quarantined file B");
+
+            let before_git = fs::read(&git_path).expect("snapshot git.redb before AC5");
+            let before_cap = fs::read(&cap_path).expect("snapshot capture.redb before AC5");
+            let before_spool = snapshot_directory_tree(&spool_dir);
+            let before_queue = snapshot_directory_tree(&queue_dir);
+
+            let started = Instant::now();
+            let err = quiesce_reverse_repository_phase1(&storage).expect_err(&format!(
+                "AC5 ({variant}): non-empty capture-spool/quarantine/ must fail closed"
+            ));
+            let elapsed = started.elapsed();
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !err.to_string().contains(&storage.display().to_string()),
+                "AC5 ({variant}): must not leak private path: {err}"
+            );
+            assert!(
+                elapsed <= Duration::from_millis(20),
+                "AC5 ({variant}): quarantine dir check exceeded 20ms budget: {elapsed:?}"
+            );
+
+            // AC6: Every quarantined file 100% byte-for-byte intact; zero mutations anywhere.
+            assert_eq!(fs::read(&quar_file_a).expect("read quar A"), bytes_a);
+            assert_eq!(fs::read(&quar_file_b).expect("read quar B"), bytes_b);
+            assert_eq!(snapshot_directory_tree(&spool_dir), before_spool);
+            assert_eq!(snapshot_directory_tree(&queue_dir), before_queue);
+            assert_eq!(fs::read(&git_path).expect("git after AC5"), before_git);
+            assert_eq!(fs::read(&cap_path).expect("cap after AC5"), before_cap);
+            assert!(!migration_lock_path(&storage).exists());
+        }
+
+        // ====================================================================
+        // Post-lock TOCTOU regression + Unix hardlink/symlink quarantine guard
+        // ====================================================================
+        {
+            struct PostLockQuarantineInjector {
+                quar_file: PathBuf,
+                injected: bool,
+            }
+            impl ReversePhase1LockObserver for PostLockQuarantineInjector {
+                fn on_stage_acquired(&mut self, stage: ReversePhase1QuiesceStage) {
+                    if stage == ReversePhase1QuiesceStage::CaptureSpoolConsumerLock {
+                        fs::write(&self.quar_file, b"{\"late_quarantine\":true}")
+                            .expect("inject late quarantine file");
+                        self.injected = true;
+                    }
+                }
+            }
+
+            let dir = tempdir().expect("rb11q post-lock quarantine TOCTOU tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_path, cap_path) = setup_rb11q_fixture(&storage, true, true).await;
+            let late_quar = capture_spool_dir_path(&storage)
+                .join(CAPTURE_SPOOL_QUARANTINE_SUBDIR)
+                .join("9999-late-quarantine.json");
+
+            let before_git = fs::read(&git_path).expect("git before post-lock TOCTOU");
+            let before_cap = fs::read(&cap_path).expect("cap before post-lock TOCTOU");
+            let mut injector = PostLockQuarantineInjector {
+                quar_file: late_quar.clone(),
+                injected: false,
+            };
+            let err = quiesce_reverse_repository_phase1_inner(&storage, Some(&mut injector))
+                .expect_err("post-lock non-empty quarantine must fail closed");
+            assert!(injector.injected);
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                fs::read(&late_quar).expect("late quarantine file must remain intact"),
+                b"{\"late_quarantine\":true}"
+            );
+            assert_eq!(fs::read(&git_path).expect("git after TOCTOU"), before_git);
+            assert_eq!(fs::read(&cap_path).expect("cap after TOCTOU"), before_cap);
+        }
+
+        #[cfg(unix)]
+        {
+            let dir = tempdir().expect("rb11q symlink/hardlink quarantine tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = setup_rb11q_fixture(&storage, true, true).await;
+            let quar_path = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+            fs::remove_dir(&quar_path).expect("remove empty quarantine dir");
+
+            let decoy = dir.path().join("quar-tombstone-decoy");
+            fs::write(&decoy, CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                .expect("write decoy quarantine tombstone");
+
+            fs::hard_link(&decoy, &quar_path).expect("plant hard-linked quarantine tombstone");
+            let hl_err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("hard-linked capture-spool/quarantine tombstone must fail closed");
+            assert_eq!(hl_err.stable_code_str(), "LBR-IO-001");
+            fs::remove_file(&quar_path).expect("remove hard-linked quarantine");
+
+            std::os::unix::fs::symlink(&decoy, &quar_path)
+                .expect("plant symlinked quarantine tombstone");
+            let sym_err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("symlinked capture-spool/quarantine must fail closed");
+            assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
+        }
+    }
+
+    fn snapshot_dir_tree_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            let Ok(rd) = fs::read_dir(dir) else {
+                return;
+            };
+            let mut entries: Vec<_> = rd.flatten().collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(base)
+                    .expect("strip prefix")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if let Ok(meta) = fs::symlink_metadata(&path) {
+                    if meta.file_type().is_dir() {
+                        walk(base, &path, out);
+                    } else if meta.file_type().is_file() {
+                        out.insert(rel, fs::read(&path).expect("read snapshot file"));
+                    }
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    fn make_rb11_test_session(session_id: &str, provider_session_id: &str) -> AgentSessionRecord {
+        AgentSessionRecord {
+            session_id: session_id.to_string(),
+            agent_kind: CaptureAgentKind::Codex,
+            provider_session_id: provider_session_id.to_string(),
+            thread_id: None,
+            state: CaptureSessionState::Active,
+            working_dir: "/workspace/rb11i".to_string(),
+            worktree_id: Some("wt-main".to_string()),
+            parent_commit: Some("a".repeat(40)),
+            parent_session_id: None,
+            metadata_json: "{\"rb11\":\"ok\"}".to_string(),
+            redaction_report: "{}".to_string(),
+            started_at: 1_795_500_000,
+            last_event_at: 1_795_500_100,
+            stopped_at: None,
+            schema_version: 1,
+            sync_revision: 1,
+            repo_id: None,
+            workspace_id: None,
+            workspace_fence: None,
+            scope_state: CaptureScopeState::LegacyUnknown,
+        }
+    }
+
+    /// `RB-11i` AC1, AC2, AC6: single-pass deadlock-free streaming export of
+    /// all 61+25 source tables + post-cutover commits, direct ascending replay
+    /// of real half-committed `META_CROSS_STORE_INTENT` (`gen > cap_gen`) inside
+    /// held `(git_wtx, cap_wtx)`, and `<= 500` rows/batch streaming cap.
+    #[tokio::test]
+    async fn reverse_phase1_replays_real_half_committed_intent_deadlock_free() {
+        use crate::storage::{
+            CrossStoreIntentRecord, GitStore, NoteCasOp, RedbGitStore, RefKey, RefTarget,
+        };
+
+        let dir = tempdir().expect("rb11i intent tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        // Seed post-cutover commits/refs + >500 notes rows so streaming MUST
+        // split into multiple batches each <= 500 rows (AC1 & AC6).
+        let git_store = RedbGitStore::open_read_write(&git_path).expect("open git.redb");
+        let tip_oid = "b".repeat(40);
+        git_store
+            .update_ref_cas(
+                &RefKey::LocalBranch {
+                    name: "rb11i-post-cutover".to_string(),
+                },
+                None,
+                Some(&RefTarget::Direct(tip_oid.clone())),
+                &[],
+            )
+            .await
+            .expect("write post-cutover branch");
+
+        let mut note_ops = Vec::with_capacity(620);
+        for i in 0..620u32 {
+            note_ops.push(NoteCasOp::InsertIfAbsent {
+                object: format!("{i:040x}"),
+                blob: format!("{:040x}", i + 10_000),
+            });
+        }
+        git_store
+            .apply_notes_cas_batch("refs/notes/commits", &note_ops)
+            .await
+            .expect("seed 620 notes rows");
+
+        // Inject REAL half-committed cross-store intents: `git.META_GENERATION = 2`
+        // with `META_CROSS_STORE_INTENT[1]` and `META_CROSS_STORE_INTENT[2]`, while
+        // `capture.META_GENERATION` remains at `0`!
+        let intent_sess_1 = make_rb11_test_session("sess-intent-gen1", "prov-intent-gen1");
+        let intent_sess_2 = make_rb11_test_session("sess-intent-gen2", "prov-intent-gen2");
+        let intent_audit_2 = AgentAuditLogRecord {
+            audit_id: "audit-intent-gen2".to_string(),
+            timestamp: "2026-11-26T00:00:02Z".to_string(),
+            user_id: Some("u1".to_string()),
+            user_name: Some("Tester".to_string()),
+            action: "raw_export".to_string(),
+            checkpoint_id: "cp-intent-2".to_string(),
+            scope: "full".to_string(),
+            export_path: None,
+            justification: Some("rb11i".to_string()),
+            granted: true,
+        };
+        let intent_1 = CrossStoreIntentRecord {
+            generation: 1,
+            items: vec![CaptureBatchItem {
+                dedup_key: "intent-key-1".to_string(),
+                payload: CaptureBatchPayload::UpsertSession(intent_sess_1.clone()),
+            }],
+        };
+        let intent_2 = CrossStoreIntentRecord {
+            generation: 2,
+            items: vec![
+                // Duplicate dedup_key from gen 1 verifies idempotent replay!
+                CaptureBatchItem {
+                    dedup_key: "intent-key-1".to_string(),
+                    payload: CaptureBatchPayload::UpsertSession(intent_sess_1.clone()),
+                },
+                CaptureBatchItem {
+                    dedup_key: "intent-key-2-sess".to_string(),
+                    payload: CaptureBatchPayload::UpsertSession(intent_sess_2.clone()),
+                },
+                CaptureBatchItem {
+                    dedup_key: "intent-key-2-audit".to_string(),
+                    payload: CaptureBatchPayload::AppendAuditLog(intent_audit_2.clone()),
+                },
+            ],
+        };
+        {
+            let wtx = git_store
+                .begin_checked_write_tx()
+                .expect("begin git wtx to plant half-committed intents");
+            let b1 = encode_versioned(CROSS_STORE_INTENT_CODEC_VERSION, &intent_1)
+                .expect("encode intent 1");
+            let b2 = encode_versioned(CROSS_STORE_INTENT_CODEC_VERSION, &intent_2)
+                .expect("encode intent 2");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 1, &b1).expect("put intent 1");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 2, &b2).expect("put intent 2");
+            RedbGitStore::write_cross_store_generation_in_wtx(&wtx, 2).expect("set git gen 2");
+            wtx.commit().expect("commit planted intents");
+        }
+        drop(git_store);
+
+        let before_git = fs::read(&git_path).expect("read git.redb before");
+        let before_cap = fs::read(&cap_path).expect("read cap.redb before");
+
+        let guard = quiesce_reverse_repository_phase1(&storage)
+            .expect("quiesce reverse Phase 1 must succeed");
+        let export = export_reverse_phase1_to_sqlite_tmp(&guard, &storage)
+            .await
+            .expect("reverse Phase 1 export + intent replay must complete deadlock-free");
+
+        // AC1: all 61 Git tables + 25 Capture tables accounted for.
+        assert_eq!(export.git_table_counts.len(), 61);
+        assert_eq!(export.capture_table_counts.len(), 25);
+        assert_eq!(export.git_table_counts.get("notes"), Some(&620));
+
+        // AC2: both unreconciled intents replayed in strict ascending order, idempotently.
+        assert_eq!(export.intent_replay.git_generation, 2);
+        assert_eq!(export.intent_replay.capture_generation, 0);
+        assert_eq!(export.intent_replay.replayed_generations, vec![1, 2]);
+        assert_eq!(export.intent_replay.applied_items, 3);
+        assert_eq!(export.intent_replay.deduplicated_items, 1);
+
+        // AC6: strict <= 500 rows/batch streaming cap.
+        assert!(export.max_batch_rows <= FORWARD_MIGRATION_STREAM_BATCH_ROWS);
+        assert_eq!(export.max_batch_rows, 500);
+        assert!(export.total_streaming_batches >= 2);
+
+        // Verify post-cutover ref + 620 notes in `libra.db.tmp`.
+        let mut git_conn = open_reverse_sqlite_tmp_conn_async(
+            &export.git_tmp_path,
+            DatabaseRole::Repository,
+            true,
+        )
+        .await
+        .expect("open libra.db.tmp");
+        let ref_oid: String = sea_orm::sqlx::query_scalar(
+            "SELECT \"commit\" FROM reference WHERE kind = 'Branch' AND name = 'rb11i-post-cutover'",
+        )
+        .fetch_one(&mut git_conn)
+        .await
+        .expect("query post-cutover branch in libra.db.tmp");
+        assert_eq!(ref_oid, tip_oid);
+        let notes_cnt: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM notes")
+            .fetch_one(&mut git_conn)
+            .await
+            .expect("count notes in libra.db.tmp");
+        assert_eq!(notes_cnt, 620);
+        git_conn.close().await.expect("close libra.db.tmp");
+
+        // Verify replayed intents landed in `capture.db.tmp`.
+        let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+            &export.capture_tmp_path,
+            DatabaseRole::Capture,
+            true,
+        )
+        .await
+        .expect("open capture.db.tmp");
+        let mut sess_ids: Vec<String> = sea_orm::sqlx::query_scalar(
+            "SELECT session_id FROM agent_session ORDER BY session_id ASC",
+        )
+        .fetch_all(&mut cap_conn)
+        .await
+        .expect("query replayed sessions in capture.db.tmp");
+        sess_ids.sort();
+        assert_eq!(sess_ids, vec!["sess-intent-gen1", "sess-intent-gen2"]);
+        let audit_cnt: i64 = sea_orm::sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_audit_log WHERE audit_id = 'audit-intent-gen2'",
+        )
+        .fetch_one(&mut cap_conn)
+        .await
+        .expect("query replayed audit in capture.db.tmp");
+        assert_eq!(audit_cnt, 1);
+        cap_conn.close().await.expect("close capture.db.tmp");
+
+        // Aborting Phase 1 guard leaves source redb files 100% byte-identical.
+        guard.abort_and_release().expect("abort reverse guard");
+        assert_eq!(fs::read(&git_path).expect("git.redb after"), before_git);
+        assert_eq!(fs::read(&cap_path).expect("cap.redb after"), before_cap);
+    }
+
+    /// `RB-11i` AC3, AC4, AC5: read-only direct ingestion of pending
+    /// `capture-queue/{priority,normal}/` frames (zero source queue mutation)
+    /// and identical unique non-zero `PRAGMA application_id = target_migration_tag`
+    /// stamped on both `capture.db.tmp` and `libra.db.tmp`.
+    #[tokio::test]
+    async fn reverse_phase1_stamps_application_id_and_ingests_queue_readonly() {
+        use crate::storage::{
+            CaptureQueueLane, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, append_postcard_frame,
+        };
+
+        let dir = tempdir().expect("rb11i queue & tag tempdir");
+        let storage = dir.path().join(".libra");
+        let (_git_path, _cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let prio_sess = make_rb11_test_session("sess-queue-prio", "prov-queue-prio");
+        let norm_sess = make_rb11_test_session("sess-queue-norm", "prov-queue-norm");
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Priority,
+            FRAME_FLAG_PRIORITY,
+            "q-prio-1",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(prio_sess),
+        )
+        .expect("append priority queue frame");
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "q-norm-1",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(norm_sess),
+        )
+        .expect("append normal queue frame");
+
+        let queue_dir = capture_queue_dir_path(&storage);
+        let queue_lanes_before = (
+            snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_LANE_PRIORITY_DIR)),
+            snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_LANE_NORMAL_DIR)),
+            snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_QUARANTINE_DIR)),
+        );
+
+        let guard = quiesce_reverse_repository_phase1(&storage).expect("quiesce reverse Phase 1");
+        let queue_before_export = snapshot_dir_tree_bytes(&queue_dir);
+        let export = export_reverse_phase1_to_sqlite_tmp(&guard, &storage)
+            .await
+            .expect("export reverse Phase 1");
+
+        // AC3: both priority and normal frames ingested, source queue 100% untouched.
+        assert_eq!(export.queue_ingest.priority_frames_read, 1);
+        assert_eq!(export.queue_ingest.normal_frames_read, 1);
+        assert_eq!(export.queue_ingest.applied_frames, 2);
+        let queue_after = snapshot_dir_tree_bytes(&queue_dir);
+        assert_eq!(
+            queue_after, queue_before_export,
+            "capture-queue/ must remain 100% byte-identical during read-only reverse Phase 1 ingest"
+        );
+        assert_eq!(
+            (
+                snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_LANE_PRIORITY_DIR)),
+                snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_LANE_NORMAL_DIR)),
+                snapshot_dir_tree_bytes(&queue_dir.join(QUEUE_QUARANTINE_DIR)),
+            ),
+            queue_lanes_before,
+            "capture-queue/{{priority,normal,quarantine}}/ must remain 100% byte-identical"
+        );
+
+        // AC4 & AC5: unique non-zero `PRAGMA application_id` stamped identically on both `.tmp` DBs.
+        assert_ne!(export.target_migration_tag, 0);
+        let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+            &export.capture_tmp_path,
+            DatabaseRole::Capture,
+            true,
+        )
+        .await
+        .expect("open capture.db.tmp");
+        let cap_tag: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+            .fetch_one(&mut cap_conn)
+            .await
+            .expect("read capture.db.tmp application_id");
+        assert_eq!(cap_tag, i64::from(export.target_migration_tag));
+
+        let sess_ids: Vec<String> = sea_orm::sqlx::query_scalar(
+            "SELECT session_id FROM agent_session ORDER BY session_id ASC",
+        )
+        .fetch_all(&mut cap_conn)
+        .await
+        .expect("read queued sessions from capture.db.tmp");
+        assert_eq!(sess_ids, vec!["sess-queue-norm", "sess-queue-prio"]);
+        cap_conn.close().await.expect("close capture.db.tmp");
+
+        let mut git_conn = open_reverse_sqlite_tmp_conn_async(
+            &export.git_tmp_path,
+            DatabaseRole::Repository,
+            true,
+        )
+        .await
+        .expect("open libra.db.tmp");
+        let git_tag: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+            .fetch_one(&mut git_conn)
+            .await
+            .expect("read libra.db.tmp application_id");
+        assert_eq!(git_tag, i64::from(export.target_migration_tag));
+        git_conn.close().await.expect("close libra.db.tmp");
+
+        // Second export allocates a distinct non-zero tag.
+        fs::remove_file(&export.capture_tmp_path).expect("clean capture.db.tmp");
+        fs::remove_file(&export.git_tmp_path).expect("clean libra.db.tmp");
+        let export2 = export_reverse_phase1_to_sqlite_tmp(&guard, &storage)
+            .await
+            .expect("second reverse Phase 1 export");
+        assert_ne!(export2.target_migration_tag, 0);
+        assert_ne!(export2.target_migration_tag, export.target_migration_tag);
+
+        guard.abort_and_release().expect("abort reverse guard");
+    }
+
+    /// `RB-11p` AC1 & AC2: `libra.db.tmp` and `capture.db.tmp` pass
+    /// `PRAGMA integrity_check == "ok"` + `fsync`, and frozen `git.redb`,
+    /// `capture.redb`, and `capture-queue/{priority,normal,quarantine}/`
+    /// (preserving source dir & `append.lock` in place) are backed up to
+    /// `.libra/redb-backup/<gen>/` with independent SHA-256 verification & `fsync`.
+    #[tokio::test]
+    async fn reverse_phase1_tmp_integrity_and_verified_redb_queue_backup() {
+        use crate::storage::{CaptureQueueLane, FRAME_FLAG_PRIORITY, append_postcard_frame};
+
+        let dir = tempdir().expect("rb11p verify & backup tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Priority,
+            FRAME_FLAG_PRIORITY,
+            "rb11p-prio-1",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(make_rb11_test_session(
+                "sess-rb11p-prio",
+                "prov-rb11p-prio",
+            )),
+        )
+        .expect("append priority frame");
+        let queue_quar_file = capture_queue_dir_path(&storage)
+            .join(QUEUE_QUARANTINE_DIR)
+            .join("q-artifact-01.bin");
+        fs::write(&queue_quar_file, b"quarantined-queue-frame-bytes")
+            .expect("seed queue quarantine artifact");
+
+        let src_git_sha = sha256_file_bytes_for_test(&git_path);
+        let src_cap_sha = sha256_file_bytes_for_test(&cap_path);
+        let append_lock = capture_queue_append_lock_path(&storage);
+        assert!(
+            append_lock.is_file(),
+            "append.lock must exist before Phase 1"
+        );
+
+        let prepared = prepare_reverse_phase1(&storage)
+            .await
+            .expect("prepare_reverse_phase1 must succeed");
+
+        // AC1: both `.tmp` targets passed `PRAGMA integrity_check == "ok"` + `fsync`.
+        assert!(prepared.verification().git_tmp_integrity_ok);
+        assert!(prepared.verification().capture_tmp_integrity_ok);
+        assert_eq!(
+            prepared.verification().git_tmp_application_id,
+            prepared.export().target_migration_tag
+        );
+        assert_eq!(
+            prepared.verification().capture_tmp_application_id,
+            prepared.export().target_migration_tag
+        );
+        assert!(
+            prepared
+                .verification()
+                .durability
+                .has_file_fsync("libra.db.tmp")
+        );
+        assert!(
+            prepared
+                .verification()
+                .durability
+                .has_file_fsync("private/capture.db.tmp")
+        );
+
+        // AC2: verified `.libra/redb-backup/00000001/` contents, SHA-256 & durability ordering.
+        let backup = prepared.backup();
+        assert_eq!(backup.backup_rel_dir, "redb-backup/00000001");
+        assert_eq!(backup.git_redb_backup.sha256, src_git_sha);
+        assert_eq!(backup.capture_redb_backup.sha256, src_cap_sha);
+        assert_eq!(
+            sha256_file_bytes_for_test(&backup.git_redb_backup.backup_path),
+            src_git_sha
+        );
+        assert_eq!(
+            sha256_file_bytes_for_test(&backup.capture_redb_backup.backup_path),
+            src_cap_sha
+        );
+        assert_eq!(
+            backup.source_digests.git_redb_sha256.as_deref(),
+            Some(src_git_sha.as_str())
+        );
+        assert_eq!(
+            backup.source_digests.cap_redb_sha256.as_deref(),
+            Some(src_cap_sha.as_str())
+        );
+        assert!(backup.source_digests.queue_manifest_sha256.is_some());
+        assert!(
+            backup
+                .durability
+                .verify_file_fsync_before_publish_and_dir_fsync(
+                    "redb-backup/00000001/git.gen-00000001.redb",
+                    "redb-backup/00000001",
+                )
+        );
+        assert!(
+            backup
+                .durability
+                .verify_file_fsync_before_publish_and_dir_fsync(
+                    "redb-backup/00000001/capture.gen-00000001.redb",
+                    "redb-backup/00000001",
+                )
+        );
+
+        // Verify queue backup copied `{priority,normal,quarantine}` without moving `append.lock`.
+        let backed_quar = backup
+            .queue_backup
+            .backup_queue_dir
+            .join(QUEUE_QUARANTINE_DIR)
+            .join("q-artifact-01.bin");
+        assert_eq!(
+            fs::read(&backed_quar).expect("read backed-up queue quarantine file"),
+            b"quarantined-queue-frame-bytes"
+        );
+        assert!(
+            !backup
+                .queue_backup
+                .backup_queue_dir
+                .join(QUEUE_APPEND_LOCK_FILE)
+                .exists(),
+            "append.lock must stay in place and not be moved into backup"
+        );
+        assert!(
+            append_lock.is_file(),
+            "source append.lock must remain in place"
+        );
+        assert!(
+            backup
+                .queue_backup
+                .files
+                .iter()
+                .any(|f| f.subdir == QUEUE_LANE_PRIORITY_DIR && f.file_name.ends_with(".log"))
+        );
+
+        prepared
+            .abort_and_cleanup()
+            .expect("abort_and_cleanup must succeed");
+    }
+
+    /// `RB-11p` AC3 & AC4: Phase 1 abort (both injected mid-Phase-1 faults and
+    /// explicit post-prepare abort) discards `.tmp` files, staged backup, and
+    /// uncommitted write transactions while keeping source `git.redb`,
+    /// `capture.redb`, and `capture-queue/` 100% byte-for-byte identical.
+    #[tokio::test]
+    async fn reverse_phase1_abort_preserves_source_redb_and_queue_byte_identical() {
+        use crate::storage::{
+            CaptureQueueLane, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, append_postcard_frame,
+        };
+
+        let dir = tempdir().expect("rb11p abort invariance tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Priority,
+            FRAME_FLAG_PRIORITY,
+            "rb11p-abort-prio",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(make_rb11_test_session(
+                "sess-rb11p-abort-p",
+                "prov-rb11p-abort-p",
+            )),
+        )
+        .expect("append priority frame");
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb11p-abort-norm",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::UpsertSession(make_rb11_test_session(
+                "sess-rb11p-abort-n",
+                "prov-rb11p-abort-n",
+            )),
+        )
+        .expect("append normal frame");
+
+        // Materialize `writer.lock` as on a normal active Redb repo so the full
+        // `capture-queue/` tree (locks + segments + LTM2) can be compared byte-for-byte.
+        let _ = crate::storage::try_acquire_writer_lock(&storage).expect("init writer.lock");
+
+        // Snapshot exact source bytes BEFORE any Phase 1 attempt.
+        let before_git = fs::read(&git_path).expect("snapshot git.redb");
+        let before_cap = fs::read(&cap_path).expect("snapshot capture.redb");
+        let queue_dir = capture_queue_dir_path(&storage);
+        let before_queue = snapshot_dir_tree_bytes(&queue_dir);
+
+        // 1. Injected abort faults at every Phase 1 stage.
+        for fault in [
+            ReversePhase1FaultPoint::AfterExportBeforeVerify,
+            ReversePhase1FaultPoint::AfterVerifyBeforeBackup,
+            ReversePhase1FaultPoint::AfterBackupBeforeReturn,
+        ] {
+            let err = prepare_reverse_phase1_inner(DatabaseRole::Repository, &storage, Some(fault))
+                .await
+                .expect_err("injected Phase 1 fault must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(!git_sqlite_tmp_path(&storage).exists());
+            assert!(!capture_sqlite_tmp_path(&storage).exists());
+            assert!(!redb_backup_dir_path(&storage, 1).exists());
+            assert_eq!(
+                fs::read(&git_path).expect("git.redb after fault"),
+                before_git,
+                "AC3: git.redb must remain byte-identical after {fault:?}"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("capture.redb after fault"),
+                before_cap,
+                "AC3: capture.redb must remain byte-identical after {fault:?}"
+            );
+            assert_eq!(
+                snapshot_dir_tree_bytes(&queue_dir),
+                before_queue,
+                "AC4: capture-queue/ must remain byte-identical after {fault:?}"
+            );
+        }
+
+        // 2. Full Phase 1 prepare followed by explicit abort & cleanup.
+        let prepared = prepare_reverse_phase1(&storage)
+            .await
+            .expect("prepare_reverse_phase1 must succeed after cleaned abort");
+        assert!(git_sqlite_tmp_path(&storage).exists());
+        assert!(capture_sqlite_tmp_path(&storage).exists());
+        assert!(redb_backup_dir_path(&storage, 1).exists());
+
+        prepared
+            .abort_and_cleanup()
+            .expect("explicit Phase 1 abort_and_cleanup must succeed");
+
+        assert!(!git_sqlite_tmp_path(&storage).exists());
+        assert!(!capture_sqlite_tmp_path(&storage).exists());
+        assert!(!redb_backup_dir_path(&storage, 1).exists());
+        assert_eq!(
+            fs::read(&git_path).expect("git.redb after abort"),
+            before_git
+        );
+        assert_eq!(
+            fs::read(&cap_path).expect("capture.redb after abort"),
+            before_cap
+        );
+        assert_eq!(snapshot_dir_tree_bytes(&queue_dir), before_queue);
+    }
+
+    /// `RB-11d` AC1–AC4: Phase 2 publishes `storage-format.json(backend="sqlite",
+    /// finalized=false, spool_unfenced=false, targets_staged_for_rename=false, ...)`,
+    /// commits `META_SCHEMA min_reader_version = u32::MAX` fence to `git.redb`
+    /// and `capture.redb` (physically blocking pre-opened `Redb*Store` handles with
+    /// `RepositoryMigrated`), and persists `fenced_ready_to_unlink -> unlink +
+    /// fsync_dir -> unlinked` for each redb database.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reverse_phase2_fences_open_redb_handles_and_persists_post_unlink() {
+        use crate::storage::{
+            CaptureStore as _, GitStore as _, RedbCaptureStore, RedbGitStore, RefKey,
+        };
+
+        struct Phase2FenceRecorder {
+            storage: PathBuf,
+            preopened_git: RedbGitStore,
+            preopened_cap: RedbCaptureStore,
+            stages: Vec<(
+                ReversePhase2ObserverStage,
+                Option<Phase2DbState>,
+                Option<Phase2DbState>,
+            )>,
+            saw_git_migrated_err: bool,
+            saw_cap_migrated_err: bool,
+        }
+
+        impl ReversePhase2TestObserver for Phase2FenceRecorder {
+            fn on_stage(
+                &mut self,
+                stage: ReversePhase2ObserverStage,
+                manifest: &StorageFormatManifest,
+            ) -> StorageResult<()> {
+                let on_disk = read_storage_manifest(&self.storage)?
+                    .expect("manifest must be persisted on disk");
+                assert_eq!(&on_disk, manifest);
+                assert_eq!(on_disk.backend, StorageBackendKind::Sqlite);
+                assert!(!on_disk.finalized);
+                assert!(!on_disk.spool_unfenced);
+                assert!(!on_disk.targets_staged_for_rename);
+                assert!(on_disk.target_migration_tag.is_some_and(|t| t != 0));
+                assert!(on_disk.source_digests.git_redb_sha256.is_some());
+                assert!(on_disk.source_digests.cap_redb_sha256.is_some());
+
+                if stage == ReversePhase2ObserverStage::AfterGitRedbFenceCommitBeforeUnlink {
+                    let err = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            self.preopened_git
+                                .get_ref(&RefKey::LocalHead { worktree_id: None }),
+                        )
+                    })
+                    .expect_err("pre-opened RedbGitStore must fail closed after META_SCHEMA fence");
+                    assert!(
+                        matches!(
+                            err,
+                            StorageBackendError::RepositoryMigrated {
+                                role: DatabaseRole::Repository
+                            }
+                        ),
+                        "expected RepositoryMigrated for Repository, got {err:?}"
+                    );
+                    self.saw_git_migrated_err = true;
+                }
+                if stage == ReversePhase2ObserverStage::AfterCapRedbFenceCommitBeforeUnlink {
+                    let err = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(self.preopened_cap.get_session("any-session"))
+                    })
+                    .expect_err(
+                        "pre-opened RedbCaptureStore must fail closed after META_SCHEMA fence",
+                    );
+                    assert!(
+                        matches!(
+                            err,
+                            StorageBackendError::RepositoryMigrated {
+                                role: DatabaseRole::Capture
+                            }
+                        ),
+                        "expected RepositoryMigrated for Capture, got {err:?}"
+                    );
+                    self.saw_cap_migrated_err = true;
+                }
+
+                self.stages.push((
+                    stage,
+                    on_disk.phase2_progress.git_redb,
+                    on_disk.phase2_progress.cap_redb,
+                ));
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().expect("rb11d tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let preopened_git = RedbGitStore::open_read_only(&git_path).expect("pre-open RedbGitStore");
+        let preopened_cap = RedbCaptureStore::open_read_only(&cap_path)
+            .await
+            .expect("pre-open RedbCaptureStore");
+
+        let prepared = prepare_reverse_phase1(&storage)
+            .await
+            .expect("prepare reverse Phase 1");
+        let mut recorder = Phase2FenceRecorder {
+            storage: storage.clone(),
+            preopened_git,
+            preopened_cap,
+            stages: Vec::new(),
+            saw_git_migrated_err: false,
+            saw_cap_migrated_err: false,
+        };
+
+        let fenced = execute_reverse_phase2_fence_and_unlink_inner(prepared, Some(&mut recorder))
+            .expect("Step 2.1-2.2 fence & unlink must succeed");
+
+        assert!(
+            recorder.saw_git_migrated_err,
+            "AC2: pre-opened git handle must hit RepositoryMigrated"
+        );
+        assert!(
+            recorder.saw_cap_migrated_err,
+            "AC2: pre-opened cap handle must hit RepositoryMigrated"
+        );
+        assert!(!git_path.exists(), "AC3: git.redb must be unlinked");
+        assert!(!cap_path.exists(), "AC4: capture.redb must be unlinked");
+        assert_eq!(
+            fenced.manifest().phase2_progress.git_redb,
+            Some(Phase2DbState::Unlinked)
+        );
+        assert_eq!(
+            fenced.manifest().phase2_progress.cap_redb,
+            Some(Phase2DbState::Unlinked)
+        );
+        assert_eq!(
+            recorder.stages,
+            vec![
+                (
+                    ReversePhase2ObserverStage::AfterInProgressManifestPublish,
+                    Some(Phase2DbState::Pending),
+                    Some(Phase2DbState::Pending),
+                ),
+                (
+                    ReversePhase2ObserverStage::AfterGitRedbFenceCommitBeforeUnlink,
+                    Some(Phase2DbState::Pending),
+                    Some(Phase2DbState::Pending),
+                ),
+                (
+                    ReversePhase2ObserverStage::AfterGitRedbFencedStatePersisted,
+                    Some(Phase2DbState::FencedReadyToUnlink),
+                    Some(Phase2DbState::Pending),
+                ),
+                (
+                    ReversePhase2ObserverStage::AfterGitRedbUnlinkedPersisted,
+                    Some(Phase2DbState::Unlinked),
+                    Some(Phase2DbState::Pending),
+                ),
+                (
+                    ReversePhase2ObserverStage::AfterCapRedbFenceCommitBeforeUnlink,
+                    Some(Phase2DbState::Unlinked),
+                    Some(Phase2DbState::Pending),
+                ),
+                (
+                    ReversePhase2ObserverStage::AfterCapRedbFencedStatePersisted,
+                    Some(Phase2DbState::Unlinked),
+                    Some(Phase2DbState::FencedReadyToUnlink),
+                ),
+                (
+                    ReversePhase2ObserverStage::AfterCapRedbUnlinkedPersisted,
+                    Some(Phase2DbState::Unlinked),
+                    Some(Phase2DbState::Unlinked),
+                ),
+            ]
+        );
+    }
+
+    /// `RB-11x` AC1–AC5: under untouched in-place `capture-queue/append.lock`,
+    /// `capture-spool-consumer.lock`, and `capture-spool/capacity.lock`, installs
+    /// `0400` tombstones on `capture-queue/{priority,normal,quarantine}` (blocking
+    /// concurrent Redb hooks with `ENOTDIR`) AND verifies/actively establishes all 3
+    /// `capture-spool/{tmp,ready,quarantine}` `0400` tombstones across both
+    /// previously-migrated and fresh Redb repos (blocking legacy SQLite hooks in
+    /// `ensure_spool` across `finalized = false`).
+    #[tokio::test]
+    async fn reverse_phase2_inplace_queue_and_active_spool_tombstones_block_hooks() {
+        use crate::storage::{CaptureQueueLane, FRAME_FLAG_PRIORITY, append_postcard_frame};
+
+        for fresh_without_spool_tombstones in [false, true] {
+            let dir = tempdir().expect("rb11x tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_PRIORITY,
+                "rb11x-prio-1",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::UpsertSession(make_rb11_test_session(
+                    "sess-rb11x",
+                    "prov-rb11x",
+                )),
+            )
+            .expect("append queue frame");
+
+            if fresh_without_spool_tombstones {
+                let spool_root = capture_spool_dir_path(&storage);
+                for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                    let p = spool_root.join(sub);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+                    }
+                    fs::remove_file(&p).expect("remove pre-installed spool tombstone");
+                }
+            }
+
+            let prepared = prepare_reverse_phase1(&storage)
+                .await
+                .expect("prepare reverse Phase 1");
+            let mut fenced = execute_reverse_phase2_fence_and_unlink(prepared)
+                .expect("Step 2.1-2.2 fence & unlink");
+            let receipt = install_reverse_phase2_queue_and_spool_tombstones(&mut fenced)
+                .expect("Step 2.3 queue & spool tombstones must succeed");
+
+            assert_eq!(receipt.queue_tombstones_installed, 3);
+            assert_eq!(receipt.spool_tombstones_installed, 3);
+            assert!(fenced.manifest().phase2_progress.queue_fenced);
+            assert!(fenced.manifest().phase2_progress.spool_fenced);
+            assert!(!fenced.manifest().finalized);
+
+            assert!(capture_queue_append_lock_path(&storage).is_file());
+            let q_root = capture_queue_dir_path(&storage);
+            for sub in [
+                QUEUE_LANE_PRIORITY_DIR,
+                QUEUE_LANE_NORMAL_DIR,
+                QUEUE_QUARANTINE_DIR,
+            ] {
+                assert!(
+                    verify_is_valid_0400_tombstone(&q_root.join(sub), "check queue tombstone")
+                        .expect("verify queue tombstone"),
+                    "AC1: capture-queue/{sub} must be a verified 0400 tombstone"
+                );
+            }
+
+            let s_root = capture_spool_dir_path(&storage);
+            for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                assert!(
+                    verify_is_valid_0400_tombstone(&s_root.join(sub), "check spool tombstone")
+                        .expect("verify spool tombstone"),
+                    "AC3/AC4: capture-spool/{sub} must be a verified 0400 tombstone"
+                );
+            }
+
+            drop(fenced);
+
+            let redb_hook_err = append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_PRIORITY,
+                "rb11x-blocked",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::UpsertSession(make_rb11_test_session(
+                    "sess-blocked-q",
+                    "prov-blocked-q",
+                )),
+            )
+            .expect_err(
+                "AC2: concurrent Redb hook enqueue must fail closed against 0400 queue tombstone",
+            );
+            assert_eq!(redb_hook_err.stable_code_str(), "LBR-IO-001");
+
+            let legacy_hook_err = crate::internal::ai::capture::spool::publish(
+                &storage,
+                false,
+                "rb11x-legacy-blocked",
+                b"{\"blocked\":true}",
+                None,
+            )
+            .expect_err("AC5: concurrent legacy SQLite hook must fail closed in ensure_spool");
+            assert!(
+                legacy_hook_err
+                    .to_string()
+                    .contains("capture queue directory is not a private directory"),
+                "unexpected legacy hook error: {legacy_hook_err}"
+            );
+        }
+    }
+
+    /// `RB-11j` AC1–AC4: persists `targets_staged_for_rename = true` + `fsync(.libra/)`,
+    /// publishes `capture.db` FIRST then `libra.db` SECOND via non-overwriting
+    /// `std::fs::hard_link` + `unlink(.tmp)` + `fsync_dir`, and fails closed (`LBR-IO-001`)
+    /// without falling back to overwriting `rename` when `hard_link` returns
+    /// `Unsupported` or `EXDEV`.
+    #[tokio::test]
+    async fn reverse_phase2_step24_hardlink_capture_then_libra_and_unsupported_reject() {
+        struct OrderAndFaultObserver {
+            storage: PathBuf,
+            events: Vec<&'static str>,
+            inject_fault: Option<ReverseHardLinkFault>,
+        }
+
+        impl ReversePhase2TestObserver for OrderAndFaultObserver {
+            fn on_stage(
+                &mut self,
+                stage: ReversePhase2ObserverStage,
+                manifest: &StorageFormatManifest,
+            ) -> StorageResult<()> {
+                match stage {
+                    ReversePhase2ObserverStage::AfterTargetsStagedPersisted => {
+                        let on_disk = read_storage_manifest(&self.storage)?.unwrap();
+                        assert!(on_disk.targets_staged_for_rename);
+                        assert!(!on_disk.finalized);
+                        assert!(!capture_sqlite_db_path(&self.storage).exists());
+                        assert!(!git_sqlite_db_path(&self.storage).exists());
+                        assert_eq!(on_disk.target_migration_tag, manifest.target_migration_tag);
+                        self.events.push("targets_staged_true");
+                    }
+                    ReversePhase2ObserverStage::AfterCapturePublishedBeforeLibra => {
+                        assert!(capture_sqlite_db_path(&self.storage).is_file());
+                        assert!(!capture_sqlite_tmp_path(&self.storage).exists());
+                        assert!(!git_sqlite_db_path(&self.storage).exists());
+                        assert!(git_sqlite_tmp_path(&self.storage).is_file());
+                        self.events.push("capture_published_first");
+                    }
+                    ReversePhase2ObserverStage::AfterFinalizedBeforeSpoolUnfence => {
+                        assert!(capture_sqlite_db_path(&self.storage).is_file());
+                        assert!(git_sqlite_db_path(&self.storage).is_file());
+                        assert!(!git_sqlite_tmp_path(&self.storage).exists());
+                        self.events.push("libra_published_second");
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+
+            fn hard_link_fault(&mut self, _dst: &Path) -> Option<ReverseHardLinkFault> {
+                self.inject_fault
+            }
+        }
+
+        {
+            let dir = tempdir().expect("rb11j happy tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+            let mut obs = OrderAndFaultObserver {
+                storage: storage.clone(),
+                events: Vec::new(),
+                inject_fault: None,
+            };
+            let report = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut obs))
+                .await
+                .expect("Step 2.3-2.6 must succeed");
+            assert_eq!(
+                obs.events,
+                vec![
+                    "targets_staged_true",
+                    "capture_published_first",
+                    "libra_published_second",
+                ]
+            );
+            assert!(report.manifest.finalized);
+            assert!(report.manifest.spool_unfenced);
+            assert_eq!(
+                read_sqlite_application_id_readonly(
+                    &report.capture_sqlite_path,
+                    DatabaseRole::Capture
+                )
+                .await
+                .expect("read capture.db app_id"),
+                report.target_migration_tag
+            );
+            assert_eq!(
+                read_sqlite_application_id_readonly(
+                    &report.git_sqlite_path,
+                    DatabaseRole::Repository
+                )
+                .await
+                .expect("read libra.db app_id"),
+                report.target_migration_tag
+            );
+        }
+
+        for fault in [
+            ReverseHardLinkFault::Unsupported,
+            ReverseHardLinkFault::CrossDevice,
+        ] {
+            let dir = tempdir().expect("rb11j unsupported tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+            let mut obs = OrderAndFaultObserver {
+                storage: storage.clone(),
+                events: Vec::new(),
+                inject_fault: Some(fault),
+            };
+            let err = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut obs))
+                .await
+                .expect_err("AC3: Unsupported/EXDEV hard_link must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(!capture_sqlite_db_path(&storage).exists());
+            assert!(capture_sqlite_tmp_path(&storage).is_file());
+        }
+    }
+
+    /// `RB-11j` AC5: if `libra.db` `hard_link` hits `AlreadyExists` and existing
+    /// `libra.db` has `PRAGMA application_id != target_migration_tag`, Step 2.4
+    /// immediately fails closed `LBR-IO-001` and NEVER overwrites the foreign DB.
+    #[tokio::test]
+    async fn reverse_phase2_step24_libra_db_foreign_tag_reject() {
+        struct PlantForeignLibraObserver {
+            storage: PathBuf,
+            foreign_bytes: Vec<u8>,
+        }
+
+        impl ReversePhase2TestObserver for PlantForeignLibraObserver {
+            fn on_stage(
+                &mut self,
+                stage: ReversePhase2ObserverStage,
+                _manifest: &StorageFormatManifest,
+            ) -> StorageResult<()> {
+                if stage == ReversePhase2ObserverStage::AfterCapturePublishedBeforeLibra {
+                    fs::write(git_sqlite_db_path(&self.storage), &self.foreign_bytes)
+                        .map_err(|e| StorageBackendError::io("plant foreign libra.db", e))?;
+                }
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().expect("rb11j foreign libra tempdir");
+        let storage = dir.path().join(".libra");
+        let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let foreign_tmp = dir.path().join("foreign-libra.db");
+        let conn = crate::internal::db::schema::create_database_for_role(
+            foreign_tmp.to_str().unwrap(),
+            DatabaseRole::Repository,
+        )
+        .await
+        .expect("create foreign sqlite db");
+        conn.close().await.expect("close foreign sqlite db");
+        let mut raw =
+            open_reverse_sqlite_tmp_conn_async(&foreign_tmp, DatabaseRole::Repository, false)
+                .await
+                .expect("open foreign sqlite db");
+        stamp_sqlite_tmp_application_id(&mut raw, DatabaseRole::Repository, 0x0000_0042)
+            .await
+            .expect("stamp foreign tag");
+        raw.close().await.expect("close foreign raw");
+        let foreign_bytes = fs::read(&foreign_tmp).expect("read foreign bytes");
+
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+        let mut obs = PlantForeignLibraObserver {
+            storage: storage.clone(),
+            foreign_bytes: foreign_bytes.clone(),
+        };
+        let err = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut obs))
+            .await
+            .expect_err("AC5: foreign libra.db must fail closed without overwrite");
+        assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            fs::read(git_sqlite_db_path(&storage)).expect("read preserved foreign libra.db"),
+            foreign_bytes,
+            "AC5: foreign libra.db bytes must remain 100% untouched"
+        );
+    }
+
+    /// `RB-11y` AC1–AC5: without crash, competing legacy `capture::store::open`
+    /// creates an `application_id == 0` `capture.db` before Step 2.4; normal Step 2.4
+    /// hits `AlreadyExists`, reconciles legitimate events under single-conn `c_mig`
+    /// (respecting `agent_import_tombstone`), commits `__libra_migrated_fence__` on
+    /// the competing DB, atomically `rename`s `capture.db.tmp`, and preserves 100%
+    /// of both migrated rows and competing legacy writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reverse_phase2_normal_step24_hardlink_reconciles_no_crash_competing_capture_open() {
+        use crate::storage::{CaptureStore as _, RedbCaptureStore};
+
+        struct RacingCaptureOpenObserver {
+            storage: PathBuf,
+            planted_competing: bool,
+        }
+
+        impl ReversePhase2TestObserver for RacingCaptureOpenObserver {
+            fn on_stage(
+                &mut self,
+                stage: ReversePhase2ObserverStage,
+                _manifest: &StorageFormatManifest,
+            ) -> StorageResult<()> {
+                if stage == ReversePhase2ObserverStage::AfterTargetsStagedPersisted {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            use sea_orm::{ConnectionTrait as _, Statement};
+                            let conn = crate::internal::ai::capture::store::open(
+                                &self.storage,
+                                Duration::from_secs(5),
+                            )
+                            .await
+                            .expect("competing capture::store::open must succeed");
+                            let backend = conn.get_database_backend();
+                            conn.execute_raw(Statement::from_string(
+                                backend,
+                                "INSERT INTO agent_session \
+                                 (session_id, agent_kind, provider_session_id, state, working_dir, started_at, last_event_at) \
+                                 VALUES ('sess-competing-legit', 'codex', 'prov-competing-legit', 'active', '/ws/competing', 1795600000, 1795600001)"
+                                    .to_string(),
+                            ))
+                            .await
+                            .expect("insert competing legitimate session");
+                            conn.execute_raw(Statement::from_string(
+                                backend,
+                                "INSERT INTO agent_session \
+                                 (session_id, agent_kind, provider_session_id, state, working_dir, started_at, last_event_at) \
+                                 VALUES ('sess-erased-tomb', 'codex', 'prov-erased-tomb', 'active', '/ws/erased', 1795600002, 1795600003)"
+                                    .to_string(),
+                            ))
+                            .await
+                            .expect("insert competing tombstoned session");
+                            conn.close().await.expect("close competing capture.db");
+                        });
+                    });
+                    self.planted_competing = true;
+                }
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().expect("rb11y competing capture tempdir");
+        let storage = dir.path().join(".libra");
+        let (_git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let cap_store = RedbCaptureStore::open_read_write(
+            &cap_path,
+            crate::storage::RedbRepairContext::WriteCommand,
+        )
+        .await
+        .expect("open capture.redb");
+        cap_store
+            .upsert_session(&make_rb11_test_session(
+                "sess-migrated-orig",
+                "prov-migrated-orig",
+            ))
+            .await
+            .expect("seed migrated session");
+        cap_store
+            .put_import_tombstone(&AgentImportTombstoneRecord {
+                tombstone_id: "tomb-rb11y-1".to_string(),
+                agent_kind: "codex".to_string(),
+                provider_session_id: "prov-erased-tomb".to_string(),
+                erased_session_id: "sess-erased-tomb".to_string(),
+                source_fingerprint: Some("fp-rb11y".to_string()),
+                erased_at: 1_795_599_000,
+            })
+            .await
+            .expect("seed erasure tombstone");
+        drop(cap_store);
+
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+        let mut obs = RacingCaptureOpenObserver {
+            storage: storage.clone(),
+            planted_competing: false,
+        };
+
+        let report = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut obs))
+            .await
+            .expect("Step 2.4 competing reconcile + fence + replace must succeed");
+
+        assert!(obs.planted_competing);
+        assert!(
+            report.reconciled_competing_capture_db,
+            "AC1: competing DB must be reconciled"
+        );
+        assert_eq!(
+            report.competing_tombstoned_rows_skipped, 1,
+            "AC2: tombstoned session must be rejected during reconcile"
+        );
+        assert!(report.manifest.finalized);
+        assert!(report.manifest.spool_unfenced);
+        assert!(!capture_sqlite_tmp_path(&storage).exists());
+
+        let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+            &report.capture_sqlite_path,
+            DatabaseRole::Capture,
+            true,
+        )
+        .await
+        .expect("open final capture.db");
+        let app_id: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+            .fetch_one(&mut cap_conn)
+            .await
+            .expect("read final capture.db app_id");
+        assert_eq!(app_id, i64::from(report.target_migration_tag));
+        let sessions: Vec<String> = sea_orm::sqlx::query_scalar(
+            "SELECT session_id FROM agent_session ORDER BY session_id ASC",
+        )
+        .fetch_all(&mut cap_conn)
+        .await
+        .expect("query final sessions");
+        assert_eq!(
+            sessions,
+            vec!["sess-competing-legit", "sess-migrated-orig"],
+            "AC2 & AC5: migrated + competing legit preserved; tombstoned session never resurrected"
+        );
+        cap_conn.close().await.expect("close final capture.db");
+    }
+
+    /// `RB-11l` AC1–AC3: Step 2.5 publishes `storage-format.json(backend="sqlite",
+    /// finalized=true, spool_unfenced=false)` while holding locks; Step 2.6 then
+    /// removes ONLY `is_file()` `capture-spool/{tmp,ready,quarantine}` tombstones +
+    /// `fsync_dir` and persists `spool_unfenced = true` before releasing locks;
+    /// afterwards legacy SQLite Hooks resume enqueueing normally into `capture-spool/ready/`.
+    #[tokio::test]
+    async fn reverse_phase2_step25_26_finalize_unfence_and_legacy_hook_resume() {
+        struct Step2526Observer {
+            storage: PathBuf,
+            saw_step25_finalized_before_unfence: bool,
+            saw_step26_spool_unfenced: bool,
+        }
+
+        impl ReversePhase2TestObserver for Step2526Observer {
+            fn on_stage(
+                &mut self,
+                stage: ReversePhase2ObserverStage,
+                manifest: &StorageFormatManifest,
+            ) -> StorageResult<()> {
+                let on_disk = read_storage_manifest(&self.storage)?.unwrap();
+                assert_eq!(&on_disk, manifest);
+                if stage == ReversePhase2ObserverStage::AfterFinalizedBeforeSpoolUnfence {
+                    assert!(
+                        on_disk.finalized,
+                        "AC1: finalized=true must be published in Step 2.5"
+                    );
+                    assert!(
+                        !on_disk.spool_unfenced,
+                        "AC1: spool_unfenced must still be false before Step 2.6"
+                    );
+                    let s_root = capture_spool_dir_path(&self.storage);
+                    for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                        assert!(
+                            s_root.join(sub).is_file(),
+                            "AC2: spool tombstone {sub} must not be removed before finalized=true"
+                        );
+                    }
+                    assert!(
+                        probe_existing_lock_uncontended(
+                            &migration_lock_path(&self.storage),
+                            true,
+                            ForwardPhase1QuiesceStage::MigrationLock,
+                        )
+                        .is_err(),
+                        "AC1: migration.lock must still be held during Step 2.5"
+                    );
+                    self.saw_step25_finalized_before_unfence = true;
+                }
+                if stage == ReversePhase2ObserverStage::AfterSpoolUnfencedPersisted {
+                    assert!(on_disk.finalized);
+                    assert!(
+                        on_disk.spool_unfenced,
+                        "AC2: spool_unfenced=true must be persisted"
+                    );
+                    let s_root = capture_spool_dir_path(&self.storage);
+                    for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                        assert!(
+                            !s_root.join(sub).exists(),
+                            "AC2: spool tombstone {sub} must be unlinked in Step 2.6"
+                        );
+                    }
+                    self.saw_step26_spool_unfenced = true;
+                }
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().expect("rb11l step25-26 tempdir");
+        let storage = dir.path().join(".libra");
+        let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+        let mut obs = Step2526Observer {
+            storage: storage.clone(),
+            saw_step25_finalized_before_unfence: false,
+            saw_step26_spool_unfenced: false,
+        };
+        let report = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut obs))
+            .await
+            .expect("Step 2.5-2.6 must succeed");
+
+        assert!(obs.saw_step25_finalized_before_unfence);
+        assert!(obs.saw_step26_spool_unfenced);
+        assert_eq!(report.spool_tombstones_unfenced, 3);
+        assert!(report.manifest.finalized);
+        assert!(report.manifest.spool_unfenced);
+
+        let outcome = crate::internal::ai::capture::spool::publish(
+            &storage,
+            false,
+            "rb11l-resumed-hook-event",
+            b"{\"resumed\":true}",
+            None,
+        )
+        .expect("AC3: legacy SQLite hook must resume publishing after Step 2.6");
+        assert_eq!(
+            outcome,
+            crate::internal::ai::capture::spool::PublishOutcome::Published
+        );
+        let ready = crate::internal::ai::capture::spool::ready_names(&storage)
+            .expect("list resumed capture-spool/ready");
+        assert_eq!(ready.len(), 1);
+    }
+
+    /// `RB-11l` AC4 & AC5: `GC-13` GlobalConfig and SystemConfig isolation —
+    /// reverse repository migration NEVER opens, creates, or modifies isolated
+    /// `LIBRA_CONFIG_GLOBAL_DB` or `LIBRA_CONFIG_SYSTEM_DB` fixtures, and
+    /// rejects non-Repository roles fail-closed.
+    #[tokio::test]
+    async fn reverse_phase2_gc13_global_and_system_config_isolation() {
+        let dir = tempdir().expect("rb11l gc13 tempdir");
+        let storage = dir.path().join(".libra");
+        let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let global_db = dir.path().join("global-config.db");
+        let system_db = dir.path().join("system-config.db");
+        fs::write(&global_db, b"GLOBAL_CONFIG_SENTINEL_BYTES_RB11L").expect("write global fixture");
+        fs::write(&system_db, b"SYSTEM_CONFIG_SENTINEL_BYTES_RB11L").expect("write system fixture");
+        let before_global = fs::read(&global_db).expect("snapshot global");
+        let before_system = fs::read(&system_db).expect("snapshot system");
+
+        for forbidden in [
+            DatabaseRole::GlobalConfig,
+            DatabaseRole::SystemConfig,
+            DatabaseRole::Derived,
+        ] {
+            let err = execute_reverse_migration_for_role(forbidden, &storage)
+                .await
+                .expect_err("non-Repository role must be rejected by reverse repository migration");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        }
+
+        let report = execute_reverse_migration(&storage)
+            .await
+            .expect("full reverse repository migration must succeed");
+        assert!(report.manifest.finalized);
+        assert!(report.manifest.spool_unfenced);
+        assert_eq!(
+            fs::read(&global_db).expect("global after"),
+            before_global,
+            "AC4: GlobalConfig fixture must be 100% untouched"
+        );
+        assert_eq!(
+            fs::read(&system_db).expect("system after"),
+            before_system,
+            "AC5: SystemConfig fixture must be 100% untouched"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Milestone 3: Reverse Phase 2 Crash Recovery (`RB-11a`, `RB-11r`, `RB-11m`,
+    // `RB-11e`, `RB-11s`, `RB-11h`, `RB-11u`)
+    // ------------------------------------------------------------------------
+
+    struct CrashAtReverseStageObserver {
+        target: ReversePhase2ObserverStage,
+    }
+
+    impl ReversePhase2TestObserver for CrashAtReverseStageObserver {
+        fn on_stage(
+            &mut self,
+            stage: ReversePhase2ObserverStage,
+            _manifest: &StorageFormatManifest,
+        ) -> StorageResult<()> {
+            if stage == self.target {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!("injected reverse crash at {stage:?}"),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// `RB-11a` AC1–AC3: at EVERY reverse `finalized == false` crash checkpoint,
+    /// both `LIBRA_STORAGE_BACKEND=redb` AND `LIBRA_STORAGE_BACKEND=sqlite`
+    /// unconditionally fail closed with `LBR-IO-001` (`ManifestNotFinalized`),
+    /// and zero-external-write resume verifies `source_digests` and converges
+    /// idempotently to `finalized = true, spool_unfenced = true`.
+    #[tokio::test]
+    async fn reverse_phase2_crash_override_reject_and_idempotent_resume() {
+        let checkpoints = [
+            ReversePhase2ObserverStage::AfterInProgressManifestPublish,
+            ReversePhase2ObserverStage::AfterGitRedbFenceCommitBeforeUnlink,
+            ReversePhase2ObserverStage::AfterGitRedbUnlinkedPersisted,
+            ReversePhase2ObserverStage::AfterCapRedbUnlinkedPersisted,
+        ];
+
+        for stage in checkpoints {
+            let dir = tempdir().expect("rb11a tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let mut crash = CrashAtReverseStageObserver { target: stage };
+            let err = execute_reverse_phase2_fence_and_unlink_inner(prepared, Some(&mut crash))
+                .expect_err("injected crash must abort Phase 2");
+            assert!(err.to_string().contains("injected reverse crash"));
+
+            // AC1 & AC2: BOTH `redb` and `sqlite` env overrides must fail closed (`LBR-IO-001`).
+            assert_rb10c_unfinalized_rejects_both_env_overrides(&storage, &format!("{stage:?}"));
+
+            // AC3: Zero external writes -> idempotent resume converges cleanly without re-export.
+            let resumed = resume_reverse_migration(&storage)
+                .await
+                .expect("zero-drift reverse resume must converge");
+            assert!(resumed.manifest.finalized);
+            assert!(resumed.manifest.spool_unfenced);
+            assert_eq!(resumed.manifest.backend, StorageBackendKind::Sqlite);
+            assert!(!resumed.reexported_git_tmp);
+            assert!(!resumed.reexported_capture_tmp);
+            assert!(git_sqlite_db_path(&storage).is_file());
+            assert!(capture_sqlite_db_path(&storage).is_file());
+
+            // Calling resume a second time is an idempotent no-op.
+            let second = resume_reverse_migration(&storage)
+                .await
+                .expect("second resume must be idempotent no-op");
+            assert!(second.already_finalized);
+            assert!(second.manifest.finalized);
+            assert!(second.manifest.spool_unfenced);
+        }
+    }
+
+    /// `RB-11a` AC4: crash after `finalized = false` and BEFORE fencing `git.redb`;
+    /// an already-open redb process commits a new ref/commit to `git.redb`;
+    /// resume detects `git_redb_sha256` drift, invalidates stale `.tmp`, re-exports
+    /// the latest commit before fencing and publishing, with zero data loss.
+    #[tokio::test]
+    async fn reverse_phase2_crash_before_fence_git_redb_drift_reexports() {
+        use crate::storage::{GitStore as _, RedbGitStore, RefKey, RefTarget};
+
+        let dir = tempdir().expect("rb11a ac4 tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_redb, _cap_redb) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let mut crash = CrashAtReverseStageObserver {
+            target: ReversePhase2ObserverStage::AfterInProgressManifestPublish,
+        };
+        let _ = execute_reverse_phase2_fence_and_unlink_inner(prepared, Some(&mut crash))
+            .expect_err("crash after Step 2.1 manifest before git.redb fence");
+
+        assert_rb10c_unfinalized_rejects_both_env_overrides(&storage, "pre-fence-git-drift");
+
+        // External open redb handle writes a brand-new branch ref after Step 2.1 crash.
+        let store = RedbGitStore::open_read_write(&git_redb).expect("open unfenced git.redb");
+        let drifted_oid = "b".repeat(40);
+        store
+            .update_ref_cas(
+                &RefKey::LocalBranch {
+                    name: "rb11a-post-crash-commit".to_string(),
+                },
+                None,
+                Some(&RefTarget::Direct(drifted_oid.clone())),
+                &[],
+            )
+            .await
+            .expect("write drifted ref into unfenced git.redb");
+        drop(store);
+
+        let resumed = resume_reverse_migration(&storage)
+            .await
+            .expect("resume must detect drift and re-export");
+        assert_eq!(
+            resumed.git_state,
+            ReverseRecoveryRedbState::DriftedLivePending
+        );
+        assert!(resumed.reexported_git_tmp);
+        assert!(resumed.manifest.finalized);
+        assert!(resumed.manifest.spool_unfenced);
+
+        let mut git_conn = open_reverse_sqlite_tmp_conn_async(
+            &git_sqlite_db_path(&storage),
+            DatabaseRole::Repository,
+            true,
+        )
+        .await
+        .expect("open published libra.db");
+        let found: Option<String> = sea_orm::sqlx::query_scalar(
+            "SELECT \"commit\" FROM reference WHERE name = 'rb11a-post-crash-commit' AND kind = 'Branch'",
+        )
+        .fetch_optional(&mut git_conn)
+        .await
+        .expect("query drifted branch in published libra.db");
+        git_conn.close().await.expect("close libra.db");
+        assert_eq!(
+            found.as_deref(),
+            Some(drifted_oid.as_str()),
+            "AC4: drifted pre-fence git.redb commit must be preserved with zero data loss"
+        );
+    }
+
+    /// `RB-11r` AC1: crash IMMEDIATELY after `unlink(git.redb) + fsync_dir`
+    /// (`git_redb == FencedReadyToUnlink` while `git.redb` is already unlinked,
+    /// `capture.redb` still live and receives a new external event); resume
+    /// verifies `git.redb` backup real SHA-256 and merges live `capture.redb`
+    /// drift with zero data loss.
+    #[tokio::test]
+    async fn reverse_phase2_crash_after_git_redb_unlink_merges_live_capture() {
+        use crate::storage::{
+            AgentSessionRecord, CaptureAgentKind, CaptureScopeState, CaptureSessionState,
+            CaptureStore as _, RedbCaptureStore, RedbRepairContext,
+        };
+
+        let dir = tempdir().expect("rb11r ac1 tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_redb, cap_redb) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let mut crash = CrashAtReverseStageObserver {
+            target: ReversePhase2ObserverStage::AfterGitRedbFencedStatePersisted,
+        };
+        let _ = execute_reverse_phase2_fence_and_unlink_inner(prepared, Some(&mut crash))
+            .expect_err("crash after git_redb=fenced_ready_to_unlink");
+        // Simulate crash occurring immediately AFTER `unlink(git.redb) + fsync_dir`
+        // and BEFORE persisting `git_redb = unlinked`.
+        fs::remove_file(&git_redb).expect("unlink git.redb");
+        fsync_dir_best_effort(&storage.join(REDB_SUBDIR)).expect("fsync redb dir");
+        assert!(!git_redb.exists());
+        assert!(cap_redb.is_file());
+
+        // External writer appends a brand-new session into still-live `capture.redb`.
+        let cap_store =
+            RedbCaptureStore::open_read_write(&cap_redb, RedbRepairContext::WriteCommand)
+                .await
+                .expect("open live capture.redb");
+        cap_store
+            .upsert_session(&AgentSessionRecord {
+                session_id: "sess-rb11r-live-capture-drift".to_string(),
+                agent_kind: CaptureAgentKind::Codex,
+                provider_session_id: "prov-rb11r-live".to_string(),
+                thread_id: None,
+                state: CaptureSessionState::Active,
+                working_dir: "/ws/rb11r".to_string(),
+                worktree_id: None,
+                parent_commit: None,
+                parent_session_id: None,
+                metadata_json: "{}".to_string(),
+                redaction_report: "{}".to_string(),
+                started_at: 1795700000,
+                last_event_at: 1795700001,
+                stopped_at: None,
+                schema_version: 1,
+                sync_revision: 1,
+                repo_id: None,
+                workspace_id: None,
+                workspace_fence: None,
+                scope_state: CaptureScopeState::LegacyUnknown,
+            })
+            .await
+            .expect("upsert drifted capture session");
+        drop(cap_store);
+
+        let resumed = resume_reverse_migration(&storage)
+            .await
+            .expect("resume must verify git.redb backup and merge live capture.redb");
+        assert_eq!(
+            resumed.git_state,
+            ReverseRecoveryRedbState::LegallyUnlinkedVerifiedBackup
+        );
+        assert_eq!(
+            resumed.capture_state,
+            ReverseRecoveryRedbState::DriftedLivePending
+        );
+        assert!(resumed.reexported_capture_tmp);
+        assert!(resumed.manifest.finalized);
+
+        let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+            &capture_sqlite_db_path(&storage),
+            DatabaseRole::Capture,
+            true,
+        )
+        .await
+        .expect("open published capture.db");
+        let found: Option<String> = sea_orm::sqlx::query_scalar(
+            "SELECT provider_session_id FROM agent_session WHERE session_id = 'sess-rb11r-live-capture-drift'",
+        )
+        .fetch_optional(&mut cap_conn)
+        .await
+        .expect("query live capture drift row");
+        cap_conn.close().await.expect("close capture.db");
+        assert_eq!(found.as_deref(), Some("prov-rb11r-live"));
+    }
+
+    /// `RB-11r` AC2: crash IMMEDIATELY after `unlink(capture.redb) + fsync_dir`
+    /// (`git_redb == Unlinked`, `cap_redb == FencedReadyToUnlink`, both `.redb`
+    /// files unlinked); resume verifies BOTH `redb-backup` real SHA-256 digests
+    /// and converges idempotently to `finalized = true`.
+    #[tokio::test]
+    async fn reverse_phase2_crash_immediately_after_capture_redb_unlink() {
+        let dir = tempdir().expect("rb11r ac2 tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_redb, cap_redb) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let mut crash = CrashAtReverseStageObserver {
+            target: ReversePhase2ObserverStage::AfterCapRedbFencedStatePersisted,
+        };
+        let _ = execute_reverse_phase2_fence_and_unlink_inner(prepared, Some(&mut crash))
+            .expect_err("crash after cap_redb=fenced_ready_to_unlink");
+        fs::remove_file(&cap_redb).expect("unlink capture.redb");
+        fsync_dir_best_effort(&storage.join(PRIVATE_SUBDIR)).expect("fsync private dir");
+        assert!(!git_redb.exists());
+        assert!(!cap_redb.exists());
+
+        let resumed = resume_reverse_migration(&storage)
+            .await
+            .expect("resume must verify both backups and converge");
+        assert_eq!(
+            resumed.git_state,
+            ReverseRecoveryRedbState::LegallyUnlinkedVerifiedBackup
+        );
+        assert_eq!(
+            resumed.capture_state,
+            ReverseRecoveryRedbState::LegallyUnlinkedVerifiedBackup
+        );
+        assert!(resumed.manifest.finalized);
+        assert!(resumed.manifest.spool_unfenced);
+        assert!(git_sqlite_db_path(&storage).is_file());
+        assert!(capture_sqlite_db_path(&storage).is_file());
+    }
+
+    /// `RB-11r` AC3 & AC4: when `phase2_progress.git_redb == "pending"` and
+    /// `git.redb` is unexpectedly missing, OR `phase2_progress.cap_redb == "pending"`
+    /// and `capture.redb` is unexpectedly missing, resume immediately fails closed
+    /// with `LBR-IO-001`.
+    #[tokio::test]
+    async fn reverse_phase2_unexpected_missing_pending_redb_fails_closed() {
+        // AC3: missing `git.redb` while `git_redb == Pending`
+        {
+            let dir = tempdir().expect("rb11r ac3 tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_redb, _cap_redb) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let mut crash = CrashAtReverseStageObserver {
+                target: ReversePhase2ObserverStage::AfterInProgressManifestPublish,
+            };
+            let _ = execute_reverse_phase2_fence_and_unlink_inner(prepared, Some(&mut crash))
+                .expect_err("crash at Step 2.1");
+            fs::remove_file(&git_redb).expect("delete pending git.redb");
+
+            let err = resume_reverse_migration(&storage)
+                .await
+                .expect_err("AC3: unexpectedly missing pending git.redb must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        }
+
+        // AC4: missing `capture.redb` while `cap_redb == Pending`
+        {
+            let dir = tempdir().expect("rb11r ac4 tempdir");
+            let storage = dir.path().join(".libra");
+            let (_git_redb, cap_redb) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let mut crash = CrashAtReverseStageObserver {
+                target: ReversePhase2ObserverStage::AfterGitRedbUnlinkedPersisted,
+            };
+            let _ = execute_reverse_phase2_fence_and_unlink_inner(prepared, Some(&mut crash))
+                .expect_err("crash after git.redb unlinked while cap_redb still pending");
+            fs::remove_file(&cap_redb).expect("delete pending capture.redb");
+
+            let err = resume_reverse_migration(&storage)
+                .await
+                .expect_err("AC4: unexpectedly missing pending capture.redb must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        }
+    }
+
+    /// `RB-11m` AC1–AC3: missing `redb-backup` fails closed (`LBR-IO-001`),
+    /// tampered `redb-backup` SHA-256 fails closed (`LBR-IO-001`), and a crash
+    /// in the gap between removing `capture-queue` subdirs and installing `0400`
+    /// tombstones (with a concurrent Redb hook appending a brand-new frame)
+    /// re-acquires in-place `append.lock`, unions **backup ∪ live** queue by
+    /// dedup key, installs all 3 `0400` tombstones, and preserves 100% of old
+    /// and new frames.
+    #[tokio::test]
+    async fn reverse_phase2_corrupt_or_missing_backup_and_queue_tombstone_gap_union() {
+        use crate::storage::{
+            AgentSessionRecord, CaptureAgentKind, CaptureBatchPayload, CaptureQueueLane,
+            CaptureScopeState, CaptureSessionState,
+            queue::{FRAME_FLAG_NONE, append_postcard_frame},
+        };
+
+        // AC1 & AC2: missing backup and corrupted backup SHA-256 both fail closed.
+        {
+            let dir = tempdir().expect("rb11m ac12 tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+            let generation = read_storage_manifest(&storage)
+                .expect("read manifest")
+                .expect("manifest exists")
+                .generation;
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let mut crash = CrashAtReverseStageObserver {
+                target: ReversePhase2ObserverStage::AfterCapRedbUnlinkedPersisted,
+            };
+            let _ = execute_reverse_phase2_fence_and_unlink_inner(prepared, Some(&mut crash))
+                .expect_err("crash after both redb unlinked");
+
+            let git_bak = redb_backup_git_redb_path(&storage, generation);
+            let orig_bytes = fs::read(&git_bak).expect("read original git backup");
+
+            // AC2: Corrupt 1 byte -> SHA-256 mismatch -> fail-closed `LBR-IO-001`.
+            let mut tampered = orig_bytes.clone();
+            tampered[0] ^= 0xFF;
+            fs::write(&git_bak, &tampered).expect("tamper git backup");
+            let err_corrupt = resume_reverse_migration(&storage)
+                .await
+                .expect_err("AC2: tampered backup SHA-256 must fail closed");
+            assert_eq!(err_corrupt.stable_code_str(), "LBR-IO-001");
+
+            // AC1: Missing backup -> fail-closed `LBR-IO-001`.
+            fs::remove_file(&git_bak).expect("remove git backup");
+            let err_missing = resume_reverse_migration(&storage)
+                .await
+                .expect_err("AC1: missing backup must fail closed");
+            assert_eq!(err_missing.stable_code_str(), "LBR-IO-001");
+        }
+
+        // AC3: Gap between removing `capture-queue` subdirs and installing `0400` tombstones.
+        {
+            let dir = tempdir().expect("rb11m ac3 tempdir");
+            let storage = dir.path().join(".libra");
+            let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            // Pre-seed a frame in `capture-queue/priority/` before Phase 1 so it lands in backup.
+            let make_payload = |sid: &str, prov: &str| {
+                CaptureBatchPayload::UpsertSession(AgentSessionRecord {
+                    session_id: sid.to_string(),
+                    agent_kind: CaptureAgentKind::Codex,
+                    provider_session_id: prov.to_string(),
+                    thread_id: None,
+                    state: CaptureSessionState::Active,
+                    working_dir: "/ws/rb11m".to_string(),
+                    worktree_id: None,
+                    parent_commit: None,
+                    parent_session_id: None,
+                    metadata_json: "{}".to_string(),
+                    redaction_report: "{}".to_string(),
+                    started_at: 1795800000,
+                    last_event_at: 1795800001,
+                    stopped_at: None,
+                    schema_version: 1,
+                    sync_revision: 1,
+                    repo_id: None,
+                    workspace_id: None,
+                    workspace_fence: None,
+                    scope_state: CaptureScopeState::LegacyUnknown,
+                })
+            };
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_NONE,
+                "dedup-rb11m-old",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &make_payload("sess-rb11m-old-backup", "prov-rb11m-old"),
+            )
+            .expect("enqueue old frame before Phase 1");
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let mut crash = CrashAtReverseStageObserver {
+                target: ReversePhase2ObserverStage::AfterCapRedbUnlinkedPersisted,
+            };
+            let _ = execute_reverse_phase2_fence_and_unlink_inner(prepared, Some(&mut crash))
+                .expect_err("crash before Step 2.3 queue tombstones");
+
+            // Simulate crash in the exact gap: `priority/` was removed (live old segments gone!),
+            // and a racing Redb hook recreated `priority/` and appended a brand-new frame!
+            let qdir = capture_queue_dir_path(&storage);
+            fs::remove_dir_all(qdir.join(QUEUE_LANE_PRIORITY_DIR))
+                .expect("simulate removed live priority dir in tombstone gap");
+            fs::create_dir_all(qdir.join(QUEUE_LANE_PRIORITY_DIR))
+                .expect("racing Redb hook recreates priority dir during gap");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(
+                    qdir.join(QUEUE_LANE_PRIORITY_DIR),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .expect("chmod 0700 recreated priority dir");
+            }
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_NONE,
+                "dedup-rb11m-new",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &make_payload("sess-rb11m-new-gap", "prov-rb11m-new"),
+            )
+            .expect("racing Redb hook appends new frame during gap");
+
+            let resumed = resume_reverse_migration(&storage)
+                .await
+                .expect("AC3: resume must union backup U live queue frames");
+            assert!(resumed.queue_union_reexported);
+            assert!(resumed.manifest.finalized);
+            assert!(resumed.manifest.spool_unfenced);
+            for sub in [
+                QUEUE_LANE_PRIORITY_DIR,
+                QUEUE_LANE_NORMAL_DIR,
+                QUEUE_QUARANTINE_DIR,
+            ] {
+                assert!(
+                    qdir.join(sub).is_file(),
+                    "AC3: capture-queue/{sub} must be a 0400 tombstone after convergence"
+                );
+            }
+
+            let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+                &capture_sqlite_db_path(&storage),
+                DatabaseRole::Capture,
+                true,
+            )
+            .await
+            .expect("open published capture.db");
+            for sid in ["sess-rb11m-old-backup", "sess-rb11m-new-gap"] {
+                let exists: Option<i64> =
+                    sea_orm::sqlx::query_scalar("SELECT 1 FROM agent_session WHERE session_id = ?")
+                        .bind(sid)
+                        .fetch_optional(&mut cap_conn)
+                        .await
+                        .expect("query union session");
+                assert!(
+                    exists.is_some(),
+                    "AC3: both old backup frame and new gap frame must survive ({sid})"
+                );
+            }
+            cap_conn.close().await.expect("close capture.db");
+        }
+    }
+
+    /// `RB-11m` AC4: under `targets_staged_for_rename = true`, if an existing
+    /// `libra.db` has `PRAGMA application_id != target_migration_tag`, resume
+    /// immediately fails closed with `LBR-IO-001` without overwriting it.
+    #[tokio::test]
+    async fn reverse_phase2_foreign_libra_db_tag_mismatch_fails_closed() {
+        let dir = tempdir().expect("rb11m ac4 tempdir");
+        let storage = dir.path().join(".libra");
+        let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+        let mut crash = CrashAtReverseStageObserver {
+            target: ReversePhase2ObserverStage::AfterTargetsStagedPersisted,
+        };
+        let _ = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut crash))
+            .await
+            .expect_err("crash after targets_staged_for_rename=true");
+
+        let foreign_path = git_sqlite_db_path(&storage);
+        fs::write(&foreign_path, b"").expect("touch foreign libra.db");
+        let mut raw =
+            open_reverse_sqlite_tmp_conn_async(&foreign_path, DatabaseRole::Repository, false)
+                .await
+                .expect("create foreign libra.db");
+        stamp_sqlite_tmp_application_id(&mut raw, DatabaseRole::Repository, 0x0000_0099)
+            .await
+            .expect("stamp foreign tag");
+        raw.close().await.expect("close foreign db");
+        let foreign_bytes = fs::read(&foreign_path).expect("snapshot foreign libra.db");
+
+        let err = resume_reverse_migration(&storage)
+            .await
+            .expect_err("AC4: foreign libra.db must fail closed on resume");
+        assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            fs::read(&foreign_path).expect("re-read foreign libra.db"),
+            foreign_bytes,
+            "AC4: foreign libra.db must not be overwritten"
+        );
+    }
+
+    /// `RB-11e` AC1–AC4: under `targets_staged_for_rename = true`, cover all 3
+    /// same-tag crash states (`AlreadyExists` duplicate `.tmp`, `NotFound` after
+    /// `capture.db.tmp` unlinked, and both DBs published before `finalized=true`),
+    /// proving zero-overwrite and 100% preservation of legacy SQLite writes made
+    /// during the crash window.
+    #[tokio::test]
+    async fn reverse_phase2_staged_hardlink_already_exists_notfound_and_both_published() {
+        // Case 1 (`AlreadyExists`): `capture.db` hard-linked, crashed BEFORE `unlink(capture.db.tmp)`.
+        {
+            let dir = tempdir().expect("rb11e case1");
+            let storage = dir.path().join(".libra");
+            let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+            let mut crash = CrashAtReverseStageObserver {
+                target: ReversePhase2ObserverStage::AfterTargetsStagedPersisted,
+            };
+            let _ = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut crash))
+                .await
+                .expect_err("crash after targets_staged_for_rename=true");
+
+            // Hard-link `capture.db.tmp` -> `capture.db` WITHOUT unlinking `.tmp`.
+            fs::hard_link(
+                capture_sqlite_tmp_path(&storage),
+                capture_sqlite_db_path(&storage),
+            )
+            .expect("simulate hard_link before unlink");
+            // Legacy SQLite process writes a brand-new row into published `capture.db`.
+            let mut c = open_reverse_sqlite_tmp_conn_async(
+                &capture_sqlite_db_path(&storage),
+                DatabaseRole::Capture,
+                false,
+            )
+            .await
+            .expect("open published capture.db");
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_session \
+                 (session_id, agent_kind, provider_session_id, state, working_dir, started_at, last_event_at) \
+                 VALUES ('sess-rb11e-case1', 'codex', 'prov-rb11e-c1', 'active', '/ws/c1', 1795810000, 1795810001)",
+            )
+            .execute(&mut c)
+            .await
+            .expect("legacy write case 1");
+            c.close().await.expect("close");
+
+            let resumed = resume_reverse_migration(&storage)
+                .await
+                .expect("AC1: resume AlreadyExists same-tag must succeed");
+            assert!(resumed.manifest.finalized);
+            assert!(!capture_sqlite_tmp_path(&storage).exists());
+            assert!(git_sqlite_db_path(&storage).is_file());
+
+            let mut c2 = open_reverse_sqlite_tmp_conn_async(
+                &capture_sqlite_db_path(&storage),
+                DatabaseRole::Capture,
+                true,
+            )
+            .await
+            .expect("reopen capture.db");
+            let exists: Option<i64> = sea_orm::sqlx::query_scalar(
+                "SELECT 1 FROM agent_session WHERE session_id = 'sess-rb11e-case1'",
+            )
+            .fetch_optional(&mut c2)
+            .await
+            .expect("query case1 legacy write");
+            c2.close().await.expect("close");
+            assert!(
+                exists.is_some(),
+                "AC4: case1 legacy write must be preserved"
+            );
+        }
+
+        // Case 2 (`NotFound` on `capture.db.tmp`): `capture.db` published & `.tmp` unlinked,
+        // crashed before `libra.db` published.
+        {
+            let dir = tempdir().expect("rb11e case2");
+            let storage = dir.path().join(".libra");
+            let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+            let mut crash = CrashAtReverseStageObserver {
+                target: ReversePhase2ObserverStage::AfterCapturePublishedBeforeLibra,
+            };
+            let _ = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut crash))
+                .await
+                .expect_err("crash after capture.db published");
+            assert!(!capture_sqlite_tmp_path(&storage).exists());
+            assert!(capture_sqlite_db_path(&storage).is_file());
+            assert!(!git_sqlite_db_path(&storage).exists());
+
+            let mut c = open_reverse_sqlite_tmp_conn_async(
+                &capture_sqlite_db_path(&storage),
+                DatabaseRole::Capture,
+                false,
+            )
+            .await
+            .expect("open published capture.db");
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_session \
+                 (session_id, agent_kind, provider_session_id, state, working_dir, started_at, last_event_at) \
+                 VALUES ('sess-rb11e-case2', 'codex', 'prov-rb11e-c2', 'active', '/ws/c2', 1795820000, 1795820001)",
+            )
+            .execute(&mut c)
+            .await
+            .expect("legacy write case 2");
+            c.close().await.expect("close");
+
+            let resumed = resume_reverse_migration(&storage)
+                .await
+                .expect("AC2: resume NotFound on capture.db.tmp must finish libra.db");
+            assert!(resumed.manifest.finalized);
+            assert!(git_sqlite_db_path(&storage).is_file());
+
+            let mut c2 = open_reverse_sqlite_tmp_conn_async(
+                &capture_sqlite_db_path(&storage),
+                DatabaseRole::Capture,
+                true,
+            )
+            .await
+            .expect("reopen capture.db");
+            let exists: Option<i64> = sea_orm::sqlx::query_scalar(
+                "SELECT 1 FROM agent_session WHERE session_id = 'sess-rb11e-case2'",
+            )
+            .fetch_optional(&mut c2)
+            .await
+            .expect("query case2 legacy write");
+            c2.close().await.expect("close");
+            assert!(
+                exists.is_some(),
+                "AC4: case2 legacy write must be preserved"
+            );
+        }
+
+        // Case 3 (Both DBs published, both `.tmp` unlinked, crashed BEFORE `finalized = true`).
+        {
+            let dir = tempdir().expect("rb11e case3");
+            let storage = dir.path().join(".libra");
+            let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+            let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+            let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+            let mut crash = CrashAtReverseStageObserver {
+                target: ReversePhase2ObserverStage::AfterTargetsStagedPersisted,
+            };
+            let _ = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut crash))
+                .await
+                .expect_err("crash after targets_staged_for_rename=true");
+
+            // Publish both via hard_link + unlink `.tmp` leaving `finalized = false`.
+            fs::hard_link(
+                capture_sqlite_tmp_path(&storage),
+                capture_sqlite_db_path(&storage),
+            )
+            .expect("link capture.db");
+            fs::remove_file(capture_sqlite_tmp_path(&storage)).expect("unlink capture.db.tmp");
+            fs::hard_link(git_sqlite_tmp_path(&storage), git_sqlite_db_path(&storage))
+                .expect("link libra.db");
+            fs::remove_file(git_sqlite_tmp_path(&storage)).expect("unlink libra.db.tmp");
+
+            // Legacy writes to BOTH `capture.db` and `libra.db` during crash window.
+            let mut c = open_reverse_sqlite_tmp_conn_async(
+                &capture_sqlite_db_path(&storage),
+                DatabaseRole::Capture,
+                false,
+            )
+            .await
+            .expect("open capture.db");
+            sea_orm::sqlx::query(
+                "INSERT INTO agent_session \
+                 (session_id, agent_kind, provider_session_id, state, working_dir, started_at, last_event_at) \
+                 VALUES ('sess-rb11e-case3', 'codex', 'prov-rb11e-c3', 'active', '/ws/c3', 1795830000, 1795830001)",
+            )
+            .execute(&mut c)
+            .await
+            .expect("legacy write capture case 3");
+            c.close().await.expect("close capture.db");
+
+            let mut g = open_reverse_sqlite_tmp_conn_async(
+                &git_sqlite_db_path(&storage),
+                DatabaseRole::Repository,
+                false,
+            )
+            .await
+            .expect("open libra.db");
+            sea_orm::sqlx::query(
+                "INSERT INTO reference (name, kind, \"commit\", remote) \
+                 VALUES ('rb11e-case3-branch', 'Branch', 'cccccccccccccccccccccccccccccccccccccccc', NULL)",
+            )
+            .execute(&mut g)
+            .await
+            .expect("legacy write libra case 3");
+            g.close().await.expect("close libra.db");
+
+            let resumed = resume_reverse_migration(&storage)
+                .await
+                .expect("AC3: resume with both published must advance to finalized=true");
+            assert!(resumed.manifest.finalized);
+            assert!(resumed.manifest.spool_unfenced);
+
+            let mut g2 = open_reverse_sqlite_tmp_conn_async(
+                &git_sqlite_db_path(&storage),
+                DatabaseRole::Repository,
+                true,
+            )
+            .await
+            .expect("reopen libra.db");
+            let g_exists: Option<i64> = sea_orm::sqlx::query_scalar(
+                "SELECT 1 FROM reference WHERE name = 'rb11e-case3-branch'",
+            )
+            .fetch_optional(&mut g2)
+            .await
+            .expect("query case3 libra write");
+            g2.close().await.expect("close libra.db");
+            assert!(
+                g_exists.is_some(),
+                "AC4: case3 libra.db write must be preserved"
+            );
+
+            let mut c2 = open_reverse_sqlite_tmp_conn_async(
+                &capture_sqlite_db_path(&storage),
+                DatabaseRole::Capture,
+                true,
+            )
+            .await
+            .expect("reopen capture.db");
+            let c_exists: Option<i64> = sea_orm::sqlx::query_scalar(
+                "SELECT 1 FROM agent_session WHERE session_id = 'sess-rb11e-case3'",
+            )
+            .fetch_optional(&mut c2)
+            .await
+            .expect("query case3 capture write");
+            c2.close().await.expect("close capture.db");
+            assert!(
+                c_exists.is_some(),
+                "AC4: case3 capture.db write must be preserved"
+            );
+        }
+    }
+
+    /// `RB-11s` AC1–AC4: crash after `targets_staged_for_rename = true` before
+    /// `capture.db` publish while external legacy `capture::store::open` creates
+    /// an `application_id == 0` competing `capture.db`; resume reconciles under
+    /// single-conn `c_mig` (respecting `agent_import_tombstone`), commits
+    /// `__libra_migrated_fence__`, and even if a SECOND crash occurs AFTER
+    /// fencing the competing DB and BEFORE `rename(capture.db.tmp, capture.db)`,
+    /// the subsequent resume idempotently completes replacement with zero loss.
+    #[tokio::test]
+    async fn reverse_phase2_competing_capture_store_open_reconciles_and_fences_zero_loss() {
+        use sea_orm::{ConnectionTrait as _, Statement};
+
+        let dir = tempdir().expect("rb11s tempdir");
+        let storage = dir.path().join(".libra");
+        let (_git_redb, cap_redb) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        // Pre-seed a migrated session AND a tombstone in `capture.redb` before Phase 1.
+        {
+            use crate::storage::{
+                AgentImportTombstoneRecord, AgentSessionRecord, CaptureAgentKind,
+                CaptureScopeState, CaptureSessionState, CaptureStore as _, RedbCaptureStore,
+                RedbRepairContext,
+            };
+            let cap_store =
+                RedbCaptureStore::open_read_write(&cap_redb, RedbRepairContext::WriteCommand)
+                    .await
+                    .expect("open capture.redb");
+            cap_store
+                .upsert_session(&AgentSessionRecord {
+                    session_id: "sess-rb11s-original".to_string(),
+                    agent_kind: CaptureAgentKind::Codex,
+                    provider_session_id: "prov-rb11s-original".to_string(),
+                    thread_id: None,
+                    state: CaptureSessionState::Active,
+                    working_dir: "/ws/rb11s".to_string(),
+                    worktree_id: None,
+                    parent_commit: None,
+                    parent_session_id: None,
+                    metadata_json: "{}".to_string(),
+                    redaction_report: "{}".to_string(),
+                    started_at: 1795839990,
+                    last_event_at: 1795839991,
+                    stopped_at: None,
+                    schema_version: 1,
+                    sync_revision: 1,
+                    repo_id: None,
+                    workspace_id: None,
+                    workspace_fence: None,
+                    scope_state: CaptureScopeState::LegacyUnknown,
+                })
+                .await
+                .expect("seed original migrated session");
+            cap_store
+                .put_import_tombstone(&AgentImportTombstoneRecord {
+                    tombstone_id: "tomb-rb11s".to_string(),
+                    agent_kind: "codex".to_string(),
+                    provider_session_id: "prov-rb11s-erased".to_string(),
+                    erased_session_id: "sess-rb11s-erased".to_string(),
+                    erased_at: 1795840000,
+                    source_fingerprint: None,
+                })
+                .await
+                .expect("record tombstone");
+            drop(cap_store);
+        }
+
+        // Crash #1: right after `targets_staged_for_rename = true`, before `capture.db` publish.
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+        let mut crash1 = CrashAtReverseStageObserver {
+            target: ReversePhase2ObserverStage::AfterTargetsStagedPersisted,
+        };
+        let _ = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut crash1))
+            .await
+            .expect_err("crash #1 after targets_staged_for_rename=true");
+
+        // External legacy process opens `capture::store::open` creating `application_id == 0`.
+        let conn = crate::internal::ai::capture::store::open(&storage, Duration::from_secs(5))
+            .await
+            .expect("competing capture::store::open");
+        let backend = conn.get_database_backend();
+        conn.execute_raw(Statement::from_string(
+            backend,
+            "INSERT INTO agent_session \
+             (session_id, agent_kind, provider_session_id, state, working_dir, started_at, last_event_at) \
+             VALUES ('sess-rb11s-competing', 'codex', 'prov-rb11s-competing', 'active', '/ws/rb11s', 1795840010, 1795840011)"
+                .to_string(),
+        ))
+        .await
+        .expect("insert legitimate competing session");
+        conn.execute_raw(Statement::from_string(
+            backend,
+            "INSERT INTO agent_session \
+             (session_id, agent_kind, provider_session_id, state, working_dir, started_at, last_event_at) \
+             VALUES ('sess-rb11s-erased', 'codex', 'prov-rb11s-erased', 'active', '/ws/rb11s', 1795840012, 1795840013)"
+                .to_string(),
+        ))
+        .await
+        .expect("insert tombstoned competing session");
+        conn.close().await.expect("close competing capture.db");
+
+        // Crash #2 (`RB-11s` AC4): right AFTER fencing competing `capture.db` with
+        // `__libra_migrated_fence__` and BEFORE atomic `rename(capture.db.tmp, capture.db)`!
+        let mut crash2 = CrashAtReverseStageObserver {
+            target: ReversePhase2ObserverStage::AfterCompetingCaptureFencedBeforeRename,
+        };
+        let _ =
+            resume_reverse_migration_inner(DatabaseRole::Repository, &storage, Some(&mut crash2))
+                .await
+                .expect_err("crash #2 after competing capture.db fenced before rename");
+
+        assert!(
+            is_sqlite_file_migrated_fenced(
+                &capture_sqlite_db_path(&storage),
+                DatabaseRole::Capture,
+            )
+            .await
+            .expect("probe fenced competing capture.db"),
+            "AC2 & AC4: competing capture.db must carry __libra_migrated_fence__ before rename"
+        );
+        assert!(capture_sqlite_tmp_path(&storage).is_file());
+
+        // Resume #2 (`RB-11s` AC3 & AC4): recognizes fenced competing DB + verified `.tmp`
+        // and idempotently completes atomic replacement to `finalized = true`.
+        let resumed = resume_reverse_migration(&storage)
+            .await
+            .expect("AC4: post-fence resume must replace fenced competing capture.db");
+        assert!(resumed.reconciled_competing_capture_db);
+        assert!(resumed.manifest.finalized);
+        assert!(resumed.manifest.spool_unfenced);
+
+        let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+            &capture_sqlite_db_path(&storage),
+            DatabaseRole::Capture,
+            true,
+        )
+        .await
+        .expect("open final capture.db");
+        let legit_ok: Option<i64> = sea_orm::sqlx::query_scalar(
+            "SELECT 1 FROM agent_session WHERE session_id = 'sess-rb11s-competing'",
+        )
+        .fetch_optional(&mut cap_conn)
+        .await
+        .expect("query competing legitimate session");
+        let erased_resurrected: Option<i64> = sea_orm::sqlx::query_scalar(
+            "SELECT 1 FROM agent_session WHERE session_id = 'sess-rb11s-erased'",
+        )
+        .fetch_optional(&mut cap_conn)
+        .await
+        .expect("query erased session");
+        let migrated_count: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM agent_session")
+            .fetch_one(&mut cap_conn)
+            .await
+            .expect("count sessions");
+        cap_conn.close().await.expect("close final capture.db");
+
+        assert!(
+            legit_ok.is_some(),
+            "AC3: competing session must be 100% preserved"
+        );
+        assert!(
+            erased_resurrected.is_none(),
+            "AC1: tombstoned session must NOT be resurrected"
+        );
+        assert!(
+            migrated_count >= 2,
+            "AC3: both original migrated capture rows and competing write must survive"
+        );
+    }
+
+    /// `RB-11h` AC1, AC2, AC4: fresh Redb repo (no pre-installed spool tombstones)
+    /// with pre-existing live events in `capture-spool/ready/` archives them into
+    /// `.libra/redb-backup/<gen>/capture-spool/ready/`, directly ingests them into
+    /// `capture.db.tmp`, actively establishes all 3 `0400` spool tombstones across
+    /// `finalized = false`, AND defensively merges any live spool event written if
+    /// tombstones were externally removed during `finalized == false`.
+    #[tokio::test]
+    async fn reverse_fresh_redb_reconciles_preexisting_live_spool_and_establishes_tombstones() {
+        let dir = tempdir().expect("rb11h ac124 tempdir");
+        let storage = dir.path().join(".libra");
+        let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+        let generation = read_storage_manifest(&storage)
+            .expect("read manifest")
+            .expect("manifest exists")
+            .generation;
+
+        // Fresh Redb repo: remove any pre-existing spool tombstones and create a live
+        // `capture-spool/ready/` directory containing a valid spool envelope!
+        let spool_dir = capture_spool_dir_path(&storage);
+        for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let p = spool_dir.join(sub);
+            if p.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+                }
+                let _ = fs::remove_file(&p);
+            }
+        }
+        let ready_dir = spool_dir.join(CAPTURE_SPOOL_READY_SUBDIR);
+        fs::create_dir_all(&ready_dir).expect("create live capture-spool/ready");
+        let env1 = build_spool_envelope_bytes(
+            "codex",
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            Some("dedup-rb11h-preexisting"),
+            "prov-rb11h-preexisting",
+            "/ws/rb11h",
+            &storage,
+            "session_start",
+            "2026-11-26T00:00:01Z",
+            "",
+        );
+        fs::write(ready_dir.join("0001-preexisting.json"), &env1).expect("write preexisting spool");
+
+        // Phase 1 + Step 2.1–2.3, then inject crash AFTER Step 2.3 spool tombstones.
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        assert!(
+            redb_backup_dir_path(&storage, generation)
+                .join(CAPTURE_SPOOL_SUBDIR)
+                .join(CAPTURE_SPOOL_READY_SUBDIR)
+                .join("0001-preexisting.json")
+                .is_file(),
+            "AC1: Phase 1 must archive live capture-spool/ready into redb-backup"
+        );
+        let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+        let mut crash = CrashAtReverseStageObserver {
+            target: ReversePhase2ObserverStage::AfterSpoolTombstonesPersisted,
+        };
+        let _ = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut crash))
+            .await
+            .expect_err("crash after Step 2.3 spool tombstones");
+
+        // AC2: All 3 `capture-spool/{tmp,ready,quarantine}` are `0400` tombstones across `finalized = false`.
+        for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let p = spool_dir.join(sub);
+            assert!(
+                fs::symlink_metadata(&p)
+                    .expect("stat spool tombstone")
+                    .file_type()
+                    .is_file(),
+                "AC2: capture-spool/{sub} must be an active 0400 tombstone"
+            );
+        }
+
+        // AC4 defensive fallback: external agent removes spool tombstones during `finalized == false`
+        // and drops a brand-new live spool event into `capture-spool/ready/`.
+        for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let p = spool_dir.join(sub);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+            }
+            fs::remove_file(&p).expect("externally clear spool tombstone");
+        }
+        fs::create_dir_all(&ready_dir).expect("recreate live ready dir");
+        let env2 = build_spool_envelope_bytes(
+            "codex",
+            "codex",
+            "22222222-2222-4222-8222-222222222222",
+            Some("dedup-rb11h-defensive"),
+            "prov-rb11h-defensive",
+            "/ws/rb11h",
+            &storage,
+            "session_start",
+            "2026-11-26T00:00:02Z",
+            "",
+        );
+        fs::write(ready_dir.join("0002-defensive.json"), &env2).expect("write defensive spool");
+
+        let resumed = resume_reverse_migration(&storage)
+            .await
+            .expect("AC4: defensive resume must merge live spool event");
+        assert!(resumed.live_spool_events_merged >= 1);
+        assert!(resumed.manifest.finalized);
+        assert!(resumed.manifest.spool_unfenced);
+
+        let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+            &capture_sqlite_db_path(&storage),
+            DatabaseRole::Capture,
+            true,
+        )
+        .await
+        .expect("open published capture.db");
+        for prov in ["prov-rb11h-preexisting", "prov-rb11h-defensive"] {
+            let found: Option<i64> = sea_orm::sqlx::query_scalar(
+                "SELECT 1 FROM agent_session WHERE provider_session_id = ?",
+            )
+            .bind(prov)
+            .fetch_optional(&mut cap_conn)
+            .await
+            .expect("query reconciled spool session");
+            assert!(
+                found.is_some(),
+                "AC1 & AC4: spool event `{prov}` must be 100% preserved in capture.db"
+            );
+        }
+        cap_conn.close().await.expect("close capture.db");
+    }
+
+    /// `RB-11h` AC3: fresh Redb repo with BOTH valid and malformed events in
+    /// `capture-spool/ready/`; reverse migration holds `capture-spool-consumer.lock`
+    /// throughout live spool reconciliation so concurrent `drain_storage` exits
+    /// with ZERO moves (never quarantining malformed files to `quarantine/`).
+    #[tokio::test]
+    async fn reverse_fresh_redb_live_spool_reconcile_blocks_concurrent_drain_moves() {
+        let dir = tempdir().expect("rb11h ac3 tempdir");
+        let storage = dir.path().join(".libra");
+        let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let spool_dir = capture_spool_dir_path(&storage);
+        for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let p = spool_dir.join(sub);
+            if p.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+                }
+                let _ = fs::remove_file(&p);
+            }
+        }
+        let ready_dir = spool_dir.join(CAPTURE_SPOOL_READY_SUBDIR);
+        let quarantine_dir = spool_dir.join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+        fs::create_dir_all(&ready_dir).expect("create ready dir");
+        fs::create_dir_all(&quarantine_dir).expect("create empty quarantine dir");
+
+        let valid_env = build_spool_envelope_bytes(
+            "codex",
+            "codex",
+            "33333333-3333-4333-8333-333333333333",
+            Some("dedup-rb11h-valid"),
+            "prov-rb11h-valid",
+            "/ws/rb11h",
+            &storage,
+            "session_start",
+            "2026-11-26T00:00:03Z",
+            "",
+        );
+        fs::write(ready_dir.join("0001-valid.json"), &valid_env).expect("seed valid");
+        fs::write(ready_dir.join("0002-malformed.json"), b"{not valid json!!!")
+            .expect("seed malformed");
+
+        // Reverse Phase 1 quiescence acquires & holds `capture-spool-consumer.lock`.
+        let guard = quiesce_reverse_repository_phase1(&storage)
+            .expect("quiesce holds capture-spool-consumer.lock");
+
+        // Concurrent `drain_storage` MUST exit cleanly with ZERO files moved to `quarantine/`!
+        crate::internal::ai::capture::drain::drain_storage(
+            &storage,
+            crate::command::hooks::spool_replay_provider,
+        )
+        .await
+        .expect("concurrent drain_storage must exit cleanly without moving files");
+
+        assert!(
+            ready_dir.join("0001-valid.json").is_file()
+                && ready_dir.join("0002-malformed.json").is_file(),
+            "AC3: both valid and malformed files must remain untouched in ready/"
+        );
+        let q_entries: Vec<_> = fs::read_dir(&quarantine_dir)
+            .expect("list quarantine")
+            .collect();
+        assert!(
+            q_entries.is_empty(),
+            "AC3: concurrent drain_storage must NEVER move malformed events to quarantine/"
+        );
+        guard.abort_and_release().expect("release quiesce locks");
+    }
+
+    /// `RB-11u` AC1 & AC2 (Step 2.6 Reachable State A): `finalized = true,
+    /// spool_unfenced = false` with `tmp` & `ready` tombstones removed while
+    /// `quarantine` `0400` tombstone remains; legacy SQLite hook fails closed on
+    /// `ensure_spool`, and resume idempotently removes the remaining `quarantine`
+    /// `is_file()` tombstone + `fsync_dir` and persists `spool_unfenced = true`.
+    #[tokio::test]
+    async fn reverse_phase2_step26_partial_cleanup_blocks_old_hook_then_resumes() {
+        let dir = tempdir().expect("rb11u stateA tempdir");
+        let storage = dir.path().join(".libra");
+        let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+        let mut crash = CrashAtReverseStageObserver {
+            target: ReversePhase2ObserverStage::AfterFinalizedBeforeSpoolUnfence,
+        };
+        let _ = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut crash))
+            .await
+            .expect_err("crash after finalized=true before Step 2.6");
+
+        let manifest = read_storage_manifest(&storage)
+            .expect("read manifest")
+            .expect("manifest exists");
+        assert!(manifest.finalized);
+        assert!(!manifest.spool_unfenced);
+
+        // Simulate Reachable State A: `tmp` and `ready` tombstones removed, `quarantine` remains!
+        let spool_dir = capture_spool_dir_path(&storage);
+        for sub in ["tmp", "ready"] {
+            let p = spool_dir.join(sub);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+            }
+            fs::remove_file(&p).expect("remove partial tombstone");
+        }
+        assert!(spool_dir.join("quarantine").is_file());
+
+        // AC1: Legacy SQLite hook calling `ensure_spool` MUST fail closed while `quarantine` tombstone exists.
+        assert!(
+            crate::internal::ai::capture::spool::publish(
+                &storage,
+                false,
+                "rb11u-state-a-blocked",
+                b"{\"blocked\":true}",
+                None,
+            )
+            .is_err(),
+            "AC1: old SQLite hook must fail closed when quarantine 0400 tombstone remains"
+        );
+
+        // AC2: Resume removes ONLY the remaining `quarantine` tombstone and persists `spool_unfenced = true`.
+        let resumed = resume_reverse_migration(&storage)
+            .await
+            .expect("AC2: Step 2.6 State A resume must succeed");
+        assert_eq!(resumed.spool_tombstones_unfenced, 1);
+        assert!(resumed.manifest.finalized);
+        assert!(resumed.manifest.spool_unfenced);
+        assert!(!spool_dir.join("quarantine").exists());
+
+        // Legacy SQLite hook now succeeds!
+        let out = crate::internal::ai::capture::spool::publish(
+            &storage,
+            false,
+            "rb11u-state-a-resumed",
+            b"{\"resumed\":true}",
+            None,
+        )
+        .expect("old hook resumes after State A convergence");
+        assert_eq!(
+            out,
+            crate::internal::ai::capture::spool::PublishOutcome::Published
+        );
+    }
+
+    /// `RB-11u` AC3–AC5 (Step 2.6 Reachable State B): `finalized = true,
+    /// spool_unfenced = false` with ALL 3 spool tombstones already unlinked +
+    /// `fsync_dir` (crashed before `spool_unfenced = true` persisted); legacy
+    /// SQLite hook recreates all 3 directories and publishes a real live event
+    /// in `capture-spool/ready/`; resume detects directories, preserves them
+    /// 100% untouched, persists `spool_unfenced = true`, and subsequent drain
+    /// commits the live event into `capture.db` with zero loss.
+    #[tokio::test]
+    async fn reverse_phase2_step26_post_unfence_crash_preserves_live_old_hook_event() {
+        let dir = tempdir().expect("rb11u stateB tempdir");
+        let storage = dir.path().join(".libra");
+        let _ = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let prepared = prepare_reverse_phase1(&storage).await.expect("phase 1");
+        let fenced = execute_reverse_phase2_fence_and_unlink(prepared).expect("step 2.1-2.2");
+        let mut crash = CrashAtReverseStageObserver {
+            target: ReversePhase2ObserverStage::AfterFinalizedBeforeSpoolUnfence,
+        };
+        let _ = finalize_reverse_phase2_publish_and_unfence_inner(fenced, Some(&mut crash))
+            .await
+            .expect_err("crash after finalized=true before Step 2.6");
+
+        // Simulate Reachable State B: ALL 3 spool tombstones removed + `fsync_dir`,
+        // crashed BEFORE persisting `spool_unfenced = true`.
+        let spool_dir = capture_spool_dir_path(&storage);
+        for sub in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let p = spool_dir.join(sub);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+            }
+            fs::remove_file(&p).expect("remove all 3 tombstones");
+        }
+        fsync_dir_best_effort(&spool_dir).expect("fsync spool dir");
+
+        // AC3: Old SQLite hook recreates all 3 directories and publishes a REAL valid envelope!
+        let live_env = build_spool_envelope_bytes(
+            "codex",
+            "codex",
+            "44444444-4444-4444-8444-444444444444",
+            Some("dedup-rb11u-state-b-live"),
+            "prov-rb11u-state-b-live",
+            "/ws/rb11u",
+            &storage,
+            "session_start",
+            "2026-11-26T00:00:04Z",
+            "",
+        );
+        let pub_outcome = crate::internal::ai::capture::spool::publish(
+            &storage,
+            false,
+            "dedup-rb11u-state-b-live",
+            &live_env,
+            None,
+        )
+        .expect("AC3: old SQLite hook must publish real live event in Reachable State B");
+        assert_eq!(
+            pub_outcome,
+            crate::internal::ai::capture::spool::PublishOutcome::Published
+        );
+        assert_eq!(
+            crate::internal::ai::capture::spool::ready_names(&storage)
+                .expect("ready names before resume")
+                .len(),
+            1
+        );
+
+        // AC4: Resume detects all 3 entries are live directories, preserves them 100% untouched,
+        // and persists `spool_unfenced = true`.
+        let resumed = resume_reverse_migration(&storage)
+            .await
+            .expect("AC4: Step 2.6 State B resume must preserve live spool dir");
+        assert_eq!(resumed.spool_tombstones_unfenced, 0);
+        assert!(resumed.manifest.finalized);
+        assert!(resumed.manifest.spool_unfenced);
+        assert_eq!(
+            crate::internal::ai::capture::spool::ready_names(&storage)
+                .expect("ready names after resume")
+                .len(),
+            1,
+            "AC4: live spool event must remain untouched during resume"
+        );
+
+        // AC5: Consume `capture-spool/ready/` and verify the live event commits into `capture.db`!
+        let mut cap_conn = open_reverse_sqlite_tmp_conn_async(
+            &capture_sqlite_db_path(&storage),
+            DatabaseRole::Capture,
+            false,
+        )
+        .await
+        .expect("open published capture.db for AC5 drain check");
+        sea_orm::sqlx::query(
+            "CREATE TEMP TABLE _rev_mig_dedup_keys (dedup_key TEXT NOT NULL PRIMARY KEY)",
+        )
+        .execute(&mut cap_conn)
+        .await
+        .expect("create temp dedup table");
+        let mut telemetry = ExportStreamTelemetry::new();
+        let (applied, _) = ingest_capture_spool_ready_dir_to_sqlite_tmp(
+            &spool_dir.join(CAPTURE_SPOOL_READY_SUBDIR),
+            &storage,
+            &mut cap_conn,
+            None,
+            &mut telemetry,
+        )
+        .await
+        .expect("AC5: consume State B live spool event into capture.db");
+        assert_eq!(applied, 1);
+        let stored: Option<i64> = sea_orm::sqlx::query_scalar(
+            "SELECT 1 FROM agent_session WHERE provider_session_id = 'prov-rb11u-state-b-live'",
+        )
+        .fetch_optional(&mut cap_conn)
+        .await
+        .expect("query AC5 committed session");
+        cap_conn.close().await.expect("close capture.db");
+        assert!(
+            stored.is_some(),
+            "AC5: live old-hook event published in State B must be 100% persisted in capture.db"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Milestone 4: GlobalConfig & SystemConfig Bidirectional Migration &
+    // Crash Recovery (`RB-11b`, `RB-11v`, `RB-11k`, `RB-11w`, `RB-11f`,
+    // `RB-11n`, `RB-11g`, `RB-11o`)
+    // ------------------------------------------------------------------------
+
+    struct CrashAtConfigStageObserver {
+        target: ConfigMigrationTestStage,
+    }
+
+    impl ConfigMigrationTestObserver for CrashAtConfigStageObserver {
+        fn on_stage(
+            &mut self,
+            stage: ConfigMigrationTestStage,
+            _scope_dir: &Path,
+            _role: DatabaseRole,
+        ) -> StorageResult<()> {
+            if stage == self.target {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!("injected config migration crash at {stage:?}"),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    async fn seed_sqlite_config_scope_fixture(scope_dir: &Path, role: DatabaseRole, tag: &str) {
+        fs::create_dir_all(scope_dir).expect("create config scope dir");
+        let db_path = crate::storage::config_store::config_sqlite_path_in_scope_dir(scope_dir);
+        fs::write(&db_path, b"").expect("touch config.db");
+        apply_config_file_mode(&db_path, role, false).expect("chmod config.db");
+
+        let mut conn = open_reverse_sqlite_tmp_conn_async(&db_path, role, false)
+            .await
+            .expect("open seed config.db");
+        let ddl = format!(
+            "{}\n{}\n{}",
+            crate::internal::db::schema::CONFIG_KV_SQL,
+            include_str!("../../sql/migrations/2026090601_legacy_config_table.sql"),
+            "CREATE TABLE IF NOT EXISTS configuration_schema_versions (\n\
+                version INTEGER PRIMARY KEY,\n\
+                name TEXT NOT NULL,\n\
+                applied_at TEXT NOT NULL\n\
+            );"
+        );
+        for stmt in ddl.split(';') {
+            let t = stmt.trim();
+            if !t.is_empty() {
+                sea_orm::sqlx::query(AssertSqlSafe(t.to_string()))
+                    .execute(&mut conn)
+                    .await
+                    .expect("exec config DDL");
+            }
+        }
+        sea_orm::sqlx::query(
+            "INSERT INTO configuration_schema_versions (version, name, applied_at) \
+             VALUES (2026090601, 'configuration_base', '2026-11-26T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed configuration_schema_versions");
+        sea_orm::sqlx::query(
+            "INSERT INTO config (configuration, name, \"key\", value) \
+             VALUES ('user', NULL, 'name', ?1), ('remote', 'origin', 'url', ?2)",
+        )
+        .bind(format!("legacy-user-{tag}"))
+        .bind(format!("https://example.test/{tag}.git"))
+        .execute(&mut conn)
+        .await
+        .expect("seed legacy config");
+        sea_orm::sqlx::query(
+            "INSERT INTO config_kv (\"key\", value, encrypted) \
+             VALUES ('user.email', ?1, 0), ('vault.secret', ?2, 1)",
+        )
+        .bind(format!("{tag}@example.test"))
+        .bind(format!("enc-{tag}"))
+        .execute(&mut conn)
+        .await
+        .expect("seed config_kv");
+        conn.close().await.expect("close seed config.db");
+    }
+
+    async fn assert_legacy_sqlite_config_open_fails_corrupt(db_path: &Path, role: DatabaseRole) {
+        // Simulate legacy binary (`config.rs:257`) observing `db_path.exists() == true`
+        // and attempting to query `config_kv` on the in-place fenced tombstone.
+        assert!(
+            db_path.is_file(),
+            "fenced config.db tombstone must remain in place"
+        );
+        let mut conn = open_reverse_sqlite_tmp_conn_async(db_path, role, true)
+            .await
+            .expect("SQLite open succeeds before schema parse");
+        let err = sea_orm::sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM config_kv")
+            .persistent(false)
+            .fetch_one(&mut conn)
+            .await
+            .expect_err(
+                "legacy SQLite binary MUST fail closed with SQLITE_CORRUPT / malformed schema",
+            );
+        let _ = conn.close().await;
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("malformed database schema") || msg.contains("corrupt"),
+            "expected SQLITE_CORRUPT/malformed schema, got: {msg}"
+        );
+    }
+
+    /// `RB-11b` AC1–AC4: `GlobalConfig` forward migration produces `0600`
+    /// `config.redb`, publishes `config-format.json(backend="redb", finalized=true,
+    /// legacy_sqlite_tombstone=true)`, permanently retains in-place `0400` fenced
+    /// `config.db` tombstone blocking legacy binaries with `SQLITE_CORRUPT`, and
+    /// never touches isolated `SystemConfig` or repository fixtures (`GC-13`).
+    #[tokio::test]
+    async fn gc13_global_config_forward_migration_tombstone_and_legacy_block() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+            open_config_scope_for_read,
+        };
+
+        let dir = tempdir().expect("rb11b tempdir");
+        let global_dir = dir.path().join("global");
+        let system_dir = dir.path().join("system");
+        let repo_sentinel = dir.path().join("repo-libra.db");
+        seed_sqlite_config_scope_fixture(&global_dir, DatabaseRole::GlobalConfig, "global").await;
+        seed_sqlite_config_scope_fixture(&system_dir, DatabaseRole::SystemConfig, "system").await;
+        fs::write(&repo_sentinel, b"REPO_SENTINEL_RB11B").expect("write repo sentinel");
+        let before_system =
+            fs::read(config_sqlite_path_in_scope_dir(&system_dir)).expect("snap sys");
+        let before_repo = fs::read(&repo_sentinel).expect("snap repo");
+
+        let report = migrate_global_config(&global_dir, StorageBackendKind::Redb)
+            .await
+            .expect("AC1: GlobalConfig forward migration must succeed");
+        assert_eq!(report.role, DatabaseRole::GlobalConfig);
+        assert!(report.manifest.finalized);
+        assert!(report.manifest.legacy_sqlite_tombstone);
+        assert_eq!(report.manifest.backend, StorageBackendKind::Redb);
+        assert_eq!(report.config_rows_migrated, 2);
+        assert_eq!(report.config_kv_rows_migrated, 2);
+        assert_eq!(report.schema_version_rows_migrated, 1);
+
+        let redb_path = config_redb_path_in_scope_dir(&global_dir);
+        let sqlite_path = config_sqlite_path_in_scope_dir(&global_dir);
+        assert!(redb_path.is_file());
+        assert!(
+            sqlite_path.is_file(),
+            "AC2: config.db tombstone must NOT be unlinked"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&redb_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+        }
+
+        // AC3: Legacy binary opening retained `0400` fenced `config.db` fails closed (`SQLITE_CORRUPT`).
+        assert_legacy_sqlite_config_open_fails_corrupt(&sqlite_path, DatabaseRole::GlobalConfig)
+            .await;
+
+        // Verify migrated Redb store serves all migrated entries.
+        let store = open_config_scope_for_read(
+            &global_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+        )
+        .await
+        .expect("open migrated GlobalConfig");
+        assert_eq!(store.backend(), StorageBackendKind::Redb);
+        assert_eq!(
+            store.get("user.email").await.unwrap().unwrap().value,
+            "global@example.test"
+        );
+        drop(store);
+
+        // AC4: `GC-13` strict isolation of SystemConfig and Repository.
+        assert_eq!(
+            fs::read(config_sqlite_path_in_scope_dir(&system_dir)).expect("sys after"),
+            before_system
+        );
+        assert_eq!(fs::read(&repo_sentinel).expect("repo after"), before_repo);
+    }
+
+    /// `RB-11v` AC1–AC4: `SystemConfig` forward migration produces `0644`
+    /// `config.redb`, retains `0444` fenced `config.db` tombstone blocking legacy
+    /// binaries with `SQLITE_CORRUPT`, and strictly isolates `GlobalConfig` & repo.
+    #[tokio::test]
+    async fn gc13_system_config_forward_migration_tombstone_and_legacy_block() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+            open_config_scope_for_read,
+        };
+
+        let dir = tempdir().expect("rb11v tempdir");
+        let global_dir = dir.path().join("global");
+        let system_dir = dir.path().join("system");
+        let repo_sentinel = dir.path().join("repo-libra.db");
+        seed_sqlite_config_scope_fixture(&global_dir, DatabaseRole::GlobalConfig, "global").await;
+        seed_sqlite_config_scope_fixture(&system_dir, DatabaseRole::SystemConfig, "system").await;
+        fs::write(&repo_sentinel, b"REPO_SENTINEL_RB11V").expect("write repo sentinel");
+        let before_global =
+            fs::read(config_sqlite_path_in_scope_dir(&global_dir)).expect("snap glb");
+        let before_repo = fs::read(&repo_sentinel).expect("snap repo");
+
+        let report = migrate_system_config(&system_dir, StorageBackendKind::Redb)
+            .await
+            .expect("AC1: SystemConfig forward migration must succeed");
+        assert_eq!(report.role, DatabaseRole::SystemConfig);
+        assert!(report.manifest.finalized);
+        assert!(report.manifest.legacy_sqlite_tombstone);
+        assert_eq!(report.manifest.backend, StorageBackendKind::Redb);
+
+        let redb_path = config_redb_path_in_scope_dir(&system_dir);
+        let sqlite_path = config_sqlite_path_in_scope_dir(&system_dir);
+        assert!(redb_path.is_file());
+        assert!(
+            sqlite_path.is_file(),
+            "AC2: SystemConfig config.db tombstone retained in place"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&redb_path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+            assert_eq!(
+                fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
+
+        // AC3: Legacy binary opening retained `0444` fenced `config.db` fails closed (`SQLITE_CORRUPT`).
+        assert_legacy_sqlite_config_open_fails_corrupt(&sqlite_path, DatabaseRole::SystemConfig)
+            .await;
+
+        let store = open_config_scope_for_read(
+            &system_dir,
+            DatabaseRole::SystemConfig,
+            StorageBackendKind::Redb,
+        )
+        .await
+        .expect("open migrated SystemConfig");
+        assert_eq!(store.backend(), StorageBackendKind::Redb);
+        assert_eq!(
+            store.get("user.email").await.unwrap().unwrap().value,
+            "system@example.test"
+        );
+        drop(store);
+
+        // AC4: `GC-13` strict isolation of GlobalConfig and Repository.
+        assert_eq!(
+            fs::read(config_sqlite_path_in_scope_dir(&global_dir)).expect("global after"),
+            before_global
+        );
+        assert_eq!(fs::read(&repo_sentinel).expect("repo after"), before_repo);
+    }
+
+    /// `RB-11k` AC1–AC3: bidirectional lossless roundtrip (`Sqlite -> Redb -> Sqlite`)
+    /// for BOTH `GlobalConfig` (`0600`) and `SystemConfig` (`0644`), verifying
+    /// 100% lossless preservation of `config`, `config_kv`, and
+    /// `configuration_schema_versions` plus tombstone replacement and `finalized = true,
+    /// legacy_sqlite_tombstone = false`.
+    #[tokio::test]
+    async fn gc13_global_and_system_config_reverse_migration_replaces_tombstone() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-rt", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-rt", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11k tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+
+            // Snapshot canonical 3-table logical SHA-256 BEFORE forward migration.
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            let mut before_conn = open_reverse_sqlite_tmp_conn_async(&sqlite_path, role, true)
+                .await
+                .expect("open before sqlite");
+            let before_sha = compute_config_sqlite_logical_sha256(&mut before_conn, role)
+                .await
+                .expect("before logical sha");
+            before_conn.close().await.expect("close before");
+
+            // Forward (`Sqlite -> Redb`)
+            let fwd = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("forward config migration");
+            assert!(fwd.manifest.finalized && fwd.manifest.legacy_sqlite_tombstone);
+
+            // Reverse (`Redb -> Sqlite`)
+            let rev = migrate_config_scope(role, &scope_dir, StorageBackendKind::Sqlite)
+                .await
+                .expect("reverse config migration must replace tombstone");
+            assert!(rev.manifest.finalized);
+            assert!(!rev.manifest.legacy_sqlite_tombstone);
+            assert_eq!(rev.manifest.backend, StorageBackendKind::Sqlite);
+            assert_eq!(rev.config_rows_migrated, 2);
+            assert_eq!(rev.config_kv_rows_migrated, 2);
+            assert_eq!(rev.schema_version_rows_migrated, 1);
+            assert!(!config_redb_path_in_scope_dir(&scope_dir).exists());
+            assert!(sqlite_path.is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            // Verify 100% lossless roundtrip across all 3 tables via exact logical SHA-256 equality!
+            let mut after_conn = open_reverse_sqlite_tmp_conn_async(&sqlite_path, role, true)
+                .await
+                .expect("open after sqlite");
+            let after_sha = compute_config_sqlite_logical_sha256(&mut after_conn, role)
+                .await
+                .expect("after logical sha");
+            after_conn.close().await.expect("close after");
+            assert_eq!(
+                after_sha, before_sha,
+                "AC3: 3-table logical SHA-256 must match 100% after Sqlite -> Redb -> Sqlite roundtrip ({role})"
+            );
+        }
+    }
+
+    /// `RB-11w` AC1–AC4: all 4 combinations (`GlobalConfig`/`SystemConfig` ×
+    /// `Sqlite`/`Redb`) fail closed with typed `LBR-IO-001` (`WriteLockBusy`)
+    /// under bounded lock timeout (`Duration::ZERO`) while migration holds
+    /// exclusive `LOCK_EX` on `config-migration.lock`.
+    #[tokio::test]
+    async fn config_migration_bounded_lock_contention_global_and_system_fail_closed() {
+        use crate::storage::config_store::{
+            ConfigScopeLock, open_config_scope_read_write_with_deadline,
+        };
+
+        for (role, label) in [
+            (DatabaseRole::GlobalConfig, "global"),
+            (DatabaseRole::SystemConfig, "system"),
+        ] {
+            // Sqlite runtime command contention (`AC1` Global, `AC3` System)
+            {
+                let dir = tempdir().expect("rb11w sqlite tempdir");
+                let scope_dir = dir.path().join(label);
+                seed_sqlite_config_scope_fixture(&scope_dir, role, label).await;
+
+                let _mig_lock =
+                    ConfigScopeLock::try_lock_exclusive_bounded(&scope_dir, role, Duration::ZERO)
+                        .expect("migration acquires LOCK_EX");
+                let err =
+                    open_config_scope_read_write_with_deadline(&scope_dir, role, Duration::ZERO)
+                        .await
+                        .expect_err(
+                            "concurrent Sqlite config command must fail closed during LOCK_EX",
+                        );
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert!(matches!(err, StorageBackendError::WriteLockBusy { .. }));
+            }
+
+            // Redb runtime command contention (`AC2` Global, `AC4` System)
+            {
+                let dir = tempdir().expect("rb11w redb tempdir");
+                let scope_dir = dir.path().join(label);
+                seed_sqlite_config_scope_fixture(&scope_dir, role, label).await;
+                let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                    .await
+                    .expect("prepare Redb config scope");
+
+                let _mig_lock =
+                    ConfigScopeLock::try_lock_exclusive_bounded(&scope_dir, role, Duration::ZERO)
+                        .expect("migration acquires LOCK_EX");
+                let err =
+                    open_config_scope_read_write_with_deadline(&scope_dir, role, Duration::ZERO)
+                        .await
+                        .expect_err(
+                            "concurrent Redb config command must fail closed during LOCK_EX",
+                        );
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert!(matches!(err, StorageBackendError::WriteLockBusy { .. }));
+            }
+        }
+    }
+
+    /// `RB-11f` AC1 & AC2: for BOTH `GlobalConfig` and `SystemConfig`, inject a
+    /// real mid-fence SQLite hot rollback journal (`config.db-journal`) AND tear
+    /// the entire first 512-byte physical sector of Page 1 in `config.db`;
+    /// resume triggers SQLite hot rollback recovery and converges cleanly to
+    /// `finalized = true, legacy_sqlite_tombstone = true` (`0600`/`0400` Global,
+    /// `0644`/`0444` System) with zero data loss.
+    #[tokio::test]
+    async fn config_forward_crash_hot_journal_torn_sector_global_and_system() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+            open_config_scope_for_read,
+        };
+
+        // Isolated OS child mode: spill a genuine SQLite hot rollback journal
+        // (`config.db-journal`) containing original Page 1 during mid-fence
+        // transaction and hard-exit via `_exit(0)` without closing SQLite!
+        if std::env::var_os("LIBRA_RB11F_CHILD_MODE").is_some() {
+            let target = PathBuf::from(
+                std::env::var_os("LIBRA_RB11F_TARGET_PATH").expect("LIBRA_RB11F_TARGET_PATH"),
+            );
+            let mut conn =
+                open_reverse_sqlite_tmp_conn_async(&target, DatabaseRole::GlobalConfig, false)
+                    .await
+                    .expect("child open config.db");
+            for pragma in [
+                "PRAGMA journal_mode = DELETE;",
+                "PRAGMA synchronous = FULL;",
+                "PRAGMA locking_mode = EXCLUSIVE;",
+                "PRAGMA cache_size = 1;",
+                "PRAGMA cache_spill = 1;",
+            ] {
+                sea_orm::sqlx::query(pragma)
+                    .persistent(false)
+                    .execute(&mut conn)
+                    .await
+                    .expect("set pragma");
+            }
+            let sv_before: i64 = sea_orm::sqlx::query_scalar("PRAGMA schema_version;")
+                .persistent(false)
+                .fetch_one(&mut conn)
+                .await
+                .expect("read sv");
+            sea_orm::sqlx::query("BEGIN EXCLUSIVE;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await
+                .expect("begin exclusive");
+            sea_orm::sqlx::query(AssertSqlSafe(format!(
+                "CREATE TABLE {SQLITE_MIGRATED_FENCE_TABLE} (x INTEGER);"
+            )))
+            .persistent(false)
+            .execute(&mut conn)
+            .await
+            .expect("create fence table");
+            sea_orm::sqlx::query("PRAGMA writable_schema = ON;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await
+                .expect("writable_schema on");
+            sea_orm::sqlx::query(AssertSqlSafe(format!(
+                "UPDATE sqlite_master SET sql = '{SQLITE_MIGRATED_FENCE_SQL}' \
+                 WHERE type = 'table' AND name = '{SQLITE_MIGRATED_FENCE_TABLE}';"
+            )))
+            .persistent(false)
+            .execute(&mut conn)
+            .await
+            .expect("update fence sql");
+            sea_orm::sqlx::query(AssertSqlSafe(format!(
+                "PRAGMA schema_version = {};",
+                (sv_before as i32).wrapping_add(2)
+            )))
+            .persistent(false)
+            .execute(&mut conn)
+            .await
+            .expect("bump sv");
+            // Dirty >25 pages of `config` while `writable_schema = ON` so `pagerStress()`
+            // flushes the hot `-journal` (preserving original Page 1) and spills dirty Page 1!
+            sea_orm::sqlx::query("UPDATE config SET value = value || '!'")
+                .persistent(false)
+                .execute(&mut conn)
+                .await
+                .expect("dirty pages to force hot journal spill");
+            sea_orm::sqlx::query("PRAGMA writable_schema = OFF;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await
+                .expect("writable_schema off");
+
+            let journal_path = sqlite_sidecar_path(&target, "-journal");
+            let j_bytes = fs::read(&journal_path).expect("hot config.db-journal must exist");
+            assert!(
+                j_bytes.len() >= 512 + 4096 && j_bytes[..8] == SQLITE_HOT_ROLLBACK_JOURNAL_MAGIC,
+                "hot config.db-journal must carry valid SQLite hot journal header"
+            );
+            println!("RB11F_POWERLOSS_OK");
+            let _ = std::io::stdout().flush();
+            #[cfg(unix)]
+            unsafe {
+                libc::_exit(0);
+            }
+            #[cfg(not(unix))]
+            std::process::exit(0);
+        }
+
+        for (role, tag, expected_redb_mode, expected_tomb_mode) in [
+            (DatabaseRole::GlobalConfig, "global-hot", 0o600u32, 0o400u32),
+            (DatabaseRole::SystemConfig, "system-hot", 0o644u32, 0o444u32),
+        ] {
+            let dir = tempdir().expect("rb11f hot tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            {
+                let mut pad_conn = open_reverse_sqlite_tmp_conn_async(
+                    &config_sqlite_path_in_scope_dir(&scope_dir),
+                    role,
+                    false,
+                )
+                .await
+                .expect("open config.db for padding");
+                let pad_val = "x".repeat(120);
+                sea_orm::sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut pad_conn)
+                    .await
+                    .expect("begin padding tx");
+                for idx in 0..800u32 {
+                    sea_orm::sqlx::query(
+                        "INSERT INTO config (configuration, name, \"key\", value) VALUES ('pad', NULL, ?1, ?2)",
+                    )
+                    .bind(format!("pad.key.{idx:04}"))
+                    .bind(&pad_val)
+                    .execute(&mut pad_conn)
+                    .await
+                    .expect("insert padding config row");
+                }
+                sea_orm::sqlx::query("COMMIT")
+                    .execute(&mut pad_conn)
+                    .await
+                    .expect("commit padding tx");
+                pad_conn.close().await.expect("close padding conn");
+            }
+
+            // Crash right after Step 2.1 (`config-format.json(finalized=false, source_db_state=pending)`).
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardPendingManifest,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash at Step 2.1");
+
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            let journal_path = sqlite_sidecar_path(&sqlite_path, "-journal");
+
+            let exe = std::env::current_exe().expect("locate current test exe");
+            let child_out = Command::new(&exe)
+                .arg("--exact")
+                .arg("storage::migrate::tests::config_forward_crash_hot_journal_torn_sector_global_and_system")
+                .arg("--nocapture")
+                .env("LIBRA_RB11F_CHILD_MODE", "1")
+                .env("LIBRA_RB11F_TARGET_PATH", &sqlite_path)
+                .env("LIBRA_TEST", "1")
+                .output()
+                .expect("spawn powerloss child for config.db");
+            assert!(
+                child_out.status.success()
+                    && String::from_utf8_lossy(&child_out.stdout).contains("RB11F_POWERLOSS_OK"),
+                "powerloss child failed: {}",
+                String::from_utf8_lossy(&child_out.stderr)
+            );
+            assert!(journal_path.is_file(), "hot config.db-journal must exist");
+
+            // Tear the ENTIRE first 512-byte physical sector of Page 1 in `config.db`!
+            {
+                let mut f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&sqlite_path)
+                    .expect("open config.db to tear 512-byte sector");
+                let mut torn = [0u8; 512];
+                for (i, b) in torn.iter_mut().enumerate() {
+                    *b = if i % 2 == 0 { 0xA5 } else { 0x5A };
+                }
+                f.write_all(&torn).expect("write torn sector");
+                f.sync_all().expect("fsync torn config.db");
+            }
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("hot-journal torn-sector resume must succeed");
+            assert!(resumed.resumed_from_unfinalized);
+            assert!(resumed.hot_journal_recovered);
+            assert!(resumed.manifest.finalized);
+            assert!(resumed.manifest.legacy_sqlite_tombstone);
+            assert_eq!(resumed.manifest.backend, StorageBackendKind::Redb);
+
+            let redb_path = config_redb_path_in_scope_dir(&scope_dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&redb_path).unwrap().permissions().mode() & 0o777,
+                    expected_redb_mode
+                );
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_tomb_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = (expected_redb_mode, expected_tomb_mode);
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Redb)
+                .await
+                .expect("open recovered config store");
+            assert_eq!(
+                store.get("user.email").await.unwrap().unwrap().value,
+                format!("{tag}@example.test")
+            );
+        }
+    }
+
+    /// `RB-11f` AC3 & AC4: for BOTH `GlobalConfig` and `SystemConfig`, crash
+    /// AFTER `rename(config.redb.tmp, config.redb)` and BEFORE `finalized = true`;
+    /// resume detects the already-published `config.redb`, NEVER overwrites it,
+    /// verifies the fenced `config.db` tombstone, and publishes `finalized = true`.
+    #[tokio::test]
+    async fn config_forward_crash_staged_rename_preserves_redb_global_and_system() {
+        use crate::storage::{
+            config_store::{
+                ConfigStore as _, config_redb_path_in_scope_dir, open_config_scope_for_read,
+            },
+            redb::config_store::RedbConfigStore,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-staged", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-staged", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11f staged tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardRenamedBeforeFinalize,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after rename(config.redb.tmp, config.redb) before finalize");
+
+            let redb_path = config_redb_path_in_scope_dir(&scope_dir);
+            assert!(redb_path.is_file());
+
+            // Write a brand-new post-rename key directly into already-published `config.redb`
+            // AND plant a stale `config.redb.tmp` to prove resume NEVER overwrites `config.redb`!
+            let rw = RedbConfigStore::open_read_write(&redb_path, role)
+                .expect("open published config.redb");
+            rw.set("post.rename.canary", "MUST_SURVIVE", false)
+                .await
+                .expect("write post-rename canary");
+            drop(rw);
+            fs::write(
+                config_redb_tmp_path_in_scope(&scope_dir),
+                b"STALE_TMP_MUST_BE_DELETED",
+            )
+            .expect("plant stale tmp");
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("staged-rename resume must preserve config.redb");
+            assert!(resumed.manifest.finalized);
+            assert!(resumed.manifest.legacy_sqlite_tombstone);
+            assert!(!config_redb_tmp_path_in_scope(&scope_dir).exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&redb_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Redb)
+                .await
+                .expect("open preserved config.redb");
+            assert_eq!(
+                store
+                    .get("post.rename.canary")
+                    .await
+                    .unwrap()
+                    .expect("canary must NOT be overwritten")
+                    .value,
+                "MUST_SURVIVE"
+            );
+        }
+    }
+
+    /// `RB-11n` AC1–AC4: forward config recovery rejects (1) `GlobalConfig`
+    /// `pending` missing `config.db`, (2) `SystemConfig` `pending` missing
+    /// `config.db`, (3) fenced state missing `sqlite-backup`, and (4) fenced
+    /// state `sqlite-backup` `backup_sha256` mismatch — all fail-closed `LBR-IO-001`.
+    #[tokio::test]
+    async fn config_forward_crash_pending_missing_and_backup_fault_reject() {
+        use crate::storage::config_store::config_sqlite_path_in_scope_dir;
+
+        // AC1 & AC2: `pending` missing `config.db` for BOTH GlobalConfig and SystemConfig
+        for (role, tag) in [
+            (DatabaseRole::GlobalConfig, "global-miss"),
+            (DatabaseRole::SystemConfig, "system-miss"),
+        ] {
+            let dir = tempdir().expect("rb11n ac12 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardPendingManifest,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash at Step 2.1");
+
+            fs::remove_file(config_sqlite_path_in_scope_dir(&scope_dir))
+                .expect("delete pending config.db");
+            let err = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect_err("missing pending config.db must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        }
+
+        // AC3 & AC4: fenced state missing `sqlite-backup` and tampered `backup_sha256`
+        {
+            let dir = tempdir().expect("rb11n ac34 tempdir");
+            let scope_dir = dir.path().join("global-bak-fault");
+            seed_sqlite_config_scope_fixture(&scope_dir, DatabaseRole::GlobalConfig, "bak").await;
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardFencedBeforeStaged,
+            };
+            let _ = migrate_config_scope_inner(
+                DatabaseRole::GlobalConfig,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after fence before staged");
+
+            let bak = config_sqlite_backup_path_in_scope(&scope_dir, 1);
+            let orig = fs::read(&bak).expect("read backup");
+
+            // AC4: Tampered backup SHA-256 mismatch -> fail-closed `LBR-IO-001`.
+            let mut bad = orig.clone();
+            bad[0] ^= 0xFF;
+            fs::write(&bak, &bad).expect("tamper sqlite-backup");
+            let err_sha = resume_config_scope_migration(DatabaseRole::GlobalConfig, &scope_dir)
+                .await
+                .expect_err("AC4: tampered backup_sha256 must fail closed");
+            assert_eq!(err_sha.stable_code_str(), "LBR-IO-001");
+
+            // AC3: Missing backup -> fail-closed `LBR-IO-001`.
+            fs::remove_file(&bak).expect("remove sqlite-backup");
+            let err_miss = resume_config_scope_migration(DatabaseRole::GlobalConfig, &scope_dir)
+                .await
+                .expect_err("AC3: missing sqlite-backup must fail closed");
+            assert_eq!(err_miss.stable_code_str(), "LBR-IO-001");
+        }
+    }
+
+    /// `RB-11n` AC5 & AC6: after a crash releases `config-migration.lock` while
+    /// leaving `config-format.json(finalized = false)`, BOTH `Sqlite` and `Redb`
+    /// runtime config commands fail closed with `LBR-IO-001` (`ManifestNotFinalized`).
+    #[tokio::test]
+    async fn config_forward_pending_manifest_rejects_sqlite_and_redb_commands() {
+        use crate::storage::config_store::{
+            inspect_config_scope_authority, open_config_scope_for_read_with_deadline,
+            open_config_scope_read_write_with_deadline,
+        };
+
+        for (role, tag) in [
+            (DatabaseRole::GlobalConfig, "global-pend"),
+            (DatabaseRole::SystemConfig, "system-pend"),
+        ] {
+            let dir = tempdir().expect("rb11n ac56 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+
+            // Unfinalized forward manifest (`backend="redb", finalized=false`)
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardPendingManifest,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash leaving finalized=false");
+
+            let auth_err = inspect_config_scope_authority(&scope_dir, role)
+                .expect_err("inspect authority must reject finalized=false");
+            assert!(matches!(
+                auth_err,
+                StorageBackendError::ManifestNotFinalized { .. }
+            ));
+            assert_eq!(auth_err.stable_code_str(), "LBR-IO-001");
+
+            let rw_err =
+                open_config_scope_read_write_with_deadline(&scope_dir, role, Duration::ZERO)
+                    .await
+                    .expect_err("AC5/AC6: write command must fail closed on finalized=false");
+            assert!(matches!(
+                rw_err,
+                StorageBackendError::ManifestNotFinalized { .. }
+            ));
+            assert_eq!(rw_err.stable_code_str(), "LBR-IO-001");
+
+            for runtime_backend in [StorageBackendKind::Sqlite, StorageBackendKind::Redb] {
+                let ro_err = open_config_scope_for_read_with_deadline(
+                    &scope_dir,
+                    role,
+                    runtime_backend,
+                    Duration::ZERO,
+                )
+                .await
+                .expect_err("AC5/AC6: read command must fail closed on finalized=false");
+                assert!(matches!(
+                    ro_err,
+                    StorageBackendError::ManifestNotFinalized { .. }
+                ));
+                assert_eq!(ro_err.stable_code_str(), "LBR-IO-001");
+            }
+        }
+    }
+
+    /// `RB-11g` AC1 & AC2: for BOTH `GlobalConfig` (`0600`) and `SystemConfig`
+    /// (`0644`), crash IMMEDIATELY after `unlink(config.redb) + fsync_dir`
+    /// (`source_db_state == FencedReadyToUnlink` while `config.redb` is already
+    /// unlinked); resume verifies real `redb-backup` SHA-256 and converges
+    /// cleanly to `finalized = true, legacy_sqlite_tombstone = false`.
+    #[tokio::test]
+    async fn config_reverse_crash_after_config_redb_unlink_global_and_system() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+            open_config_scope_for_read,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-rev-unlink", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-rev-unlink", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11g ac12 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("prepare Redb config scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReverseRedbFencedBeforeUnlink,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after fenced_ready_to_unlink");
+
+            // Simulate crash IMMEDIATELY AFTER `unlink(config.redb) + fsync_dir`!
+            let redb_path = config_redb_path_in_scope_dir(&scope_dir);
+            fs::remove_file(&redb_path).expect("unlink config.redb");
+            fsync_dir_best_effort(&scope_dir).expect("fsync scope dir");
+            // Also remove `config.db.tmp` to force full verified re-export from `redb-backup`!
+            let _ = fs::remove_file(config_sqlite_tmp_path_in_scope(&scope_dir));
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("post-unlink reverse config resume must verify redb-backup and converge");
+            assert!(resumed.resumed_from_unfinalized);
+            assert!(resumed.manifest.finalized);
+            assert!(!resumed.manifest.legacy_sqlite_tombstone);
+            assert_eq!(resumed.manifest.backend, StorageBackendKind::Sqlite);
+
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            assert!(sqlite_path.is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Sqlite)
+                .await
+                .expect("open restored sqlite config");
+            assert_eq!(store.backend(), StorageBackendKind::Sqlite);
+            assert_eq!(
+                store.get("user.email").await.unwrap().unwrap().value,
+                format!("{tag}@example.test")
+            );
+        }
+    }
+
+    /// `RB-11g` AC3–AC6: reverse config recovery rejects (AC3) `GlobalConfig`
+    /// `pending` missing `config.redb`, (AC4) `SystemConfig` `pending` missing
+    /// `config.redb`, (AC5) unlinked state missing `redb-backup`, and (AC6)
+    /// unlinked state tampered `redb-backup` SHA-256 — all fail-closed `LBR-IO-001`.
+    #[tokio::test]
+    async fn config_reverse_crash_pending_missing_and_corrupt_backup_reject() {
+        use crate::storage::config_store::config_redb_path_in_scope_dir;
+
+        // AC3 & AC4: `pending` missing `config.redb` for Global and System
+        for (role, tag) in [
+            (DatabaseRole::GlobalConfig, "global-rev-miss"),
+            (DatabaseRole::SystemConfig, "system-rev-miss"),
+        ] {
+            let dir = tempdir().expect("rb11g ac34 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("prepare Redb scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReversePendingManifest,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash at reverse Step 2.1");
+
+            fs::remove_file(config_redb_path_in_scope_dir(&scope_dir))
+                .expect("delete pending config.redb");
+            let err = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect_err("missing pending config.redb must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        }
+
+        // AC5 & AC6: legally unlinked state missing/tampered `redb-backup`
+        {
+            let dir = tempdir().expect("rb11g ac56 tempdir");
+            let scope_dir = dir.path().join("global-rev-bak-fault");
+            seed_sqlite_config_scope_fixture(&scope_dir, DatabaseRole::GlobalConfig, "revbak")
+                .await;
+            let _ = migrate_config_scope(
+                DatabaseRole::GlobalConfig,
+                &scope_dir,
+                StorageBackendKind::Redb,
+            )
+            .await
+            .expect("prepare Redb scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReverseRedbUnlinkedBeforeStaged,
+            };
+            let _ = migrate_config_scope_inner(
+                DatabaseRole::GlobalConfig,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after unlink(config.redb)");
+
+            // Generation is 2 (forward was 1, reverse is 2).
+            let bak = config_redb_backup_path_in_scope(&scope_dir, 2);
+            let orig = fs::read(&bak).expect("read redb-backup");
+
+            // AC6: Tampered SHA-256 -> fail-closed `LBR-IO-001`.
+            let mut bad = orig.clone();
+            bad[0] ^= 0xFF;
+            fs::write(&bak, &bad).expect("tamper redb-backup");
+            let err_sha = resume_config_scope_migration(DatabaseRole::GlobalConfig, &scope_dir)
+                .await
+                .expect_err("AC6: tampered redb-backup SHA-256 must fail closed");
+            assert_eq!(err_sha.stable_code_str(), "LBR-IO-001");
+
+            // AC5: Missing backup -> fail-closed `LBR-IO-001`.
+            fs::remove_file(&bak).expect("remove redb-backup");
+            let err_miss = resume_config_scope_migration(DatabaseRole::GlobalConfig, &scope_dir)
+                .await
+                .expect_err("AC5: missing redb-backup must fail closed");
+            assert_eq!(err_miss.stable_code_str(), "LBR-IO-001");
+        }
+    }
+
+    /// `RB-11o` AC1 & AC2: for BOTH `GlobalConfig` and `SystemConfig`, crash
+    /// AFTER `rename(config.db.tmp, config.db)` and BEFORE `finalized = true`
+    /// while an old binary writes a brand-new key into live `config.db`; resume
+    /// detects the valid unfenced `config.db`, NEVER overwrites it, cleans `.tmp`,
+    /// publishes `finalized = true, legacy_sqlite_tombstone = false`, and
+    /// preserves 100% of the old binary's write.
+    #[tokio::test]
+    async fn config_reverse_staged_rename_preserves_old_binary_writes_global_and_system() {
+        use crate::storage::config_store::{
+            config_sqlite_path_in_scope_dir, open_config_scope_for_read,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-post-ren", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-post-ren", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11o ac12 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("prepare Redb scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReverseRenamedBeforeFinalize,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after rename(config.db.tmp, config.db) before finalize");
+
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            // Old binary writes a new key directly into live `config.db` during crash window!
+            let mut conn = open_reverse_sqlite_tmp_conn_async(&sqlite_path, role, false)
+                .await
+                .expect("old binary opens live config.db");
+            sea_orm::sqlx::query(
+                "INSERT INTO config_kv (\"key\", value, encrypted) VALUES ('old.binary.key', 'PRESERVED_VALUE', 0)",
+            )
+            .execute(&mut conn)
+            .await
+            .expect("old binary writes new key");
+            conn.close().await.expect("close old binary conn");
+
+            // Also plant a stale `config.db.tmp` to prove resume cleans `.tmp` without overwriting!
+            fs::write(
+                config_sqlite_tmp_path_in_scope(&scope_dir),
+                b"STALE_SQLITE_TMP",
+            )
+            .expect("plant stale config.db.tmp");
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("post-rename reverse resume must preserve old binary write");
+            assert!(resumed.manifest.finalized);
+            assert!(!resumed.manifest.legacy_sqlite_tombstone);
+            assert!(!config_sqlite_tmp_path_in_scope(&scope_dir).exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Sqlite)
+                .await
+                .expect("open finalized sqlite config");
+            assert_eq!(
+                store
+                    .get("old.binary.key")
+                    .await
+                    .unwrap()
+                    .expect("old binary write MUST survive")
+                    .value,
+                "PRESERVED_VALUE"
+            );
+        }
+    }
+
+    /// `RB-11o` AC3 & AC4: for BOTH `GlobalConfig` (`0400 -> 0600`) and
+    /// `SystemConfig` (`0444 -> 0644`), crash AFTER `targets_staged_for_rename = true`
+    /// and BEFORE `rename(config.db.tmp, config.db)` while `config.db` is still a
+    /// read-only tombstone; resume atomically replaces the tombstone and publishes
+    /// `finalized = true, legacy_sqlite_tombstone = false`.
+    #[tokio::test]
+    async fn config_reverse_staged_rename_before_rename_replaces_tombstone_global_and_system() {
+        use crate::storage::config_store::{
+            config_sqlite_path_in_scope_dir, is_config_sqlite_fenced_tombstone,
+            open_config_scope_for_read,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-pre-ren", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-pre-ren", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11o ac34 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("prepare Redb scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReverseStagedBeforeRename,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after targets_staged_for_rename=true before rename");
+
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            assert!(
+                is_config_sqlite_fenced_tombstone(&sqlite_path).unwrap(),
+                "config.db must still be a fenced tombstone before resume"
+            );
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("pre-rename reverse resume must replace tombstone");
+            assert!(resumed.manifest.finalized);
+            assert!(!resumed.manifest.legacy_sqlite_tombstone);
+            assert_eq!(resumed.manifest.backend, StorageBackendKind::Sqlite);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Sqlite)
+                .await
+                .expect("open replaced sqlite config");
+            assert_eq!(store.backend(), StorageBackendKind::Sqlite);
+            assert_eq!(
+                store.get("user.email").await.unwrap().unwrap().value,
+                format!("{tag}@example.test")
+            );
         }
     }
 }

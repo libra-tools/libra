@@ -705,3 +705,5 @@ Combined OpenCode native-origin untrust also returns `LBR-AGENT-005` (exit 128) 
 
 
 RG-03 opaque reasoning export: `LBR-AGENT-013` refuses missing/blank authorization or output, a malformed lowercase SHA-256, mixed `--raw`, or a platform without the owner-only file permission primitive. A `reasoning_artifact_export` denial audit is appended before checkpoint lookup. Audit persistence failure stops before any artifact body read or output. `LBR-AGENT-009` refuses invalid role/object identity/digest/declared byte length or the 32 MiB cap without reflecting payload. Undeclared selectors and destination/write/publication failures carry actionable errors; grants record attempts and remain after later failures. Libra preserves provider-encrypted bytes; it neither owns nor guesses decryption keys. No new stable error code; ordinary raw transcript action remains unchanged.
+
+pattern unset with no match exits 5.
