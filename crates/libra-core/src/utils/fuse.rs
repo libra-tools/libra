@@ -1306,7 +1306,12 @@ mod tests {
     fn sweep_fuse_task_worktrees_dir_cleans_stale_fuse_roots() {
         let temp = tempdir().expect("create temp dir");
         let tasks_dir = temp.path().join("tasks");
-        let root = tasks_dir.join("libra-task-worktree-fuse-999999-019ddec6-de60-7383");
+        let dead_pid = (999_999u32..i32::MAX as u32)
+            .find(|&pid| !pid_is_live(pid))
+            .expect("find dead pid");
+        let root = tasks_dir.join(format!(
+            "libra-task-worktree-fuse-{dead_pid}-019ddec6-de60-7383"
+        ));
         fs::create_dir_all(root.join("workspace")).expect("create workspace");
 
         let report = sweep_fuse_task_worktrees_dir(&tasks_dir).expect("sweep succeeds");

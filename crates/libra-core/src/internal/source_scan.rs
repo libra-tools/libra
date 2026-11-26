@@ -444,7 +444,8 @@ pub fn storage_rooted_join_literals() -> std::collections::BTreeSet<String> {
         // elsewhere may refer to an arbitrary workdir or temporary path.
         let common_storage_alias = matches!(
             label.as_str(),
-            "src/utils/worktree_layout.rs"
+            "crates/libra-core/src/utils/worktree_layout.rs"
+                | "crates/libra-core/src/internal/worktree_registry.rs"
                 | "src/command/worktree/lock.rs"
                 | "src/command/worktree/registry.rs"
                 | "src/command/worktree-fuse.rs"

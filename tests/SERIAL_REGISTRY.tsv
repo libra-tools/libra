@@ -251,6 +251,7 @@ storage_config_unresolved_fetch_stays_local_fetch	lane:cwd+env	points fetch at a
 storage_config_unresolved_fetch_stays_local_pull	lane:cwd+env	points pull at a missing global config database from a temporary repository
 subagent_scope_row_persists_linkage_and_is_idempotent	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 successful_ingest_clears_its_inflight_marker	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+symbolic_ref_migration_upgrade_contract	lane:env	PM-01 uses ConfigDbFixture, which sets and restores five process environment variables
 system_config_create_uses_system_role	lane:env+cwd	fixture temporarily points system config at a future-schema database while in-process init may read it
 takeover_reports_its_own_fence_even_if_another_lands_immediately_after	lane:workspace_failpoints	installs process-wide failpoints
 test_add_all_flag	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -338,6 +339,8 @@ test_branch_rename	lane:cwd	changes the process working directory (ChangeDirGuar
 test_branch_set_upstream_to_with_branch_arg_and_local_upstream_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_show_current_surfaces_corrupt_head_storage	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_cache_evict_dry_run_writes_no_objects	lane:cwd	retains the classifier-required cwd lane for upstream issue 483 preview and operation-recording checks in isolated repositories
+test_cf_71_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
+test_cf_73_predicates	lane:cwd	integration test uses process cwd while isolating Libra repository state
 test_changes_to_be_staged	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_checkout_current_branch_with_dirty_worktree_succeeds	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_checkout_existing_branch_with_unstaged_dirty_worktree_returns_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -518,6 +521,7 @@ test_fetch_prune_tags_matrix	lane:cwd	changes the process working directory (Cha
 test_fetch_refmap_requires_refspec	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
 test_fetch_refmap_with_cli_refspec	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
 test_fetch_repository_path_and_url_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_fetch_set_upstream_invalid_url_and_url_remote	lane:cwd	integration test uses process cwd while isolating Libra repository state
 test_fetch_set_upstream_no_branch_and_colon_forms	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
 test_fetch_set_upstream_writes_branch_config	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
 test_fetch_shallow_then_shallow_is_idempotent	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
@@ -755,6 +759,7 @@ test_push_force_if_includes_matrix_real_git	lane:env	mutates or depends on the p
 test_push_force_with_local_changes	lane:env	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper)
 test_push_invalid_remote	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_push_json_with_set_upstream_keeps_structured_output_clean	lane:env	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper)
+test_push_local_delete_flag_and_missing_ref	lane:cwd	integration test uses process cwd while isolating Libra repository state
 test_push_local_git_target_updates_pack_and_ref	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
 test_push_local_libra_nonbare_checked_out_branch_rejected	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
 test_push_local_libra_target_updates_ref	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
@@ -1208,4 +1213,3 @@ worktree_doctor_reports_scope_diagnostics	lane:cwd+env+hash_kind	fail-closed bod
 worktree_remove_keep_dir_preserves_or_tombstones_scope	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 worktree_remove_purges_layer_scope_rows	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 writer_emits_all_six_e4_libra_entries	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
-symbolic_ref_migration_upgrade_contract	lane:env	PM-01 uses ConfigDbFixture, which sets and restores five process environment variables

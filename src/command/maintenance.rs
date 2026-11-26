@@ -5455,6 +5455,10 @@ mod tests {
                 "directory component beneath sessions; run manifests are classified separately as object roots",
             ),
             (
+                "capture.db.tmp",
+                "transient SQLite reverse-migration staging file beneath private/ during RB-11 migration, atomically renamed to capture.db or unlinked",
+            ),
+            (
                 "checkpoint-input",
                 "ephemeral materialized task input beneath worktree/tasks; its object graph is rooted by the run manifest",
             ),
