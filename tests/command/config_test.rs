@@ -7560,3 +7560,24 @@ fn config_default_implies_get() {
     let missing = run_libra_command(&["config", "new.key"], repo.path());
     assert!(!missing.status.success(), "AC5 must not write the key");
 }
+
+mod value_pattern {
+    use super::*;
+
+    #[test]
+    fn test_cf_38_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["v1", "v2"] {
+            let set = run_libra_command(&["config", "--add", "p.k", value], repo.path());
+            assert_cli_success(&set, "config --add p.k");
+        }
+        let out = run_libra_command(&["config", "--unset-all", "p.k", "zzz"], repo.path());
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "pattern unset with no match exits 5: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
