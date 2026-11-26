@@ -3292,6 +3292,28 @@ mod tests {
     }
 
     #[test]
+    fn hard_rollback_failure_returns_rollback_error() {
+        let merged = merge_reset_failure(
+            ResetError::WorktreeRestore("injected hard apply failure".into()),
+            Err(ResetError::WorktreeRestore(
+                "injected hard rollback failure".into(),
+            )),
+        );
+        assert!(matches!(merged, ResetError::Rollback { .. }));
+    }
+
+    #[test]
+    fn mixed_rollback_failure_returns_rollback_error() {
+        let merged = merge_reset_failure(
+            ResetError::WorktreeRestore("injected mixed apply failure".into()),
+            Err(ResetError::WorktreeRestore(
+                "injected mixed rollback failure".into(),
+            )),
+        );
+        assert!(matches!(merged, ResetError::Rollback { .. }));
+    }
+
+    #[test]
     fn test_merge_reset_failure_preserves_primary_error_category() {
         let merged = merge_reset_failure(
             ResetError::ObjectLoad {
