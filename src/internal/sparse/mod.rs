@@ -41,22 +41,39 @@ impl SparseViewStore {
     /// tampered store, and a materialization gate (hydrate) must fail
     /// closed on it rather than see an empty (no-op) view.
     pub async fn list_strict(scope: &WorktreeScope) -> Result<Vec<String>, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let stmt = Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT pattern FROM sparse_view WHERE worktree_id = ? \
-             ORDER BY ordinal ASC, id ASC",
-            [scope.storage_key().into()],
-        );
-        let rows = db
-            .query_all_raw(stmt)
-            .await
-            .map_err(|e| format!("failed to list the sparse view: {e}"))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            out.push(row.try_get_by_index(0).map_err(|e| e.to_string())?);
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to list the sparse view: {e}"))?;
+                Ok(store
+                    .get_sparse_view(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to list the sparse view: {e}"))?
+                    .map(|snap| snap.patterns)
+                    .unwrap_or_default())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT pattern FROM sparse_view WHERE worktree_id = ? \
+                     ORDER BY ordinal ASC, id ASC",
+                    [scope.storage_key().into()],
+                );
+                let rows = db
+                    .query_all_raw(stmt)
+                    .await
+                    .map_err(|e| format!("failed to list the sparse view: {e}"))?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(row.try_get_by_index(0).map_err(|e| e.to_string())?);
+                }
+                Ok(out)
+            }
         }
-        Ok(out)
     }
 
     /// Whether `scope`'s view is enabled, PROPAGATING every read error
@@ -65,16 +82,34 @@ impl SparseViewStore {
     /// an unreadable or missing toggle store as "disabled" (the migration
     /// runner creates the table on every connection; absence = corruption).
     pub async fn is_enabled_strict(scope: &WorktreeScope) -> Result<bool, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let stmt = Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ?",
-            [scope.storage_key().into()],
-        );
-        match db.query_one_raw(stmt).await {
-            Ok(Some(row)) => Ok(row.try_get_by_index::<i32>(0).map_err(|e| e.to_string())? != 0),
-            Ok(None) => Ok(false),
-            Err(e) => Err(format!("failed to read the sparse view toggle: {e}")),
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to read the sparse view toggle: {e}"))?;
+                Ok(store
+                    .get_sparse_view(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to read the sparse view toggle: {e}"))?
+                    .is_some_and(|snap| snap.enabled))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ?",
+                    [scope.storage_key().into()],
+                );
+                match db.query_one_raw(stmt).await {
+                    Ok(Some(row)) => {
+                        Ok(row.try_get_by_index::<i32>(0).map_err(|e| e.to_string())? != 0)
+                    }
+                    Ok(None) => Ok(false),
+                    Err(e) => Err(format!("failed to read the sparse view toggle: {e}")),
+                }
+            }
         }
     }
 
@@ -86,39 +121,89 @@ impl SparseViewStore {
     }
 
     async fn set_enabled(scope: &WorktreeScope, enabled: bool) -> Result<(), String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?) \
-             ON CONFLICT(worktree_id) DO UPDATE SET enabled = excluded.enabled",
-            [
-                scope.storage_key().into(),
-                (if enabled { 1 } else { 0 }).into(),
-            ],
-        ))
-        .await
-        .map_err(|e| format!("failed to set the sparse view toggle: {e}"))?;
-        Ok(())
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to set the sparse view toggle: {e}"))?;
+                let patterns = store
+                    .get_sparse_view(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to read the sparse view: {e}"))?
+                    .map(|snap| snap.patterns)
+                    .unwrap_or_default();
+                store
+                    .replace_sparse_view(scope.storage_key(), enabled, &patterns)
+                    .await
+                    .map_err(|e| format!("failed to set the sparse view toggle: {e}"))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?) \
+                     ON CONFLICT(worktree_id) DO UPDATE SET enabled = excluded.enabled",
+                    [
+                        scope.storage_key().into(),
+                        (if enabled { 1 } else { 0 }).into(),
+                    ],
+                ))
+                .await
+                .map_err(|e| format!("failed to set the sparse view toggle: {e}"))?;
+                Ok(())
+            }
+        }
     }
 
     /// Replace `scope`'s pattern list (transactional) and ENABLE its view.
     pub async fn replace(scope: &WorktreeScope, patterns: &[String]) -> Result<(), String> {
-        Self::rewrite(scope, patterns).await?;
-        Self::set_enabled(scope, true).await
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to save the sparse view: {e}"))?;
+                store
+                    .replace_sparse_view(scope.storage_key(), true, patterns)
+                    .await
+                    .map_err(|e| format!("failed to save the sparse view: {e}"))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                Self::rewrite(scope, patterns).await?;
+                Self::set_enabled(scope, true).await
+            }
+        }
     }
 
     /// Append patterns (keeping order) and ENABLE `scope`'s view.
     pub async fn add(scope: &WorktreeScope, patterns: &[String]) -> Result<(), String> {
         let mut all = Self::list(scope).await?;
         all.extend(patterns.iter().cloned());
-        Self::rewrite(scope, &all).await?;
-        Self::set_enabled(scope, true).await
+        Self::replace(scope, &all).await
     }
 
     /// Drop every pattern and DISABLE `scope`'s view.
     pub async fn clear(scope: &WorktreeScope) -> Result<(), String> {
-        Self::rewrite(scope, &[]).await?;
-        Self::set_enabled(scope, false).await
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to clear the sparse view: {e}"))?;
+                store
+                    .clear_sparse_view(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to clear the sparse view: {e}"))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                Self::rewrite(scope, &[]).await?;
+                Self::set_enabled(scope, false).await
+            }
+        }
     }
 
     /// Enable / disable `scope`'s view without changing the patterns.
@@ -165,45 +250,66 @@ pub(crate) async fn snapshot_for_storage(
     storage: &std::path::Path,
     scope: &WorktreeScope,
 ) -> Result<(Vec<String>, bool), String> {
-    let db_path = storage.join(util::DATABASE);
-    let db_path = db_path
-        .to_str()
-        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
-    let db = crate::internal::db::open_connection_without_schema_management(
-        db_path,
-        std::time::Duration::from_secs(30),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT pattern FROM sparse_view WHERE worktree_id = ? ORDER BY ordinal ASC, id ASC",
-            [scope.storage_key().into()],
-        ))
-        .await
-        .map_err(|error| format!("failed to list the sparse view: {error}"))?;
-    let mut patterns = Vec::with_capacity(rows.len());
-    for row in rows {
-        patterns.push(row.try_get_by_index(0).map_err(|error| error.to_string())?);
-    }
-    let enabled = match db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ?",
-            [scope.storage_key().into()],
-        ))
-        .await
-    {
-        Ok(Some(row)) => {
-            row.try_get_by_index::<i32>(0)
-                .map_err(|error| error.to_string())?
-                != 0
+    let backend =
+        crate::storage::runtime::detect_repo_backend(storage).map_err(|error| error.to_string())?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_git_state_store_read_only(storage)
+                .await
+                .map_err(|error| error.to_string())?;
+            let snap = store
+                .get_sparse_view(scope.storage_key())
+                .await
+                .map_err(|error| format!("failed to list the sparse view: {error}"))?;
+            Ok(match snap {
+                Some(s) => (s.patterns, s.enabled),
+                None => (Vec::new(), false),
+            })
         }
-        Ok(None) => false,
-        Err(error) => return Err(format!("failed to read the sparse view toggle: {error}")),
-    };
-    Ok((patterns, enabled))
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = storage.join(util::DATABASE);
+            let db_path = db_path.to_str().ok_or_else(|| {
+                format!("database path is not valid UTF-8: {}", db_path.display())
+            })?;
+            let db = crate::internal::db::open_connection_without_schema_management(
+                db_path,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let rows = db
+                .query_all_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT pattern FROM sparse_view WHERE worktree_id = ? ORDER BY ordinal ASC, id ASC",
+                    [scope.storage_key().into()],
+                ))
+                .await
+                .map_err(|error| format!("failed to list the sparse view: {error}"))?;
+            let mut patterns = Vec::with_capacity(rows.len());
+            for row in rows {
+                patterns.push(row.try_get_by_index(0).map_err(|error| error.to_string())?);
+            }
+            let enabled = match db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ?",
+                    [scope.storage_key().into()],
+                ))
+                .await
+            {
+                Ok(Some(row)) => {
+                    row.try_get_by_index::<i32>(0)
+                        .map_err(|error| error.to_string())?
+                        != 0
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    return Err(format!("failed to read the sparse view toggle: {error}"));
+                }
+            };
+            Ok((patterns, enabled))
+        }
+    }
 }
 
 /// Restore sparse state through an explicitly opened connection for the
@@ -215,55 +321,69 @@ pub(crate) async fn restore_for_storage(
     patterns: &[String],
     enabled: bool,
 ) -> Result<(), String> {
-    let db_path = storage.join(util::DATABASE);
-    let db_path = db_path
-        .to_str()
-        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
-    let db = crate::internal::db::open_connection_without_schema_management(
-        db_path,
-        std::time::Duration::from_secs(30),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let txn = db
-        .begin()
-        .await
-        .map_err(|error| format!("failed to begin sparse view restore transaction: {error}"))?;
-    txn.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "DELETE FROM sparse_view WHERE worktree_id = ?",
-        [scope.storage_key().into()],
-    ))
-    .await
-    .map_err(|error| format!("failed to clear the sparse view: {error}"))?;
-    for (ordinal, pattern) in patterns.iter().enumerate() {
-        txn.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
-            [
-                scope.storage_key().into(),
-                pattern.as_str().into(),
-                (ordinal as i64).into(),
-            ],
-        ))
-        .await
-        .map_err(|error| format!("failed to restore a sparse pattern: {error}"))?;
+    let backend =
+        crate::storage::runtime::detect_repo_backend(storage).map_err(|error| error.to_string())?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_git_state_store_read_write(storage)
+                .await
+                .map_err(|error| error.to_string())?;
+            store
+                .replace_sparse_view(scope.storage_key(), enabled, patterns)
+                .await
+                .map_err(|error| format!("failed to restore sparse view: {error}"))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = storage.join(util::DATABASE);
+            let db_path = db_path.to_str().ok_or_else(|| {
+                format!("database path is not valid UTF-8: {}", db_path.display())
+            })?;
+            let db = crate::internal::db::open_connection_without_schema_management(
+                db_path,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let txn = db.begin().await.map_err(|error| {
+                format!("failed to begin sparse view restore transaction: {error}")
+            })?;
+            txn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM sparse_view WHERE worktree_id = ?",
+                [scope.storage_key().into()],
+            ))
+            .await
+            .map_err(|error| format!("failed to clear the sparse view: {error}"))?;
+            for (ordinal, pattern) in patterns.iter().enumerate() {
+                txn.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
+                    [
+                        scope.storage_key().into(),
+                        pattern.as_str().into(),
+                        (ordinal as i64).into(),
+                    ],
+                ))
+                .await
+                .map_err(|error| format!("failed to restore a sparse pattern: {error}"))?;
+            }
+            txn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?) \
+                 ON CONFLICT(worktree_id) DO UPDATE SET enabled = excluded.enabled",
+                [
+                    scope.storage_key().into(),
+                    (if enabled { 1 } else { 0 }).into(),
+                ],
+            ))
+            .await
+            .map_err(|error| format!("failed to restore the sparse view toggle: {error}"))?;
+            txn.commit()
+                .await
+                .map_err(|error| format!("failed to commit sparse view restore: {error}"))?;
+            Ok(())
+        }
     }
-    txn.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?) \
-         ON CONFLICT(worktree_id) DO UPDATE SET enabled = excluded.enabled",
-        [
-            scope.storage_key().into(),
-            (if enabled { 1 } else { 0 }).into(),
-        ],
-    ))
-    .await
-    .map_err(|error| format!("failed to restore the sparse view toggle: {error}"))?;
-    txn.commit()
-        .await
-        .map_err(|error| format!("failed to commit sparse view restore: {error}"))?;
-    Ok(())
 }
 
 /// A compiled sparse view ready for per-path verdicts. `None` when the view is
@@ -573,5 +693,136 @@ mod tests {
         .expect("restore meta table");
         let view = SparseView::try_load(&scope).await.expect("restored");
         assert!(view.is_active(), "restored view is active again");
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_layer_sparse_and_obliteration_roundtrip() {
+        use crate::{
+            internal::{
+                layer::LayerStore,
+                obliteration::{ObliterationStore, is_tombstoned_cached, refresh_snapshot_result},
+            },
+            storage::runtime::init_redb_repository_storage,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dot_libra = tmp.path().join(".libra");
+        let _paths = init_redb_repository_storage(&dot_libra)
+            .await
+            .expect("init redb repo");
+        assert!(!dot_libra.join("libra.db").exists());
+        let _guard = ChangeDirGuard::new(tmp.path());
+
+        let main = WorktreeScope::Main;
+        let linked = WorktreeScope::Linked("wt-rb15".to_string());
+
+        // SparseViewStore round-trip on redb (no libra.db).
+        assert!(!SparseViewStore::is_enabled(&main).await);
+        SparseViewStore::replace(&main, &["src/**".to_string()])
+            .await
+            .expect("replace main sparse");
+        SparseViewStore::add(&main, &["!src/gen/**".to_string()])
+            .await
+            .expect("add main sparse");
+        SparseViewStore::replace(&linked, &["docs/**".to_string()])
+            .await
+            .expect("replace linked sparse");
+        assert!(SparseViewStore::is_enabled(&main).await);
+        assert_eq!(
+            SparseViewStore::list(&main).await.expect("list main"),
+            vec!["src/**", "!src/gen/**"]
+        );
+        assert_eq!(
+            SparseViewStore::list(&linked).await.expect("list linked"),
+            vec!["docs/**"]
+        );
+        let (snap_patterns, snap_enabled) = snapshot_for_storage(&dot_libra, &main)
+            .await
+            .expect("snapshot sparse");
+        assert!(snap_enabled);
+        assert_eq!(snap_patterns, vec!["src/**", "!src/gen/**"]);
+        SparseViewStore::clear(&main).await.expect("clear main");
+        assert!(!SparseViewStore::is_enabled(&main).await);
+        restore_for_storage(&dot_libra, &main, &snap_patterns, true)
+            .await
+            .expect("restore sparse");
+        assert!(SparseViewStore::is_enabled(&main).await);
+
+        // LayerStore round-trip on redb.
+        LayerStore::add(&main, "overlay-a", "/tmp/layer-src", 10, true)
+            .await
+            .expect("add layer");
+        assert!(
+            LayerStore::add(&main, "overlay-a", "/tmp/layer-src", 10, true)
+                .await
+                .is_err(),
+            "duplicate layer name must be rejected"
+        );
+        assert_eq!(LayerStore::list(&main).await.expect("list layers").len(), 1);
+        assert!(
+            LayerStore::set_enabled(&main, "overlay-a", false)
+                .await
+                .expect("disable layer")
+        );
+        assert!(
+            !LayerStore::get(&main, "overlay-a")
+                .await
+                .expect("get layer")
+                .expect("present")
+                .enabled
+        );
+        assert!(
+            LayerStore::remove(&main, "overlay-a")
+                .await
+                .expect("remove layer")
+        );
+        assert!(
+            LayerStore::list(&main)
+                .await
+                .expect("list after remove")
+                .is_empty()
+        );
+
+        // ObliterationStore round-trip & fence on redb.
+        let oid = git_internal::hash::ObjectHash::from_type_and_data(
+            git_internal::internal::object::types::ObjectType::Blob,
+            b"secret-payload-rb15",
+        );
+        assert!(!ObliterationStore::is_tombstoned(&oid).await);
+        ObliterationStore::begin_obliterating(
+            &oid,
+            Some("compliance"),
+            Some("tester"),
+            Some("cli"),
+        )
+        .await
+        .expect("begin obliterating");
+        assert!(ObliterationStore::is_tombstoned(&oid).await);
+        assert_eq!(
+            ObliterationStore::incomplete().await.expect("incomplete"),
+            vec![oid.to_string()]
+        );
+        refresh_snapshot_result().await.expect("refresh snapshot");
+        assert!(is_tombstoned_cached(&oid));
+        ObliterationStore::mark_obliterated(&oid)
+            .await
+            .expect("mark obliterated");
+        let tomb = ObliterationStore::lookup(&oid)
+            .await
+            .expect("lookup")
+            .expect("tombstone present");
+        assert!(!tomb.is_obliterating());
+        assert!(
+            ObliterationStore::incomplete()
+                .await
+                .expect("incomplete after finalize")
+                .is_empty()
+        );
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "pure redb RB-15 must never create libra.db"
+        );
     }
 }

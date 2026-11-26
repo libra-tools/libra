@@ -607,6 +607,97 @@ async fn resolve_ref(s: &str) -> Result<ObjectHash, NotesError> {
         .map_err(|e| NotesError::InvalidObject(s.to_string(), e))
 }
 
+/// Add a note directly against a [`crate::storage::GitStore`].
+pub async fn add_with_store(
+    store: &dyn crate::storage::GitStore,
+    notes_ref: &str,
+    object_str: &str,
+    note_hash: &str,
+    force: bool,
+) -> Result<AddNoteResult, NotesError> {
+    validate_notes_ref(notes_ref)?;
+    let outcome = store
+        .put_note(notes_ref, object_str, note_hash, force)
+        .await
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+    match outcome {
+        crate::storage::NoteWriteOutcome::AlreadyExists { .. } => Err(NotesError::AlreadyExists {
+            notes_ref: notes_ref.to_string(),
+            object: object_str.to_string(),
+        }),
+        _ => Ok(AddNoteResult {
+            notes_ref: notes_ref.to_string(),
+            object: object_str.to_string(),
+            note_hash: note_hash.to_string(),
+        }),
+    }
+}
+
+/// List notes directly from a [`crate::storage::GitStore`].
+pub async fn list_with_store(
+    store: &dyn crate::storage::GitStore,
+    notes_ref: &str,
+    object_str: Option<&str>,
+) -> Result<Vec<NoteEntry>, NotesError> {
+    validate_notes_ref(notes_ref)?;
+    if let Some(obj) = object_str {
+        let note = store
+            .get_note(notes_ref, obj)
+            .await
+            .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+        match note {
+            Some(rec) => Ok(vec![NoteEntry {
+                note_hash: Some(rec.blob),
+                annotated_object: rec.object,
+            }]),
+            None => Ok(vec![NoteEntry {
+                note_hash: None,
+                annotated_object: obj.to_string(),
+            }]),
+        }
+    } else {
+        let notes = store
+            .list_notes(notes_ref)
+            .await
+            .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+        Ok(notes
+            .into_iter()
+            .map(|rec| NoteEntry {
+                note_hash: Some(rec.blob),
+                annotated_object: rec.object,
+            })
+            .collect())
+    }
+}
+
+/// Remove a note directly from a [`crate::storage::GitStore`].
+pub async fn remove_with_store(
+    store: &dyn crate::storage::GitStore,
+    notes_ref: &str,
+    object_str: &str,
+) -> Result<String, NotesError> {
+    validate_notes_ref(notes_ref)?;
+    let existing = store
+        .get_note(notes_ref, object_str)
+        .await
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+        .ok_or_else(|| NotesError::NotFound {
+            notes_ref: notes_ref.to_string(),
+            object: object_str.to_string(),
+        })?;
+    let removed = store
+        .remove_note_cas(notes_ref, object_str, Some(&existing.blob))
+        .await
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+    if !removed {
+        return Err(NotesError::NotFound {
+            notes_ref: notes_ref.to_string(),
+            object: object_str.to_string(),
+        });
+    }
+    Ok(existing.blob)
+}
+
 /// Add a note to an object.
 ///
 /// Creates a blob from `message`, stores it in the object database, and
@@ -622,8 +713,6 @@ pub async fn add(
     let object_hash = resolve_object(Some(object)).await?;
     let object_str = object_hash.to_string();
 
-    let db = get_db_conn_instance().await;
-
     // Create and store the blob
     let blob = git_internal::internal::object::blob::Blob::from_content(message);
     let storage =
@@ -633,49 +722,58 @@ pub async fn add(
         .map_err(NotesError::StoreBlobFailed)?;
     let note_hash = blob.id.to_string();
 
-    if force {
-        // INSERT … ON CONFLICT DO UPDATE: atomic upsert — no check-then-act gap.
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?) \
-             ON CONFLICT(notes_ref, object) DO UPDATE SET blob = excluded.blob",
-            [
-                notes_ref.into(),
-                object_str.clone().into(),
-                note_hash.clone().into(),
-            ],
-        ))
-        .await?;
-    } else {
-        // INSERT OR IGNORE: if the row already exists the statement is a
-        // no-op and rows_affected() returns 0, so we detect the conflict
-        // without a separate query that could land on a different pooled
-        // connection.
-        let result = db
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "INSERT OR IGNORE INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)",
-                [
-                    notes_ref.into(),
-                    object_str.clone().into(),
-                    note_hash.clone().into(),
-                ],
-            ))
-            .await?;
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+            add_with_store(store.as_ref(), notes_ref, &object_str, &note_hash, force).await
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
 
-        if result.rows_affected() == 0 {
-            return Err(NotesError::AlreadyExists {
+            if force {
+                db.execute_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?) \
+                     ON CONFLICT(notes_ref, object) DO UPDATE SET blob = excluded.blob",
+                    [
+                        notes_ref.into(),
+                        object_str.clone().into(),
+                        note_hash.clone().into(),
+                    ],
+                ))
+                .await?;
+            } else {
+                let result = db
+                    .execute_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "INSERT OR IGNORE INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)",
+                        [
+                            notes_ref.into(),
+                            object_str.clone().into(),
+                            note_hash.clone().into(),
+                        ],
+                    ))
+                    .await?;
+
+                if result.rows_affected() == 0 {
+                    return Err(NotesError::AlreadyExists {
+                        notes_ref: notes_ref.to_string(),
+                        object: object_str,
+                    });
+                }
+            }
+
+            Ok(AddNoteResult {
                 notes_ref: notes_ref.to_string(),
                 object: object_str,
-            });
+                note_hash,
+            })
         }
     }
-
-    Ok(AddNoteResult {
-        notes_ref: notes_ref.to_string(),
-        object: object_str,
-        note_hash,
-    })
 }
 
 /// List notes in a notes ref.
@@ -684,46 +782,61 @@ pub async fn add(
 /// When `None`, returns all notes in the given notes ref.
 pub async fn list(notes_ref: &str, object: Option<&str>) -> Result<Vec<NoteEntry>, NotesError> {
     validate_notes_ref(notes_ref)?;
-    let db = get_db_conn_instance().await;
+    let resolved_opt = match object {
+        Some(obj) => Some(resolve_object(Some(obj)).await?.to_string()),
+        None => None,
+    };
 
-    if let Some(obj) = object {
-        let resolved = resolve_object(Some(obj)).await?;
-        let obj_str = resolved.to_string();
-        let rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "SELECT blob, object FROM notes WHERE notes_ref = ? AND object = ?",
-                [notes_ref.into(), obj_str.clone().into()],
-            ))
-            .await?;
-        if rows.is_empty() {
-            return Ok(vec![NoteEntry {
-                note_hash: None,
-                annotated_object: obj_str,
-            }]);
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+            list_with_store(store.as_ref(), notes_ref, resolved_opt.as_deref()).await
         }
-        Ok(rows
-            .iter()
-            .map(|row| NoteEntry {
-                note_hash: Some(row.try_get::<String>("", "blob").unwrap_or_default()),
-                annotated_object: row.try_get::<String>("", "object").unwrap_or_default(),
-            })
-            .collect())
-    } else {
-        let rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "SELECT blob, object FROM notes WHERE notes_ref = ?",
-                [notes_ref.into()],
-            ))
-            .await?;
-        Ok(rows
-            .iter()
-            .map(|row| NoteEntry {
-                note_hash: Some(row.try_get::<String>("", "blob").unwrap_or_default()),
-                annotated_object: row.try_get::<String>("", "object").unwrap_or_default(),
-            })
-            .collect())
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+
+            if let Some(obj_str) = resolved_opt {
+                let rows = db
+                    .query_all_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "SELECT blob, object FROM notes WHERE notes_ref = ? AND object = ?",
+                        [notes_ref.into(), obj_str.clone().into()],
+                    ))
+                    .await?;
+                if rows.is_empty() {
+                    return Ok(vec![NoteEntry {
+                        note_hash: None,
+                        annotated_object: obj_str,
+                    }]);
+                }
+                Ok(rows
+                    .iter()
+                    .map(|row| NoteEntry {
+                        note_hash: Some(row.try_get::<String>("", "blob").unwrap_or_default()),
+                        annotated_object: row.try_get::<String>("", "object").unwrap_or_default(),
+                    })
+                    .collect())
+            } else {
+                let rows = db
+                    .query_all_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "SELECT blob, object FROM notes WHERE notes_ref = ?",
+                        [notes_ref.into()],
+                    ))
+                    .await?;
+                Ok(rows
+                    .iter()
+                    .map(|row| NoteEntry {
+                        note_hash: Some(row.try_get::<String>("", "blob").unwrap_or_default()),
+                        annotated_object: row.try_get::<String>("", "object").unwrap_or_default(),
+                    })
+                    .collect())
+            }
+        }
     }
 }
 
@@ -736,13 +849,33 @@ pub async fn show(
     let obj_hash = resolve_object(object).await?;
     let obj_str = obj_hash.to_string();
 
-    let db = get_db_conn_instance().await;
-    let blob_hash = find_note_blob(&db, notes_ref, &obj_str)
-        .await?
-        .ok_or_else(|| NotesError::NotFound {
-            notes_ref: notes_ref.to_string(),
-            object: obj_str.clone(),
-        })?;
+    let blob_hash = match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?;
+            store
+                .get_note(notes_ref, &obj_str)
+                .await
+                .map_err(|err| NotesError::from(DbErr::Custom(err.to_string())))?
+                .map(|r| r.blob)
+                .ok_or_else(|| NotesError::NotFound {
+                    notes_ref: notes_ref.to_string(),
+                    object: obj_str.clone(),
+                })?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            find_note_blob(&db, notes_ref, &obj_str)
+                .await?
+                .ok_or_else(|| NotesError::NotFound {
+                    notes_ref: notes_ref.to_string(),
+                    object: obj_str.clone(),
+                })?
+        }
+    };
 
     // Load the blob to get the text
     let blob_hash_parsed = crate::internal::object_format::parse_repo_oid(&blob_hash)

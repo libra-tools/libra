@@ -64,27 +64,56 @@ impl LayerStore {
     /// method takes the request's ONE resolved [`WorktreeScope`] — the same
     /// layer name may exist independently in different worktrees.
     pub async fn list(scope: &WorktreeScope) -> Result<Vec<Layer>, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let stmt = Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT name, source, priority, enabled FROM layer \
-             WHERE worktree_id = ? ORDER BY priority ASC, name ASC",
-            [scope.storage_key().into()],
-        );
-        let rows = db
-            .query_all_raw(stmt)
-            .await
-            .map_err(|e| format!("failed to list layers: {e}"))?;
-        let mut layers = Vec::with_capacity(rows.len());
-        for row in rows {
-            layers.push(Layer {
-                name: row.try_get_by_index(0).map_err(|e| e.to_string())?,
-                source: row.try_get_by_index(1).map_err(|e| e.to_string())?,
-                priority: row.try_get_by_index(2).map_err(|e| e.to_string())?,
-                enabled: row.try_get_by_index::<i32>(3).map_err(|e| e.to_string())? != 0,
-            });
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to open repository state store: {e}"))?;
+                let mut rows = store
+                    .list_layers(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to list layers: {e}"))?;
+                rows.sort_by(|a, b| {
+                    a.priority
+                        .cmp(&b.priority)
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+                Ok(rows
+                    .into_iter()
+                    .map(|r| Layer {
+                        name: r.name,
+                        source: r.source,
+                        priority: r.priority,
+                        enabled: r.enabled,
+                    })
+                    .collect())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT name, source, priority, enabled FROM layer \
+                     WHERE worktree_id = ? ORDER BY priority ASC, name ASC",
+                    [scope.storage_key().into()],
+                );
+                let rows = db
+                    .query_all_raw(stmt)
+                    .await
+                    .map_err(|e| format!("failed to list layers: {e}"))?;
+                let mut layers = Vec::with_capacity(rows.len());
+                for row in rows {
+                    layers.push(Layer {
+                        name: row.try_get_by_index(0).map_err(|e| e.to_string())?,
+                        source: row.try_get_by_index(1).map_err(|e| e.to_string())?,
+                        priority: row.try_get_by_index(2).map_err(|e| e.to_string())?,
+                        enabled: row.try_get_by_index::<i32>(3).map_err(|e| e.to_string())? != 0,
+                    });
+                }
+                Ok(layers)
+            }
         }
-        Ok(layers)
     }
 
     /// Register a new layer in `scope`. Duplicate names (within the scope)
@@ -96,28 +125,59 @@ impl LayerStore {
         priority: i64,
         enabled: bool,
     ) -> Result<(), String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO layer (worktree_id, name, source, priority, enabled) \
-             VALUES (?, ?, ?, ?, ?)",
-            [
-                scope.storage_key().into(),
-                name.into(),
-                source.into(),
-                priority.into(),
-                (if enabled { 1 } else { 0 }).into(),
-            ],
-        ))
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("UNIQUE") {
-                format!("a layer named '{name}' already exists")
-            } else {
-                format!("failed to add layer: {e}")
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open repository state store: {e}"))?;
+                let existing = store
+                    .list_layers(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to check existing layers: {e}"))?;
+                if existing.iter().any(|l| l.name == name) {
+                    return Err(format!("a layer named '{name}' already exists"));
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                store
+                    .upsert_layer(&crate::storage::git_state_store::LayerRecord {
+                        worktree_id: scope.storage_key().to_string(),
+                        name: name.to_string(),
+                        source: source.to_string(),
+                        priority,
+                        enabled,
+                        created_at: now.clone(),
+                        updated_at: now,
+                    })
+                    .await
+                    .map_err(|e| format!("failed to add layer: {e}"))
             }
-        })?;
-        Ok(())
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO layer (worktree_id, name, source, priority, enabled) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    [
+                        scope.storage_key().into(),
+                        name.into(),
+                        source.into(),
+                        priority.into(),
+                        (if enabled { 1 } else { 0 }).into(),
+                    ],
+                ))
+                .await
+                .map_err(|e| {
+                    if e.to_string().contains("UNIQUE") {
+                        format!("a layer named '{name}' already exists")
+                    } else {
+                        format!("failed to add layer: {e}")
+                    }
+                })?;
+                Ok(())
+            }
+        }
     }
 
     /// Look up one layer by name within `scope`.
@@ -134,45 +194,85 @@ impl LayerStore {
         name: &str,
         enabled: bool,
     ) -> Result<bool, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let result = db
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE layer SET enabled = ?, updated_at = CURRENT_TIMESTAMP \
-                 WHERE worktree_id = ? AND name = ?",
-                [
-                    (if enabled { 1 } else { 0 }).into(),
-                    scope.storage_key().into(),
-                    name.into(),
-                ],
-            ))
-            .await
-            .map_err(|e| format!("failed to update layer: {e}"))?;
-        Ok(result.rows_affected() > 0)
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open repository state store: {e}"))?;
+                let existing = store
+                    .list_layers(scope.storage_key())
+                    .await
+                    .map_err(|e| format!("failed to read layers: {e}"))?;
+                let Some(mut rec) = existing.into_iter().find(|l| l.name == name) else {
+                    return Ok(false);
+                };
+                rec.enabled = enabled;
+                rec.updated_at = chrono::Utc::now().to_rfc3339();
+                store
+                    .upsert_layer(&rec)
+                    .await
+                    .map_err(|e| format!("failed to update layer: {e}"))?;
+                Ok(true)
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let result = db
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "UPDATE layer SET enabled = ?, updated_at = CURRENT_TIMESTAMP \
+                         WHERE worktree_id = ? AND name = ?",
+                        [
+                            (if enabled { 1 } else { 0 }).into(),
+                            scope.storage_key().into(),
+                            name.into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(|e| format!("failed to update layer: {e}"))?;
+                Ok(result.rows_affected() > 0)
+            }
+        }
     }
 
     /// Remove a layer registration and its path records within `scope` (the
     /// caller unapplies the materialized files first).
     pub async fn remove(scope: &WorktreeScope, name: &str) -> Result<bool, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let txn = db.begin().await.map_err(|e| e.to_string())?;
-        txn.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM layer_path WHERE worktree_id = ? AND layer_name = ?",
-            [scope.storage_key().into(), name.into()],
-        ))
-        .await
-        .map_err(|e| format!("failed to clear layer paths: {e}"))?;
-        let result = txn
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "DELETE FROM layer WHERE worktree_id = ? AND name = ?",
-                [scope.storage_key().into(), name.into()],
-            ))
-            .await
-            .map_err(|e| format!("failed to remove layer: {e}"))?;
-        txn.commit().await.map_err(|e| e.to_string())?;
-        Ok(result.rows_affected() > 0)
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open repository state store: {e}"))?;
+                store
+                    .delete_layer(scope.storage_key(), name)
+                    .await
+                    .map_err(|e| format!("failed to remove layer: {e}"))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let txn = db.begin().await.map_err(|e| e.to_string())?;
+                txn.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM layer_path WHERE worktree_id = ? AND layer_name = ?",
+                    [scope.storage_key().into(), name.into()],
+                ))
+                .await
+                .map_err(|e| format!("failed to clear layer paths: {e}"))?;
+                let result = txn
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "DELETE FROM layer WHERE worktree_id = ? AND name = ?",
+                        [scope.storage_key().into(), name.into()],
+                    ))
+                    .await
+                    .map_err(|e| format!("failed to remove layer: {e}"))?;
+                txn.commit().await.map_err(|e| e.to_string())?;
+                Ok(result.rows_affected() > 0)
+            }
+        }
     }
 
     /// Every overlay path currently materialized in `scope` (repo-relative,
@@ -182,28 +282,51 @@ impl LayerStore {
     pub async fn materialized_paths(
         scope: &WorktreeScope,
     ) -> Result<Vec<MaterializedPath>, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let stmt = Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT layer_name, path, content_hash FROM layer_path WHERE worktree_id = ?",
-            [scope.storage_key().into()],
-        );
-        let rows = match db.query_all_raw(stmt).await {
-            Ok(rows) => rows,
-            // Absence-tolerant: before the migration created the table (or on
-            // an old binary), there are simply no materialized paths.
-            Err(e) if e.to_string().contains("no such table") => return Ok(Vec::new()),
-            Err(e) => return Err(format!("failed to list layer paths: {e}")),
-        };
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            out.push(MaterializedPath {
-                layer_name: row.try_get_by_index(0).map_err(|e| e.to_string())?,
-                path: row.try_get_by_index(1).map_err(|e| e.to_string())?,
-                content_hash: row.try_get_by_index(2).map_err(|e| e.to_string())?,
-            });
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to open repository state store: {e}"))?;
+                let rows = store
+                    .list_layer_paths(scope.storage_key(), None)
+                    .await
+                    .map_err(|e| format!("failed to list layer paths: {e}"))?;
+                Ok(rows
+                    .into_iter()
+                    .map(|r| MaterializedPath {
+                        layer_name: r.layer_name,
+                        path: r.path,
+                        content_hash: r.content_hash,
+                    })
+                    .collect())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT layer_name, path, content_hash FROM layer_path WHERE worktree_id = ?",
+                    [scope.storage_key().into()],
+                );
+                let rows = match db.query_all_raw(stmt).await {
+                    Ok(rows) => rows,
+                    // Absence-tolerant: before the migration created the table (or on
+                    // an old binary), there are simply no materialized paths.
+                    Err(e) if e.to_string().contains("no such table") => return Ok(Vec::new()),
+                    Err(e) => return Err(format!("failed to list layer paths: {e}")),
+                };
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(MaterializedPath {
+                        layer_name: row.try_get_by_index(0).map_err(|e| e.to_string())?,
+                        path: row.try_get_by_index(1).map_err(|e| e.to_string())?,
+                        content_hash: row.try_get_by_index(2).map_err(|e| e.to_string())?,
+                    });
+                }
+                Ok(out)
+            }
         }
-        Ok(out)
     }
 
     /// The set of layer-owned paths in `scope` as a fast lookup (for the
@@ -226,33 +349,53 @@ impl LayerStore {
     /// overlays are protected", so it would remove files only a re-apply could
     /// restore. A destructive caller has to be able to see the failure.
     pub async fn owned_path_set_strict(scope: &WorktreeScope) -> Result<HashSet<String>, String> {
-        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|error| {
+                        format!("failed to read layer ownership for this worktree: {error}")
+                    })?;
+                let rows = store
+                    .list_layer_paths(scope.storage_key(), None)
+                    .await
+                    .map_err(|error| {
+                        format!("failed to read layer ownership for this worktree: {error}")
+                    })?;
+                Ok(rows.into_iter().map(|r| r.path).collect())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        // NOT `materialized_paths`, which is absence-tolerant: a missing
-        // `layer_path` table there means "no overlays" so an old binary or a
-        // pre-migration database does not break `status`. For a DESTRUCTIVE
-        // caller that same answer is indistinguishable from "nothing is
-        // protected", so every error — including the missing table — is
-        // propagated and `clean` refuses.
-        let rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT path FROM layer_path WHERE worktree_id = ?",
-                [scope.storage_key().into()],
-            ))
-            .await
-            .map_err(|error| {
-                format!("failed to read layer ownership for this worktree: {error}")
-            })?;
-        let mut out = HashSet::with_capacity(rows.len());
-        for row in rows {
-            out.insert(
-                row.try_get_by_index::<String>(0)
-                    .map_err(|error| format!("failed to read a layer path: {error}"))?,
-            );
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                // NOT `materialized_paths`, which is absence-tolerant: a missing
+                // `layer_path` table there means "no overlays" so an old binary or a
+                // pre-migration database does not break `status`. For a DESTRUCTIVE
+                // caller that same answer is indistinguishable from "nothing is
+                // protected", so every error — including the missing table — is
+                // propagated and `clean` refuses.
+                let rows = db
+                    .query_all_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "SELECT path FROM layer_path WHERE worktree_id = ?",
+                        [scope.storage_key().into()],
+                    ))
+                    .await
+                    .map_err(|error| {
+                        format!("failed to read layer ownership for this worktree: {error}")
+                    })?;
+                let mut out = HashSet::with_capacity(rows.len());
+                for row in rows {
+                    out.insert(
+                        row.try_get_by_index::<String>(0)
+                            .map_err(|error| format!("failed to read a layer path: {error}"))?,
+                    );
+                }
+                Ok(out)
+            }
         }
-        Ok(out)
     }
 }
 
@@ -468,32 +611,58 @@ impl LayerStore {
         scope: &WorktreeScope,
         records: &[MaterializedPath],
     ) -> Result<(), String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        let txn = db.begin().await.map_err(|e| e.to_string())?;
-        txn.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM layer_path WHERE worktree_id = ?",
-            [scope.storage_key().into()],
-        ))
-        .await
-        .map_err(|e| format!("failed to clear layer paths: {e}"))?;
-        for record in records {
-            txn.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash) \
-                 VALUES (?, ?, ?, ?)",
-                [
-                    scope.storage_key().into(),
-                    record.layer_name.as_str().into(),
-                    record.path.as_str().into(),
-                    record.content_hash.as_str().into(),
-                ],
-            ))
-            .await
-            .map_err(|e| format!("failed to record layer path: {e}"))?;
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to open repository state store: {e}"))?;
+                let now = chrono::Utc::now().to_rfc3339();
+                let recs: Vec<crate::storage::git_state_store::LayerPathRecord> = records
+                    .iter()
+                    .map(|r| crate::storage::git_state_store::LayerPathRecord {
+                        worktree_id: scope.storage_key().to_string(),
+                        layer_name: r.layer_name.clone(),
+                        path: r.path.clone(),
+                        content_hash: r.content_hash.clone(),
+                        materialized_at: now.clone(),
+                    })
+                    .collect();
+                store
+                    .replace_layer_paths(scope.storage_key(), &recs)
+                    .await
+                    .map_err(|e| format!("failed to record layer paths: {e}"))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked().await?;
+                let txn = db.begin().await.map_err(|e| e.to_string())?;
+                txn.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM layer_path WHERE worktree_id = ?",
+                    [scope.storage_key().into()],
+                ))
+                .await
+                .map_err(|e| format!("failed to clear layer paths: {e}"))?;
+                for record in records {
+                    txn.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash) \
+                         VALUES (?, ?, ?, ?)",
+                        [
+                            scope.storage_key().into(),
+                            record.layer_name.as_str().into(),
+                            record.path.as_str().into(),
+                            record.content_hash.as_str().into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(|e| format!("failed to record layer path: {e}"))?;
+                }
+                txn.commit().await.map_err(|e| e.to_string())?;
+                Ok(())
+            }
         }
-        txn.commit().await.map_err(|e| e.to_string())?;
-        Ok(())
     }
 }
 

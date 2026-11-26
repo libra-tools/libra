@@ -1760,7 +1760,11 @@ impl GitStateStore for SqliteGitStateStore {
     ) -> StorageResult<OperationHeadConvergeOutcome> {
         self.ensure_writable()?;
         validate_operation_record(op, parent_op_ids)?;
-        validate_non_empty_identifier(scope_key, "operation_head scope_key")?;
+        if scope_key.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "operation_head scope_key must not contain NUL bytes".to_string(),
+            });
+        }
         if let Some(jrn) = journal {
             validate_operation_journal(jrn)?;
             if jrn.op_id != op.op_id {
@@ -1850,6 +1854,79 @@ impl GitStateStore for SqliteGitStateStore {
                 "commit update_operation_status",
                 err,
             )
+        })?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn update_operation_args_digest(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        args_digest: &str,
+    ) -> StorageResult<bool> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(repo_id, "operation repo_id")?;
+        validate_non_empty_identifier(op_id, "operation op_id")?;
+        validate_no_nul(args_digest, "operation args_digest")?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin update_operation_args_digest",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let res = txn
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE operation SET args_digest = ? WHERE repo_id = ? AND op_id = ?",
+                [args_digest.into(), repo_id.into(), op_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "update operation args_digest",
+                    err,
+                )
+            })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit update_operation_args_digest",
+                err,
+            )
+        })?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn delete_operation(&self, repo_id: &str, op_id: &str) -> StorageResult<bool> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(repo_id, "operation repo_id")?;
+        validate_non_empty_identifier(op_id, "operation op_id")?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "begin delete_operation", err)
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM operation_parent WHERE op_id = ?",
+            [op_id.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "delete operation_parent", err)
+        })?;
+        let res = txn
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM operation WHERE repo_id = ? AND op_id = ?",
+                [repo_id.into(), op_id.into()],
+            ))
+            .await
+            .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "delete operation", err))?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "commit delete_operation", err)
         })?;
         Ok(res.rows_affected() > 0)
     }
@@ -2022,6 +2099,24 @@ impl GitStateStore for SqliteGitStateStore {
         rows.iter().map(decode_operation_journal).collect()
     }
 
+    async fn list_all_operation_journals(&self) -> StorageResult<Vec<OperationJournalRecord>> {
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT journal_id, op_id, phase, pre_view_oid, target_view_oid, owner, \
+                        updated_at, recovery_payload \
+                 FROM operation_journal ORDER BY updated_at ASC, journal_id ASC",
+                [],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list all operation_journal", err)
+            })?;
+        rows.iter().map(decode_operation_journal).collect()
+    }
+
     async fn delete_operation_journal(&self, journal_id: &str) -> StorageResult<bool> {
         self.ensure_writable()?;
         validate_non_empty_identifier(journal_id, "operation_journal journal_id")?;
@@ -2053,13 +2148,37 @@ impl GitStateStore for SqliteGitStateStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn list_all_operation_heads(&self, repo_id: &str) -> StorageResult<Vec<String>> {
+        validate_non_empty_identifier(repo_id, "operation_head repo_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT DISTINCT op_id FROM operation_head \
+                 WHERE repo_id = ? AND op_id <> ? ORDER BY op_id ASC",
+                [repo_id.into(), OP_HEAD_GENERATION_SENTINEL.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list all operation_head", err)
+            })?;
+        rows.iter()
+            .map(|row| col(row, 0, "operation_head.op_id"))
+            .collect()
+    }
+
     async fn get_operation_heads(
         &self,
         repo_id: &str,
         scope_key: &str,
     ) -> StorageResult<OperationHeadsSnapshot> {
         validate_non_empty_identifier(repo_id, "operation_head repo_id")?;
-        validate_non_empty_identifier(scope_key, "operation_head scope_key")?;
+        if scope_key.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "operation_head scope_key must not contain NUL bytes".to_string(),
+            });
+        }
         query_operation_heads_in_conn(&self.conn, repo_id, scope_key).await
     }
 
@@ -2073,7 +2192,11 @@ impl GitStateStore for SqliteGitStateStore {
     ) -> StorageResult<OperationHeadCasOutcome> {
         self.ensure_writable()?;
         validate_non_empty_identifier(repo_id, "operation_head repo_id")?;
-        validate_non_empty_identifier(scope_key, "operation_head scope_key")?;
+        if scope_key.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "operation_head scope_key must not contain NUL bytes".to_string(),
+            });
+        }
         let expected = normalize_op_heads(expected_heads)?;
         let replacement = normalize_op_heads(new_heads)?;
 
@@ -2122,7 +2245,11 @@ impl GitStateStore for SqliteGitStateStore {
     ) -> StorageResult<OperationHeadConvergeOutcome> {
         self.ensure_writable()?;
         validate_non_empty_identifier(repo_id, "operation_head repo_id")?;
-        validate_non_empty_identifier(scope_key, "operation_head scope_key")?;
+        if scope_key.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "operation_head scope_key must not contain NUL bytes".to_string(),
+            });
+        }
         let expected = normalize_op_heads(expected_heads)?;
         let replacement = normalize_op_heads(replacement_heads)?;
 
@@ -2493,6 +2620,41 @@ impl GitStateStore for SqliteGitStateStore {
         rows.iter().map(decode_ai_operation_link).collect()
     }
 
+    async fn delete_pending_ai_operation_link(&self, operation_id: &str) -> StorageResult<bool> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(operation_id, "ai_operation_link operation_id")?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin delete_pending_ai_operation_link",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let res = txn
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM ai_operation_link WHERE operation_id = ? AND change_id IS NULL",
+                [operation_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "delete pending ai_operation_link",
+                    err,
+                )
+            })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit delete_pending_ai_operation_link",
+                err,
+            )
+        })?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn replace_working_dirty_snapshot(
         &self,
         meta: &WorkingDirtyMetaRecord,
@@ -2782,6 +2944,49 @@ impl GitStateStore for SqliteGitStateStore {
         .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "upsert layer_path", err))?;
         txn.commit().await.map_err(|err| {
             map_sqlite_db_err(DatabaseRole::Repository, "commit upsert_layer_path", err)
+        })
+    }
+
+    async fn replace_layer_paths(
+        &self,
+        worktree_id: &str,
+        records: &[LayerPathRecord],
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_no_nul(worktree_id, "layer_path worktree_id")?;
+        for rec in records {
+            validate_layer_path_record(rec)?;
+        }
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "begin replace_layer_paths", err)
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM layer_path WHERE worktree_id = ?",
+            [worktree_id.into()],
+        ))
+        .await
+        .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "clear layer_path", err))?;
+        for record in records {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO layer_path \
+                 (worktree_id, layer_name, path, content_hash, materialized_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+                [
+                    worktree_id.into(),
+                    record.layer_name.clone().into(),
+                    record.path.clone().into(),
+                    record.content_hash.clone().into(),
+                    record.materialized_at.clone().into(),
+                ],
+            ))
+            .await
+            .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "insert layer_path", err))?;
+        }
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "commit replace_layer_paths", err)
         })
     }
 

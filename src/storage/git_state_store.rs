@@ -2021,6 +2021,13 @@ pub trait GitStateStore: Send + Sync + fmt::Debug {
         post_view_oid: Option<&str>,
         end_ts: Option<i64>,
     ) -> StorageResult<bool>;
+    async fn update_operation_args_digest(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        args_digest: &str,
+    ) -> StorageResult<bool>;
+    async fn delete_operation(&self, repo_id: &str, op_id: &str) -> StorageResult<bool>;
     async fn get_operation(
         &self,
         repo_id: &str,
@@ -2036,6 +2043,7 @@ pub trait GitStateStore: Send + Sync + fmt::Debug {
         &self,
         op_id: &str,
     ) -> StorageResult<Vec<OperationJournalRecord>>;
+    async fn list_all_operation_journals(&self) -> StorageResult<Vec<OperationJournalRecord>>;
     async fn delete_operation_journal(&self, journal_id: &str) -> StorageResult<bool>;
 
     async fn get_operation_heads(
@@ -2043,6 +2051,7 @@ pub trait GitStateStore: Send + Sync + fmt::Debug {
         repo_id: &str,
         scope_key: &str,
     ) -> StorageResult<OperationHeadsSnapshot>;
+    async fn list_all_operation_heads(&self, repo_id: &str) -> StorageResult<Vec<String>>;
     async fn cas_update_operation_heads(
         &self,
         repo_id: &str,
@@ -2103,6 +2112,7 @@ pub trait GitStateStore: Send + Sync + fmt::Debug {
         repo_id: &str,
         change_id: &str,
     ) -> StorageResult<Vec<AiOperationLinkRecord>>;
+    async fn delete_pending_ai_operation_link(&self, operation_id: &str) -> StorageResult<bool>;
 
     // -------------------------------------------------------------------------
     // AC5: Dirty Cache, Layers & Sparse View (6 worktree-scoped tables)
@@ -2130,6 +2140,11 @@ pub trait GitStateStore: Send + Sync + fmt::Debug {
     async fn list_layers(&self, worktree_id: &str) -> StorageResult<Vec<LayerRecord>>;
     async fn delete_layer(&self, worktree_id: &str, name: &str) -> StorageResult<bool>;
     async fn upsert_layer_path(&self, record: &LayerPathRecord) -> StorageResult<()>;
+    async fn replace_layer_paths(
+        &self,
+        worktree_id: &str,
+        records: &[LayerPathRecord],
+    ) -> StorageResult<()>;
     async fn list_layer_paths(
         &self,
         worktree_id: &str,

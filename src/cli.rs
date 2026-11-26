@@ -109,58 +109,117 @@ static CLI_INVOCATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 ///   panic.
 /// - Currently accepts only `"sha1"` and `"sha256"`; anything else is rejected with a
 ///   fatal error.
-async fn set_local_hash_kind_for_storage(storage: &Path) -> CliResult<()> {
-    let db_path = storage.join(utils::util::DATABASE);
-    if !db_path.exists() {
-        return Err(CliError::fatal(format!(
-            "repository database not found at '{}'",
-            db_path.display()
-        )));
-    }
+///
+/// Route CLI backend selection and manifest/migration validation through
+/// `crate::storage::backend::StorageBackendKind::resolve` (`RB-16` AC5–AC6).
+///
+/// Before `RB-29a` unlocks `REDB_RUNTIME_UNLOCKED`, any request asking for
+/// `LIBRA_STORAGE_BACKEND=redb` (or targeting a `redb` repo through the
+/// production CLI entry) returns `LBR-CLI-003` (`CliInvalidArguments`).
+pub(crate) fn resolve_cli_storage_backend(
+    storage: Option<&Path>,
+) -> CliResult<crate::storage::StorageBackendKind> {
+    let result = match storage {
+        Some(path) => crate::storage::backend::StorageBackendKind::resolve(path),
+        None => crate::storage::backend::StorageBackendKind::resolve_without_repo(),
+    };
+    result.map_err(CliError::from)
+}
 
-    let db_conn = db::get_db_conn_instance_for_path(&db_path)
-        .await
-        .map_err(|e| {
-            CliError::fatal(format!(
-                "failed to open repository database '{}': {}",
-                db_path.display(),
-                e
-            ))
-        })?;
-    let object_format = ConfigKv::get_with_conn(&db_conn, "core.objectformat")
-        .await
-        .map_err(|e| {
-            CliError::fatal(format!(
-                "failed to read core.objectformat from repository database '{}': {}",
-                db_path.display(),
-                e
-            ))
-        })?
-        .map(|e| e.value)
-        .unwrap_or_else(|| "sha1".to_string());
+async fn set_local_hash_kind_for_storage(storage: &Path) -> CliResult<()> {
+    let backend = crate::storage::runtime::detect_repo_backend(storage).map_err(CliError::from)?;
+    let object_format = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_repo_config_store_read_only(storage)
+                .await
+                .map_err(CliError::from)?;
+            ConfigKv::get_with_store(&*store, "core.objectformat")
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to read core.objectformat from repository store '{}': {}",
+                        storage.display(),
+                        e
+                    ))
+                })?
+                .map(|e| e.value)
+                .unwrap_or_else(|| "sha1".to_string())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = storage.join(utils::util::DATABASE);
+            if !db_path.exists() {
+                return Err(CliError::fatal(format!(
+                    "repository database not found at '{}'",
+                    db_path.display()
+                )));
+            }
+
+            let db_conn = db::get_db_conn_instance_for_path(&db_path)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to open repository database '{}': {}",
+                        db_path.display(),
+                        e
+                    ))
+                })?;
+            ConfigKv::get_with_conn(&db_conn, "core.objectformat")
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to read core.objectformat from repository database '{}': {}",
+                        db_path.display(),
+                        e
+                    ))
+                })?
+                .map(|e| e.value)
+                .unwrap_or_else(|| "sha1".to_string())
+        }
+    };
 
     set_hash_kind_from_object_format(object_format)
 }
 
 async fn set_local_hash_kind_for_storage_without_schema_guard(storage: &Path) -> CliResult<()> {
-    let db_path = storage.join(utils::util::DATABASE);
-    if !db_path.exists() {
-        return Err(CliError::fatal(format!(
-            "repository database not found at '{}'",
-            db_path.display()
-        )));
-    }
+    let backend = crate::storage::runtime::detect_repo_backend(storage).map_err(CliError::from)?;
+    let object_format = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_repo_config_store_read_only(storage)
+                .await
+                .map_err(CliError::from)?;
+            ConfigKv::get_with_store(&*store, "core.objectformat")
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to read core.objectformat from repository store '{}': {}",
+                        storage.display(),
+                        e
+                    ))
+                })?
+                .map(|e| e.value)
+                .unwrap_or_else(|| "sha1".to_string())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = storage.join(utils::util::DATABASE);
+            if !db_path.exists() {
+                return Err(CliError::fatal(format!(
+                    "repository database not found at '{}'",
+                    db_path.display()
+                )));
+            }
 
-    let db_conn = db::open_database_without_migrations(&db_path)
-        .await
-        .map_err(|e| {
-            CliError::fatal(format!(
-                "failed to open repository database '{}': {}",
-                db_path.display(),
-                e
-            ))
-        })?;
-    let object_format = read_schema_free_object_format(&db_conn, &db_path).await?;
+            let db_conn = db::open_database_without_migrations(&db_path)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to open repository database '{}': {}",
+                        db_path.display(),
+                        e
+                    ))
+                })?;
+            read_schema_free_object_format(&db_conn, &db_path).await?
+        }
+    };
 
     set_hash_kind_from_object_format(object_format)
 }
@@ -3949,6 +4008,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     let require_complete_object_index = command_requires_complete_object_index(&args.command);
     enforce_sparse_checkout_guard(&args.command).await?;
     let preflight = command_preflight(&args.command, args.json.is_some() || args.machine)?;
+    // RB-16 AC5–AC6: route backend resolution, `finalized == false` check, and
+    // pre-unlock `LBR-CLI-003` gate through `crate::storage::backend`.
+    let _active_storage_backend = resolve_cli_storage_backend(preflight.storage.as_deref())?;
     // ADR-IG-04 (issue #487): an interrupted Git conversion leaves a
     // valid-looking but history-less repository. Refuse every command except
     // `init` (which owns the retry) instead of presenting it as empty.

@@ -281,7 +281,7 @@ fn classify_rb05_table_layout(existing: &[String]) -> StorageResult<bool> {
     }
 }
 
-fn initialize_rb05_state_tables(wtx: &WriteTransaction) -> StorageResult<()> {
+pub(crate) fn initialize_rb05_state_tables(wtx: &WriteTransaction) -> StorageResult<()> {
     let _ = wtx
         .open_table(SEQUENCE_STATE_TABLE)
         .map_err(|err| map_redb_table_err(err, "init sequence_state"))?;
@@ -411,7 +411,7 @@ fn classify_rb05b_table_layout(existing: &[String]) -> StorageResult<bool> {
     }
 }
 
-fn initialize_rb05b_state_tables(wtx: &WriteTransaction) -> StorageResult<()> {
+pub(crate) fn initialize_rb05b_state_tables(wtx: &WriteTransaction) -> StorageResult<()> {
     let _ = wtx
         .open_table(AI_THREAD_TABLE)
         .map_err(|err| map_redb_table_err(err, "init ai_thread"))?;
@@ -1891,7 +1891,11 @@ impl GitStateStore for RedbGitStateStore {
         replacement_heads: &[String],
     ) -> StorageResult<OperationHeadConvergeOutcome> {
         validate_operation_record(op, parent_op_ids)?;
-        validate_non_empty_identifier(scope_key, "operation_head scope_key")?;
+        if scope_key.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "operation_head scope_key must not contain NUL bytes".to_string(),
+            });
+        }
         if let Some(jrn) = journal {
             validate_operation_journal(jrn)?;
             if jrn.op_id != op.op_id {
@@ -2000,6 +2004,102 @@ impl GitStateStore for RedbGitStateStore {
                 .insert(op_owned.as_str(), bytes.as_slice())
                 .map_err(|err| map_redb_storage_err(err, "update operation"))?;
             Ok((true, true))
+        })
+        .await
+    }
+
+    async fn update_operation_args_digest(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        args_digest: &str,
+    ) -> StorageResult<bool> {
+        validate_non_empty_identifier(repo_id, "operation repo_id")?;
+        validate_non_empty_identifier(op_id, "operation op_id")?;
+        validate_no_nul(args_digest, "operation args_digest")?;
+        let repo_owned = repo_id.to_string();
+        let op_owned = op_id.to_string();
+        let digest_owned = args_digest.to_string();
+
+        self.run_write_conditional(move |wtx| {
+            let mut op_table = wtx
+                .open_table(OPERATION_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open operation"))?;
+            let existing: Option<OperationRecord> = match op_table
+                .get(op_owned.as_str())
+                .map_err(|err| map_redb_storage_err(err, "read operation"))?
+            {
+                Some(g) => Some(decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?),
+                None => None,
+            };
+            let Some(mut row) = existing else {
+                return Ok((false, false));
+            };
+            if row.repo_id != repo_owned {
+                return Ok((false, false));
+            }
+            row.args_digest = Some(digest_owned);
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &row)?;
+            op_table
+                .insert(op_owned.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "update operation args_digest"))?;
+            Ok((true, true))
+        })
+        .await
+    }
+
+    async fn delete_operation(&self, repo_id: &str, op_id: &str) -> StorageResult<bool> {
+        validate_non_empty_identifier(repo_id, "operation repo_id")?;
+        validate_non_empty_identifier(op_id, "operation op_id")?;
+        let repo_owned = repo_id.to_string();
+        let op_owned = op_id.to_string();
+
+        self.run_write_conditional(move |wtx| {
+            let mut op_table = wtx
+                .open_table(OPERATION_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open operation"))?;
+            let matches_repo = match op_table
+                .get(op_owned.as_str())
+                .map_err(|err| map_redb_storage_err(err, "read operation"))?
+            {
+                Some(g) => {
+                    let row: OperationRecord =
+                        decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?;
+                    row.repo_id == repo_owned
+                }
+                None => false,
+            };
+            let removed = if matches_repo {
+                op_table
+                    .remove(op_owned.as_str())
+                    .map_err(|err| map_redb_storage_err(err, "delete operation"))?
+                    .is_some()
+            } else {
+                false
+            };
+            drop(op_table);
+
+            let mut p_table = wtx
+                .open_table(OPERATION_PARENT_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open operation_parent"))?;
+            let mut ordinals = Vec::new();
+            {
+                let range = p_table
+                    .range((op_owned.as_str(), i64::MIN)..=(op_owned.as_str(), i64::MAX))
+                    .map_err(|err| map_redb_storage_err(err, "scan operation_parent"))?;
+                for entry in range {
+                    let (k, _) =
+                        entry.map_err(|err| map_redb_storage_err(err, "read operation_parent"))?;
+                    ordinals.push(k.value().1);
+                }
+            }
+            let removed_parents = !ordinals.is_empty();
+            for ord in ordinals {
+                let _ = p_table
+                    .remove((op_owned.as_str(), ord))
+                    .map_err(|err| map_redb_storage_err(err, "delete operation_parent"))?;
+            }
+            Ok((removed || removed_parents, removed))
         })
         .await
     }
@@ -2147,6 +2247,34 @@ impl GitStateStore for RedbGitStateStore {
         .await
     }
 
+    async fn list_all_operation_journals(&self) -> StorageResult<Vec<OperationJournalRecord>> {
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, OPERATION_JOURNAL_TABLE, "open operation_journal")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter operation_journal"))?
+            {
+                let (_, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read operation_journal"))?;
+                let row: OperationJournalRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(row);
+            }
+            out.sort_by(|a, b| {
+                a.updated_at
+                    .cmp(&b.updated_at)
+                    .then_with(|| a.journal_id.cmp(&b.journal_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
     async fn delete_operation_journal(&self, journal_id: &str) -> StorageResult<bool> {
         validate_non_empty_identifier(journal_id, "operation_journal journal_id")?;
         let jid = journal_id.to_string();
@@ -2163,13 +2291,42 @@ impl GitStateStore for RedbGitStateStore {
         .await
     }
 
+    async fn list_all_operation_heads(&self, repo_id: &str) -> StorageResult<Vec<String>> {
+        validate_non_empty_identifier(repo_id, "operation_head repo_id")?;
+        let repo_owned = repo_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(rtx, OPERATION_HEAD_TABLE, "open operation_head")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut heads = std::collections::BTreeSet::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter operation_head"))?
+            {
+                let (k, _) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read operation_head"))?;
+                let (r, _scope, op_id) = k.value();
+                if r == repo_owned && op_id != OP_HEAD_GENERATION_SENTINEL {
+                    heads.insert(op_id.to_string());
+                }
+            }
+            Ok(heads.into_iter().collect())
+        })
+        .await
+    }
+
     async fn get_operation_heads(
         &self,
         repo_id: &str,
         scope_key: &str,
     ) -> StorageResult<OperationHeadsSnapshot> {
         validate_non_empty_identifier(repo_id, "operation_head repo_id")?;
-        validate_non_empty_identifier(scope_key, "operation_head scope_key")?;
+        if scope_key.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "operation_head scope_key must not contain NUL bytes".to_string(),
+            });
+        }
         let repo_owned = repo_id.to_string();
         let scope_owned = scope_key.to_string();
         self.run_read(move |rtx| {
@@ -2194,7 +2351,11 @@ impl GitStateStore for RedbGitStateStore {
         new_heads: &[String],
     ) -> StorageResult<OperationHeadCasOutcome> {
         validate_non_empty_identifier(repo_id, "operation_head repo_id")?;
-        validate_non_empty_identifier(scope_key, "operation_head scope_key")?;
+        if scope_key.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "operation_head scope_key must not contain NUL bytes".to_string(),
+            });
+        }
         let expected = normalize_op_heads(expected_heads)?;
         let replacement = normalize_op_heads(new_heads)?;
         let repo_owned = repo_id.to_string();
@@ -2247,7 +2408,11 @@ impl GitStateStore for RedbGitStateStore {
         replacement_heads: &[String],
     ) -> StorageResult<OperationHeadConvergeOutcome> {
         validate_non_empty_identifier(repo_id, "operation_head repo_id")?;
-        validate_non_empty_identifier(scope_key, "operation_head scope_key")?;
+        if scope_key.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "operation_head scope_key must not contain NUL bytes".to_string(),
+            });
+        }
         let expected = normalize_op_heads(expected_heads)?;
         let replacement = normalize_op_heads(replacement_heads)?;
         let repo_owned = repo_id.to_string();
@@ -2574,7 +2739,38 @@ impl GitStateStore for RedbGitStateStore {
                     out.push(rec);
                 }
             }
+            out.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
             Ok(out)
+        })
+        .await
+    }
+
+    async fn delete_pending_ai_operation_link(&self, operation_id: &str) -> StorageResult<bool> {
+        validate_non_empty_identifier(operation_id, "ai_operation_link operation_id")?;
+        let id = operation_id.to_string();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AI_OPERATION_LINK_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_operation_link"))?;
+            let is_pending = match table
+                .get(id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "get ai_operation_link"))?
+            {
+                Some(g) => {
+                    let rec: AiOperationLinkRecord =
+                        decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?;
+                    rec.change_id.is_none()
+                }
+                None => false,
+            };
+            if !is_pending {
+                return Ok((false, false));
+            }
+            let removed = table
+                .remove(id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "delete ai_operation_link"))?
+                .is_some();
+            Ok((removed, removed))
         })
         .await
     }
@@ -2838,6 +3034,51 @@ impl GitStateStore for RedbGitStateStore {
                     bytes.as_slice(),
                 )
                 .map_err(|err| map_redb_storage_err(err, "upsert layer_path"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn replace_layer_paths(
+        &self,
+        worktree_id: &str,
+        records: &[LayerPathRecord],
+    ) -> StorageResult<()> {
+        validate_no_nul(worktree_id, "layer_path worktree_id")?;
+        for rec in records {
+            validate_layer_path_record(rec)?;
+        }
+        let wt = worktree_id.to_string();
+        let recs = records.to_vec();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(LAYER_PATH_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open layer_path"))?;
+            let mut existing = Vec::new();
+            {
+                let range = table
+                    .range((wt.as_str(), "")..)
+                    .map_err(|err| map_redb_storage_err(err, "scan layer_path"))?;
+                for entry in range {
+                    let (k, _) =
+                        entry.map_err(|err| map_redb_storage_err(err, "read layer_path"))?;
+                    if k.value().0 != wt {
+                        break;
+                    }
+                    existing.push(k.value().1.to_string());
+                }
+            }
+            for p in existing {
+                let _ = table
+                    .remove((wt.as_str(), p.as_str()))
+                    .map_err(|err| map_redb_storage_err(err, "clear layer_path"))?;
+            }
+            for rec in &recs {
+                let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, rec)?;
+                table
+                    .insert((wt.as_str(), rec.path.as_str()), bytes.as_slice())
+                    .map_err(|err| map_redb_storage_err(err, "insert layer_path"))?;
+            }
             Ok((true, ()))
         })
         .await

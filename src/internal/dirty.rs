@@ -241,11 +241,60 @@ impl DirtyCache {
         }))
     }
 
-    pub async fn meta() -> Result<Option<DirtyMeta>> {
-        let db = crate::internal::sequencer::request_db_checked()
+    pub async fn meta_with_store(
+        store: &dyn crate::storage::GitStateStore,
+    ) -> Result<Option<DirtyMeta>> {
+        let scope = Self::scope_key();
+        let row = store.get_working_dirty_meta(&scope).await.map_err(|err| {
+            anyhow::anyhow!("failed to read working_dirty_meta from store: {err}")
+        })?;
+        Ok(row.map(|row| DirtyMeta {
+            state: row.state,
+            index_fingerprint: row.index_fingerprint,
+            head_oid: row.head_oid,
+            scanned_at: row.scanned_at,
+            scan_lock_pid: row.scan_lock_pid,
+            scan_lock_at: row.scan_lock_at,
+        }))
+    }
+
+    pub async fn list_with_store(
+        store: &dyn crate::storage::GitStateStore,
+    ) -> Result<Vec<DirtyEntry>> {
+        let scope = Self::scope_key();
+        let rows = store
+            .list_working_dirty_entries(&scope)
             .await
-            .map_err(|error| anyhow::anyhow!(error))?;
-        Self::meta_with_conn(&db).await
+            .map_err(|err| anyhow::anyhow!("failed to list working_dirty from store: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DirtyEntry {
+                path: row.path,
+                kind: row.kind,
+                source: row.source,
+                marked_at: row.marked_at,
+                verified_at: row.verified_at,
+            })
+            .collect())
+    }
+
+    pub async fn meta() -> Result<Option<DirtyMeta>> {
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| anyhow::anyhow!(err))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Self::meta_with_conn(&db).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err))?;
+                Self::meta_with_store(store.as_ref()).await
+            }
+        }
     }
 
     /// Classify freshness against the CURRENT fingerprint + HEAD.
@@ -293,10 +342,22 @@ impl DirtyCache {
     }
 
     pub async fn list() -> Result<Vec<DirtyEntry>> {
-        let db = crate::internal::sequencer::request_db_checked()
-            .await
-            .map_err(|error| anyhow::anyhow!(error))?;
-        Self::list_with_conn(&db).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| anyhow::anyhow!(err))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = crate::internal::sequencer::request_db_checked()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Self::list_with_conn(&db).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err))?;
+                Self::list_with_store(store.as_ref()).await
+            }
+        }
     }
 
     /// Upsert manual advisory marks (`libra dirty <paths>`, the service mark
@@ -683,6 +744,178 @@ impl DirtyCache {
                 .context("failed to stamp a confirmed dirty row")?;
         }
         Ok(())
+    }
+
+    pub async fn try_acquire_scan_lock_with_store(
+        store: &dyn crate::storage::git_state_store::GitStateStore,
+        pid: i64,
+    ) -> Result<ScanLockOutcome> {
+        let scope = Self::scope_key();
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let cutoff = (now - chrono::Duration::seconds(SCAN_LOCK_STEAL_SECS)).to_rfc3339();
+        let existing_meta = store
+            .get_working_dirty_meta(&scope)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read working_dirty_meta: {e}"))?;
+        let entries = store
+            .list_working_dirty_entries(&scope)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read working_dirty entries: {e}"))?;
+        if let Some(meta) = &existing_meta
+            && let Some(holder_pid) = meta.scan_lock_pid
+            && let Some(lock_at) = meta.scan_lock_at.as_deref()
+            && lock_at >= cutoff.as_str()
+        {
+            return Ok(ScanLockOutcome::Held {
+                pid: holder_pid,
+                since: lock_at.to_string(),
+            });
+        }
+        let stole = existing_meta
+            .as_ref()
+            .and_then(|m| m.scan_lock_pid)
+            .is_some();
+        let mut next =
+            existing_meta.unwrap_or(crate::storage::git_state_store::WorkingDirtyMetaRecord {
+                worktree_id: scope,
+                state: "stale".to_string(),
+                index_fingerprint: None,
+                head_oid: None,
+                scanned_at: None,
+                scan_lock_pid: None,
+                scan_lock_at: None,
+            });
+        next.scan_lock_pid = Some(pid);
+        next.scan_lock_at = Some(now_text);
+        store
+            .replace_working_dirty_snapshot(&next, &entries)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to take the scan lock: {e}"))?;
+        Ok(ScanLockOutcome::Acquired { stole })
+    }
+
+    pub async fn release_scan_lock_with_store(
+        store: &dyn crate::storage::git_state_store::GitStateStore,
+        pid: i64,
+    ) -> Result<()> {
+        let scope = Self::scope_key();
+        let Some(mut meta) = store
+            .get_working_dirty_meta(&scope)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read working_dirty_meta: {e}"))?
+        else {
+            return Ok(());
+        };
+        if meta.scan_lock_pid == Some(pid) {
+            let entries = store
+                .list_working_dirty_entries(&scope)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to read working_dirty entries: {e}"))?;
+            meta.scan_lock_pid = None;
+            meta.scan_lock_at = None;
+            store
+                .replace_working_dirty_snapshot(&meta, &entries)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to release the scan lock: {e}"))?;
+        }
+        Ok(())
+    }
+
+    pub async fn replace_all_with_store(
+        store: &dyn crate::storage::git_state_store::GitStateStore,
+        entries: &[(String, &'static str)],
+        fingerprint: &str,
+        head_oid: Option<&str>,
+        scan_started_at: &str,
+    ) -> Result<()> {
+        let scope = Self::scope_key();
+        let now = now_timestamp();
+        let existing_meta = store
+            .get_working_dirty_meta(&scope)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read working_dirty_meta: {e}"))?;
+        let existing_entries = store
+            .list_working_dirty_entries(&scope)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read working_dirty entries: {e}"))?;
+        let mut merged: std::collections::BTreeMap<
+            (String, String),
+            crate::storage::git_state_store::WorkingDirtyEntryRecord,
+        > = std::collections::BTreeMap::new();
+        for rec in existing_entries {
+            let keep = rec.source != SOURCE_SCAN
+                && rec.source != SOURCE_CHECK
+                && rec.marked_at.as_str() >= scan_started_at;
+            if keep {
+                merged.insert((rec.path.clone(), rec.kind.clone()), rec);
+            }
+        }
+        for (path, kind) in entries {
+            merged.insert(
+                (path.clone(), (*kind).to_string()),
+                crate::storage::git_state_store::WorkingDirtyEntryRecord {
+                    worktree_id: scope.clone(),
+                    path: path.clone(),
+                    kind: (*kind).to_string(),
+                    source: SOURCE_SCAN.to_string(),
+                    marked_at: now.clone(),
+                    verified_at: Some(now.clone()),
+                },
+            );
+        }
+        let next_meta = crate::storage::git_state_store::WorkingDirtyMetaRecord {
+            worktree_id: scope,
+            state: "fresh".to_string(),
+            index_fingerprint: Some(fingerprint.to_string()),
+            head_oid: head_oid.map(str::to_string),
+            scanned_at: Some(now),
+            scan_lock_pid: existing_meta.as_ref().and_then(|m| m.scan_lock_pid),
+            scan_lock_at: existing_meta.and_then(|m| m.scan_lock_at),
+        };
+        let next_entries: Vec<_> = merged.into_values().collect();
+        store
+            .replace_working_dirty_snapshot(&next_meta, &next_entries)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to write working_dirty snapshot: {e}"))
+    }
+
+    pub async fn prune_and_confirm_with_store(
+        store: &dyn crate::storage::git_state_store::GitStateStore,
+        pruned: &[(String, String)],
+        confirmed: &[(String, String)],
+    ) -> Result<()> {
+        let scope = Self::scope_key();
+        let now = now_timestamp();
+        let Some(meta) = store
+            .get_working_dirty_meta(&scope)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read working_dirty_meta: {e}"))?
+        else {
+            return Ok(());
+        };
+        let existing_entries = store
+            .list_working_dirty_entries(&scope)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read working_dirty entries: {e}"))?;
+        let mut next_entries = Vec::with_capacity(existing_entries.len());
+        for mut rec in existing_entries {
+            if pruned.iter().any(|(p, k)| p == &rec.path && k == &rec.kind) {
+                continue;
+            }
+            if confirmed
+                .iter()
+                .any(|(p, k)| p == &rec.path && k == &rec.kind)
+            {
+                rec.verified_at = Some(now.clone());
+                rec.source = SOURCE_CHECK.to_string();
+            }
+            next_entries.push(rec);
+        }
+        store
+            .replace_working_dirty_snapshot(&meta, &next_entries)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to update working_dirty snapshot: {e}"))
     }
 }
 

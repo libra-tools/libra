@@ -440,6 +440,187 @@ fn validate_objects(manifest: &HistoryManifest, storage: &ClientStorage) -> Resu
     Ok(())
 }
 
+/// Backend-agnostic counterpart of [`import_history`] that dispatches across
+/// `Redb` and `Sqlite` using the repository's storage directory.
+pub async fn import_history_with_store(
+    storage_root: &Path,
+    manifest: &HistoryManifest,
+    manifest_sha256: &str,
+    operation_id: &str,
+) -> Result<ImportReceipt> {
+    let backend = crate::storage::runtime::detect_repo_backend(storage_root)
+        .map_err(|err| anyhow::anyhow!("failed to detect repository backend: {err}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let config_store =
+                crate::storage::runtime::open_repo_config_store_read_only(storage_root)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("failed to open config store: {err}"))?;
+            let repo_id = ConfigKv::get_with_store(&*config_store, "libra.repoid")
+                .await?
+                .context("repository identity is missing; initialize the repository first")?
+                .value;
+            validate_shape(manifest, &repo_id)?;
+            ensure!(
+                crate::command::replace::snapshot().is_empty(),
+                "history import refuses replacement refs; use an isolated unmodified object view"
+            );
+            let storage = ClientStorage::init_local_existing(storage_root.join("objects"));
+            validate_objects(manifest, &storage)?;
+
+            let git_store = crate::storage::runtime::open_git_store_read_only(storage_root)
+                .await
+                .map_err(|err| anyhow::anyhow!("failed to open git store: {err}"))?;
+            let tip = Head::current_commit_result_with_store(&*git_store)
+                .await?
+                .context("repository HEAD has no commit")?;
+            ensure!(
+                tip.to_string() == manifest.base_commit,
+                "repository HEAD differs from manifest base; use a fresh base-specific repository"
+            );
+            let state_store =
+                crate::storage::runtime::open_git_state_store_read_write(storage_root)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("failed to open git state store: {err}"))?;
+            let (operation, _) = state_store
+                .get_operation(&repo_id, operation_id)
+                .await
+                .map_err(|err| anyhow::anyhow!("failed to load operation: {err}"))?
+                .context(
+                    "history import requires a persisted current operation; invoke 'libra revision import'",
+                )?;
+            ensure!(
+                crate::internal::operation::current_operation_id().as_deref() == Some(operation_id)
+                    && operation.status == "running"
+                    && operation.repo_id == repo_id
+                    && operation.command_name.as_deref() == Some(IMPORT_COMMAND)
+                    && operation.args_digest.as_deref() == Some(manifest_sha256),
+                "history manifest or operation changed; retry with the frozen manifest"
+            );
+
+            let identities = state_store
+                .list_change_identities_by_prefix(&repo_id, "")
+                .await
+                .map_err(|err| anyhow::anyhow!("failed to list change identities: {err}"))?;
+            let mut existing_commits = Vec::new();
+            for id in identities {
+                let revs = state_store
+                    .list_change_revisions(&id.change_id)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("failed to list change revisions: {err}"))?;
+                for rev in revs {
+                    existing_commits.push(rev.commit_oid);
+                }
+            }
+            ensure!(
+                existing_commits.len() <= 5000,
+                "repository has more than 5000 revision facts; use a fresh base-specific import repository"
+            );
+            let allowed: BTreeSet<_> = manifest.commit_oids.iter().collect();
+            let admitted_sources: BTreeSet<_> = manifest
+                .sources
+                .iter()
+                .map(|source| source.commit_oid.as_str())
+                .collect();
+            for commit_oid in existing_commits {
+                ensure!(
+                    allowed.contains(&commit_oid),
+                    "repository already contains change facts outside this base view; use a fresh base-specific repository"
+                );
+                ensure!(
+                    manifest.cutoff_ms.is_none() || admitted_sources.contains(commit_oid.as_str()),
+                    "repository contains source facts omitted from this cutoff manifest; use a fresh base/cutoff-specific repository"
+                );
+            }
+
+            let kind = object_format::parse_config_value(&manifest.object_format)?;
+            let mut mappings = Vec::new();
+            let mut imported = 0;
+            for source in &manifest.sources {
+                let existing = ChangeStore::change_id_for_commit_with_store(
+                    &*state_store,
+                    &repo_id,
+                    &source.commit_oid,
+                )
+                .await?;
+                let id = match existing {
+                    Some(id) => {
+                        let revision = ChangeStore::revision_with_store(
+                            &*state_store,
+                            id,
+                            &source.commit_oid,
+                        )
+                        .await?
+                        .context(
+                            "existing change is missing its revision; repair repository metadata",
+                        )?;
+                        ensure!(
+                            revision.visibility == super::RevisionVisibility::Visible,
+                            "history source has a hidden revision; import cannot restore revoked visibility"
+                        );
+                        id
+                    }
+                    None => {
+                        let oid = object_format::parse_hex_for_kind(kind, &source.commit_oid)?;
+                        let id = ChangeId::synthetic_for_commit(kind.as_str(), oid.as_ref());
+                        ChangeRevisionBuilder::for_rewrite_with_store(
+                            state_store.clone(),
+                            &repo_id,
+                            operation_id,
+                            id,
+                        )
+                        .with_identity_origin("synthetic")
+                        .set_commit_oid(&source.commit_oid)
+                        .build()
+                        .await?;
+                        imported += 1;
+                        id
+                    }
+                };
+                mappings.push(ImportMapping {
+                    commit_oid: source.commit_oid.clone(),
+                    change_id: id.to_string(),
+                    historical_outcome: "unknown",
+                });
+            }
+            if imported > 0
+                && let Some(mut proj) = state_store
+                    .get_memory_projection_state(
+                        &repo_id,
+                        crate::storage::git_state_store::MemorySourceKind::Commit,
+                    )
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!("failed to read memory projection state: {err}")
+                    })?
+            {
+                proj.fingerprint = format!("history-import:{manifest_sha256}");
+                state_store
+                    .upsert_memory_projection_state(&proj)
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!("failed to invalidate memory projection state: {err}")
+                    })?;
+            }
+            Ok(ImportReceipt {
+                manifest_sha256: manifest_sha256.to_string(),
+                base_commit: manifest.base_commit.clone(),
+                imported,
+                reused: manifest.sources.len() - imported,
+                finite_history: !manifest.shallow_cuts.is_empty(),
+                mappings,
+            })
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::db::get_db_conn_instance_for_path(
+                &storage_root.join(util::DATABASE),
+            )
+            .await?;
+            import_history(&db, manifest, manifest_sha256, operation_id).await
+        }
+    }
+}
+
 /// Import facts through the existing revision writer in one transaction.
 /// Object validation is offline and precedes writes. The caller must retain the
 /// digest-addressed manifest and external availability evidence with the receipt.

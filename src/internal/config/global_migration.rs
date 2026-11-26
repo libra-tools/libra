@@ -46,6 +46,72 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 /// Busy timeout for the two short-lived inspection connections.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// ADR-RB-02 classification of a global configuration directory (`config.redb`
+/// vs unmigrated SQLite `config.db`), preserving `GC-13` isolation (never
+/// creates or touches any Repository-owned table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GlobalConfigBackendState {
+    /// `config.redb` is present and authoritative for this global config dir.
+    RedbActive { redb_path: PathBuf },
+    /// Only an unmigrated SQLite `config.db` exists (neither sentinel nor
+    /// fenced tombstone).
+    UnmigratedSqlite { sqlite_path: PathBuf },
+    /// Neither an active `config.redb` nor an active SQLite `config.db` exists.
+    FreshEmpty,
+}
+
+/// Classify a global configuration directory per `ADR-RB-02` without opening
+/// or mutating any database.
+pub(crate) fn classify_global_config_dir(dir: &Path) -> Result<GlobalConfigBackendState, String> {
+    let redb_path = dir.join(crate::storage::config_store::CONFIG_REDB_FILE_NAME);
+    if redb_path.exists() {
+        return Ok(GlobalConfigBackendState::RedbActive { redb_path });
+    }
+    let sqlite_path = dir.join("config.db");
+    if sqlite_path.exists() {
+        let is_tombstone =
+            crate::storage::config_store::is_config_sqlite_tombstone_sentinel(&sqlite_path)
+                .map_err(|err| {
+                    format!(
+                        "cannot inspect '{}' for tombstone sentinel: {err}",
+                        sqlite_path.display()
+                    )
+                })?
+                || crate::storage::config_store::is_config_sqlite_fenced_tombstone(&sqlite_path)
+                    .map_err(|err| {
+                        format!(
+                            "cannot inspect '{}' for fenced tombstone: {err}",
+                            sqlite_path.display()
+                        )
+                    })?;
+        if !is_tombstone {
+            return Ok(GlobalConfigBackendState::UnmigratedSqlite { sqlite_path });
+        }
+    }
+    Ok(GlobalConfigBackendState::FreshEmpty)
+}
+
+fn is_tombstone_config_db(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(
+        crate::storage::config_store::is_config_sqlite_tombstone_sentinel(path).map_err(|err| {
+            format!(
+                "cannot inspect '{}' for tombstone sentinel: {err}",
+                path.display()
+            )
+        })? || crate::storage::config_store::is_config_sqlite_fenced_tombstone(path).map_err(
+            |err| {
+                format!(
+                    "cannot inspect '{}' for fenced tombstone: {err}",
+                    path.display()
+                )
+            },
+        )?,
+    )
+}
+
 /// What the one-time migration did for this call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GlobalConfigMigration {
@@ -85,6 +151,19 @@ async fn migrate(legacy: &Path, target: &Path) -> Result<GlobalConfigMigration, 
         ));
     };
 
+    // ADR-RB-02: if `config.redb` is already active in `dir`, never overwrite
+    // or run SQLite legacy copy alongside it (GC-13 isolation).
+    if matches!(
+        classify_global_config_dir(dir)?,
+        GlobalConfigBackendState::RedbActive { .. }
+    ) {
+        return Ok(GlobalConfigMigration::AlreadyPresent);
+    }
+    // Never migrate a SQLite tombstone sentinel or fenced tombstone.
+    if is_tombstone_config_db(legacy)? {
+        return Ok(GlobalConfigMigration::NotNeeded);
+    }
+
     create_config_dir(dir)?;
 
     let lock = match acquire_migration_lock(dir, target).await? {
@@ -100,27 +179,37 @@ async fn migrate(legacy: &Path, target: &Path) -> Result<GlobalConfigMigration, 
 
     // Re-probe under the lock: a holder that finished while we waited has
     // already published the file, and re-copying would overwrite it.
-    if target.exists() {
+    if matches!(
+        classify_global_config_dir(dir)?,
+        GlobalConfigBackendState::RedbActive { .. }
+    ) || target.exists()
+    {
         drop(lock);
         return Ok(GlobalConfigMigration::AlreadyPresent);
     }
-    if !legacy.exists() {
+    if !legacy.exists() || is_tombstone_config_db(legacy)? {
         drop(lock);
         return Ok(GlobalConfigMigration::NotNeeded);
     }
 
-    let staging = Staging::create(dir)?;
-    let source = snapshot_legacy(legacy, staging.path()).await?;
-    validate_snapshot(staging.path(), &source).await?;
-    publish(staging.path(), target).map_err(|error| {
-        format!(
-            "cannot publish the migrated database at '{}': {error}",
-            target.display()
-        )
-    })?;
-    staging.published();
-    drop(lock);
-    Ok(GlobalConfigMigration::Migrated)
+    let backend = crate::storage::StorageBackendKind::Sqlite;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => Ok(GlobalConfigMigration::AlreadyPresent),
+        crate::storage::StorageBackendKind::Sqlite => {
+            let staging = Staging::create(dir)?;
+            let source = snapshot_legacy(legacy, staging.path()).await?;
+            validate_snapshot(staging.path(), &source).await?;
+            publish(staging.path(), target).map_err(|error| {
+                format!(
+                    "cannot publish the migrated database at '{}': {error}",
+                    target.display()
+                )
+            })?;
+            staging.published();
+            drop(lock);
+            Ok(GlobalConfigMigration::Migrated)
+        }
+    }
 }
 
 /// Create the configuration directory, restricting it to the owner on Unix.

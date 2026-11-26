@@ -199,36 +199,63 @@ fn core_ignorecase_value_sync(dir: &Path) -> Result<Option<String>> {
             dir.display()
         )
     })?;
-    let db_path = storage.join(util::DATABASE);
+    let backend = crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(|error| anyhow!("failed to detect repository backend: {error}"))?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| -> Result<Option<String>> {
             let runtime = tokio::runtime::Runtime::new()
                 .map_err(|err| anyhow!("failed to create tokio runtime: {err}"))?;
             runtime.block_on(async {
-                let db_path_text = db_path.to_str().ok_or_else(|| {
-                    anyhow!(
-                        "repository database path is not valid UTF-8: {}",
-                        db_path.display()
-                    )
-                })?;
-                let db = establish_connection(db_path_text).await.map_err(|error| {
-                    anyhow!(
-                        "failed to open repository database {}: {error}",
-                        db_path.display()
-                    )
-                })?;
-                let value =
-                    ConfigKv::get_var_case_insensitive_with_conn(&db, "core.", "ignorecase")
+                match backend {
+                    crate::storage::StorageBackendKind::Redb => {
+                        let store =
+                            crate::storage::runtime::open_repo_config_store_read_only(&storage)
+                                .await
+                                .map_err(|error| {
+                                    anyhow!(
+                                        "failed to open repository config store {}: {error}",
+                                        storage.display()
+                                    )
+                                })?;
+                        ConfigKv::get_var_case_insensitive_with_store(
+                            &*store,
+                            "core.",
+                            "ignorecase",
+                        )
+                        .await
+                        .map(|entry| entry.map(|entry| entry.value))
+                    }
+                    crate::storage::StorageBackendKind::Sqlite => {
+                        let db_path = storage.join(util::DATABASE);
+                        let db_path_text = db_path.to_str().ok_or_else(|| {
+                            anyhow!(
+                                "repository database path is not valid UTF-8: {}",
+                                db_path.display()
+                            )
+                        })?;
+                        let db = establish_connection(db_path_text).await.map_err(|error| {
+                            anyhow!(
+                                "failed to open repository database {}: {error}",
+                                db_path.display()
+                            )
+                        })?;
+                        let value = ConfigKv::get_var_case_insensitive_with_conn(
+                            &db,
+                            "core.",
+                            "ignorecase",
+                        )
                         .await
                         .map(|entry| entry.map(|entry| entry.value));
-                db.close().await.map_err(|error| {
-                    anyhow!(
-                        "failed to close repository database {}: {error}",
-                        db_path.display()
-                    )
-                })?;
-                value
+                        db.close().await.map_err(|error| {
+                            anyhow!(
+                                "failed to close repository database {}: {error}",
+                                db_path.display()
+                            )
+                        })?;
+                        value
+                    }
+                }
             })
         })();
         let _ = tx.send(result);

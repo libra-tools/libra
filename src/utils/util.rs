@@ -218,7 +218,7 @@ fn is_valid_storage_dir(path: &Path) -> bool {
     if is_global_libra_home(path) {
         return false;
     }
-    if path.join(DATABASE).exists() {
+    if path.join(DATABASE).exists() || crate::storage::runtime::has_redb_storage_markers(path) {
         return true;
     }
     // lore.md 2.1: a linked worktree's `.libra` holds only `commondir` +
@@ -495,7 +495,7 @@ fn is_terminal_common_storage(path: &Path) -> bool {
     ) {
         return false;
     }
-    if path.join(DATABASE).exists() {
+    if path.join(DATABASE).exists() || crate::storage::runtime::has_redb_storage_markers(path) {
         return true;
     }
     ["objects", "info/exclude", "hooks"]
@@ -812,9 +812,13 @@ fn try_get_paths_full_with_storage_lookup(
             ));
         }
         let standard_repo = path.join(ROOT_DIR);
-        if standard_repo.join(DATABASE).exists() && is_global_libra_home(&standard_repo) {
+        let standard_has_db = standard_repo.join(DATABASE).exists()
+            || crate::storage::runtime::has_redb_storage_markers(&standard_repo);
+        let path_has_db = path.join(DATABASE).exists()
+            || crate::storage::runtime::has_redb_storage_markers(&path);
+        if standard_has_db && is_global_libra_home(&standard_repo) {
             skipped_home = Some(standard_repo.clone());
-        } else if path.join(DATABASE).exists() && is_global_libra_home(&path) {
+        } else if path_has_db && is_global_libra_home(&path) {
             skipped_home = Some(path.clone());
         }
         if standard_repo.is_dir() && is_valid_storage_dir(&standard_repo) {
@@ -836,7 +840,8 @@ fn try_get_paths_full_with_storage_lookup(
             return Ok((common, path.clone(), gitdir));
         }
 
-        if path.join(DATABASE).exists()
+        if (path.join(DATABASE).exists()
+            || crate::storage::runtime::has_redb_storage_markers(&path))
             && path.join("objects").exists()
             && !is_global_libra_home(&path)
         {
@@ -6500,5 +6505,77 @@ mod test {
         );
         assert_eq!(candidates_json[1]["type"], "blob");
         assert_eq!(candidates_json[1]["abbrev"], "1f2ae0c");
+    }
+}
+
+#[cfg(all(test, feature = "storage-redb"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_repo_discovery_and_home_rejection() {
+        let tmp = tempfile::tempdir().expect("tmp");
+
+        // 1. Standard non-bare redb repository (no libra.db).
+        let worktree = tmp.path().join("normal-repo");
+        let dot_libra = worktree.join(".libra");
+        let sub = worktree.join("nested/dir");
+        std::fs::create_dir_all(&sub).expect("mkdir sub");
+        let _paths = crate::storage::runtime::init_redb_repository_storage(&dot_libra)
+            .await
+            .expect("init normal redb");
+        assert!(!dot_libra.join("libra.db").exists());
+        assert!(is_valid_storage_dir(&dot_libra));
+        let found = try_get_storage_path(Some(sub.clone())).expect("discover normal redb");
+        assert_eq!(
+            std::fs::canonicalize(&found).unwrap_or(found),
+            std::fs::canonicalize(&dot_libra).unwrap_or(dot_libra.clone())
+        );
+
+        // 2. Bare redb repository (no libra.db).
+        let bare = tmp.path().join("bare-repo.libra");
+        std::fs::create_dir_all(bare.join("objects")).expect("mkdir bare objects");
+        std::fs::create_dir_all(bare.join("hooks")).expect("mkdir bare hooks");
+        let _bare_paths = crate::storage::runtime::init_redb_repository_storage(&bare)
+            .await
+            .expect("init bare redb");
+        assert!(!bare.join("libra.db").exists());
+        let (storage, workdir, gitdir) =
+            try_get_paths_full(Some(bare.join("objects"))).expect("discover bare redb");
+        let expected_bare = std::fs::canonicalize(&bare).unwrap_or(bare.clone());
+        assert_eq!(
+            std::fs::canonicalize(&storage).unwrap_or(storage),
+            expected_bare
+        );
+        assert_eq!(
+            std::fs::canonicalize(&workdir).unwrap_or(workdir),
+            expected_bare
+        );
+        assert_eq!(
+            std::fs::canonicalize(&gitdir).unwrap_or(gitdir),
+            expected_bare
+        );
+
+        // 3. $LIBRA_HOME containing storage-format.json or redb/ MUST still be rejected!
+        let fake_home = tmp.path().join("fake-home");
+        let home_libra = fake_home.join(".libra");
+        let outside_dir = fake_home.join("projects/uninit");
+        std::fs::create_dir_all(&outside_dir).expect("mkdir outside");
+        let _home_paths = crate::storage::runtime::init_redb_repository_storage(&home_libra)
+            .await
+            .expect("init fake home redb");
+        let prev_home = std::env::var_os("LIBRA_HOME");
+        // SAFETY: test holds #[serial_test::serial(cwd, env)].
+        unsafe { std::env::set_var("LIBRA_HOME", &home_libra) };
+        let res = try_get_storage_path(Some(outside_dir));
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("LIBRA_HOME", v) },
+            None => unsafe { std::env::remove_var("LIBRA_HOME") },
+        }
+        assert!(
+            res.is_err(),
+            "$LIBRA_HOME with redb markers must never be adopted as a repository: {res:?}"
+        );
     }
 }

@@ -147,8 +147,48 @@ async fn load_stored() -> Result<Option<StoredSequenceState>, String> {
 /// through, so two probes can never disagree about which worktree they are
 /// answering for.
 async fn load_stored_in_scope(scope_key: &str) -> Result<Option<StoredSequenceState>, String> {
-    let db = request_db_checked().await?;
-    load_stored_with_conn(&db, scope_key).await
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                .await
+                .map_err(|e| format!("failed to open repository state store: {e}"))?;
+            load_stored_with_store(&*store, scope_key).await
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = request_db_checked().await?;
+            load_stored_with_conn(&db, scope_key).await
+        }
+    }
+}
+
+async fn load_stored_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    scope_key: &str,
+) -> Result<Option<StoredSequenceState>, String> {
+    let Some(rec) = store
+        .get_sequence_state(scope_key)
+        .await
+        .map_err(|err| format!("failed to load sequence_state: {err}"))?
+    else {
+        return Ok(None);
+    };
+    let todo = rec
+        .todo
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(Some(StoredSequenceState {
+        kind: rec.kind,
+        head_name: rec.head_name,
+        head_orig: rec.head_orig,
+        current_oid: rec.current_oid,
+        todo,
+        payload: rec.payload,
+    }))
 }
 
 /// [`load_stored_in_scope`] against an already-opened connection, so a caller
@@ -258,17 +298,30 @@ pub(crate) async fn load_snapshot_for_storage(
     storage: &Path,
     scope: &crate::internal::worktree_scope::WorktreeScope,
 ) -> Result<Option<serde_json::Value>, String> {
-    let db_path = storage.join(util::DATABASE);
-    let db_path = db_path
-        .to_str()
-        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
-    let db = crate::internal::db::open_connection_without_schema_management(
-        db_path,
-        Duration::from_secs(30),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let Some(stored) = load_stored_with_conn(&db, scope.storage_key()).await? else {
+    let backend =
+        crate::storage::runtime::detect_repo_backend(storage).map_err(|error| error.to_string())?;
+    let stored = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_git_state_store_read_only(storage)
+                .await
+                .map_err(|error| error.to_string())?;
+            load_stored_with_store(&*store, scope.storage_key()).await?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = storage.join(util::DATABASE);
+            let db_path = db_path.to_str().ok_or_else(|| {
+                format!("database path is not valid UTF-8: {}", db_path.display())
+            })?;
+            let db = crate::internal::db::open_connection_without_schema_management(
+                db_path,
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            load_stored_with_conn(&db, scope.storage_key()).await?
+        }
+    };
+    let Some(stored) = stored else {
         return Ok(None);
     };
     Ok(Some(serde_json::json!({
@@ -291,63 +344,103 @@ pub(crate) async fn restore_snapshot_for_storage(
     scope: &crate::internal::worktree_scope::WorktreeScope,
     value: &serde_json::Value,
 ) -> Result<(), String> {
-    let db_path = storage.join(util::DATABASE);
-    let db_path = db_path
-        .to_str()
-        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
-    let db = crate::internal::db::open_connection_without_schema_management(
-        db_path,
-        Duration::from_secs(30),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let txn = db
-        .begin()
-        .await
-        .map_err(|error| format!("failed to begin sequence_state transaction: {error}"))?;
     let (kind, state) = parse_snapshot_state(value)?;
-    save_fields_for_scope(
-        &txn,
-        scope.storage_key(),
-        SequenceStateFields {
-            kind: &kind,
-            head_name: &state.head_name,
-            head_orig: &state.head_orig,
-            current_oid: &state.current_oid,
-            todo: &state.todo,
-            payload: &state.payload,
-        },
-    )
-    .await
-    .map_err(|error| format!("failed to restore sequence_state: {error}"))?;
-    txn.commit()
-        .await
-        .map_err(|error| format!("failed to commit sequence_state transaction: {error}"))?;
-    Ok(())
+    let backend =
+        crate::storage::runtime::detect_repo_backend(storage).map_err(|error| error.to_string())?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_git_state_store_read_write(storage)
+                .await
+                .map_err(|error| error.to_string())?;
+            store
+                .put_sequence_state(&crate::storage::git_state_store::SequenceStateRecord {
+                    worktree_id: scope.storage_key().to_string(),
+                    kind,
+                    head_name: state.head_name,
+                    head_orig: state.head_orig,
+                    current_oid: state.current_oid,
+                    todo: state.todo.join("\n"),
+                    payload: state.payload,
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                })
+                .await
+                .map_err(|error| format!("failed to restore sequence_state: {error}"))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = storage.join(util::DATABASE);
+            let db_path = db_path.to_str().ok_or_else(|| {
+                format!("database path is not valid UTF-8: {}", db_path.display())
+            })?;
+            let db = crate::internal::db::open_connection_without_schema_management(
+                db_path,
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let txn = db
+                .begin()
+                .await
+                .map_err(|error| format!("failed to begin sequence_state transaction: {error}"))?;
+            save_fields_for_scope(
+                &txn,
+                scope.storage_key(),
+                SequenceStateFields {
+                    kind: &kind,
+                    head_name: &state.head_name,
+                    head_orig: &state.head_orig,
+                    current_oid: &state.current_oid,
+                    todo: &state.todo,
+                    payload: &state.payload,
+                },
+            )
+            .await
+            .map_err(|error| format!("failed to restore sequence_state: {error}"))?;
+            txn.commit()
+                .await
+                .map_err(|error| format!("failed to commit sequence_state transaction: {error}"))?;
+            Ok(())
+        }
+    }
 }
 
 pub(crate) async fn clear_snapshot_for_storage(
     storage: &Path,
     scope: &crate::internal::worktree_scope::WorktreeScope,
 ) -> Result<(), String> {
-    let db_path = storage.join(util::DATABASE);
-    let db_path = db_path
-        .to_str()
-        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
-    let db = crate::internal::db::open_connection_without_schema_management(
-        db_path,
-        Duration::from_secs(30),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "DELETE FROM sequence_state WHERE worktree_id = ?",
-        [scope.storage_key().into()],
-    ))
-    .await
-    .map_err(|error| format!("failed to clear sequence_state: {error}"))?;
-    Ok(())
+    let backend =
+        crate::storage::runtime::detect_repo_backend(storage).map_err(|error| error.to_string())?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_git_state_store_read_write(storage)
+                .await
+                .map_err(|error| error.to_string())?;
+            let _ = store
+                .delete_sequence_state(scope.storage_key())
+                .await
+                .map_err(|error| format!("failed to clear sequence_state: {error}"))?;
+            Ok(())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = storage.join(util::DATABASE);
+            let db_path = db_path.to_str().ok_or_else(|| {
+                format!("database path is not valid UTF-8: {}", db_path.display())
+            })?;
+            let db = crate::internal::db::open_connection_without_schema_management(
+                db_path,
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM sequence_state WHERE worktree_id = ?",
+                [scope.storage_key().into()],
+            ))
+            .await
+            .map_err(|error| format!("failed to clear sequence_state: {error}"))?;
+            Ok(())
+        }
+    }
 }
 
 fn parse_snapshot_state(value: &serde_json::Value) -> Result<(String, AmSequenceState), String> {
@@ -438,32 +531,66 @@ async fn claim_fields(
     todo: &[String],
     payload: &str,
 ) -> Result<(), String> {
-    let db = request_db_checked().await?;
     let scope_key = current_scope_key();
-    let todo = todo.join("\n");
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO sequence_state \
-             (worktree_id, kind, head_name, head_orig, current_oid, todo, payload) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [
-                scope_key.into(),
-                kind.into(),
-                head_name.into(),
-                head_orig.into(),
-                current_oid.into(),
-                todo.into(),
-                payload.into(),
-            ],
-        ))
-        .await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(err) if is_unique_violation(&err) => Err(format!(
-            "another {kind} is already in progress in this worktree"
-        )),
-        Err(err) => Err(format!("failed to claim sequence_state: {err}")),
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|e| format!("failed to open repository state store: {e}"))?;
+            if store
+                .get_sequence_state(&scope_key)
+                .await
+                .map_err(|e| format!("failed to claim sequence_state: {e}"))?
+                .is_some()
+            {
+                return Err(format!(
+                    "another {kind} is already in progress in this worktree"
+                ));
+            }
+            store
+                .put_sequence_state(&crate::storage::git_state_store::SequenceStateRecord {
+                    worktree_id: scope_key,
+                    kind: kind.to_string(),
+                    head_name: head_name.to_string(),
+                    head_orig: head_orig.to_string(),
+                    current_oid: current_oid.to_string(),
+                    todo: todo.join("\n"),
+                    payload: payload.to_string(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                })
+                .await
+                .map_err(|e| format!("failed to claim sequence_state: {e}"))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = request_db_checked().await?;
+            let todo = todo.join("\n");
+            let result = db
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO sequence_state \
+                     (worktree_id, kind, head_name, head_orig, current_oid, todo, payload) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        scope_key.into(),
+                        kind.into(),
+                        head_name.into(),
+                        head_orig.into(),
+                        current_oid.into(),
+                        todo.into(),
+                        payload.into(),
+                    ],
+                ))
+                .await;
+            match result {
+                Ok(_) => Ok(()),
+                Err(err) if is_unique_violation(&err) => Err(format!(
+                    "another {kind} is already in progress in this worktree"
+                )),
+                Err(err) => Err(format!("failed to claim sequence_state: {err}")),
+            }
+        }
     }
 }
 
@@ -483,19 +610,43 @@ pub(crate) fn is_unique_violation_text(message: &str) -> bool {
 /// Persist (upsert) the active sequence. `DELETE`+`INSERT` in one transaction:
 /// atomic, and the `id = 1` replace never trips the single-row `CHECK`.
 pub async fn save(state: &SequenceState) -> Result<(), String> {
-    use sea_orm::TransactionTrait;
-    let db = request_db_checked().await?;
-    let txn = db
-        .begin()
-        .await
-        .map_err(|e| format!("failed to begin sequence_state transaction: {e}"))?;
-    save_with_conn(&txn, state)
-        .await
-        .map_err(|e| format!("failed to save sequence_state: {e}"))?;
-    txn.commit()
-        .await
-        .map_err(|e| format!("failed to commit sequence_state transaction: {e}"))?;
-    Ok(())
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|e| format!("failed to open repository state store: {e}"))?;
+            store
+                .put_sequence_state(&crate::storage::git_state_store::SequenceStateRecord {
+                    worktree_id: current_scope_key(),
+                    kind: state.kind.as_str().to_string(),
+                    head_name: state.head_name.clone(),
+                    head_orig: state.head_orig.clone(),
+                    current_oid: state.current_oid.clone(),
+                    todo: state.todo.join("\n"),
+                    payload: state.payload.clone(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                })
+                .await
+                .map_err(|e| format!("failed to save sequence_state: {e}"))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            use sea_orm::TransactionTrait;
+            let db = request_db_checked().await?;
+            let txn = db
+                .begin()
+                .await
+                .map_err(|e| format!("failed to begin sequence_state transaction: {e}"))?;
+            save_with_conn(&txn, state)
+                .await
+                .map_err(|e| format!("failed to save sequence_state: {e}"))?;
+            txn.commit()
+                .await
+                .map_err(|e| format!("failed to commit sequence_state transaction: {e}"))?;
+            Ok(())
+        }
+    }
 }
 
 /// Replace the unified sequence row using the caller's transaction. Commands
@@ -620,36 +771,105 @@ async fn reclaim_race_seam() -> Result<(), String> {
 
 /// Delete this worktree's row only while it still matches `snapshot`.
 async fn clear_if_unchanged(snapshot: &SequenceState) -> Result<bool, String> {
-    let db = request_db_checked().await?;
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM sequence_state WHERE worktree_id = ? AND kind = ? AND head_name = ? \
-             AND head_orig = ? AND current_oid = ? AND todo = ? AND payload = ?",
-            fence_values(snapshot),
-        ))
-        .await
-        .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
-    Ok(result.rows_affected() == 1)
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|e| format!("failed to open repository state store: {e}"))?;
+            let scope_key = current_scope_key();
+            let Some(cur) = store
+                .get_sequence_state(&scope_key)
+                .await
+                .map_err(|e| format!("failed to read sequence_state: {e}"))?
+            else {
+                return Ok(false);
+            };
+            if cur.kind == snapshot.kind.as_str()
+                && cur.head_name == snapshot.head_name
+                && cur.head_orig == snapshot.head_orig
+                && cur.current_oid == snapshot.current_oid
+                && cur.todo == snapshot.todo.join("\n")
+                && cur.payload == snapshot.payload
+            {
+                store
+                    .delete_sequence_state(&scope_key)
+                    .await
+                    .map_err(|e| format!("failed to clear sequence_state: {e}"))
+            } else {
+                Ok(false)
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = request_db_checked().await?;
+            let result = db
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM sequence_state WHERE worktree_id = ? AND kind = ? AND head_name = ? \
+                     AND head_orig = ? AND current_oid = ? AND todo = ? AND payload = ?",
+                    fence_values(snapshot),
+                ))
+                .await
+                .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+            Ok(result.rows_affected() == 1)
+        }
+    }
 }
 
 /// Rewrite only the payload of this worktree's row, and only while every other
 /// column still matches `snapshot`.
 async fn mark_if_unchanged(snapshot: &SequenceState, payload: &str) -> Result<bool, String> {
-    let db = request_db_checked().await?;
-    let mut values = vec![payload.to_string().into()];
-    values.extend(fence_values(snapshot));
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE sequence_state SET payload = ?, updated_at = CURRENT_TIMESTAMP \
-             WHERE worktree_id = ? AND kind = ? AND head_name = ? AND head_orig = ? \
-             AND current_oid = ? AND todo = ? AND payload = ?",
-            values,
-        ))
-        .await
-        .map_err(|e| format!("failed to save sequence_state: {e}"))?;
-    Ok(result.rows_affected() == 1)
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|e| format!("failed to open repository state store: {e}"))?;
+            let scope_key = current_scope_key();
+            let Some(mut cur) = store
+                .get_sequence_state(&scope_key)
+                .await
+                .map_err(|e| format!("failed to read sequence_state: {e}"))?
+            else {
+                return Ok(false);
+            };
+            if cur.kind == snapshot.kind.as_str()
+                && cur.head_name == snapshot.head_name
+                && cur.head_orig == snapshot.head_orig
+                && cur.current_oid == snapshot.current_oid
+                && cur.todo == snapshot.todo.join("\n")
+                && cur.payload == snapshot.payload
+            {
+                cur.payload = payload.to_string();
+                cur.updated_at = chrono::Utc::now().to_rfc3339();
+                store
+                    .put_sequence_state(&cur)
+                    .await
+                    .map_err(|e| format!("failed to save sequence_state: {e}"))?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = request_db_checked().await?;
+            let mut values = vec![payload.to_string().into()];
+            values.extend(fence_values(snapshot));
+            let result = db
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE sequence_state SET payload = ?, updated_at = CURRENT_TIMESTAMP \
+                     WHERE worktree_id = ? AND kind = ? AND head_name = ? AND head_orig = ? \
+                     AND current_oid = ? AND todo = ? AND payload = ?",
+                    values,
+                ))
+                .await
+                .map_err(|e| format!("failed to save sequence_state: {e}"))?;
+            Ok(result.rows_affected() == 1)
+        }
+    }
 }
 
 /// The snapshot columns both fenced statements compare against, in WHERE order.
@@ -673,16 +893,43 @@ pub(crate) async fn clear_if_payload_contains(
     kind: SequenceKind,
     needle: &str,
 ) -> Result<bool, String> {
-    let db = request_db_checked().await?;
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ? AND instr(payload, ?) > 0",
-            [kind.as_str().into(), current_scope_key().into(), needle.into()],
-        ))
-        .await
-        .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
-    Ok(result.rows_affected() > 0)
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|e| format!("failed to open repository state store: {e}"))?;
+            let scope_key = current_scope_key();
+            let Some(cur) = store
+                .get_sequence_state(&scope_key)
+                .await
+                .map_err(|e| format!("failed to read sequence_state: {e}"))?
+            else {
+                return Ok(false);
+            };
+            if cur.kind == kind.as_str() && cur.payload.contains(needle) {
+                store
+                    .delete_sequence_state(&scope_key)
+                    .await
+                    .map_err(|e| format!("failed to clear sequence_state: {e}"))
+            } else {
+                Ok(false)
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = request_db_checked().await?;
+            let result = db
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ? AND instr(payload, ?) > 0",
+                    [kind.as_str().into(), current_scope_key().into(), needle.into()],
+                ))
+                .await
+                .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+            Ok(result.rows_affected() > 0)
+        }
+    }
 }
 
 /// The FIRST write of a starting `am`, as an atomic claim (§C.4.4) — see
@@ -700,19 +947,43 @@ pub(crate) async fn claim_start_am(state: &AmSequenceState) -> Result<(), String
 }
 
 pub(crate) async fn save_am(state: &AmSequenceState) -> Result<(), String> {
-    use sea_orm::TransactionTrait;
-    let db = request_db_checked().await?;
-    let txn = db
-        .begin()
-        .await
-        .map_err(|e| format!("failed to begin sequence_state transaction: {e}"))?;
-    save_am_with_conn(&txn, state)
-        .await
-        .map_err(|e| format!("failed to save am sequence_state: {e}"))?;
-    txn.commit()
-        .await
-        .map_err(|e| format!("failed to commit sequence_state transaction: {e}"))?;
-    Ok(())
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|e| format!("failed to open repository state store: {e}"))?;
+            store
+                .put_sequence_state(&crate::storage::git_state_store::SequenceStateRecord {
+                    worktree_id: current_scope_key(),
+                    kind: "am".to_string(),
+                    head_name: state.head_name.clone(),
+                    head_orig: state.head_orig.clone(),
+                    current_oid: state.current_oid.clone(),
+                    todo: state.todo.join("\n"),
+                    payload: state.payload.clone(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                })
+                .await
+                .map_err(|e| format!("failed to save am sequence_state: {e}"))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            use sea_orm::TransactionTrait;
+            let db = request_db_checked().await?;
+            let txn = db
+                .begin()
+                .await
+                .map_err(|e| format!("failed to begin sequence_state transaction: {e}"))?;
+            save_am_with_conn(&txn, state)
+                .await
+                .map_err(|e| format!("failed to save am sequence_state: {e}"))?;
+            txn.commit()
+                .await
+                .map_err(|e| format!("failed to commit sequence_state transaction: {e}"))?;
+            Ok(())
+        }
+    }
 }
 
 pub(crate) async fn save_am_with_conn<C>(
@@ -853,10 +1124,34 @@ fn current_scope_key() -> String {
 /// consumer's row once merge/revert/rebase also migrate (Codex P1).
 /// Idempotent.
 pub async fn clear(kind: SequenceKind) -> Result<(), String> {
-    let db = request_db_checked().await?;
-    clear_with_conn(&db, kind)
-        .await
-        .map_err(|e| format!("failed to clear sequence_state: {e}"))
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|e| format!("failed to open repository state store: {e}"))?;
+            let scope_key = current_scope_key();
+            if let Some(cur) = store
+                .get_sequence_state(&scope_key)
+                .await
+                .map_err(|e| format!("failed to read sequence_state: {e}"))?
+                && cur.kind == kind.as_str()
+            {
+                let _ = store
+                    .delete_sequence_state(&scope_key)
+                    .await
+                    .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+            }
+            Ok(())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = request_db_checked().await?;
+            clear_with_conn(&db, kind)
+                .await
+                .map_err(|e| format!("failed to clear sequence_state: {e}"))
+        }
+    }
 }
 
 /// Transaction-scoped counterpart of [`clear`].
@@ -876,10 +1171,34 @@ where
 }
 
 pub(crate) async fn clear_am() -> Result<(), String> {
-    let db = request_db_checked().await?;
-    clear_am_with_conn(&db)
-        .await
-        .map_err(|e| format!("failed to clear am sequence_state: {e}"))
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|e| format!("failed to open repository state store: {e}"))?;
+            let scope_key = current_scope_key();
+            if let Some(cur) = store
+                .get_sequence_state(&scope_key)
+                .await
+                .map_err(|e| format!("failed to read sequence_state: {e}"))?
+                && cur.kind == "am"
+            {
+                let _ = store
+                    .delete_sequence_state(&scope_key)
+                    .await
+                    .map_err(|e| format!("failed to clear am sequence_state: {e}"))?;
+            }
+            Ok(())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = request_db_checked().await?;
+            clear_am_with_conn(&db)
+                .await
+                .map_err(|e| format!("failed to clear am sequence_state: {e}"))
+        }
+    }
 }
 
 pub(crate) async fn clear_am_with_conn<C>(db: &C) -> Result<(), sea_orm::DbErr>
@@ -1095,12 +1414,52 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
     let common_storage = context.storage;
     let scope_key = context.scope.storage_key().to_string();
     let scope = context.scope;
-    let db =
-        crate::internal::db::get_db_conn_instance_for_path(&common_storage.join(util::DATABASE))
+    let backend = crate::storage::runtime::detect_repo_backend(&common_storage)
+        .map_err(|error| format!("failed to detect repository backend: {error}"))?;
+    let (db_opt, state_store_opt) = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_git_state_store_read_only(&common_storage)
+                .await
+                .map_err(|error| format!("failed to open repository state store: {error}"))?;
+            (None, Some(store))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::db::get_db_conn_instance_for_path(
+                &common_storage.join(util::DATABASE),
+            )
             .await
             .map_err(|error| format!("failed to open the repository database: {error}"))?;
+            (Some(db), None)
+        }
+    };
     // Unified table first (cherry-pick/am in v1), against the resolved scope.
-    if let Some(kind) = unified_active_in_scope(&db, &scope_key).await? {
+    let unified = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = state_store_opt
+                .as_deref()
+                .ok_or_else(|| "missing redb state store".to_string())?;
+            if let Some(stored) = load_stored_with_store(store, &scope_key).await? {
+                if stored.kind == "am" {
+                    Some(ActiveSequenceKind::Am)
+                } else {
+                    Some(
+                        SequenceKind::from_token(&stored.kind)
+                            .map(ActiveSequenceKind::Known)
+                            .ok_or_else(|| format!("unknown sequence kind '{}'", stored.kind))?,
+                    )
+                }
+            } else {
+                None
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = db_opt
+                .as_ref()
+                .ok_or_else(|| "missing sqlite database".to_string())?;
+            unified_active_in_scope(db, &scope_key).await?
+        }
+    };
+    if let Some(kind) = unified {
         return Ok(Some(kind));
     }
     // `merge` and `revert` state are per-worktree JSON sidecars in THIS
@@ -1116,17 +1475,6 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
         if !sidecar.exists() {
             continue;
         }
-        // §C.4.3: for a LINKED worktree the sidecar is in its own gitdir, so it
-        // is unambiguously that worktree's. For MAIN the local gitdir IS common
-        // storage — and a sidecar there could have been written by a linked
-        // worktree that has since been removed, in which case continuing or
-        // aborting it would reset MAIN's HEAD, index and working tree from
-        // another worktree's state and then delete the evidence. With
-        // linked-worktree history and no way to prove ownership, it is
-        // AMBIGUOUS: status reports it, control paths refuse.
-        // W2: a sidecar whose writer RECORDED main's scope is proven main's,
-        // even in a repository with linked history — the guess W1 had to make
-        // is only made for files that carry no record (an old binary's).
         let proven_main = sidecar_recorded_owner(&sidecar)?.as_deref() == Some("");
         if !proven_main
             && !scope.is_linked()
@@ -1139,42 +1487,52 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
         return Ok(Some(ActiveSequenceKind::Known(kind)));
     }
 
-    // Part C W1 (§C.4.2/§C.4.4): `rebase_state` is keyed by `worktree_id`
-    // (migration 2026072101), so probe THIS worktree's row BEFORE the linked
-    // early-return — once the rebase guard lifts, a linked worktree's own
-    // rebase must occupy its own mutex, while main's rebase must not block a
-    // linked worktree's sequence (and vice versa).
-    if scoped_rebase_state_active(&db, &scope_key).await? {
+    let rebase_active = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = state_store_opt
+                .as_deref()
+                .ok_or_else(|| "missing redb state store".to_string())?;
+            store
+                .get_rebase_state(&scope_key)
+                .await
+                .map_err(|err| format!("failed to probe rebase_state: {err}"))?
+                .is_some()
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = db_opt
+                .as_ref()
+                .ok_or_else(|| "missing sqlite database".to_string())?;
+            scoped_rebase_state_active(db, &scope_key).await?
+        }
+    };
+    if rebase_active {
         return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Rebase)));
     }
-    // §C.4.4 bisect/sequencer mutual exclusion: a bisect owns the scope just
-    // as a rebase does. It was missing here entirely, so `bisect start` could
-    // begin beside an active sequence (and vice versa) in the same worktree.
-    if scoped_bisect_state_active(&db, &scope_key).await? {
+    let bisect_active = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = state_store_opt
+                .as_deref()
+                .ok_or_else(|| "missing redb state store".to_string())?;
+            store
+                .get_bisect_state(&scope_key)
+                .await
+                .map_err(|err| format!("failed to probe bisect_state: {err}"))?
+                .is_some()
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = db_opt
+                .as_ref()
+                .ok_or_else(|| "missing sqlite database".to_string())?;
+            scoped_bisect_state_active(db, &scope_key).await?
+        }
+    };
+    if bisect_active {
         return Ok(Some(ActiveSequenceKind::Bisect));
     }
-    // The remaining probes cover main-owned COMMON state only (the legacy
-    // rebase dirs and the pre-2.6 cherry_pick_state table have no worktree
-    // scope — ambiguous-sidecar rule: they belong to main).
     if scope.is_linked() {
         return Ok(None);
     }
-    // The storage this invocation RESOLVED, not the ambient one: the unified
-    // row above was read from the pinned database, and pairing it with a
-    // sidecar directory found under a cwd that has since moved is precisely
-    // the mismatch §C.4.2 exists to prevent.
     if let Some(legacy_dir) = ambiguous_legacy_dir(&common_storage) {
-        // The common legacy dirs carry no owner metadata. Treating one as
-        // MAIN's rebase is only correct when main is the unambiguous owner.
-        // With linked worktrees registered it may be any of them — and since
-        // `rebase --abort` now PRESERVES such a directory instead of deleting
-        // it (§C.4.2 / ADR-0714-08), reading it as "a rebase is in progress"
-        // would block main's next cherry-pick forever on state that is not
-        // main's and that main is not allowed to clear.
-        //
-        // Reported as its OWN kind rather than as an error: a command that
-        // only READS state must keep working and say what it found, while a
-        // command that would START a sequence refuses.
         if crate::command::maintenance::repository_had_linked_worktrees() {
             return Ok(Some(ActiveSequenceKind::AmbiguousLegacy(
                 AmbiguousLegacyState::Directory(legacy_dir),
@@ -1182,10 +1540,9 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
         }
         return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Rebase)));
     }
-    // Compat window: an old binary may have recreated the pre-2.6
-    // `cherry_pick_state` table after this binary migrated it away.
-    if legacy_table_active(&db, "cherry_pick_state").await? {
-        // Same rule: an unscoped legacy table cannot prove it was main's.
+    if let Some(db) = db_opt.as_ref()
+        && legacy_table_active(db, "cherry_pick_state").await?
+    {
         if !scope.is_linked() && crate::command::maintenance::repository_had_linked_worktrees() {
             return Ok(Some(ActiveSequenceKind::AmbiguousLegacy(
                 AmbiguousLegacyState::Table("cherry_pick_state"),
@@ -2255,5 +2612,120 @@ mod tests {
             "public legacy enum must not silently hide active am"
         );
         clear_am().await.expect("clear am");
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_sequencer_mutex_and_worktree_isolation() {
+        use crate::{
+            internal::worktree_scope::{RequestScope, WorktreeScope, with_request_scope},
+            storage::runtime::init_redb_repository_storage,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dot_libra = tmp.path().join(".libra");
+        let _paths = init_redb_repository_storage(&dot_libra)
+            .await
+            .expect("init redb repo");
+        assert!(!dot_libra.join("libra.db").exists());
+        let _guard = ChangeDirGuard::new(tmp.path());
+
+        let main_scope = RequestScope {
+            scope: WorktreeScope::Main,
+            workdir: tmp.path().to_path_buf(),
+            gitdir: dot_libra.clone(),
+            storage: dot_libra.clone(),
+            worktree_root: tmp.path().to_path_buf(),
+        };
+        let linked_gitdir = dot_libra.join("worktrees").join("wt-redb-1");
+        std::fs::create_dir_all(&linked_gitdir).expect("mkdir linked gitdir");
+        let linked_scope = RequestScope {
+            scope: WorktreeScope::Linked("wt-redb-1".to_string()),
+            workdir: tmp.path().to_path_buf(),
+            gitdir: linked_gitdir,
+            storage: dot_libra.clone(),
+            worktree_root: tmp.path().to_path_buf(),
+        };
+
+        // Main worktree claims a cherry-pick sequence.
+        with_request_scope(Some(main_scope.clone()), async {
+            claim_start(&sample(SequenceKind::CherryPick))
+                .await
+                .expect("claim cherry-pick on main");
+            assert!(
+                claim_start(&sample(SequenceKind::CherryPick))
+                    .await
+                    .is_err(),
+                "duplicate claim in same worktree must fail"
+            );
+            // Symmetric mutex: rebase/merge/revert/am blocked in main.
+            for other in [
+                SequenceKind::Merge,
+                SequenceKind::Revert,
+                SequenceKind::Rebase,
+            ] {
+                let err = ensure_none_in_progress(other)
+                    .await
+                    .expect_err("cherry-pick blocks cross-op start");
+                assert_eq!(err.stable_code(), StableErrorCode::ConflictOperationBlocked);
+            }
+            assert!(ensure_none_for_am().await.is_err());
+            // Same-op defers to command's own check.
+            ensure_none_in_progress(SequenceKind::CherryPick)
+                .await
+                .expect("same op allowed");
+        })
+        .await;
+
+        // Linked worktree is isolated: sees no active sequence and can start its own am!
+        with_request_scope(Some(linked_scope.clone()), async {
+            assert_eq!(
+                detect_active_operation().await.expect("detect linked"),
+                None
+            );
+            claim_start_am(&sample_am())
+                .await
+                .expect("linked worktree claims am independently");
+            assert_eq!(
+                detect_active_operation().await.expect("detect linked am"),
+                Some(ActiveSequenceKind::Am)
+            );
+            assert!(
+                ensure_none_in_progress(SequenceKind::Rebase).await.is_err(),
+                "linked am blocks linked rebase"
+            );
+            // Snapshot capture & clear/restore round-trip on redb.
+            let snap = load_snapshot_for_storage(&dot_libra, &linked_scope.scope)
+                .await
+                .expect("load snapshot")
+                .expect("snapshot present");
+            clear_snapshot_for_storage(&dot_libra, &linked_scope.scope)
+                .await
+                .expect("clear snapshot");
+            assert!(load_am().await.expect("load am after clear").is_none());
+            restore_snapshot_for_storage(&dot_libra, &linked_scope.scope, &snap)
+                .await
+                .expect("restore snapshot");
+            assert!(load_am().await.expect("load am after restore").is_some());
+            clear_am().await.expect("clear linked am");
+        })
+        .await;
+
+        // Main worktree's cherry-pick is still intact after linked worktree cleared its am.
+        with_request_scope(Some(main_scope), async {
+            let loaded = load().await.expect("load main").expect("still active");
+            assert_eq!(loaded.kind, SequenceKind::CherryPick);
+            clear(SequenceKind::CherryPick)
+                .await
+                .expect("clear main cherry-pick");
+            assert!(load().await.expect("load after clear").is_none());
+        })
+        .await;
+
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "pure redb sequencer must never create libra.db"
+        );
     }
 }

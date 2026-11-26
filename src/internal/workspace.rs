@@ -646,6 +646,61 @@ impl RepoIdentity {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Resolve and validate `libra.repoid` using a backend-agnostic [`ConfigStore`].
+    pub async fn resolve_with_store(
+        store: &dyn crate::storage::config_store::ConfigStore,
+    ) -> WorkspaceResult<Self> {
+        let entry = ConfigKv::get_with_store(store, "libra.repoid")
+            .await
+            .map_err(|error| {
+                WorkspaceError::ReadFailed(format!("cannot read the repository identity: {error}"))
+            })?;
+        let value = entry.map(|entry| entry.value).ok_or_else(|| {
+            WorkspaceError::Corrupt(
+                "repository identity (libra.repoid) is missing; the repository metadata is \
+                 incomplete — run `libra init` in a fresh clone or restore this repository's \
+                 configuration"
+                    .to_string(),
+            )
+        })?;
+        if value.trim().is_empty() {
+            return Err(WorkspaceError::Corrupt(
+                "repository identity (libra.repoid) is empty; the repository metadata is \
+                 incomplete"
+                    .to_string(),
+            ));
+        }
+        if value != value.trim() {
+            return Err(WorkspaceError::Corrupt(format!(
+                "repository identity (libra.repoid) has surrounding whitespace ({value:?}); \
+                 rewrite it without padding so every subsystem keys the repository identically"
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    /// Backend-agnostic counterpart of [`Self::resolve_or_init`].
+    pub async fn resolve_or_init_with_store(
+        store: &dyn crate::storage::config_store::ConfigStore,
+    ) -> WorkspaceResult<Self> {
+        let existing = ConfigKv::get_with_store(store, "libra.repoid")
+            .await
+            .map_err(|error| {
+                WorkspaceError::ReadFailed(format!("cannot read the repository identity: {error}"))
+            })?;
+        if existing.is_none() {
+            let minted = uuid::Uuid::new_v4().to_string();
+            ConfigKv::set_with_store(store, "libra.repoid", &minted, false)
+                .await
+                .map_err(|error| {
+                    WorkspaceError::WriteFailed(format!(
+                        "cannot initialize the repository identity (libra.repoid): {error}"
+                    ))
+                })?;
+        }
+        Self::resolve_with_store(store).await
+    }
 }
 
 impl std::fmt::Display for RepoIdentity {
@@ -1265,6 +1320,21 @@ impl WorkspaceStore {
     }
 
     /// Load one record of THIS repository by id.
+    pub async fn get_with_store(
+        store: &dyn crate::storage::GitStateStore,
+        workspace_id: &str,
+    ) -> crate::storage::StorageResult<Option<crate::storage::WorkspaceRecordRow>> {
+        store.get_workspace_record(workspace_id).await
+    }
+
+    pub async fn list_with_store(
+        store: &dyn crate::storage::GitStateStore,
+        repo_id: &str,
+        state_filter: Option<crate::storage::WorkspaceRecordState>,
+    ) -> crate::storage::StorageResult<Vec<crate::storage::WorkspaceRecordRow>> {
+        store.list_workspace_records(repo_id, state_filter).await
+    }
+
     pub async fn get_with_conn<C: ConnectionTrait>(
         conn: &C,
         workspace_id: &str,

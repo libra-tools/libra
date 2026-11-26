@@ -340,6 +340,114 @@ impl Reflog {
         .await?)
     }
 
+    /// Read all reflog entries for `ref_name` directly from a [`crate::storage::GitStore`].
+    pub async fn find_all_with_store(
+        store: &dyn crate::storage::GitStore,
+        ref_name: &str,
+    ) -> Result<Vec<Model>, ReflogError> {
+        let worktree_id = if ref_name == HEAD {
+            crate::utils::util::current_worktree_id()
+        } else {
+            None
+        };
+        let entries = store
+            .list_reflog(ref_name, worktree_id.as_deref(), None)
+            .await
+            .map_err(|err| ReflogError::Storage(err.to_string()))?;
+        Ok(entries
+            .into_iter()
+            .map(|e| Model {
+                id: e.id,
+                ref_name: e.ref_name,
+                old_oid: e.old_oid,
+                new_oid: e.new_oid,
+                committer_name: e.committer_name,
+                committer_email: e.committer_email,
+                timestamp: e.timestamp,
+                action: e.action,
+                message: e.message,
+                worktree_id: e.worktree_id,
+            })
+            .collect())
+    }
+
+    /// Read the newest reflog entry for `ref_name` from a [`crate::storage::GitStore`].
+    pub async fn find_one_with_store(
+        store: &dyn crate::storage::GitStore,
+        ref_name: &str,
+    ) -> Result<Option<Model>, ReflogError> {
+        let worktree_id = if ref_name == HEAD {
+            crate::utils::util::current_worktree_id()
+        } else {
+            None
+        };
+        let entries = store
+            .list_reflog(ref_name, worktree_id.as_deref(), Some(1))
+            .await
+            .map_err(|err| ReflogError::Storage(err.to_string()))?;
+        Ok(entries.into_iter().next().map(|e| Model {
+            id: e.id,
+            ref_name: e.ref_name,
+            old_oid: e.old_oid,
+            new_oid: e.new_oid,
+            committer_name: e.committer_name,
+            committer_email: e.committer_email,
+            timestamp: e.timestamp,
+            action: e.action,
+            message: e.message,
+            worktree_id: e.worktree_id,
+        }))
+    }
+
+    /// Read the newest switch/checkout HEAD reflog entry from a [`crate::storage::GitStore`].
+    pub async fn find_latest_navigation_with_store(
+        store: &dyn crate::storage::GitStore,
+    ) -> Result<Option<Model>, ReflogError> {
+        let entries = Self::find_all_with_store(store, HEAD).await?;
+        Ok(entries
+            .into_iter()
+            .find(|e| e.action == "switch" || e.action == "checkout"))
+    }
+
+    /// Build a [`crate::storage::ReflogWrite`] from `context` for atomic commit
+    /// alongside [`crate::storage::GitStore::update_ref_cas`].
+    pub async fn build_reflog_write_with_store(
+        cfg_store: &dyn crate::storage::ConfigStore,
+        context: &ReflogContext,
+        ref_to_log: &str,
+    ) -> crate::storage::ReflogWrite {
+        let name = cfg_store
+            .get("user.name")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value)
+            .unwrap_or_else(|| "mega".to_string());
+        let email = cfg_store
+            .get("user.email")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value)
+            .unwrap_or_else(|| "admin@mega.org".to_string());
+        let worktree_id = if ref_to_log == HEAD {
+            crate::utils::util::current_worktree_id()
+        } else {
+            None
+        };
+        crate::storage::ReflogWrite {
+            ref_name: ref_to_log.to_string(),
+            old_oid: context.old_oid.clone(),
+            new_oid: context.new_oid.clone(),
+            timestamp: timestamp_seconds(),
+            committer_name: name,
+            committer_email: email,
+            action: context.action.kind().to_string(),
+            message: context.to_string(),
+            worktree_id,
+        }
+    }
+
     /// lore.md 2.1: scope a HEAD-reflog query to the current worktree (branch
     /// reflogs are shared, unscoped).
     fn scope_head(

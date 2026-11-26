@@ -65,27 +65,48 @@ impl ObliterationStore {
 
     /// Error-aware tombstone lookup (used by the mutating obliterate driver).
     pub async fn lookup(hash: &ObjectHash) -> Result<Option<Tombstone>, String> {
-        let db = get_db_conn_instance().await;
-        let oid = hash.to_string();
-        let stmt = Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT oid, hash_kind, state, reason FROM object_obliteration WHERE oid = ? LIMIT 1",
-            [oid.into()],
-        );
-        let row = match db.query_one_raw(stmt).await {
-            Ok(row) => row,
-            Err(e) if e.to_string().contains("no such table") => return Ok(None),
-            Err(e) => return Err(format!("failed to read obliteration tombstone: {e}")),
-        };
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        Ok(Some(Tombstone {
-            oid: row.try_get_by_index(0).map_err(|e| e.to_string())?,
-            hash_kind: row.try_get_by_index(1).map_err(|e| e.to_string())?,
-            state: row.try_get_by_index(2).map_err(|e| e.to_string())?,
-            reason: row.try_get_by_index(3).map_err(|e| e.to_string())?,
-        }))
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to read obliteration tombstone: {e}"))?;
+                let rec = store
+                    .get_object_obliteration(&hash.to_string())
+                    .await
+                    .map_err(|e| format!("failed to read obliteration tombstone: {e}"))?;
+                Ok(rec.map(|r| Tombstone {
+                    oid: r.oid,
+                    hash_kind: r.hash_kind.as_str().to_string(),
+                    state: r.state.as_str().to_string(),
+                    reason: r.reason,
+                }))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                let oid = hash.to_string();
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT oid, hash_kind, state, reason FROM object_obliteration WHERE oid = ? LIMIT 1",
+                    [oid.into()],
+                );
+                let row = match db.query_one_raw(stmt).await {
+                    Ok(row) => row,
+                    Err(e) if e.to_string().contains("no such table") => return Ok(None),
+                    Err(e) => return Err(format!("failed to read obliteration tombstone: {e}")),
+                };
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                Ok(Some(Tombstone {
+                    oid: row.try_get_by_index(0).map_err(|e| e.to_string())?,
+                    hash_kind: row.try_get_by_index(1).map_err(|e| e.to_string())?,
+                    state: row.try_get_by_index(2).map_err(|e| e.to_string())?,
+                    reason: row.try_get_by_index(3).map_err(|e| e.to_string())?,
+                }))
+            }
+        }
     }
 
     /// Live → Obliterating: write the tombstone row (the fsynced commit happens
@@ -97,78 +118,133 @@ impl ObliterationStore {
         actor: Option<&str>,
         approval_source: Option<&str>,
     ) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT OR IGNORE INTO object_obliteration \
-             (oid, hash_kind, state, reason, actor, approval_source) \
-             VALUES (?, ?, 'obliterating', ?, ?, ?)",
-            [
-                hash.to_string().into(),
-                hash_kind_str().into(),
-                reason.into(),
-                actor.into(),
-                approval_source.into(),
-            ],
-        ))
-        .await
-        .map_err(|e| format!("failed to write obliteration tombstone: {e}"))?;
-        // Verify a tombstone for THIS (oid, hash_kind) now exists (Codex P1):
-        // `INSERT OR IGNORE` silently no-ops on a pre-existing row, so confirm
-        // the caller may proceed (either freshly-inserted 'obliterating', or an
-        // already-present tombstone in either state — both mean the object is
-        // being / has been obliterated for this hash kind).
-        let stmt = Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT state FROM object_obliteration WHERE oid = ? AND hash_kind = ? LIMIT 1",
-            [hash.to_string().into(), hash_kind_str().into()],
-        );
-        let row = db
-            .query_one_raw(stmt)
-            .await
-            .map_err(|e| format!("failed to verify obliteration tombstone: {e}"))?;
-        match row {
-            Some(_) => Ok(()),
-            None => Err(format!(
-                "obliteration tombstone for {hash} ({}) was not written",
-                hash_kind_str()
-            )),
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to write obliteration tombstone: {e}"))?;
+                let hash_kind = crate::storage::git_store::ObjectHashKind::parse(hash_kind_str())
+                    .map_err(|e| format!("invalid hash kind: {e}"))?;
+                let _ = store
+                    .begin_object_obliteration(&crate::storage::git_store::ObliterationRequest {
+                        oid: hash.to_string(),
+                        hash_kind,
+                        reason: reason.map(str::to_string),
+                        actor: actor.map(str::to_string),
+                        approval_source: approval_source.map(str::to_string),
+                        recorded_at: chrono::Utc::now().to_rfc3339(),
+                    })
+                    .await
+                    .map_err(|e| format!("failed to write obliteration tombstone: {e}"))?;
+                Ok(())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT OR IGNORE INTO object_obliteration \
+                     (oid, hash_kind, state, reason, actor, approval_source) \
+                     VALUES (?, ?, 'obliterating', ?, ?, ?)",
+                    [
+                        hash.to_string().into(),
+                        hash_kind_str().into(),
+                        reason.into(),
+                        actor.into(),
+                        approval_source.into(),
+                    ],
+                ))
+                .await
+                .map_err(|e| format!("failed to write obliteration tombstone: {e}"))?;
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT state FROM object_obliteration WHERE oid = ? AND hash_kind = ? LIMIT 1",
+                    [hash.to_string().into(), hash_kind_str().into()],
+                );
+                let row = db
+                    .query_one_raw(stmt)
+                    .await
+                    .map_err(|e| format!("failed to verify obliteration tombstone: {e}"))?;
+                match row {
+                    Some(_) => Ok(()),
+                    None => Err(format!(
+                        "obliteration tombstone for {hash} ({}) was not written",
+                        hash_kind_str()
+                    )),
+                }
+            }
         }
     }
 
     /// Obliterating → Obliterated: record the payload as physically removed.
     pub async fn mark_obliterated(hash: &ObjectHash) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE object_obliteration \
-             SET state = 'obliterated', payload_deleted_at = CURRENT_TIMESTAMP, \
-                 updated_at = CURRENT_TIMESTAMP \
-             WHERE oid = ?",
-            [hash.to_string().into()],
-        ))
-        .await
-        .map_err(|e| format!("failed to finalize obliteration: {e}"))?;
-        Ok(())
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|e| format!("failed to finalize obliteration: {e}"))?;
+                let hash_kind = crate::storage::git_store::ObjectHashKind::parse(hash_kind_str())
+                    .map_err(|e| format!("invalid hash kind: {e}"))?;
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = store
+                    .mark_object_obliterated(&hash.to_string(), hash_kind, &now)
+                    .await
+                    .map_err(|e| format!("failed to finalize obliteration: {e}"))?;
+                Ok(())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE object_obliteration \
+                     SET state = 'obliterated', payload_deleted_at = CURRENT_TIMESTAMP, \
+                         updated_at = CURRENT_TIMESTAMP \
+                     WHERE oid = ?",
+                    [hash.to_string().into()],
+                ))
+                .await
+                .map_err(|e| format!("failed to finalize obliteration: {e}"))?;
+                Ok(())
+            }
+        }
     }
 
     /// All OIDs stuck in `obliterating` (crash recovery / diagnostics).
     pub async fn incomplete() -> Result<Vec<String>, String> {
-        let db = get_db_conn_instance().await;
-        let stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT oid FROM object_obliteration WHERE state = 'obliterating'".to_string(),
-        );
-        let rows = match db.query_all_raw(stmt).await {
-            Ok(rows) => rows,
-            Err(e) if e.to_string().contains("no such table") => return Ok(Vec::new()),
-            Err(e) => return Err(format!("failed to scan incomplete obliterations: {e}")),
-        };
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            out.push(row.try_get_by_index(0).map_err(|e| e.to_string())?);
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| format!("failed to detect repository backend: {e}"))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|e| format!("failed to scan incomplete obliterations: {e}"))?;
+                let rows = store
+                    .list_incomplete_obliterations()
+                    .await
+                    .map_err(|e| format!("failed to scan incomplete obliterations: {e}"))?;
+                Ok(rows.into_iter().map(|r| r.oid).collect())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                let stmt = Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT oid FROM object_obliteration WHERE state = 'obliterating'".to_string(),
+                );
+                let rows = match db.query_all_raw(stmt).await {
+                    Ok(rows) => rows,
+                    Err(e) if e.to_string().contains("no such table") => return Ok(Vec::new()),
+                    Err(e) => return Err(format!("failed to scan incomplete obliterations: {e}")),
+                };
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(row.try_get_by_index(0).map_err(|e| e.to_string())?);
+                }
+                Ok(out)
+            }
         }
-        Ok(out)
     }
 }
 
@@ -196,17 +272,33 @@ pub async fn refresh_snapshot() {
 /// diagnostic readers (fsck) may keep the lenient form, where an empty
 /// snapshot only costs a less precise message.
 pub async fn refresh_snapshot_result() -> Result<(), sea_orm::DbErr> {
-    let db = get_db_conn_instance().await;
-    let stmt = Statement::from_string(
-        DbBackend::Sqlite,
-        "SELECT oid FROM object_obliteration".to_string(),
-    );
-    let set: std::collections::HashSet<String> = db
-        .query_all_raw(stmt)
-        .await?
-        .into_iter()
-        .filter_map(|row| row.try_get_by_index::<String>(0).ok())
-        .collect();
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+    let set: std::collections::HashSet<String> = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+            store
+                .list_obliterated_oids()
+                .await
+                .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?
+                .into_iter()
+                .collect()
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let stmt = Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT oid FROM object_obliteration".to_string(),
+            );
+            db.query_all_raw(stmt)
+                .await?
+                .into_iter()
+                .filter_map(|row| row.try_get_by_index::<String>(0).ok())
+                .collect()
+        }
+    };
     let mut guard = TOMBSTONE_SNAPSHOT
         .write()
         .unwrap_or_else(|poison| poison.into_inner());

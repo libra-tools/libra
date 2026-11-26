@@ -75,6 +75,65 @@ fn walk_first_parents(tip: &ObjectHash, stop_at: Option<&str>) -> Result<(Vec<St
 pub struct RevisionOrdinalIndex;
 
 impl RevisionOrdinalIndex {
+    pub async fn meta_with_store(
+        store: &dyn crate::storage::GitStore,
+        ref_name: &str,
+    ) -> Result<Option<OrdinalMeta>> {
+        let row = store
+            .get_revision_ordinal_meta(ref_name)
+            .await
+            .map_err(|err| anyhow!("failed to read revision_ordinal_meta from store: {err}"))?;
+        Ok(row.map(|r| OrdinalMeta {
+            ref_name: r.ref_name,
+            tip_oid: r.tip_oid,
+            replace_sig: r.replace_sig,
+            max_ordinal: r.max_ordinal,
+            built_at: r.built_at,
+        }))
+    }
+
+    pub async fn find_by_ordinal_with_store(
+        store: &dyn crate::storage::GitStore,
+        ref_name: &str,
+        ordinal: i64,
+    ) -> Result<Option<String>> {
+        store
+            .find_revision_oid_by_ordinal(ref_name, ordinal)
+            .await
+            .map_err(|err| anyhow!("failed to look up revision ordinal from store: {err}"))
+    }
+
+    pub async fn ordinal_of_with_store(
+        store: &dyn crate::storage::GitStore,
+        ref_name: &str,
+        oid: &str,
+    ) -> Result<Option<i64>> {
+        store
+            .find_revision_ordinal_by_oid(ref_name, oid)
+            .await
+            .map_err(|err| anyhow!("failed to look up oid ordinal from store: {err}"))
+    }
+
+    pub async fn count_with_store(
+        store: &dyn crate::storage::GitStore,
+        ref_name: &str,
+    ) -> Result<u64> {
+        store
+            .count_revision_ordinals(ref_name)
+            .await
+            .map_err(|err| anyhow!("failed to count revision ordinals from store: {err}"))
+    }
+
+    pub async fn prune_missing_refs_with_store(
+        store: &dyn crate::storage::GitStore,
+        live_refs: &[String],
+    ) -> Result<usize> {
+        store
+            .prune_revision_ordinals_except(live_refs)
+            .await
+            .map_err(|err| anyhow!("failed to prune revision ordinals in store: {err}"))
+    }
+
     pub async fn meta_with_conn<C: ConnectionTrait>(
         db: &C,
         ref_name: &str,

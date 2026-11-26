@@ -1682,7 +1682,10 @@ fn verify_required_tables_write(wtx: &WriteTransaction, role: DatabaseRole) -> S
     Ok(())
 }
 
-fn initialize_config_tables(wtx: &WriteTransaction, role: DatabaseRole) -> StorageResult<String> {
+pub(crate) fn initialize_config_tables(
+    wtx: &WriteTransaction,
+    role: DatabaseRole,
+) -> StorageResult<String> {
     let _ = wtx
         .open_table(CONFIG_KV_TABLE)
         .map_err(|err| map_redb_table_err(err, "init config_kv table"))?;

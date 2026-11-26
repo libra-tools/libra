@@ -35,6 +35,7 @@ pub mod opener;
 pub mod queue;
 #[cfg(feature = "storage-redb")]
 pub mod redb;
+pub mod runtime;
 #[cfg(feature = "storage-sqlite")]
 pub mod sqlite;
 

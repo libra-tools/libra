@@ -21,6 +21,38 @@ pub enum ResolveError {
     Storage(#[from] ChangeStoreError),
 }
 
+/// Backend-agnostic counterpart of [`resolve_change_id_prefix`].
+#[allow(dead_code)]
+pub async fn resolve_change_id_prefix_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    repo_id: &str,
+    prefix: &str,
+) -> Result<ChangeIdResolution, ResolveError> {
+    let prefix = prefix.trim().to_ascii_lowercase();
+    if prefix.is_empty() || prefix.len() > 32 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ResolveError::Invalid(super::ChangeIdError::InvalidHex));
+    }
+    let rows = store
+        .list_change_identities_by_prefix(repo_id, &prefix)
+        .await
+        .map_err(|error| {
+            ResolveError::Storage(ChangeStoreError::Database(sea_orm::DbErr::Custom(
+                error.to_string(),
+            )))
+        })?;
+    let mut ids = rows
+        .into_iter()
+        .map(|rec| rec.change_id.parse().map_err(ResolveError::Invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.sort();
+    ids.dedup();
+    Ok(match ids.len() {
+        0 => ChangeIdResolution::NotFound,
+        1 => ChangeIdResolution::Exact(ids.remove(0)),
+        _ => ChangeIdResolution::Ambiguous(ids),
+    })
+}
+
 /// Resolve a human prefix through the indexed projection.  The returned
 /// canonical IDs are always full 128-bit values, including in JSON output.
 pub async fn resolve_change_id_prefix(

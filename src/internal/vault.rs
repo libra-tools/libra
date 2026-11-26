@@ -269,6 +269,38 @@ async fn read_cfg_value(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Read a vault configuration key directly from a [`crate::storage::ConfigStore`]
+/// without touching `.libra/vault.db` (`RB-13` AC4).
+pub async fn read_cfg_value_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    key: &str,
+) -> Option<String> {
+    crate::internal::config::ConfigKv::get_with_store(store, key)
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value)
+        .filter(|v| !v.is_empty())
+}
+
+/// Write or clear a vault configuration key directly against a [`crate::storage::ConfigStore`]
+/// while keeping `.libra/vault.db` managed by `libvault` (`RB-13` AC4).
+pub async fn restore_cfg_value_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    key: &str,
+    before: Option<String>,
+) -> Result<()> {
+    match before {
+        Some(value) => crate::internal::config::ConfigKv::set_with_store(store, key, &value, false)
+            .await
+            .with_context(|| format!("failed to restore '{key}' in ConfigStore")),
+        None => crate::internal::config::ConfigKv::unset_with_store(store, key)
+            .await
+            .map(|_| ())
+            .with_context(|| format!("failed to clear '{key}' in ConfigStore")),
+    }
+}
+
 /// Restore a config key to its before-image: set when it existed, otherwise
 /// remove it. Used by the ADR-VG-06 §6 staged-step compensation.
 async fn restore_cfg_value(key: &str, before: Option<String>) -> Result<()> {

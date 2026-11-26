@@ -420,13 +420,36 @@ impl WorkspaceSnapshotter {
         }
         // Read only this request's repository. The directory name cannot
         // classify `init --bare .libra`, and global config is not authoritative.
-        let db_path = self.scope.storage.join(util::DATABASE);
-        let db = crate::internal::db::get_db_conn_instance_for_path(&db_path).await?;
-        let entry = ConfigKv::get_with_conn(&db, "core.bare")
-            .await
-            .map_err(|error| {
-                io::Error::other(format!("cannot read repository core.bare: {error}"))
+        let backend =
+            crate::storage::runtime::detect_repo_backend(&self.scope.storage).map_err(|error| {
+                io::Error::other(format!("cannot detect repository backend: {error}"))
             })?;
+        let entry = match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store =
+                    crate::storage::runtime::open_repo_config_store_read_only(&self.scope.storage)
+                        .await
+                        .map_err(|error| {
+                            io::Error::other(format!(
+                                "cannot open repository config store: {error}"
+                            ))
+                        })?;
+                ConfigKv::get_with_store(&*store, "core.bare")
+                    .await
+                    .map_err(|error| {
+                        io::Error::other(format!("cannot read repository core.bare: {error}"))
+                    })?
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_path = self.scope.storage.join(util::DATABASE);
+                let db = crate::internal::db::get_db_conn_instance_for_path(&db_path).await?;
+                ConfigKv::get_with_conn(&db, "core.bare")
+                    .await
+                    .map_err(|error| {
+                        io::Error::other(format!("cannot read repository core.bare: {error}"))
+                    })?
+            }
+        };
         match entry {
             Some(entry) => parse_git_bool(&entry.value).ok_or_else(|| {
                 io::Error::new(
@@ -441,15 +464,36 @@ impl WorkspaceSnapshotter {
     }
 
     async fn autocrlf_enabled(&self) -> bool {
-        let db_path = self.scope.storage.join(util::DATABASE);
-        let Ok(db) = crate::internal::db::get_db_conn_instance_for_path(&db_path).await else {
-            // Fail closed: without a readable config we cannot prove conversion is off.
+        let Ok(backend) = crate::storage::runtime::detect_repo_backend(&self.scope.storage) else {
             return true;
         };
-        match ConfigKv::get_bool_with_conn(&db, "core.autocrlf").await {
-            Ok(Some(true)) => true,
-            Ok(Some(false)) | Ok(None) => false,
-            Err(_) => true,
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let Ok(store) =
+                    crate::storage::runtime::open_repo_config_store_read_only(&self.scope.storage)
+                        .await
+                else {
+                    return true;
+                };
+                match ConfigKv::get_bool_with_store(&*store, "core.autocrlf").await {
+                    Ok(Some(true)) => true,
+                    Ok(Some(false)) | Ok(None) => false,
+                    Err(_) => true,
+                }
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_path = self.scope.storage.join(util::DATABASE);
+                let Ok(db) = crate::internal::db::get_db_conn_instance_for_path(&db_path).await
+                else {
+                    // Fail closed: without a readable config we cannot prove conversion is off.
+                    return true;
+                };
+                match ConfigKv::get_bool_with_conn(&db, "core.autocrlf").await {
+                    Ok(Some(true)) => true,
+                    Ok(Some(false)) | Ok(None) => false,
+                    Err(_) => true,
+                }
+            }
         }
     }
 
@@ -1195,30 +1239,73 @@ async fn read_head(scope: &PinnedRequestScope) -> Result<HeadState, SnapshotErro
         branch::BranchStoreError, db::get_db_conn_instance_for_path, head::Head,
     };
 
-    let path = scope.storage.join(crate::utils::util::DATABASE);
-    let db = get_db_conn_instance_for_path(&path)
-        .await
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot open repository database '{}' to read HEAD for worktree '{}': {error}",
-                    path.display(),
-                    scope.worktree_root.display()
-                ),
-            )
-        })?;
-    let head = Head::current_for_scope_result_with_conn(&db, &scope.scope)
-        .await
-        .map_err(|error| {
-            let kind = match &error {
-                BranchStoreError::Corrupt { .. } => io::ErrorKind::InvalidData,
-                _ => io::ErrorKind::Other};
-            io::Error::new(kind, format!(
-                "cannot read authoritative HEAD for worktree '{}' from repository database '{}': {error}",
-                scope.worktree_root.display(), path.display()
+    let backend =
+        crate::storage::runtime::detect_repo_backend(&scope.storage).map_err(|error| {
+            io::Error::other(format!(
+                "cannot detect repository backend for worktree '{}': {error}",
+                scope.worktree_root.display()
             ))
         })?;
+    let head = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_git_store_read_only(&scope.storage)
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "cannot open repository store '{}' to read HEAD for worktree '{}': {error}",
+                        scope.storage.display(),
+                        scope.worktree_root.display()
+                    ))
+                })?;
+            Head::current_for_scope_result_with_store(&*store, &scope.scope)
+                .await
+                .map_err(|error| {
+                    let kind = match &error {
+                        BranchStoreError::Corrupt { .. } => io::ErrorKind::InvalidData,
+                        _ => io::ErrorKind::Other,
+                    };
+                    io::Error::new(
+                        kind,
+                        format!(
+                            "cannot read authoritative HEAD for worktree '{}' from repository store '{}': {error}",
+                            scope.worktree_root.display(),
+                            scope.storage.display()
+                        ),
+                    )
+                })?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let path = scope.storage.join(crate::utils::util::DATABASE);
+            let db = get_db_conn_instance_for_path(&path)
+                .await
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot open repository database '{}' to read HEAD for worktree '{}': {error}",
+                            path.display(),
+                            scope.worktree_root.display()
+                        ),
+                    )
+                })?;
+            Head::current_for_scope_result_with_conn(&db, &scope.scope)
+                .await
+                .map_err(|error| {
+                    let kind = match &error {
+                        BranchStoreError::Corrupt { .. } => io::ErrorKind::InvalidData,
+                        _ => io::ErrorKind::Other,
+                    };
+                    io::Error::new(
+                        kind,
+                        format!(
+                            "cannot read authoritative HEAD for worktree '{}' from repository database '{}': {error}",
+                            scope.worktree_root.display(),
+                            path.display()
+                        ),
+                    )
+                })?
+        }
+    };
     Ok(match head {
         Head::Branch(name) => HeadState::Symbolic {
             reference: format!("refs/heads/{name}"),

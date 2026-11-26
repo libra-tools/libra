@@ -132,6 +132,32 @@ pub async fn request_db() -> std::io::Result<sea_orm::DatabaseConnection> {
     }
 }
 
+/// Return the common storage directory of the worktree THIS INVOCATION is
+/// acting on, derived from the same pinned observation as [`request_db`].
+///
+/// Falls back to [`util::try_get_storage_path(None)`] when no request scope is
+/// pinned. Works identically for both SQLite (`.libra/libra.db`) and Redb
+/// (`.libra/storage-format.json` / `.libra/redb/`) repositories.
+pub fn request_storage_dir() -> std::io::Result<PathBuf> {
+    if let Some(storage) =
+        context::with_current(|pinned| pinned.as_ref().map(|pinned| pinned.storage.clone()))
+    {
+        return Ok(storage);
+    }
+    util::try_get_storage_path(None)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::NotFound, err.to_string()))
+}
+
+/// Resolve the active `git.gen-<id>.redb` path for the worktree THIS
+/// INVOCATION is acting on from the same pinned observation (`RB-13` AC5).
+#[cfg(feature = "storage-redb")]
+pub fn request_redb_git_path() -> crate::storage::StorageResult<PathBuf> {
+    let storage = request_storage_dir().map_err(|err| {
+        crate::storage::StorageBackendError::io("resolve pinned repository storage dir", err)
+    })?;
+    crate::storage::runtime::resolve_repo_git_redb_path(&storage)
+}
+
 use crate::utils::{
     error::{CliError, CliResult},
     util,

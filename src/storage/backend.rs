@@ -115,6 +115,20 @@ impl StorageBackendKind {
         Self::resolve_with_env_lookup(common_storage, |key| env::var_os(key))
     }
 
+    /// Resolve the active backend when no repository storage directory exists
+    /// (for example, `libra init`, `libra clone`, or outside a repository).
+    /// Evaluates `LIBRA_STORAGE_BACKEND` against compiled features and
+    /// [`REDB_RUNTIME_UNLOCKED`] using [`StorageAuthority::FreshEmpty`].
+    pub fn resolve_without_repo() -> StorageResult<Self> {
+        let env_override = Self::read_env_override_from_lookup(|key| env::var_os(key))?;
+        Self::resolve_authority_with_capabilities(
+            &StorageAuthority::FreshEmpty,
+            env_override.as_deref(),
+            has_sqlite_backend(),
+            has_redb_backend(),
+        )
+    }
+
     /// Resolve the active backend for `<common_storage>` using an injected
     /// environment lookup closure (reads only [`LIBRA_STORAGE_BACKEND_ENV`] and
     /// only AFTER verifying manifest/legacy on-disk authority; never inspects

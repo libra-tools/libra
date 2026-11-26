@@ -2224,49 +2224,162 @@ impl ClientStorage {
         skip_when_busy: bool,
     ) -> Result<Option<ObjectIndexRepairOutcome>, String> {
         let db_path = db_path.to_path_buf();
-        let db_path_str = db_path.to_str().ok_or_else(|| {
-            format!(
-                "database path is not valid UTF-8 for object index repair: {}",
-                db_path.display()
-            )
-        })?;
-        let db_conn =
-            establish_connection_with_lock_timeout(db_path_str, Duration::from_millis(200))
+        let storage_dir = db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let backend =
+            crate::storage::runtime::detect_repo_backend(&storage_dir).map_err(|err| {
+                format!(
+                    "failed to detect repository backend for object index repair at {}: {err}",
+                    storage_dir.display()
+                )
+            })?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let config_store =
+                    crate::storage::runtime::open_repo_config_store_read_only(&storage_dir)
+                        .await
+                        .map_err(|err| {
+                            format!(
+                                "failed to open repository config store {} for repair: {err}",
+                                storage_dir.display()
+                            )
+                        })?;
+                let expected_oid_len = match crate::internal::config::ConfigKv::get_with_store(
+                    &*config_store,
+                    "core.objectformat",
+                )
                 .await
-                .map_err(|error| {
+                {
+                    Ok(Some(entry)) if entry.value.eq_ignore_ascii_case("sha256") => 64,
+                    _ => 40,
+                };
+                let load_path = db_path.clone();
+                let page = tokio::task::spawn_blocking(move || {
+                    let generation_lock = if skip_when_busy {
+                        let Some(lock) = try_acquire_index_repair_lock_file(
+                            &index_repair_generation_lock_path(&load_path)?,
+                            "replay",
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        lock
+                    } else {
+                        acquire_index_repair_generation_lock(&load_path, "replay")?
+                    };
+                    load_pending_object_index_updates(&load_path, expected_oid_len, generation_lock)
+                        .map(Some)
+                })
+                .await
+                .map_err(|error| format!("object-index repair marker reader failed: {error}"))?
+                .map_err(|error| format!("failed to read object-index repair markers: {error}"))?;
+                let Some(page) = page else {
+                    return Ok(None);
+                };
+                if page.updates.is_empty() {
+                    return Ok(Some(ObjectIndexRepairOutcome {
+                        repaired: 0,
+                        remaining: page.has_more,
+                    }));
+                }
+                let repo_id = crate::internal::config::ConfigKv::get_with_store(
+                    &*config_store,
+                    "libra.repoid",
+                )
+                .await
+                .map_err(|err| format!("failed to read libra.repoid for repair: {err}"))?
+                .map(|e| e.value)
+                .unwrap_or_else(|| "unknown-repo".to_string());
+                let git_store = crate::storage::runtime::open_git_store_read_write(&storage_dir)
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "failed to open repository git store {} for repair: {err}",
+                            storage_dir.display()
+                        )
+                    })?;
+                let created_at = chrono::Utc::now().timestamp();
+                let records: Vec<crate::storage::git_store::ObjectIndexRecord> = page
+                    .updates
+                    .iter()
+                    .map(|entry| crate::storage::git_store::ObjectIndexRecord {
+                        o_id: entry.hash.clone(),
+                        o_type: entry.obj_type.clone(),
+                        o_size: entry.size,
+                        repo_id: repo_id.clone(),
+                        created_at,
+                        is_synced: false,
+                    })
+                    .collect();
+                git_store
+                    .upsert_object_index_batch(&records)
+                    .await
+                    .map_err(|err| format!("failed to upsert redb object_index batch: {err}"))?;
+                let mut repaired = 0usize;
+                for entry in &page.updates {
+                    if let Some(marker_path) = entry.marker_path.as_deref() {
+                        retire_index_repair_marker(&db_path, marker_path).map_err(|err| {
+                            format!(
+                                "failed to retire object-index repair marker '{}': {err}",
+                                marker_path.display()
+                            )
+                        })?;
+                    }
+                    repaired += 1;
+                }
+                Ok(Some(ObjectIndexRepairOutcome {
+                    repaired,
+                    remaining: page.has_more,
+                }))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_path_str = db_path.to_str().ok_or_else(|| {
                     format!(
-                        "failed to connect to object index database {} for repair: {error}",
+                        "database path is not valid UTF-8 for object index repair: {}",
                         db_path.display()
                     )
                 })?;
-        let expected_oid_len = expected_index_repair_oid_len(&db_conn).await?;
-        let load_path = db_path.clone();
-        let page = tokio::task::spawn_blocking(move || {
-            let generation_lock = if skip_when_busy {
-                let Some(lock) = try_acquire_index_repair_lock_file(
-                    &index_repair_generation_lock_path(&load_path)?,
-                    "replay",
-                )?
-                else {
+                let db_conn =
+                    establish_connection_with_lock_timeout(db_path_str, Duration::from_millis(200))
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "failed to connect to object index database {} for repair: {error}",
+                                db_path.display()
+                            )
+                        })?;
+                let expected_oid_len = expected_index_repair_oid_len(&db_conn).await?;
+                let load_path = db_path.clone();
+                let page = tokio::task::spawn_blocking(move || {
+                    let generation_lock = if skip_when_busy {
+                        let Some(lock) = try_acquire_index_repair_lock_file(
+                            &index_repair_generation_lock_path(&load_path)?,
+                            "replay",
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        lock
+                    } else {
+                        acquire_index_repair_generation_lock(&load_path, "replay")?
+                    };
+                    load_pending_object_index_updates(&load_path, expected_oid_len, generation_lock)
+                        .map(Some)
+                })
+                .await
+                .map_err(|error| format!("object-index repair marker reader failed: {error}"))?
+                .map_err(|error| format!("failed to read object-index repair markers: {error}"))?;
+                let Some(page) = page else {
+                    // Generation lock busy: this replay was deliberately skipped.
                     return Ok(None);
                 };
-                lock
-            } else {
-                acquire_index_repair_generation_lock(&load_path, "replay")?
-            };
-            load_pending_object_index_updates(&load_path, expected_oid_len, generation_lock)
-                .map(Some)
-        })
-        .await
-        .map_err(|error| format!("object-index repair marker reader failed: {error}"))?
-        .map_err(|error| format!("failed to read object-index repair markers: {error}"))?;
-        let Some(page) = page else {
-            // Generation lock busy: this replay was deliberately skipped.
-            return Ok(None);
-        };
-        apply_pending_object_index_page(&db_conn, &db_path, page)
-            .await
-            .map(Some)
+                apply_pending_object_index_page(&db_conn, &db_path, page)
+                    .await
+                    .map(Some)
+            }
+        }
     }
 
     /// Read a Git object's *raw payload* by its hash.
@@ -2624,7 +2737,10 @@ impl ClientStorage {
         // Update object index asynchronously (via sequential queue). This keeps
         // foreground writes nonblocking while the marker makes retry durable.
         if let Some(db_path) = Self::index_db_path_from_base(&self.base_path)
-            && db_path.exists()
+            && (db_path.exists()
+                || db_path
+                    .parent()
+                    .is_some_and(crate::storage::runtime::has_redb_storage_markers))
         {
             let msg = IndexUpdateMsg {
                 hash: hash_str.to_string(),
@@ -3057,7 +3173,7 @@ pub(crate) fn enqueue_agent_blob_object_index_update(
     o_size: i64,
 ) -> io::Result<()> {
     let db_path = libra_dir.join(DATABASE);
-    if !db_path.exists() {
+    if !db_path.exists() && !crate::storage::runtime::has_redb_storage_markers(libra_dir) {
         return Ok(());
     }
     let mut msg = IndexUpdateMsg {
@@ -4432,6 +4548,50 @@ async fn update_object_index_once(
     o_type: &str,
     o_size: i64,
 ) -> Result<(), String> {
+    if let Some(storage_dir) = db_path.parent()
+        && crate::storage::runtime::has_redb_storage_markers(storage_dir)
+    {
+        let backend = crate::storage::runtime::detect_repo_backend(storage_dir)
+            .map_err(|err| format!("failed to detect backend for object index update: {err}"))?;
+        if backend == crate::storage::StorageBackendKind::Redb {
+            let config_store =
+                crate::storage::runtime::open_repo_config_store_read_only(storage_dir)
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "failed to open redb config store {}: {err}",
+                            storage_dir.display()
+                        )
+                    })?;
+            let repo_id =
+                crate::internal::config::ConfigKv::get_with_store(&*config_store, "libra.repoid")
+                    .await
+                    .map_err(|err| format!("failed to read libra.repoid: {err}"))?
+                    .map(|entry| entry.value)
+                    .unwrap_or_else(|| "unknown-repo".to_string());
+            let git_store = crate::storage::runtime::open_git_store_read_write(storage_dir)
+                .await
+                .map_err(|err| {
+                    format!(
+                        "failed to open redb git store {}: {err}",
+                        storage_dir.display()
+                    )
+                })?;
+            let record = crate::storage::git_store::ObjectIndexRecord {
+                o_id: o_id.to_string(),
+                o_type: o_type.to_string(),
+                o_size,
+                repo_id,
+                created_at: chrono::Utc::now().timestamp(),
+                is_synced: false,
+            };
+            git_store
+                .upsert_object_index_batch(&[record])
+                .await
+                .map_err(|err| format!("failed to upsert redb object_index row: {err}"))?;
+            return Ok(());
+        }
+    }
     if !db_path.exists() {
         return Err(format!(
             "object-index database is missing while reconciling durable repair: {}",

@@ -199,7 +199,15 @@ impl StorageBackendError {
         let code = self.stable_error_code();
         CliError::fatal(self.to_string()).with_stable_code(code)
     }
+}
 
+impl From<StorageBackendError> for CliError {
+    fn from(err: StorageBackendError) -> Self {
+        err.into_cli_error()
+    }
+}
+
+impl StorageBackendError {
     /// Construct a sanitized [`StorageBackendError::Io`] from an `io::Error`,
     /// discarding any arbitrary custom error string payload.
     #[must_use]

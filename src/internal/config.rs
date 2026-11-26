@@ -47,7 +47,7 @@ use crate::{
     utils::util::{DATABASE, try_get_storage_path},
 };
 
-mod global_migration;
+pub(crate) mod global_migration;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ConfigKv — new flat key/value API backed by the `config_kv` table
@@ -588,42 +588,196 @@ impl ConfigKv {
     // `db.transaction(|txn| { ... })` block — that deadlocks. Use the
     // `_with_conn` variant instead.
 
+    pub async fn get_with_store(
+        store: &dyn crate::storage::ConfigStore,
+        key: &str,
+    ) -> Result<Option<ConfigKvEntry>> {
+        let entry = store
+            .get(key)
+            .await
+            .map_err(|err| anyhow!("failed to query config_kv from store: {err}"))?;
+        Ok(entry.map(|e| ConfigKvEntry {
+            key: e.key,
+            value: e.value,
+            encrypted: e.encrypted,
+        }))
+    }
+
+    pub async fn get_all_with_store(
+        store: &dyn crate::storage::ConfigStore,
+        key: &str,
+    ) -> Result<Vec<ConfigKvEntry>> {
+        let rows = store
+            .get_all(key)
+            .await
+            .map_err(|err| anyhow!("failed to query config_kv from store: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|e| ConfigKvEntry {
+                key: e.key,
+                value: e.value,
+                encrypted: e.encrypted,
+            })
+            .collect())
+    }
+
+    pub async fn set_with_store(
+        store: &dyn crate::storage::ConfigStore,
+        key: &str,
+        value: &str,
+        encrypted: bool,
+    ) -> Result<()> {
+        store
+            .set(key, value, encrypted)
+            .await
+            .map_err(|err| anyhow!("failed to set config_kv in store: {err}"))
+    }
+
+    pub async fn add_with_store(
+        store: &dyn crate::storage::ConfigStore,
+        key: &str,
+        value: &str,
+        encrypted: bool,
+    ) -> Result<()> {
+        store
+            .add(key, value, encrypted)
+            .await
+            .map_err(|err| anyhow!("failed to add config_kv in store: {err}"))
+    }
+
+    pub async fn unset_with_store(
+        store: &dyn crate::storage::ConfigStore,
+        key: &str,
+    ) -> Result<usize> {
+        store
+            .unset(key)
+            .await
+            .map_err(|err| anyhow!("failed to unset config_kv in store: {err}"))
+    }
+
+    pub async fn unset_all_with_store(
+        store: &dyn crate::storage::ConfigStore,
+        key: &str,
+    ) -> Result<usize> {
+        store
+            .unset_all(key)
+            .await
+            .map_err(|err| anyhow!("failed to unset_all config_kv in store: {err}"))
+    }
+
+    pub async fn list_all_with_store(
+        store: &dyn crate::storage::ConfigStore,
+    ) -> Result<Vec<ConfigKvEntry>> {
+        let rows = store
+            .list_all()
+            .await
+            .map_err(|err| anyhow!("failed to list config_kv from store: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|e| ConfigKvEntry {
+                key: e.key,
+                value: e.value,
+                encrypted: e.encrypted,
+            })
+            .collect())
+    }
+
+    pub async fn get_by_prefix_with_store(
+        store: &dyn crate::storage::ConfigStore,
+        prefix: &str,
+    ) -> Result<Vec<ConfigKvEntry>> {
+        let rows = store
+            .get_by_prefix(prefix)
+            .await
+            .map_err(|err| anyhow!("failed to query config_kv by prefix from store: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|e| ConfigKvEntry {
+                key: e.key,
+                value: e.value,
+                encrypted: e.encrypted,
+            })
+            .collect())
+    }
+
+    /// Read a key from an external configuration scope (`GlobalConfig` or
+    /// `SystemConfig`) obeying `ADR-RB-02` #2 (checks `config-format.json` first,
+    /// dispatches by `runtime_backend`, fails closed on unmigrated/missing scope
+    /// under pure-redb instead of silently returning empty config).
+    pub async fn get_in_config_scope(
+        scope_dir: &Path,
+        role: DatabaseRole,
+        runtime_backend: crate::storage::StorageBackendKind,
+        key: &str,
+    ) -> crate::storage::StorageResult<Option<ConfigKvEntry>> {
+        let store =
+            crate::storage::open_config_scope_for_read(scope_dir, role, runtime_backend).await?;
+        let entry = store.get(key).await?;
+        Ok(entry.map(|e| ConfigKvEntry {
+            key: e.key,
+            value: e.value,
+            encrypted: e.encrypted,
+        }))
+    }
+
     /// Pool-acquiring counterpart of [`Self::get_with_conn`].
     pub async fn get(key: &str) -> Result<Option<ConfigKvEntry>> {
-        let db = get_db_conn_instance().await;
-        Self::get_with_conn(&db, key).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_with_conn(&db, key).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::get_with_store(store.as_ref(), key).await
+            }
+        }
     }
 
     /// Non-panicking counterpart of [`Self::get`].
-    ///
-    /// [`Self::get`] resolves its connection through [`get_db_conn_instance`],
-    /// which **panics** when the repository database is missing or its schema
-    /// is out of date. That is unacceptable for best-effort / background
-    /// reads — for example the SSH transport setup performed during
-    /// `clone`/`fetch`, which may walk up into an *enclosing* repository whose
-    /// schema this binary no longer supports. This variant resolves the
-    /// database path fallibly and surfaces any open/compatibility failure as
-    /// an `Err`, so callers can degrade gracefully instead of dumping a panic
-    /// to stderr.
     pub async fn get_best_effort(key: &str) -> Result<Option<ConfigKvEntry>> {
-        let db_path = try_get_storage_path(None)
-            .map_err(|err| anyhow!("not inside a libra repository: {err}"))?
-            .join(DATABASE);
-        let db = get_db_conn_instance_for_path(&db_path)
-            .await
-            .map_err(|err| {
-                anyhow!(
-                    "failed to open repository database {}: {err}",
-                    db_path.display()
-                )
-            })?;
-        Self::get_with_conn(&db, key).await
+        let storage_dir = try_get_storage_path(None)
+            .map_err(|err| anyhow!("not inside a libra repository: {err}"))?;
+        match crate::storage::runtime::detect_repo_backend(&storage_dir)
+            .map_err(|err| anyhow!(err))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_path = storage_dir.join(DATABASE);
+                let db = get_db_conn_instance_for_path(&db_path)
+                    .await
+                    .map_err(|err| {
+                        anyhow!(
+                            "failed to open repository database {}: {err}",
+                            db_path.display()
+                        )
+                    })?;
+                Self::get_with_conn(&db, key).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_repo_config_store_read_only(&storage_dir)
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::get_with_store(store.as_ref(), key).await
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Self::get_all_with_conn`].
     pub async fn get_all(key: &str) -> Result<Vec<ConfigKvEntry>> {
-        let db = get_db_conn_instance().await;
-        Self::get_all_with_conn(&db, key).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_all_with_conn(&db, key).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::get_all_with_store(store.as_ref(), key).await
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of
@@ -632,44 +786,138 @@ impl ConfigKv {
         prefix: &str,
         variable: &str,
     ) -> Result<Vec<ConfigKvEntry>> {
-        let db = get_db_conn_instance().await;
-        Self::get_var_all_case_insensitive_with_conn(&db, prefix, variable).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_var_all_case_insensitive_with_conn(&db, prefix, variable).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                let rows = Self::get_by_prefix_with_store(store.as_ref(), prefix).await?;
+                Ok(rows
+                    .into_iter()
+                    .filter(|row| {
+                        row.key
+                            .strip_prefix(prefix)
+                            .is_some_and(|name| name.eq_ignore_ascii_case(variable))
+                    })
+                    .collect())
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Self::set_with_conn`].
     pub async fn set(key: &str, value: &str, encrypted: bool) -> Result<()> {
-        let db = get_db_conn_instance().await;
-        Self::set_with_conn(&db, key, value, encrypted).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::set_with_conn(&db, key, value, encrypted).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::set_with_store(store.as_ref(), key, value, encrypted).await
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Self::add_with_conn`].
     pub async fn add(key: &str, value: &str, encrypted: bool) -> Result<()> {
-        let db = get_db_conn_instance().await;
-        Self::add_with_conn(&db, key, value, encrypted).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::add_with_conn(&db, key, value, encrypted).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::add_with_store(store.as_ref(), key, value, encrypted).await
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Self::unset_with_conn`].
     pub async fn unset(key: &str) -> Result<usize> {
-        let db = get_db_conn_instance().await;
-        Self::unset_with_conn(&db, key).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::unset_with_conn(&db, key).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::unset_with_store(store.as_ref(), key).await
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Self::unset_all_with_conn`].
     pub async fn unset_all(key: &str) -> Result<usize> {
-        let db = get_db_conn_instance().await;
-        Self::unset_all_with_conn(&db, key).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::unset_all_with_conn(&db, key).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::unset_all_with_store(store.as_ref(), key).await
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Self::list_all_with_conn`].
     pub async fn list_all() -> Result<Vec<ConfigKvEntry>> {
-        let db = get_db_conn_instance().await;
-        Self::list_all_with_conn(&db).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::list_all_with_conn(&db).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::list_all_with_store(store.as_ref()).await
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Self::get_by_prefix_with_conn`].
     pub async fn get_by_prefix(prefix: &str) -> Result<Vec<ConfigKvEntry>> {
-        let db = get_db_conn_instance().await;
-        Self::get_by_prefix_with_conn(&db, prefix).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_by_prefix_with_conn(&db, prefix).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::get_by_prefix_with_store(store.as_ref(), prefix).await
+            }
+        }
+    }
+
+    /// Storage-trait counterpart of [`Self::get_var_case_insensitive_with_conn`].
+    pub async fn get_var_case_insensitive_with_store(
+        store: &dyn crate::storage::config_store::ConfigStore,
+        prefix: &str,
+        variable: &str,
+    ) -> Result<Option<ConfigKvEntry>> {
+        let rows = Self::get_by_prefix_with_store(store, prefix).await?;
+        let needle = variable.to_ascii_lowercase();
+        Ok(rows.into_iter().rev().find(|entry| {
+            entry
+                .key
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.to_ascii_lowercase() == needle)
+        }))
     }
 
     /// Pool-acquiring counterpart of [`Self::get_var_case_insensitive_with_conn`].
@@ -677,11 +925,44 @@ impl ConfigKv {
         prefix: &str,
         variable: &str,
     ) -> Result<Option<ConfigKvEntry>> {
-        let db = get_db_conn_instance().await;
-        Self::get_var_case_insensitive_with_conn(&db, prefix, variable).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_var_case_insensitive_with_conn(&db, prefix, variable).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::get_var_case_insensitive_with_store(store.as_ref(), prefix, variable).await
+            }
+        }
     }
 
     // ── Type helpers ─────────────────────────────────────────────────────
+
+    /// Storage-trait counterpart of [`Self::get_bool_with_conn`].
+    pub async fn get_bool_with_store(
+        store: &dyn crate::storage::config_store::ConfigStore,
+        key: &str,
+    ) -> Result<Option<bool>> {
+        let entry = Self::get_with_store(store, key).await?;
+        match entry {
+            None => Ok(None),
+            Some(e) => {
+                let v = e.value.to_ascii_lowercase();
+                match v.as_str() {
+                    "true" | "yes" | "on" | "1" => Ok(Some(true)),
+                    "false" | "no" | "off" | "0" => Ok(Some(false)),
+                    _ => Err(anyhow!(
+                        "invalid value '{}' for key '{}': expected bool (true/false)",
+                        if e.encrypted { "<REDACTED>" } else { &e.value },
+                        key
+                    )),
+                }
+            }
+        }
+    }
 
     /// Get a boolean config value. Normalises `true/yes/on/1` -> `true`,
     /// `false/no/off/0` -> `false`.
@@ -762,8 +1043,11 @@ impl ConfigKv {
 
     /// Pool-acquiring counterpart of [`Self::get_remote_url_with_conn`].
     pub async fn get_remote_url(remote: &str) -> Result<String> {
-        let db = get_db_conn_instance().await;
-        Self::get_remote_url_with_conn(&db, remote).await
+        let key = format!("remote.{remote}.url");
+        match Self::get(&key).await? {
+            Some(entry) => Ok(entry.value),
+            None => Err(anyhow!("fatal: No URL configured for remote '{remote}'.")),
+        }
     }
 
     /// Get remote name for a branch from `branch.<branch>.remote`.
@@ -779,8 +1063,8 @@ impl ConfigKv {
 
     /// Pool-acquiring counterpart of [`Self::get_remote_with_conn`].
     pub async fn get_remote(branch: &str) -> Result<Option<String>> {
-        let db = get_db_conn_instance().await;
-        Self::get_remote_with_conn(&db, branch).await
+        let key = format!("branch.{branch}.remote");
+        Ok(Self::get(&key).await?.map(|e| e.value))
     }
 
     /// Get remote for the current HEAD branch.
@@ -800,8 +1084,10 @@ impl ConfigKv {
 
     /// Pool-acquiring counterpart of [`Self::get_current_remote_with_conn`].
     pub async fn get_current_remote() -> Result<Option<String>> {
-        let db = get_db_conn_instance().await;
-        Self::get_current_remote_with_conn(&db).await
+        match Head::current().await {
+            Head::Branch(name) => Self::get_remote(&name).await,
+            Head::Detached(_) => Err(anyhow!("fatal: HEAD is detached, cannot get remote")),
+        }
     }
 
     /// Get remote URL for the current HEAD branch.
@@ -820,8 +1106,10 @@ impl ConfigKv {
 
     /// Pool-acquiring counterpart of [`Self::get_current_remote_url_with_conn`].
     pub async fn get_current_remote_url() -> Result<Option<String>> {
-        let db = get_db_conn_instance().await;
-        Self::get_current_remote_url_with_conn(&db).await
+        match Self::get_current_remote().await? {
+            Some(remote) => Ok(Some(Self::get_remote_url(&remote).await?)),
+            None => Ok(None),
+        }
     }
 
     /// Enumerate every configured remote and its URL.
@@ -860,8 +1148,28 @@ impl ConfigKv {
 
     /// Pool-acquiring counterpart of [`Self::all_remote_configs_with_conn`].
     pub async fn all_remote_configs() -> Result<Vec<RemoteConfig>> {
-        let db = get_db_conn_instance().await;
-        Self::all_remote_configs_with_conn(&db).await
+        let entries = Self::get_by_prefix("remote.").await?;
+        let mut remote_names: Vec<String> = Vec::new();
+        for e in &entries {
+            if let Some(rest) = e.key.strip_prefix("remote.")
+                && let Some((name, suffix)) = rest.rsplit_once('.')
+                && suffix == "url"
+                && !remote_names.iter().any(|remote| remote == name)
+            {
+                remote_names.push(name.to_string());
+            }
+        }
+        let mut configs = Vec::new();
+        for name in remote_names {
+            let url_key = format!("remote.{name}.url");
+            if let Some(entry) = entries.iter().find(|e| e.key == url_key) {
+                configs.push(RemoteConfig {
+                    name: name.clone(),
+                    url: entry.value.clone(),
+                });
+            }
+        }
+        Ok(configs)
     }
 
     /// Get a specific remote's config (`Ok(None)` when no `remote.<name>.url`).
@@ -881,8 +1189,14 @@ impl ConfigKv {
 
     /// Pool-acquiring counterpart of [`Self::remote_config_with_conn`].
     pub async fn remote_config(name: &str) -> Result<Option<RemoteConfig>> {
-        let db = get_db_conn_instance().await;
-        Self::remote_config_with_conn(&db, name).await
+        let url_key = format!("remote.{name}.url");
+        match Self::get(&url_key).await? {
+            Some(entry) => Ok(Some(RemoteConfig {
+                name: name.to_owned(),
+                url: entry.value,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Get branch tracking configuration (the upstream remote and merge ref).
@@ -920,8 +1234,24 @@ impl ConfigKv {
 
     /// Pool-acquiring counterpart of [`Self::branch_config_with_conn`].
     pub async fn branch_config(name: &str) -> Result<Option<BranchConfig>> {
-        let db = get_db_conn_instance().await;
-        Self::branch_config_with_conn(&db, name).await
+        let remote_key = format!("branch.{name}.remote");
+        let merge_key = format!("branch.{name}.merge");
+        let remote = Self::get(&remote_key).await?;
+        let merge = Self::get(&merge_key).await?;
+        match (remote, merge) {
+            (Some(r), Some(m)) => {
+                let mut merge_val = m.value;
+                if let Some(stripped) = merge_val.strip_prefix("refs/heads/") {
+                    merge_val = stripped.to_string();
+                }
+                Ok(Some(BranchConfig {
+                    name: name.to_owned(),
+                    merge: merge_val,
+                    remote: r.value,
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Remove all config entries for a remote, including its SSH credentials.
@@ -2599,14 +2929,32 @@ async fn skip_global_scope_if_schema_future(db_path: &Path, error: anyhow::Error
 /// optional plaintext keys such as `core.excludesFile` and is best-effort
 /// by contract.
 pub async fn read_cascaded_config_value_fresh_conn(key: &str) -> Option<String> {
-    let local_db = match try_get_storage_path(None) {
-        Ok(storage) => Some(storage.join(DATABASE)),
+    let storage_dir = match try_get_storage_path(None) {
+        Ok(storage) => Some(storage),
         // Not inside a repository: local scope is genuinely absent.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         // Repository resolution itself failed: same fail-quiet rule as a
         // failing local store — do not let global answer for it.
         Err(_) => return None,
     };
+    if let Some(storage) = storage_dir.as_deref()
+        && let Ok(crate::storage::StorageBackendKind::Redb) =
+            crate::storage::runtime::detect_repo_backend(storage)
+    {
+        let store = match crate::storage::runtime::open_repo_config_store_read_only(storage).await {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        if let Ok(Some(entry)) = ConfigKv::get_with_store(&*store, key).await {
+            if entry.encrypted {
+                return None;
+            }
+            return Some(entry.value);
+        }
+        let global_db = global_config_path_for_read().await;
+        return read_cascaded_fresh_conn_at(None, global_db.as_deref(), key).await;
+    }
+    let local_db = storage_dir.map(|storage| storage.join(DATABASE));
     let global_db = global_config_path_for_read().await;
     read_cascaded_fresh_conn_at(local_db.as_deref(), global_db.as_deref(), key).await
 }
@@ -4617,6 +4965,121 @@ mod tests {
         let re_keys: Vec<String> = re_entries.into_iter().map(|e| e.key).collect();
         assert_eq!(re_keys, vec!["zz.key", "aa.key", "mm.key"]);
         db.close().await.expect("close db");
+    }
+
+    /// `RB-13` AC3 & AC4: verify repository `ConfigKv` on pure `Redb`, `GlobalConfig`
+    /// & `SystemConfig` `ADR-RB-02` #2 dispatch (fail-closed on unmigrated SQLite
+    /// under `Redb` runtime instead of returning empty config), and `vault.rs` KV
+    /// access via `ConfigStore` while preserving `.libra/vault.db` isolation.
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_config_cascade_global_system_fallback_and_vault_kv() {
+        use crate::{
+            internal::vault,
+            storage::{
+                StorageBackendKind, config_store::open_or_create_locked_config_scope_for_write,
+                runtime::init_redb_repository_storage,
+            },
+            utils::test::ChangeDirGuard,
+        };
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let repo_root = tmp.path().join("repo");
+        let dot_libra = repo_root.join(".libra");
+        std::fs::create_dir_all(dot_libra.join("objects")).expect("mkdir objects");
+        let _paths = init_redb_repository_storage(&dot_libra)
+            .await
+            .expect("init pure redb repo");
+        let _guard = ChangeDirGuard::new(&repo_root);
+
+        // 1. Repository ConfigKv read/write on pure redb (zero libra.db).
+        ConfigKv::set("user.name", "redb-dev", false)
+            .await
+            .expect("set user.name on redb");
+        ConfigKv::set("user.email", "redb@example.com", false)
+            .await
+            .expect("set user.email on redb");
+        assert_eq!(
+            ConfigKv::get("user.name")
+                .await
+                .expect("get user.name")
+                .map(|e| e.value),
+            Some("redb-dev".to_string())
+        );
+
+        // 2. Vault KV helper routes through ConfigStore without touching vault.db.
+        let cfg_rw = crate::storage::runtime::open_current_repo_config_store_read_write()
+            .await
+            .expect("open redb config store rw");
+        vault::restore_cfg_value_with_store(
+            cfg_rw.as_ref(),
+            "vault.gpg.generated_key_name",
+            Some("libra-signing-test".to_string()),
+        )
+        .await
+        .expect("write vault key via ConfigStore");
+        assert_eq!(
+            vault::read_cfg_value_with_store(cfg_rw.as_ref(), "vault.gpg.generated_key_name").await,
+            Some("libra-signing-test".to_string())
+        );
+        assert!(
+            !dot_libra.join("vault.db").exists(),
+            "vault KV ConfigStore path must not touch or synthesize vault.db"
+        );
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "redb config ops must never create libra.db"
+        );
+
+        // 3. GlobalConfig & SystemConfig ADR-RB-02 #2 dispatch under Redb runtime:
+        //    (a) Fresh redb scope writes and reads cleanly.
+        let global_dir = tmp.path().join("global-redb");
+        let system_dir = tmp.path().join("system-redb");
+        std::fs::create_dir_all(&global_dir).expect("mkdir global");
+        std::fs::create_dir_all(&system_dir).expect("mkdir system");
+        {
+            let g_scope = open_or_create_locked_config_scope_for_write(
+                &global_dir,
+                DatabaseRole::GlobalConfig,
+                StorageBackendKind::Redb,
+                crate::storage::DEFAULT_CONFIG_SCOPE_LOCK_TIMEOUT,
+            )
+            .await
+            .expect("create global redb config scope");
+            g_scope
+                .store()
+                .set("core.editor", "hx", false)
+                .await
+                .expect("set global core.editor");
+        }
+        assert_eq!(
+            ConfigKv::get_in_config_scope(
+                &global_dir,
+                DatabaseRole::GlobalConfig,
+                StorageBackendKind::Redb,
+                "core.editor",
+            )
+            .await
+            .expect("read global redb scope")
+            .map(|e| e.value),
+            Some("hx".to_string())
+        );
+
+        //    (b) Unmigrated legacy SQLite `config.db` under Redb runtime fails closed
+        //        (never silently returns empty config!).
+        let unmigrated_sys = tmp.path().join("system-legacy-sqlite");
+        std::fs::create_dir_all(&unmigrated_sys).expect("mkdir unmigrated system");
+        std::fs::write(unmigrated_sys.join("config.db"), b"SQLite format 3\0").expect("seed db");
+        let err = ConfigKv::get_in_config_scope(
+            &unmigrated_sys,
+            DatabaseRole::SystemConfig,
+            StorageBackendKind::Redb,
+            "core.editor",
+        )
+        .await
+        .expect_err("pure-redb runtime must fail closed on unmigrated SQLite SystemConfig");
+        assert_eq!(err.stable_code_str(), "LBR-CLI-003");
     }
 }
 

@@ -52,23 +52,95 @@ pub async fn record_current_repo_commit_revision_with_predecessors(
     commit_oid: impl Into<String>,
     predecessors: Vec<(String, RelationKind)>,
 ) -> Result<ChangeRevision, ChangeRevisionBuildError> {
-    let database = crate::internal::db::get_db_conn_instance().await;
-    let repo_id = crate::internal::workspace::RepoIdentity::resolve_or_init(&database)
-        .await
+    let backend = crate::storage::runtime::detect_current_repo_backend()
         .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?;
-    let repo_id = repo_id.to_string();
     let op_id = op_id.into();
     let commit_oid = commit_oid.into();
     let pending_operation_ids = pending_ai_operation_ids();
-    build_revision_with_predecessors_with_ai_context(
-        database.clone(),
-        repo_id.as_str(),
-        op_id,
-        commit_oid,
-        predecessors,
-        &pending_operation_ids,
-    )
-    .await
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?;
+            let repo_id = crate::internal::workspace::RepoIdentity::resolve_or_init_with_store(
+                &*config_store,
+            )
+            .await
+            .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?
+            .to_string();
+            let state_store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|error| {
+                    ChangeRevisionBuildError::Store(ChangeStoreError::Database(
+                        sea_orm::DbErr::Custom(error.to_string()),
+                    ))
+                })?;
+            let builder = revision_builder_for_predecessors_with_store(
+                state_store.clone(),
+                &repo_id,
+                op_id,
+                commit_oid,
+                predecessors,
+            )
+            .await?;
+            builder.build_with_ai_context(&pending_operation_ids).await
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let database = crate::internal::db::get_db_conn_instance().await;
+            let repo_id = crate::internal::workspace::RepoIdentity::resolve_or_init(&database)
+                .await
+                .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?;
+            let repo_id = repo_id.to_string();
+            build_revision_with_predecessors_with_ai_context(
+                database.clone(),
+                repo_id.as_str(),
+                op_id,
+                commit_oid,
+                predecessors,
+                &pending_operation_ids,
+            )
+            .await
+        }
+    }
+}
+
+async fn revision_builder_for_predecessors_with_store(
+    state_store: std::sync::Arc<dyn crate::storage::git_state_store::GitStateStore>,
+    repo_id: &str,
+    op_id: String,
+    commit_oid: String,
+    predecessors: Vec<(String, RelationKind)>,
+) -> Result<ChangeRevisionBuilder, ChangeRevisionBuildError> {
+    let inherited_predecessor = predecessors
+        .iter()
+        .find(|(_, relation_kind)| relation_kind.preserves_change_identity());
+    let (inherited, origin) = match inherited_predecessor {
+        Some((predecessor_oid, _)) => {
+            match ChangeStore::change_id_for_commit_with_store(
+                &*state_store,
+                repo_id,
+                predecessor_oid,
+            )
+            .await?
+            {
+                Some(change_id) => (Some(change_id), "generated"),
+                None => (
+                    synthetic_change_id_for_legacy_predecessor(predecessor_oid),
+                    "synthetic",
+                ),
+            }
+        }
+        None => (None, "generated"),
+    };
+    let builder = match inherited {
+        Some(change_id) => {
+            ChangeRevisionBuilder::for_rewrite_with_store(state_store, repo_id, op_id, change_id)
+        }
+        None => ChangeRevisionBuilder::for_new_change_with_store(state_store, repo_id, op_id),
+    }
+    .set_commit_oid(commit_oid)
+    .with_identity_origin(origin);
+    Ok(builder.set_predecessors(predecessors))
 }
 
 #[cfg(test)]
@@ -261,49 +333,94 @@ pub async fn record_split_revisions<I>(
 where
     I: IntoIterator<Item = (String, String, Vec<String>)>,
 {
-    let database = crate::internal::db::get_db_conn_instance().await;
-    let repo_id = crate::internal::workspace::RepoIdentity::resolve_or_init(&database)
-        .await
-        .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?
-        .to_string();
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?;
     let pending_operation_ids = pending_ai_operation_ids();
-    let transaction = crate::internal::db::begin_write_transaction(&database)
-        .await
-        .map_err(ChangeStoreError::Database)?;
-    let result = async {
-        let mut recorded = Vec::new();
-        for (operation_id, commit_oid, predecessors) in revisions {
-            let predecessors = predecessors
-                .into_iter()
-                .map(|oid| (oid, RelationKind::Split))
-                .collect();
-            let builder = revision_builder_for_predecessors_on(
-                &transaction,
-                database.clone(),
-                &repo_id,
-                operation_id,
-                commit_oid,
-                predecessors,
-            )
-            .await?;
-            let revision = builder.build_on(&transaction).await?;
-            link_revision_on(&transaction, &repo_id, &revision, &pending_operation_ids).await?;
-            recorded.push(revision);
-        }
-        Ok::<_, ChangeRevisionBuildError>(recorded)
-    }
-    .await;
-    match result {
-        Ok(recorded) => {
-            transaction
-                .commit()
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_write()
                 .await
-                .map_err(ChangeStoreError::Database)?;
+                .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?;
+            let repo_id = crate::internal::workspace::RepoIdentity::resolve_or_init_with_store(
+                &*config_store,
+            )
+            .await
+            .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?
+            .to_string();
+            let state_store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|error| {
+                    ChangeRevisionBuildError::Store(ChangeStoreError::Database(
+                        sea_orm::DbErr::Custom(error.to_string()),
+                    ))
+                })?;
+            let mut recorded = Vec::new();
+            for (operation_id, commit_oid, predecessors) in revisions {
+                let predecessors = predecessors
+                    .into_iter()
+                    .map(|oid| (oid, RelationKind::Split))
+                    .collect();
+                let builder = revision_builder_for_predecessors_with_store(
+                    state_store.clone(),
+                    &repo_id,
+                    operation_id,
+                    commit_oid,
+                    predecessors,
+                )
+                .await?;
+                let revision = builder
+                    .build_with_ai_context(&pending_operation_ids)
+                    .await?;
+                recorded.push(revision);
+            }
             Ok(recorded)
         }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
+        crate::storage::StorageBackendKind::Sqlite => {
+            let database = crate::internal::db::get_db_conn_instance().await;
+            let repo_id = crate::internal::workspace::RepoIdentity::resolve_or_init(&database)
+                .await
+                .map_err(|error| ChangeRevisionBuildError::RepositoryIdentity(error.to_string()))?
+                .to_string();
+            let transaction = crate::internal::db::begin_write_transaction(&database)
+                .await
+                .map_err(ChangeStoreError::Database)?;
+            let result = async {
+                let mut recorded = Vec::new();
+                for (operation_id, commit_oid, predecessors) in revisions {
+                    let predecessors = predecessors
+                        .into_iter()
+                        .map(|oid| (oid, RelationKind::Split))
+                        .collect();
+                    let builder = revision_builder_for_predecessors_on(
+                        &transaction,
+                        database.clone(),
+                        &repo_id,
+                        operation_id,
+                        commit_oid,
+                        predecessors,
+                    )
+                    .await?;
+                    let revision = builder.build_on(&transaction).await?;
+                    link_revision_on(&transaction, &repo_id, &revision, &pending_operation_ids)
+                        .await?;
+                    recorded.push(revision);
+                }
+                Ok::<_, ChangeRevisionBuildError>(recorded)
+            }
+            .await;
+            match result {
+                Ok(recorded) => {
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(ChangeStoreError::Database)?;
+                    Ok(recorded)
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
         }
     }
 }
@@ -323,7 +440,8 @@ pub async fn record_duplicate_revision(
 }
 
 pub struct ChangeRevisionBuilder {
-    db: DatabaseConnection,
+    db: Option<DatabaseConnection>,
+    state_store: Option<std::sync::Arc<dyn crate::storage::git_state_store::GitStateStore>>,
     repo_id: String,
     op_id: String,
     change_id: Option<ChangeId>,
@@ -624,7 +742,28 @@ impl ChangeRevisionBuilder {
         op_id: impl Into<String>,
     ) -> Self {
         Self {
-            db,
+            db: Some(db),
+            state_store: None,
+            repo_id: repo_id.into(),
+            op_id: op_id.into(),
+            change_id: None,
+            predecessors: Vec::new(),
+            commit_oid: None,
+            visibility: RevisionVisibility::Visible,
+            allow_existing_identity: false,
+            origin: "generated",
+        }
+    }
+
+    /// Backend-agnostic constructor backed by [`GitStateStore`].
+    pub fn for_new_change_with_store(
+        state_store: std::sync::Arc<dyn crate::storage::git_state_store::GitStateStore>,
+        repo_id: impl Into<String>,
+        op_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            db: None,
+            state_store: Some(state_store),
             repo_id: repo_id.into(),
             op_id: op_id.into(),
             change_id: None,
@@ -650,6 +789,18 @@ impl ChangeRevisionBuilder {
         change_id: ChangeId,
     ) -> Self {
         let mut builder = Self::for_new_change(db, repo_id, op_id);
+        builder.change_id = Some(change_id);
+        builder.allow_existing_identity = true;
+        builder
+    }
+
+    pub fn for_rewrite_with_store(
+        state_store: std::sync::Arc<dyn crate::storage::git_state_store::GitStateStore>,
+        repo_id: impl Into<String>,
+        op_id: impl Into<String>,
+        change_id: ChangeId,
+    ) -> Self {
+        let mut builder = Self::for_new_change_with_store(state_store, repo_id, op_id);
         builder.change_id = Some(change_id);
         builder.allow_existing_identity = true;
         builder
@@ -687,22 +838,47 @@ impl ChangeRevisionBuilder {
         self
     }
 
+    fn backend_kind(&self) -> crate::storage::StorageBackendKind {
+        if let Some(store) = &self.state_store {
+            store.backend()
+        } else {
+            crate::storage::StorageBackendKind::Sqlite
+        }
+    }
+
     pub async fn build(self) -> Result<ChangeRevision, ChangeRevisionBuildError> {
-        let transaction = crate::internal::db::begin_write_transaction(&self.db)
-            .await
-            .map_err(ChangeStoreError::Database)?;
-        let result = self.build_on(&transaction).await;
-        match result {
-            Ok(revision) => {
-                transaction
-                    .commit()
+        match self.backend_kind() {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = self.state_store.as_ref().ok_or_else(|| {
+                    ChangeStoreError::Database(sea_orm::DbErr::Custom(
+                        "missing GitStateStore".to_string(),
+                    ))
+                })?;
+                self.build_with_store(&**store).await
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = self.db.as_ref().ok_or_else(|| {
+                    ChangeStoreError::Database(sea_orm::DbErr::Custom(
+                        "missing SQLite DatabaseConnection".to_string(),
+                    ))
+                })?;
+                let transaction = crate::internal::db::begin_write_transaction(db)
                     .await
                     .map_err(ChangeStoreError::Database)?;
-                Ok(revision)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
+                let result = self.build_on(&transaction).await;
+                match result {
+                    Ok(revision) => {
+                        transaction
+                            .commit()
+                            .await
+                            .map_err(ChangeStoreError::Database)?;
+                        Ok(revision)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
             }
         }
     }
@@ -711,32 +887,151 @@ impl ChangeRevisionBuilder {
         self,
         pending_operation_ids: &[String],
     ) -> Result<ChangeRevision, ChangeRevisionBuildError> {
-        let transaction = crate::internal::db::begin_write_transaction(&self.db)
-            .await
-            .map_err(ChangeStoreError::Database)?;
-        let revision = match self.build_on(&transaction).await {
-            Ok(revision) => revision,
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
+        match self.backend_kind() {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = self.state_store.as_ref().ok_or_else(|| {
+                    ChangeStoreError::Database(sea_orm::DbErr::Custom(
+                        "missing GitStateStore".to_string(),
+                    ))
+                })?;
+                let revision = self.build_with_store(&**store).await?;
+                super::genealogy::link_ai_operation_with_store(
+                    &**store,
+                    &AiOperationLink {
+                        operation_id: revision.created_op_id.clone(),
+                        change_id: revision.change_id,
+                        session_id: None,
+                        run_id: None,
+                        tool_invocation_id: None,
+                        intent_id: None,
+                        repo_id: self.repo_id.clone(),
+                        worktree_id: None,
+                        workspace_id: None,
+                        lease_generation: None,
+                        config_provenance_digest: None,
+                        redaction_version: "v1".to_string(),
+                    },
+                )
+                .await?;
+                let op_ids = pending_operation_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                super::genealogy::attach_pending_ai_operation_links_with_store(
+                    &**store,
+                    &self.repo_id,
+                    revision.change_id,
+                    &op_ids,
+                )
+                .await?;
+                Ok(revision)
             }
-        };
-        if let Err(error) = link_revision_on(
-            &transaction,
-            &self.repo_id,
-            &revision,
-            pending_operation_ids,
-        )
-        .await
-        {
-            let _ = transaction.rollback().await;
-            return Err(error);
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = self.db.as_ref().ok_or_else(|| {
+                    ChangeStoreError::Database(sea_orm::DbErr::Custom(
+                        "missing SQLite DatabaseConnection".to_string(),
+                    ))
+                })?;
+                let transaction = crate::internal::db::begin_write_transaction(db)
+                    .await
+                    .map_err(ChangeStoreError::Database)?;
+                let revision = match self.build_on(&transaction).await {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = link_revision_on(
+                    &transaction,
+                    &self.repo_id,
+                    &revision,
+                    pending_operation_ids,
+                )
+                .await
+                {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(ChangeStoreError::Database)?;
+                Ok(revision)
+            }
         }
-        transaction
-            .commit()
-            .await
-            .map_err(ChangeStoreError::Database)?;
-        Ok(revision)
+    }
+
+    pub(crate) async fn build_with_store(
+        &self,
+        store: &dyn crate::storage::git_state_store::GitStateStore,
+    ) -> Result<ChangeRevision, ChangeRevisionBuildError> {
+        let commit_oid = self
+            .commit_oid
+            .as_ref()
+            .ok_or(ChangeRevisionBuildError::EmptyCommitOid)?
+            .clone();
+        if commit_oid.trim().is_empty() {
+            return Err(ChangeRevisionBuildError::EmptyCommitOid);
+        }
+        let supplied_change_id = self.change_id;
+        let mut change_id = supplied_change_id.unwrap_or(ChangeId::generate()?);
+        let revision_ordinal =
+            ChangeStore::next_revision_ordinal_with_store(store, &self.repo_id, change_id).await?;
+        loop {
+            let identity_result = if self.allow_existing_identity {
+                ChangeStore::ensure_identity_with_store(
+                    store,
+                    &self.repo_id,
+                    change_id,
+                    self.origin,
+                    &self.op_id,
+                )
+                .await
+            } else {
+                ChangeStore::insert_identity_with_store(
+                    store,
+                    &self.repo_id,
+                    change_id,
+                    self.origin,
+                    &self.op_id,
+                )
+                .await
+            };
+            match identity_result {
+                Ok(()) => break,
+                Err(ChangeStoreError::Collision(_)) if supplied_change_id.is_none() => {
+                    change_id = ChangeId::generate()?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let revision = ChangeRevision {
+            change_id,
+            commit_oid: commit_oid.clone(),
+            created_op_id: self.op_id.clone(),
+            visibility: self.visibility,
+            revision_ordinal,
+        };
+        ChangeStore::insert_revision_with_store(store, &revision).await?;
+        for (ordinal, (predecessor_oid, relation_kind)) in self.predecessors.iter().enumerate() {
+            super::genealogy::insert_predecessor_with_store(
+                store,
+                &PredecessorEdge {
+                    successor_oid: commit_oid.clone(),
+                    predecessor_oid: predecessor_oid.clone(),
+                    op_id: self.op_id.clone(),
+                    relation_kind: *relation_kind,
+                    ordinal: ordinal as i32,
+                },
+            )
+            .await?;
+        }
+        Ok(
+            ChangeStore::revision_with_store(store, change_id, &commit_oid)
+                .await?
+                .unwrap_or(revision),
+        )
     }
 
     pub(crate) async fn build_on(

@@ -92,6 +92,279 @@ pub enum GenealogyError {
     InvalidAiLink(String),
 }
 
+pub async fn insert_predecessor_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    edge: &PredecessorEdge,
+) -> Result<(), GenealogyError> {
+    store
+        .upsert_change_predecessor(&crate::storage::git_state_store::ChangePredecessorRecord {
+            successor_oid: edge.successor_oid.clone(),
+            predecessor_oid: edge.predecessor_oid.clone(),
+            op_id: edge.op_id.clone(),
+            relation_kind: edge.relation_kind.as_str().to_string(),
+            ordinal: edge.ordinal as i64,
+        })
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))
+}
+
+pub async fn link_ai_operation_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    link: &AiOperationLink,
+) -> Result<(), GenealogyError> {
+    validate_ai_link(link)?;
+    let existing = store
+        .get_change_identity(&link.change_id.to_string())
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+    if existing.as_ref().map(|r| r.repo_id.as_str()) != Some(link.repo_id.as_str()) {
+        return Err(GenealogyError::InvalidAiLink(format!(
+            "change {} is not registered in repository {}",
+            link.change_id, link.repo_id
+        )));
+    }
+    store
+        .upsert_ai_operation_link(&crate::storage::git_state_store::AiOperationLinkRecord {
+            operation_id: link.operation_id.clone(),
+            session_id: link.session_id.clone(),
+            run_id: link.run_id.clone(),
+            tool_invocation_id: link.tool_invocation_id.clone(),
+            intent_id: link.intent_id.clone(),
+            repo_id: link.repo_id.clone(),
+            worktree_id: link.worktree_id.clone(),
+            workspace_id: link.workspace_id.clone(),
+            lease_generation: link.lease_generation,
+            config_provenance_digest: link.config_provenance_digest.clone(),
+            redaction_version: link.redaction_version.clone(),
+            change_id: Some(link.change_id.to_string()),
+        })
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub async fn record_pending_ai_operation_link_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    operation_id: &str,
+    session_id: Option<&str>,
+    run_id: Option<&str>,
+    tool_invocation_id: Option<&str>,
+    intent_id: Option<&str>,
+    repo_id: &str,
+    redaction_version: &str,
+) -> Result<(), GenealogyError> {
+    for (name, value) in [
+        ("operation id", operation_id),
+        ("repository id", repo_id),
+        ("redaction version", redaction_version),
+    ] {
+        validate_redacted_value(name, value)?;
+    }
+    for (name, value) in [
+        ("session id", session_id),
+        ("run id", run_id),
+        ("tool invocation id", tool_invocation_id),
+        ("intent id", intent_id),
+    ] {
+        if let Some(value) = value {
+            validate_redacted_value(name, value)?;
+        }
+    }
+    let existing = store
+        .get_ai_operation_link(operation_id)
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+    let record = crate::storage::git_state_store::AiOperationLinkRecord {
+        operation_id: operation_id.to_string(),
+        session_id: session_id.map(str::to_string),
+        run_id: run_id.map(str::to_string),
+        tool_invocation_id: tool_invocation_id.map(str::to_string),
+        intent_id: intent_id.map(str::to_string),
+        repo_id: repo_id.to_string(),
+        worktree_id: existing.as_ref().and_then(|r| r.worktree_id.clone()),
+        workspace_id: existing.as_ref().and_then(|r| r.workspace_id.clone()),
+        lease_generation: existing.as_ref().and_then(|r| r.lease_generation),
+        config_provenance_digest: existing
+            .as_ref()
+            .and_then(|r| r.config_provenance_digest.clone()),
+        redaction_version: redaction_version.to_string(),
+        change_id: existing.and_then(|r| r.change_id),
+    };
+    store
+        .upsert_ai_operation_link(&record)
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))
+}
+
+pub async fn attach_pending_ai_operation_links_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    repo_id: &str,
+    change_id: ChangeId,
+    operation_ids: &[&str],
+) -> Result<(), GenealogyError> {
+    for op_id in operation_ids {
+        if let Some(mut rec) = store
+            .get_ai_operation_link(op_id)
+            .await
+            .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?
+            && rec.repo_id == repo_id
+            && rec.change_id.is_none()
+        {
+            rec.change_id = Some(change_id.to_string());
+            store
+                .upsert_ai_operation_link(&rec)
+                .await
+                .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn remove_pending_ai_operation_link_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    operation_id: &str,
+) -> Result<(), GenealogyError> {
+    let _ = store
+        .delete_pending_ai_operation_link(operation_id)
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn ai_links_for_change_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    repo_id: &str,
+    change_id: ChangeId,
+) -> Result<Vec<AiOperationLink>, GenealogyError> {
+    let rows = store
+        .list_ai_operation_links_by_change(repo_id, &change_id.to_string())
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+    rows.into_iter().map(ai_link_from_record).collect()
+}
+
+#[allow(dead_code)]
+pub async fn ai_links_for_intent_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    repo_id: &str,
+    intent_id: &str,
+) -> Result<Vec<AiOperationLink>, GenealogyError> {
+    if intent_id.trim().is_empty() {
+        return Err(GenealogyError::InvalidAiLink(
+            "intent id must not be empty".to_string(),
+        ));
+    }
+    let identities = store
+        .list_change_identities_by_prefix(repo_id, "")
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+    let mut out = Vec::new();
+    for id in identities {
+        let links = store
+            .list_ai_operation_links_by_change(repo_id, &id.change_id)
+            .await
+            .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+        for rec in links {
+            if rec.intent_id.as_deref() == Some(intent_id) && rec.change_id.is_some() {
+                out.push(ai_link_from_record(rec)?);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    Ok(out)
+}
+
+#[allow(dead_code)]
+pub async fn evolution_for_commit_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    commit_oid: &str,
+    limit: usize,
+) -> Result<Vec<PredecessorEdge>, GenealogyError> {
+    let clamped = limit.clamp(1, 10_000);
+    let mut rows = store
+        .list_change_predecessors(commit_oid)
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+    rows.sort_by_key(|r| r.ordinal);
+    rows.truncate(clamped);
+    rows.into_iter()
+        .map(|rec| {
+            Ok(PredecessorEdge {
+                successor_oid: rec.successor_oid,
+                predecessor_oid: rec.predecessor_oid,
+                op_id: rec.op_id,
+                relation_kind: relation_kind(&rec.relation_kind)?,
+                ordinal: rec.ordinal as i32,
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+pub async fn predecessor_edges_with_store(
+    store: &dyn crate::storage::git_state_store::GitStateStore,
+    repo_id: &str,
+    limit: usize,
+) -> Result<Vec<PredecessorEdge>, GenealogyError> {
+    let clamped = limit.clamp(1, 200);
+    let identities = store
+        .list_change_identities_by_prefix(repo_id, "")
+        .await
+        .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+    let mut out = Vec::new();
+    for id in identities {
+        let revs = store
+            .list_change_revisions(&id.change_id)
+            .await
+            .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+        for rev in revs {
+            let preds = store
+                .list_change_predecessors(&rev.commit_oid)
+                .await
+                .map_err(|err| GenealogyError::Database(sea_orm::DbErr::Custom(err.to_string())))?;
+            for rec in preds {
+                out.push(PredecessorEdge {
+                    successor_oid: rec.successor_oid,
+                    predecessor_oid: rec.predecessor_oid,
+                    op_id: rec.op_id,
+                    relation_kind: relation_kind(&rec.relation_kind)?,
+                    ordinal: rec.ordinal as i32,
+                });
+            }
+        }
+    }
+    out.truncate(clamped);
+    Ok(out)
+}
+
+fn ai_link_from_record(
+    rec: crate::storage::git_state_store::AiOperationLinkRecord,
+) -> Result<AiOperationLink, GenealogyError> {
+    let raw_change_id = rec
+        .change_id
+        .ok_or_else(|| GenealogyError::InvalidChangeId(String::new()))?;
+    let change_id = raw_change_id
+        .parse()
+        .map_err(|_| GenealogyError::InvalidChangeId(raw_change_id.clone()))?;
+    Ok(AiOperationLink {
+        operation_id: rec.operation_id,
+        change_id,
+        session_id: rec.session_id,
+        run_id: rec.run_id,
+        tool_invocation_id: rec.tool_invocation_id,
+        intent_id: rec.intent_id,
+        repo_id: rec.repo_id,
+        worktree_id: rec.worktree_id,
+        workspace_id: rec.workspace_id,
+        lease_generation: rec.lease_generation,
+        config_provenance_digest: rec.config_provenance_digest,
+        redaction_version: rec.redaction_version,
+    })
+}
+
 pub async fn insert_predecessor(
     db: &DatabaseConnection,
     edge: &PredecessorEdge,

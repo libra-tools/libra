@@ -207,6 +207,21 @@ impl RestoreEngine {
         }
     }
 
+    /// Backend-agnostic constructor backed by [`GitStateStore`].
+    pub fn new_with_store(
+        scope: PinnedRequestScope,
+        repo_id: impl Into<String>,
+        state_store: std::sync::Arc<dyn crate::storage::git_state_store::GitStateStore>,
+        storage: ClientStorage,
+    ) -> Self {
+        let repo_id = repo_id.into();
+        Self {
+            scope,
+            store: OperationStoreV2::new_for_repo_with_store(repo_id.clone(), state_store, storage),
+            repo_id,
+        }
+    }
+
     pub fn store(&self) -> &OperationStoreV2 {
         &self.store
     }
@@ -408,10 +423,23 @@ impl RestoreEngine {
         // restores only the current worktree's facets. Serialize every such
         // transition against ref writers in all linked worktrees.
         let _repo_lease = if matches!(what, RestoreWhat::All | RestoreWhat::Head) {
-            let shared_repository =
-                ConfigKv::get_with_conn(self.store.db(), "core.sharedRepository")
+            let shared_repository = match self.store.backend_kind() {
+                crate::storage::StorageBackendKind::Redb => {
+                    let config_store = crate::storage::runtime::open_repo_config_store_read_only(
+                        &self.scope.storage,
+                    )
                     .await
                     .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                    ConfigKv::get_with_store(&*config_store, "core.sharedRepository")
+                        .await
+                        .map_err(|error| RestoreError::Storage(error.to_string()))?
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    ConfigKv::get_with_conn(self.store.db(), "core.sharedRepository")
+                        .await
+                        .map_err(|error| RestoreError::Storage(error.to_string()))?
+                }
+            };
             if shared_repository
                 .as_ref()
                 .is_some_and(|entry| entry.encrypted)
@@ -949,27 +977,105 @@ impl RestoreEngine {
     }
 
     async fn capture_reference_state(&self) -> Result<serde_json::Value, RestoreError> {
-        let rows = self
-            .store
-            .db()
-            .query_all_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT id, name, kind, `commit`, remote, worktree_id FROM reference ORDER BY id",
-            ))
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        let mut references = Vec::with_capacity(rows.len());
-        for row in rows {
-            references.push(serde_json::json!({
-                "id": row.try_get_by_index::<i64>(0).map_err(|error| RestoreError::Storage(error.to_string()))?,
-                "name": row.try_get_by_index::<Option<String>>(1).map_err(|error| RestoreError::Storage(error.to_string()))?,
-                "kind": row.try_get_by_index::<String>(2).map_err(|error| RestoreError::Storage(error.to_string()))?,
-                "commit": row.try_get_by_index::<Option<String>>(3).map_err(|error| RestoreError::Storage(error.to_string()))?,
-                "remote": row.try_get_by_index::<Option<String>>(4).map_err(|error| RestoreError::Storage(error.to_string()))?,
-                "worktree_id": row.try_get_by_index::<Option<String>>(5).map_err(|error| RestoreError::Storage(error.to_string()))?,
-            }));
+        match self.store.backend_kind() {
+            crate::storage::StorageBackendKind::Redb => {
+                let git_store =
+                    crate::storage::runtime::open_git_store_read_only(&self.scope.storage)
+                        .await
+                        .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                let mut rows = git_store
+                    .list_refs(None)
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                let heads = git_store
+                    .list_all_local_heads()
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                for head in heads {
+                    if !rows.iter().any(|r| r.key == head.key) {
+                        rows.push(head);
+                    }
+                }
+                let mut references = Vec::with_capacity(rows.len());
+                for (idx, rec) in rows.into_iter().enumerate() {
+                    let (name, kind, commit, remote, worktree_id) = match rec.key {
+                        crate::storage::git_store::RefKey::LocalHead { worktree_id } => {
+                            match rec.target {
+                                crate::storage::git_store::RefTarget::Symbolic(branch) => {
+                                    (Some(branch), "Head", None, None, worktree_id)
+                                }
+                                crate::storage::git_store::RefTarget::Direct(oid) => {
+                                    (None, "Head", Some(oid), None, worktree_id)
+                                }
+                            }
+                        }
+                        crate::storage::git_store::RefKey::RemoteHead { remote } => {
+                            match rec.target {
+                                crate::storage::git_store::RefTarget::Symbolic(branch) => {
+                                    (Some(branch), "Head", None, Some(remote), None)
+                                }
+                                crate::storage::git_store::RefTarget::Direct(oid) => {
+                                    (None, "Head", Some(oid), Some(remote), None)
+                                }
+                            }
+                        }
+                        crate::storage::git_store::RefKey::LocalBranch { name } => {
+                            let commit = match rec.target {
+                                crate::storage::git_store::RefTarget::Direct(oid) => Some(oid),
+                                crate::storage::git_store::RefTarget::Symbolic(_) => None,
+                            };
+                            (Some(name), "Branch", commit, None, None)
+                        }
+                        crate::storage::git_store::RefKey::RemoteBranch { remote, name } => {
+                            let commit = match rec.target {
+                                crate::storage::git_store::RefTarget::Direct(oid) => Some(oid),
+                                crate::storage::git_store::RefTarget::Symbolic(_) => None,
+                            };
+                            (Some(name), "Branch", commit, Some(remote), None)
+                        }
+                        crate::storage::git_store::RefKey::Tag { name } => {
+                            let commit = match rec.target {
+                                crate::storage::git_store::RefTarget::Direct(oid) => Some(oid),
+                                crate::storage::git_store::RefTarget::Symbolic(_) => None,
+                            };
+                            (Some(name), "Tag", commit, None, None)
+                        }
+                    };
+                    references.push(serde_json::json!({
+                        "id": (idx as i64) + 1,
+                        "name": name,
+                        "kind": kind,
+                        "commit": commit,
+                        "remote": remote,
+                        "worktree_id": worktree_id,
+                    }));
+                }
+                Ok(serde_json::Value::Array(references))
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let rows = self
+                    .store
+                    .db()
+                    .query_all_raw(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "SELECT id, name, kind, `commit`, remote, worktree_id FROM reference ORDER BY id",
+                    ))
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                let mut references = Vec::with_capacity(rows.len());
+                for row in rows {
+                    references.push(serde_json::json!({
+                        "id": row.try_get_by_index::<i64>(0).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                        "name": row.try_get_by_index::<Option<String>>(1).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                        "kind": row.try_get_by_index::<String>(2).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                        "commit": row.try_get_by_index::<Option<String>>(3).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                        "remote": row.try_get_by_index::<Option<String>>(4).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                        "worktree_id": row.try_get_by_index::<Option<String>>(5).map_err(|error| RestoreError::Storage(error.to_string()))?,
+                    }));
+                }
+                Ok(serde_json::Value::Array(references))
+            }
         }
-        Ok(serde_json::Value::Array(references))
     }
 
     async fn fail_and_rollback(
@@ -1160,65 +1266,116 @@ impl RestoreEngine {
             "target branch ref does not reference a commit object",
         )?;
 
-        // A deferred transaction would read (branch ownership, reference rows)
-        // before it writes, and SQLite returns SQLITE_BUSY immediately — without
-        // consulting busy_timeout — when a transaction that holds a read lock
-        // asks for the write lock while another connection owns the writer
-        // slot. That is the intermittent `database is locked` failure when the
-        // background object-index consumer writes the same repository during a
-        // restore. Take the write lock first, then read under it.
-        let txn = begin_write_transaction(self.store.db())
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        if let Some(other_worktree) = Head::branch_checked_out_elsewhere_for_scope_result_with_conn(
-            &txn,
-            branch,
-            &self.scope.scope,
-        )
-        .await
-        .map_err(|error| RestoreError::Storage(error.to_string()))?
-        {
-            return Err(RestoreError::Storage(format!(
-                "cannot restore branch {branch:?}: it is checked out in worktree {other_worktree:?}"
-            )));
+        match self.store.backend_kind() {
+            crate::storage::StorageBackendKind::Redb => {
+                let git_store =
+                    crate::storage::runtime::open_git_store_read_write(&self.scope.storage)
+                        .await
+                        .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                if let Some(other_worktree) =
+                    Head::branch_checked_out_elsewhere_for_scope_result_with_store(
+                        &*git_store,
+                        branch,
+                        &self.scope.scope,
+                    )
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?
+                {
+                    return Err(RestoreError::Storage(format!(
+                        "cannot restore branch {branch:?}: it is checked out in worktree {other_worktree:?}"
+                    )));
+                }
+                let key = crate::storage::git_store::RefKey::LocalBranch {
+                    name: branch.to_string(),
+                };
+                let existing = git_store
+                    .get_ref(&key)
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                let outcome = git_store
+                    .update_ref_cas(
+                        &key,
+                        existing.as_ref(),
+                        Some(&crate::storage::git_store::RefTarget::Direct(
+                            commit_oid.to_string(),
+                        )),
+                        &[],
+                    )
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                if !matches!(
+                    outcome,
+                    crate::storage::git_store::RefCasOutcome::Applied { .. }
+                ) {
+                    return Err(RestoreError::Cas(format!(
+                        "concurrent update while restoring branch {branch:?}"
+                    )));
+                }
+                Ok(())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                // A deferred transaction would read (branch ownership, reference rows)
+                // before it writes, and SQLite returns SQLITE_BUSY immediately — without
+                // consulting busy_timeout — when a transaction that holds a read lock
+                // asks for the write lock while another connection owns the writer
+                // slot. That is the intermittent `database is locked` failure when the
+                // background object-index consumer writes the same repository during a
+                // restore. Take the write lock first, then read under it.
+                let txn = begin_write_transaction(self.store.db())
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                if let Some(other_worktree) =
+                    Head::branch_checked_out_elsewhere_for_scope_result_with_conn(
+                        &txn,
+                        branch,
+                        &self.scope.scope,
+                    )
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?
+                {
+                    return Err(RestoreError::Storage(format!(
+                        "cannot restore branch {branch:?}: it is checked out in worktree {other_worktree:?}"
+                    )));
+                }
+                let rows = txn
+                    .query_all_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "SELECT id FROM reference WHERE kind = 'Branch' AND name = ? AND remote IS NULL",
+                        [branch.into()],
+                    ))
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                if rows.len() > 1 {
+                    return Err(RestoreError::Storage(format!(
+                        "cannot restore ambiguous duplicate branch refs for {branch:?}"
+                    )));
+                }
+                if let Some(row) = rows.first() {
+                    let id = row
+                        .try_get_by_index::<i64>(0)
+                        .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                    txn.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        r#"UPDATE reference SET "commit" = ? WHERE id = ?"#,
+                        [commit_oid.to_string().into(), id.into()],
+                    ))
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                } else {
+                    txn.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        r#"INSERT INTO reference (name, kind, "commit", remote, worktree_id) VALUES (?, 'Branch', ?, NULL, NULL)"#,
+                        [branch.into(), commit_oid.to_string().into()],
+                    ))
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                }
+                txn.commit()
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                Ok(())
+            }
         }
-        let rows = txn
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT id FROM reference WHERE kind = 'Branch' AND name = ? AND remote IS NULL",
-                [branch.into()],
-            ))
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        if rows.len() > 1 {
-            return Err(RestoreError::Storage(format!(
-                "cannot restore ambiguous duplicate branch refs for {branch:?}"
-            )));
-        }
-        if let Some(row) = rows.first() {
-            let id = row
-                .try_get_by_index::<i64>(0)
-                .map_err(|error| RestoreError::Storage(error.to_string()))?;
-            txn.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                r#"UPDATE reference SET "commit" = ? WHERE id = ?"#,
-                [commit_oid.to_string().into(), id.into()],
-            ))
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        } else {
-            txn.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                r#"INSERT INTO reference (name, kind, "commit", remote, worktree_id) VALUES (?, 'Branch', ?, NULL, NULL)"#,
-                [branch.into(), commit_oid.to_string().into()],
-            ))
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        }
-        txn.commit()
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        Ok(())
     }
 
     /// Replace the reference table with the view's refs facet, keeping every
@@ -1360,113 +1517,350 @@ impl RestoreEngine {
         }
         self.protect_linked_worktree_heads(references).await?;
 
-        // Same write-lock-first rule as `restore_symbolic_head_branch_tip`:
-        // keep the reference rewrite from racing the background index consumer
-        // through a read-then-write upgrade.
-        let txn = begin_write_transaction(self.store.db())
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        self.protect_changed_branch_refs(&txn, references).await?;
-        // Read the live preserved rows under the write lock so a concurrent
-        // capture writer's update is either kept here or applied after us.
-        let preserved = read_preserved_branch_rows(&txn).await?;
-        let diverged = preserved_branches_diverge(references, &preserved);
-        txn.execute_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "DELETE FROM reference",
-        ))
-        .await
-        .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        for row in &preserved {
-            txn.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO reference (id, name, kind, `commit`, remote, worktree_id) \
-                 VALUES (?, ?, 'Branch', ?, NULL, ?)",
-                [
-                    row.id.into(),
-                    row.name.clone().into(),
-                    row.commit.clone().into(),
-                    row.worktree_id.clone().into(),
-                ],
-            ))
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        }
-        let preserved_ids = preserved.iter().map(|row| row.id).collect::<BTreeSet<_>>();
-        for reference in references {
-            if is_restore_preserved_reference(reference) {
-                continue;
+        match self.store.backend_kind() {
+            crate::storage::StorageBackendKind::Redb => {
+                let git_store =
+                    crate::storage::runtime::open_git_store_read_write(&self.scope.storage)
+                        .await
+                        .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                self.protect_changed_branch_refs_with_store(&*git_store, references)
+                    .await?;
+                let mut current_refs = git_store
+                    .list_refs(None)
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                let current_heads = git_store
+                    .list_all_local_heads()
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                for head in current_heads {
+                    if !current_refs.iter().any(|r| r.key == head.key) {
+                        current_refs.push(head);
+                    }
+                }
+                let preserved: Vec<PreservedBranchRow> = current_refs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, rec)| match &rec.key {
+                        crate::storage::git_store::RefKey::LocalBranch { name }
+                            if is_restore_preserved_branch(name) =>
+                        {
+                            let commit = match &rec.target {
+                                crate::storage::git_store::RefTarget::Direct(oid) => {
+                                    Some(oid.clone())
+                                }
+                                _ => None,
+                            };
+                            Some(PreservedBranchRow {
+                                id: (idx as i64) + 1,
+                                name: name.clone(),
+                                commit,
+                                worktree_id: None,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let diverged = preserved_branches_diverge(references, &preserved);
+
+                let mut desired: Vec<(
+                    crate::storage::git_store::RefKey,
+                    crate::storage::git_store::RefTarget,
+                )> = Vec::new();
+                for reference in references {
+                    if is_restore_preserved_reference(reference) {
+                        continue;
+                    }
+                    let kind = reference
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            RestoreError::Storage("refs facet entry has no kind".to_string())
+                        })?;
+                    let name = reference
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let commit = reference
+                        .get("commit")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let remote = reference
+                        .get("remote")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let worktree_id = reference
+                        .get("worktree_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let (key, target) = match kind {
+                        "Head" => {
+                            let target = match (name, commit) {
+                                (Some(branch), _) => {
+                                    crate::storage::git_store::RefTarget::Symbolic(branch)
+                                }
+                                (None, Some(oid)) => {
+                                    crate::storage::git_store::RefTarget::Direct(oid)
+                                }
+                                (None, None) => {
+                                    return Err(RestoreError::Storage(
+                                        "head ref missing both name and commit".to_string(),
+                                    ));
+                                }
+                            };
+                            let key = match remote {
+                                Some(remote) => {
+                                    crate::storage::git_store::RefKey::RemoteHead { remote }
+                                }
+                                None => {
+                                    crate::storage::git_store::RefKey::LocalHead { worktree_id }
+                                }
+                            };
+                            (key, target)
+                        }
+                        "Branch" => {
+                            let name = name.ok_or_else(|| {
+                                RestoreError::Storage("branch ref missing name".to_string())
+                            })?;
+                            let oid = commit.ok_or_else(|| {
+                                RestoreError::Storage("branch ref missing commit".to_string())
+                            })?;
+                            let key = match remote {
+                                Some(remote) => {
+                                    crate::storage::git_store::RefKey::RemoteBranch { remote, name }
+                                }
+                                None => crate::storage::git_store::RefKey::LocalBranch { name },
+                            };
+                            (key, crate::storage::git_store::RefTarget::Direct(oid))
+                        }
+                        "Tag" => {
+                            let name = name.ok_or_else(|| {
+                                RestoreError::Storage("tag ref missing name".to_string())
+                            })?;
+                            let oid = commit.ok_or_else(|| {
+                                RestoreError::Storage("tag ref missing commit".to_string())
+                            })?;
+                            (
+                                crate::storage::git_store::RefKey::Tag { name },
+                                crate::storage::git_store::RefTarget::Direct(oid),
+                            )
+                        }
+                        other => {
+                            return Err(RestoreError::Storage(format!(
+                                "refs facet contains unsupported kind {other:?}"
+                            )));
+                        }
+                    };
+                    desired.push((key, target));
+                }
+
+                // Delete non-preserved live refs that are absent from desired.
+                for rec in &current_refs {
+                    let is_preserved = matches!(
+                        &rec.key,
+                        crate::storage::git_store::RefKey::LocalBranch { name }
+                            if is_restore_preserved_branch(name)
+                    );
+                    if is_preserved {
+                        continue;
+                    }
+                    if !desired.iter().any(|(k, _)| k == &rec.key) {
+                        let _ = git_store
+                            .update_ref_cas(&rec.key, Some(&rec.target), None, &[])
+                            .await
+                            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                    }
+                }
+                // Upsert desired refs.
+                for (key, target) in desired {
+                    let existing = git_store
+                        .get_ref(&key)
+                        .await
+                        .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                    if existing.as_ref() != Some(&target) {
+                        let _ = git_store
+                            .update_ref_cas(&key, existing.as_ref(), Some(&target), &[])
+                            .await
+                            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                    }
+                }
+                Ok(diverged)
             }
-            let id = reference
-                .get("id")
-                .and_then(serde_json::Value::as_i64)
-                .ok_or_else(|| RestoreError::Storage("refs facet entry has no id".to_string()))?;
-            let name = reference
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            let kind = reference
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| RestoreError::Storage("refs facet entry has no kind".to_string()))?;
-            let commit = reference
-                .get("commit")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            let remote = reference
-                .get("remote")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            let worktree_id = reference
-                .get("worktree_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            // Reference ids carry no meaning beyond row identity. Ids are
-            // never reused (AUTOINCREMENT), so a view row colliding with a
-            // kept preserved row is not expected; if one does, let SQLite
-            // assign it a fresh id rather than drop either row.
-            let statement = if preserved_ids.contains(&id) {
-                Statement::from_sql_and_values(
+            crate::storage::StorageBackendKind::Sqlite => {
+                // Same write-lock-first rule as `restore_symbolic_head_branch_tip`:
+                // keep the reference rewrite from racing the background index consumer
+                // through a read-then-write upgrade.
+                let txn = begin_write_transaction(self.store.db())
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                self.protect_changed_branch_refs(&txn, references).await?;
+                // Read the live preserved rows under the write lock so a concurrent
+                // capture writer's update is either kept here or applied after us.
+                let preserved = read_preserved_branch_rows(&txn).await?;
+                let diverged = preserved_branches_diverge(references, &preserved);
+                txn.execute_raw(Statement::from_string(
                     DbBackend::Sqlite,
-                    "INSERT INTO reference (name, kind, `commit`, remote, worktree_id) \
-                     VALUES (?, ?, ?, ?, ?)",
-                    [
-                        name.into(),
-                        kind.to_string().into(),
-                        commit.into(),
-                        remote.into(),
-                        worktree_id.into(),
-                    ],
-                )
-            } else {
-                Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "INSERT INTO reference (id, name, kind, `commit`, remote, worktree_id) \
-                     VALUES (?, ?, ?, ?, ?, ?)",
-                    [
-                        id.into(),
-                        name.into(),
-                        kind.to_string().into(),
-                        commit.into(),
-                        remote.into(),
-                        worktree_id.into(),
-                    ],
-                )
-            };
-            txn.execute_raw(statement)
+                    "DELETE FROM reference",
+                ))
                 .await
                 .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                for row in &preserved {
+                    txn.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "INSERT INTO reference (id, name, kind, `commit`, remote, worktree_id) \
+                         VALUES (?, ?, 'Branch', ?, NULL, ?)",
+                        [
+                            row.id.into(),
+                            row.name.clone().into(),
+                            row.commit.clone().into(),
+                            row.worktree_id.clone().into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                }
+                let preserved_ids = preserved.iter().map(|row| row.id).collect::<BTreeSet<_>>();
+                for reference in references {
+                    if is_restore_preserved_reference(reference) {
+                        continue;
+                    }
+                    let id = reference
+                        .get("id")
+                        .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| {
+                            RestoreError::Storage("refs facet entry has no id".to_string())
+                        })?;
+                    let name = reference
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let kind = reference
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            RestoreError::Storage("refs facet entry has no kind".to_string())
+                        })?;
+                    let commit = reference
+                        .get("commit")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let remote = reference
+                        .get("remote")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let worktree_id = reference
+                        .get("worktree_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    // Reference ids carry no meaning beyond row identity. Ids are
+                    // never reused (AUTOINCREMENT), so a view row colliding with a
+                    // kept preserved row is not expected; if one does, let SQLite
+                    // assign it a fresh id rather than drop either row.
+                    let statement = if preserved_ids.contains(&id) {
+                        Statement::from_sql_and_values(
+                            DbBackend::Sqlite,
+                            "INSERT INTO reference (name, kind, `commit`, remote, worktree_id) \
+                             VALUES (?, ?, ?, ?, ?)",
+                            [
+                                name.into(),
+                                kind.to_string().into(),
+                                commit.into(),
+                                remote.into(),
+                                worktree_id.into(),
+                            ],
+                        )
+                    } else {
+                        Statement::from_sql_and_values(
+                            DbBackend::Sqlite,
+                            "INSERT INTO reference (id, name, kind, `commit`, remote, worktree_id) \
+                             VALUES (?, ?, ?, ?, ?, ?)",
+                            [
+                                id.into(),
+                                name.into(),
+                                kind.to_string().into(),
+                                commit.into(),
+                                remote.into(),
+                                worktree_id.into(),
+                            ],
+                        )
+                    };
+                    txn.execute_raw(statement)
+                        .await
+                        .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                }
+                txn.commit()
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                Ok(diverged)
+            }
         }
-        txn.commit()
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        Ok(diverged)
     }
 
     /// A repository-wide restore rewrites the shared branch table. Refuse to
     /// move or delete a branch that another linked worktree currently has
     /// checked out; otherwise that worktree would retain a HEAD pointing at a
     /// branch whose tip or row no longer matches its working tree.
+    async fn protect_changed_branch_refs_with_store(
+        &self,
+        store: &dyn crate::storage::git_store::GitStore,
+        target_references: &[serde_json::Value],
+    ) -> Result<(), RestoreError> {
+        let target_branches = target_references
+            .iter()
+            .filter(|reference| {
+                reference.get("kind").and_then(serde_json::Value::as_str) == Some("Branch")
+                    && reference
+                        .get("remote")
+                        .is_none_or(serde_json::Value::is_null)
+            })
+            .filter_map(|reference| {
+                let name = reference.get("name").and_then(serde_json::Value::as_str)?;
+                let commit = reference
+                    .get("commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                Some((name.to_string(), commit))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let current_refs = store
+            .list_refs(None)
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        for rec in current_refs {
+            let crate::storage::git_store::RefKey::LocalBranch { name } = rec.key else {
+                continue;
+            };
+            if is_restore_preserved_branch(&name) {
+                continue;
+            }
+            let current_commit = match rec.target {
+                crate::storage::git_store::RefTarget::Direct(oid) => Some(oid),
+                _ => None,
+            };
+            let changed = match target_branches.get(&name) {
+                Some(target_commit) => target_commit != &current_commit,
+                None => true,
+            };
+            if !changed {
+                continue;
+            }
+            if let Some(other_worktree) =
+                Head::branch_checked_out_elsewhere_for_scope_result_with_store(
+                    store,
+                    &name,
+                    &self.scope.scope,
+                )
+                .await
+                .map_err(|error| RestoreError::Storage(error.to_string()))?
+            {
+                return Err(RestoreError::Storage(format!(
+                    "cannot restore branch '{name}': it is checked out in worktree '{other_worktree}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn protect_changed_branch_refs<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -1560,20 +1954,47 @@ impl RestoreEngine {
                     .map(str::to_string)
             })
             .collect::<BTreeSet<_>>();
-        let rows = self
-            .store
-            .db()
-            .query_all_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT worktree_id FROM reference WHERE kind = 'Head'",
-            ))
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let live_worktrees: Vec<Option<String>> = match self.store.backend_kind() {
+            crate::storage::StorageBackendKind::Redb => {
+                let git_store =
+                    crate::storage::runtime::open_git_store_read_only(&self.scope.storage)
+                        .await
+                        .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                git_store
+                    .list_all_local_heads()
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?
+                    .into_iter()
+                    .filter_map(|rec| match rec.key {
+                        crate::storage::git_store::RefKey::LocalHead { worktree_id } => {
+                            Some(worktree_id)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let rows = self
+                    .store
+                    .db()
+                    .query_all_raw(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "SELECT worktree_id FROM reference WHERE kind = 'Head'",
+                    ))
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(
+                        row.try_get_by_index::<Option<String>>(0)
+                            .map_err(|error| RestoreError::Storage(error.to_string()))?,
+                    );
+                }
+                out
+            }
+        };
         let mut missing_worktrees = BTreeSet::new();
-        for row in rows {
-            let worktree_id = row
-                .try_get_by_index::<Option<String>>(0)
-                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        for worktree_id in live_worktrees {
             if worktree_id == current_worktree {
                 continue;
             }
@@ -1934,9 +2355,32 @@ impl RestoreEngine {
                 ),
                 HeadState::Detached { oid } => Head::Detached(*oid),
             };
-            Head::update_for_scope_result_with_conn(self.store.db(), head, None, &self.scope.scope)
-                .await
-                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            match self.store.backend_kind() {
+                crate::storage::StorageBackendKind::Redb => {
+                    let git_store =
+                        crate::storage::runtime::open_git_store_read_write(&self.scope.storage)
+                            .await
+                            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                    Head::update_for_scope_result_with_store(
+                        &*git_store,
+                        head,
+                        None,
+                        &self.scope.scope,
+                    )
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    Head::update_for_scope_result_with_conn(
+                        self.store.db(),
+                        head,
+                        None,
+                        &self.scope.scope,
+                    )
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                }
+            }
             self.restore_symbolic_head_branch_tip(target_view, snapshot)
                 .await?;
         }

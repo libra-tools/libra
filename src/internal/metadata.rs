@@ -1061,14 +1061,104 @@ impl MetadataKv {
         Ok(row.as_ref().map(MetadataEntry::from_model))
     }
 
+    pub async fn get_with_store(
+        store: &dyn crate::storage::MetadataStore,
+        scope: MetadataScope,
+        target: &str,
+        key: &str,
+    ) -> Result<Option<MetadataEntry>> {
+        let rec = store
+            .get_metadata(scope.as_str(), target, key)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to query metadata_kv from store: {err}"))?;
+        Ok(rec.map(|r| MetadataEntry {
+            scope: r.scope,
+            target: r.target,
+            key: r.key,
+            value: r.value,
+            value_type: r.value_type,
+        }))
+    }
+
+    pub async fn set_with_store(
+        store: &dyn crate::storage::MetadataStore,
+        scope: MetadataScope,
+        target: &str,
+        key: &str,
+        value: &str,
+        value_type: MetadataValueType,
+    ) -> Result<Option<String>> {
+        store
+            .set_metadata(scope.as_str(), target, key, value, value_type.as_str())
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to upsert metadata_kv in store: {err}"))
+    }
+
+    pub async fn unset_with_store(
+        store: &dyn crate::storage::MetadataStore,
+        scope: MetadataScope,
+        target: &str,
+        key: &str,
+    ) -> Result<bool> {
+        store
+            .unset_metadata(scope.as_str(), target, key)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to delete metadata_kv in store: {err}"))
+    }
+
+    pub async fn list_with_store(
+        store: &dyn crate::storage::MetadataStore,
+        scope: MetadataScope,
+        target: &str,
+        key_prefix: Option<&str>,
+    ) -> Result<Vec<MetadataEntry>> {
+        let rows = store
+            .list_metadata(scope.as_str(), target, key_prefix)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to list metadata_kv from store: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| MetadataEntry {
+                scope: r.scope,
+                target: r.target,
+                key: r.key,
+                value: r.value,
+                value_type: r.value_type,
+            })
+            .collect())
+    }
+
+    pub async fn delete_all_for_target_with_store(
+        store: &dyn crate::storage::MetadataStore,
+        scope: MetadataScope,
+        target: &str,
+    ) -> Result<u64> {
+        store
+            .delete_metadata_target(scope.as_str(), target)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to delete metadata target from store: {err}"))
+    }
+
     /// Pool-acquiring counterpart of [`Self::get_with_conn`].
     pub async fn get(
         scope: MetadataScope,
         target: &str,
         key: &str,
     ) -> Result<Option<MetadataEntry>> {
-        let db = get_db_conn_instance().await;
-        Self::get_with_conn(&db, scope, target, key).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| anyhow::anyhow!(err))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::get_with_conn(&db, scope, target, key).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_metadata_store_read_only()
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err))?;
+                Self::get_with_store(store.as_ref(), scope, target, key).await
+            }
+        }
     }
 
     /// Upsert one entry atomically (`INSERT … ON CONFLICT DO UPDATE` on the
@@ -1129,8 +1219,20 @@ impl MetadataKv {
         value: &str,
         value_type: MetadataValueType,
     ) -> Result<Option<String>> {
-        let db = get_db_conn_instance().await;
-        Self::set_with_conn(&db, scope, target, key, value, value_type).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| anyhow::anyhow!(err))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::set_with_conn(&db, scope, target, key, value, value_type).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_metadata_store_read_write()
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err))?;
+                Self::set_with_store(store.as_ref(), scope, target, key, value, value_type).await
+            }
+        }
     }
 
     /// Delete one entry; returns whether a row was removed.
@@ -1155,8 +1257,20 @@ impl MetadataKv {
 
     /// Pool-acquiring counterpart of [`Self::unset_with_conn`].
     pub async fn unset(scope: MetadataScope, target: &str, key: &str) -> Result<bool> {
-        let db = get_db_conn_instance().await;
-        Self::unset_with_conn(&db, scope, target, key).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| anyhow::anyhow!(err))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::unset_with_conn(&db, scope, target, key).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_metadata_store_read_write()
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err))?;
+                Self::unset_with_store(store.as_ref(), scope, target, key).await
+            }
+        }
     }
 
     /// List a target's entries, key-ordered, optionally filtered to a key
@@ -1190,8 +1304,20 @@ impl MetadataKv {
         target: &str,
         key_prefix: Option<&str>,
     ) -> Result<Vec<MetadataEntry>> {
-        let db = get_db_conn_instance().await;
-        Self::list_with_conn(&db, scope, target, key_prefix).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| anyhow::anyhow!(err))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::list_with_conn(&db, scope, target, key_prefix).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_metadata_store_read_only()
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err))?;
+                Self::list_with_store(store.as_ref(), scope, target, key_prefix).await
+            }
+        }
     }
 
     /// List EVERY entry in a scope across all targets, ordered by

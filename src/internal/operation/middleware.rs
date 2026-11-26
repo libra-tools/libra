@@ -354,13 +354,57 @@ where
         return run_ephemeral_operation(class, f).await;
     }
 
-    let db_path = scope.storage.join(DATABASE);
-    let db = get_db_conn_instance_for_path(&db_path)
-        .await
+    let backend = crate::storage::runtime::detect_repo_backend(&scope.storage)
         .map_err(|error| OperationError::Storage(error.to_string()))?;
-    let identity = RepoIdentity::resolve(&db)
-        .await
-        .map_err(|error| OperationError::Storage(error.to_string()))?;
+    let (db_opt, git_store_opt, state_store_opt, identity, shared_repository) = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let config_store =
+                crate::storage::runtime::open_repo_config_store_read_only(&scope.storage)
+                    .await
+                    .map_err(|error| OperationError::Storage(error.to_string()))?;
+            let identity = RepoIdentity::resolve_with_store(&*config_store)
+                .await
+                .map_err(|error| OperationError::Storage(error.to_string()))?;
+            let shared_repository = ConfigKv::get_with_store(&*config_store, "core.sharedRepository")
+                .await
+                .map_err(|error| {
+                    OperationError::Storage(format!(
+                        "cannot read core.sharedRepository before acquiring the operation scope lease: {error}"
+                    ))
+                })?;
+            let git_store = crate::storage::runtime::open_git_store_read_only(&scope.storage)
+                .await
+                .map_err(|error| OperationError::Storage(error.to_string()))?;
+            let state_store =
+                crate::storage::runtime::open_git_state_store_read_write(&scope.storage)
+                    .await
+                    .map_err(|error| OperationError::Storage(error.to_string()))?;
+            (
+                None,
+                Some(git_store),
+                Some(state_store),
+                identity,
+                shared_repository,
+            )
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = scope.storage.join(DATABASE);
+            let db = get_db_conn_instance_for_path(&db_path)
+                .await
+                .map_err(|error| OperationError::Storage(error.to_string()))?;
+            let identity = RepoIdentity::resolve(&db)
+                .await
+                .map_err(|error| OperationError::Storage(error.to_string()))?;
+            let shared_repository = ConfigKv::get_with_conn(&db, "core.sharedRepository")
+                .await
+                .map_err(|error| {
+                    OperationError::Storage(format!(
+                        "cannot read core.sharedRepository before acquiring the operation scope lease: {error}"
+                    ))
+                })?;
+            (Some(db), None, None, identity, shared_repository)
+        }
+    };
     let repo_id = identity.as_str().to_string();
     let operation_worktree_id = Some(scope.scope.storage_key());
     let operation_scope_kind = if scope.scope.is_linked() {
@@ -368,13 +412,6 @@ where
     } else {
         "main"
     };
-    let shared_repository = ConfigKv::get_with_conn(&db, "core.sharedRepository")
-        .await
-        .map_err(|error| {
-            OperationError::Storage(format!(
-                "cannot read core.sharedRepository before acquiring the operation scope lease: {error}"
-            ))
-        })?;
     if shared_repository
         .as_ref()
         .is_some_and(|entry| entry.encrypted)
@@ -416,7 +453,22 @@ where
         Some(ScopeLease::acquire_with_permissions(scope, &repo_id, lease_permissions).await?)
     };
     let storage = ClientStorage::try_init_local(scope.storage.join("objects"))?;
-    let store = OperationStoreV2::new_for_repo(&repo_id, db.clone(), storage.clone());
+    let store = match backend {
+        crate::storage::StorageBackendKind::Redb => OperationStoreV2::new_for_repo_with_store(
+            &repo_id,
+            state_store_opt
+                .clone()
+                .ok_or_else(|| OperationError::Storage("missing redb state store".to_string()))?,
+            storage.clone(),
+        ),
+        crate::storage::StorageBackendKind::Sqlite => OperationStoreV2::new_for_repo(
+            &repo_id,
+            db_opt
+                .clone()
+                .ok_or_else(|| OperationError::Storage("missing sqlite db".to_string()))?,
+            storage.clone(),
+        ),
+    };
     let scope_key = scope.scope.storage_key().to_string();
     let mut heads = store
         .read_heads_view(&repo_id, &scope_key)
@@ -455,7 +507,9 @@ where
         ));
     }
     let pre_refs = capture_reference_state_with_repository_lease(
-        &db,
+        backend,
+        db_opt.as_ref(),
+        git_store_opt.as_deref(),
         scope,
         &repo_id,
         shared_repository_value,
@@ -712,7 +766,9 @@ where
         return Err(OperationError::ExternalUnverified);
     }
     let post_refs = capture_reference_state_with_repository_lease(
-        &db,
+        backend,
+        db_opt.as_ref(),
+        git_store_opt.as_deref(),
         scope,
         &repo_id,
         shared_repository_value,
@@ -945,6 +1001,76 @@ fn write_view(
         .map_err(|error| OperationError::Storage(error.to_string()))
 }
 
+async fn capture_reference_state_with_store(
+    store: &dyn crate::storage::git_store::GitStore,
+) -> Result<serde_json::Value, OperationError> {
+    let mut rows = store
+        .list_refs(None)
+        .await
+        .map_err(|error| OperationError::Storage(error.to_string()))?;
+    // Include linked-worktree HEAD rows as well for parity with `SELECT * FROM reference`.
+    let heads = store
+        .list_all_local_heads()
+        .await
+        .map_err(|error| OperationError::Storage(error.to_string()))?;
+    for head in heads {
+        if !rows.iter().any(|r| r.key == head.key) {
+            rows.push(head);
+        }
+    }
+    let mut references = Vec::with_capacity(rows.len());
+    for (idx, rec) in rows.into_iter().enumerate() {
+        let (name, kind, commit, remote, worktree_id) = match rec.key {
+            crate::storage::git_store::RefKey::LocalHead { worktree_id } => match rec.target {
+                crate::storage::git_store::RefTarget::Symbolic(branch) => {
+                    (Some(branch), "Head", None, None, worktree_id)
+                }
+                crate::storage::git_store::RefTarget::Direct(oid) => {
+                    (None, "Head", Some(oid), None, worktree_id)
+                }
+            },
+            crate::storage::git_store::RefKey::RemoteHead { remote } => match rec.target {
+                crate::storage::git_store::RefTarget::Symbolic(branch) => {
+                    (Some(branch), "Head", None, Some(remote), None)
+                }
+                crate::storage::git_store::RefTarget::Direct(oid) => {
+                    (None, "Head", Some(oid), Some(remote), None)
+                }
+            },
+            crate::storage::git_store::RefKey::LocalBranch { name } => {
+                let commit = match rec.target {
+                    crate::storage::git_store::RefTarget::Direct(oid) => Some(oid),
+                    crate::storage::git_store::RefTarget::Symbolic(_) => None,
+                };
+                (Some(name), "Branch", commit, None, None)
+            }
+            crate::storage::git_store::RefKey::RemoteBranch { remote, name } => {
+                let commit = match rec.target {
+                    crate::storage::git_store::RefTarget::Direct(oid) => Some(oid),
+                    crate::storage::git_store::RefTarget::Symbolic(_) => None,
+                };
+                (Some(name), "Branch", commit, Some(remote), None)
+            }
+            crate::storage::git_store::RefKey::Tag { name } => {
+                let commit = match rec.target {
+                    crate::storage::git_store::RefTarget::Direct(oid) => Some(oid),
+                    crate::storage::git_store::RefTarget::Symbolic(_) => None,
+                };
+                (Some(name), "Tag", commit, None, None)
+            }
+        };
+        references.push(json!({
+            "id": (idx as i64) + 1,
+            "name": name,
+            "kind": kind,
+            "commit": commit,
+            "remote": remote,
+            "worktree_id": worktree_id,
+        }));
+    }
+    Ok(serde_json::Value::Array(references))
+}
+
 async fn capture_reference_state(
     db: &DatabaseConnection,
 ) -> Result<serde_json::Value, OperationError> {
@@ -970,7 +1096,9 @@ async fn capture_reference_state(
 }
 
 async fn capture_reference_state_with_repository_lease(
-    db: &DatabaseConnection,
+    backend: crate::storage::StorageBackendKind,
+    db: Option<&DatabaseConnection>,
+    git_store: Option<&dyn crate::storage::git_store::GitStore>,
     scope: &PinnedRequestScope,
     repo_id: &str,
     shared_repository: Option<&str>,
@@ -981,7 +1109,20 @@ async fn capture_reference_state_with_repository_lease(
     } else {
         Some(ScopeLease::acquire_repository_wait(scope, repo_id, shared_repository).await?)
     };
-    capture_reference_state(db).await
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = git_store.ok_or_else(|| {
+                OperationError::Storage("missing redb git store for reference snapshot".to_string())
+            })?;
+            capture_reference_state_with_store(store).await
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = db.ok_or_else(|| {
+                OperationError::Storage("missing sqlite db for reference snapshot".to_string())
+            })?;
+            capture_reference_state(db).await
+        }
+    }
 }
 
 async fn append_journal(

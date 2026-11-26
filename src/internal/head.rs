@@ -338,8 +338,240 @@ impl Head {
     }
 
     pub async fn current() -> Head {
-        let db_conn = get_db_conn_instance().await;
-        Self::current_with_conn(&db_conn).await
+        match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .expect("failed to open redb GitStore for HEAD");
+                Self::current_result_with_store(store.as_ref())
+                    .await
+                    .expect("HEAD row in redb store is corrupt")
+            }
+            _ => {
+                let db_conn = get_db_conn_instance().await;
+                Self::current_with_conn(&db_conn).await
+            }
+        }
+    }
+
+    pub async fn current_result_with_store(
+        store: &dyn crate::storage::GitStore,
+    ) -> Result<Head, BranchStoreError> {
+        let scope = WorktreeScope::current();
+        Self::current_for_scope_result_with_store(store, &scope).await
+    }
+
+    pub(crate) async fn current_for_scope_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        scope: &WorktreeScope,
+    ) -> Result<Head, BranchStoreError> {
+        let key = crate::storage::RefKey::LocalHead {
+            worktree_id: scope.worktree_id().map(ToOwned::to_owned),
+        };
+        let target = store
+            .get_ref(&key)
+            .await
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+            .ok_or_else(|| BranchStoreError::Corrupt {
+                name: "HEAD".to_string(),
+                detail: format!(
+                    "HEAD reference is missing from storage for worktree '{}'; restore this worktree's HEAD reference before retrying",
+                    scope.worktree_id().unwrap_or("main")
+                ),
+            })?;
+        match target {
+            crate::storage::RefTarget::Symbolic(name) => {
+                if name.trim().is_empty() {
+                    return Err(BranchStoreError::Corrupt {
+                        name: "HEAD".to_string(),
+                        detail: "symbolic HEAD branch name is empty".to_string(),
+                    });
+                }
+                Ok(Head::Branch(name))
+            }
+            crate::storage::RefTarget::Direct(commit) => {
+                parse_ref_commit(&commit, "HEAD", "detached HEAD commit hash").map(Head::Detached)
+            }
+        }
+    }
+
+    pub async fn remote_current_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        remote: &str,
+    ) -> Result<Option<Head>, BranchStoreError> {
+        let key = crate::storage::RefKey::RemoteHead {
+            remote: remote.to_string(),
+        };
+        let Some(target) = store
+            .get_ref(&key)
+            .await
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        match target {
+            crate::storage::RefTarget::Symbolic(name) => Ok(Some(Head::Branch(name))),
+            crate::storage::RefTarget::Direct(commit) => {
+                let parsed = parse_ref_commit(
+                    &commit,
+                    &format!("refs/remotes/{remote}/HEAD"),
+                    "detached remote HEAD commit hash",
+                )?;
+                Ok(Some(Head::Detached(parsed)))
+            }
+        }
+    }
+
+    pub async fn current_commit_result_with_store(
+        store: &dyn crate::storage::GitStore,
+    ) -> Result<Option<ObjectHash>, BranchStoreError> {
+        match Self::current_result_with_store(store).await? {
+            Head::Branch(name) => {
+                let key = crate::storage::RefKey::LocalBranch { name: name.clone() };
+                let Some(target) = store
+                    .get_ref(&key)
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                match target {
+                    crate::storage::RefTarget::Direct(commit) => {
+                        parse_ref_commit(&commit, &name, "branch commit hash").map(Some)
+                    }
+                    crate::storage::RefTarget::Symbolic(sym) => Err(BranchStoreError::Corrupt {
+                        name,
+                        detail: format!("local branch unexpectedly stored symbolic target `{sym}`"),
+                    }),
+                }
+            }
+            Head::Detached(commit_hash) => Ok(Some(commit_hash)),
+        }
+    }
+
+    pub async fn branch_checked_out_anywhere_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        branch: &str,
+    ) -> Result<Option<String>, BranchStoreError> {
+        let heads = store
+            .list_all_local_heads()
+            .await
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+        for rec in heads {
+            if rec.target == crate::storage::RefTarget::Symbolic(branch.to_string()) {
+                return Ok(Some(rec.key.worktree_id().unwrap_or("(main)").to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn branch_checked_out_elsewhere_for_scope_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        branch: &str,
+        scope: &WorktreeScope,
+    ) -> Result<Option<String>, BranchStoreError> {
+        let own = scope.worktree_id();
+        let heads = store
+            .list_all_local_heads()
+            .await
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+        for rec in heads {
+            if rec.key.worktree_id() != own
+                && rec.target == crate::storage::RefTarget::Symbolic(branch.to_string())
+            {
+                return Ok(Some(rec.key.worktree_id().unwrap_or("(main)").to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn update_for_scope_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        new_head: Self,
+        remote: Option<&str>,
+        scope: &WorktreeScope,
+    ) -> Result<(), BranchStoreError> {
+        if remote.is_none()
+            && let Head::Branch(ref branch_name) = new_head
+            && let Some(other) = Self::branch_checked_out_elsewhere_for_scope_result_with_store(
+                store,
+                branch_name,
+                scope,
+            )
+            .await?
+        {
+            return Err(BranchStoreError::CheckedOutElsewhere {
+                name: branch_name.clone(),
+                worktree: other,
+            });
+        }
+        let key = match remote {
+            Some(r) => crate::storage::RefKey::RemoteHead {
+                remote: r.to_string(),
+            },
+            None => crate::storage::RefKey::LocalHead {
+                worktree_id: scope.worktree_id().map(ToOwned::to_owned),
+            },
+        };
+        let target = match new_head {
+            Head::Branch(name) => crate::storage::RefTarget::Symbolic(name),
+            Head::Detached(oid) => crate::storage::RefTarget::Direct(oid.to_string()),
+        };
+        for _ in 0..8 {
+            let current = store
+                .get_ref(&key)
+                .await
+                .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+            match store
+                .update_ref_cas(&key, current.as_ref(), Some(&target), &[])
+                .await
+                .map_err(|err| BranchStoreError::Query(err.to_string()))?
+            {
+                crate::storage::RefCasOutcome::Applied { .. } => return Ok(()),
+                crate::storage::RefCasOutcome::CasConflict { .. } => continue,
+            }
+        }
+        Err(BranchStoreError::Query(
+            "failed to update HEAD in store after CAS retries".to_string(),
+        ))
+    }
+
+    pub async fn update_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        new_head: Self,
+        remote: Option<&str>,
+    ) -> Result<(), BranchStoreError> {
+        let scope = WorktreeScope::current();
+        Self::update_for_scope_result_with_store(store, new_head, remote, &scope).await
+    }
+
+    pub async fn delete_remote_head_with_store(
+        store: &dyn crate::storage::GitStore,
+        remote: &str,
+    ) -> Result<(), BranchStoreError> {
+        let key = crate::storage::RefKey::RemoteHead {
+            remote: remote.to_string(),
+        };
+        for _ in 0..8 {
+            let current = store
+                .get_ref(&key)
+                .await
+                .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+            if current.is_none() {
+                return Ok(());
+            }
+            match store
+                .update_ref_cas(&key, current.as_ref(), None, &[])
+                .await
+                .map_err(|err| BranchStoreError::Query(err.to_string()))?
+            {
+                crate::storage::RefCasOutcome::Applied { .. } => return Ok(()),
+                crate::storage::RefCasOutcome::CasConflict { .. } => continue,
+            }
+        }
+        Err(BranchStoreError::Query(
+            "failed to delete remote HEAD after CAS retries".to_string(),
+        ))
     }
 
     pub async fn current_result_with_conn<C>(db: &C) -> Result<Head, BranchStoreError>
@@ -368,8 +600,20 @@ impl Head {
     }
 
     pub async fn current_result() -> Result<Head, BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        Self::current_result_with_conn(&db_conn).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                Self::current_result_with_conn(&db_conn).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::current_result_with_store(store.as_ref()).await
+            }
+        }
     }
 
     /// Resolve the HEAD of a SPECIFIC worktree scope (not the ambient cwd
@@ -382,39 +626,83 @@ impl Head {
     pub async fn head_for_worktree_scope(
         worktree_id: Option<&str>,
     ) -> Result<Option<(Head, Option<ObjectHash>)>, BranchStoreError> {
-        let db = get_db_conn_instance().await;
-        let mut query = reference::Entity::find()
-            .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
-            .filter(reference::Column::Remote.is_null());
-        query = match worktree_id {
-            Some(id) => query.filter(reference::Column::WorktreeId.eq(id.to_string())),
-            None => query.filter(reference::Column::WorktreeId.is_null()),
-        };
-        let Some(model) = query
-            .one(&db)
-            .await
+        match crate::storage::runtime::detect_current_repo_backend()
             .map_err(|err| BranchStoreError::Query(err.to_string()))?
-        else {
-            return Ok(None);
-        };
-        match model.name {
-            Some(name) => {
-                // Branch HEAD: resolve the branch tip commit (shared refs).
-                let commit = Branch::find_branch_result(&name, None)
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
                     .await
-                    .ok()
-                    .flatten()
-                    .map(|b| b.commit);
-                Ok(Some((Head::Branch(name), commit)))
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                let key = crate::storage::RefKey::LocalHead {
+                    worktree_id: worktree_id.map(ToOwned::to_owned),
+                };
+                let Some(target) = store
+                    .get_ref(&key)
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                match target {
+                    crate::storage::RefTarget::Symbolic(name) => {
+                        let commit =
+                            Branch::find_branch_result_with_store(store.as_ref(), &name, None)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|b| b.commit);
+                        Ok(Some((Head::Branch(name), commit)))
+                    }
+                    crate::storage::RefTarget::Direct(commit_hash) => {
+                        let commit = parse_ref_commit(
+                            commit_hash.as_str(),
+                            "HEAD",
+                            "detached HEAD commit hash",
+                        )?;
+                        Ok(Some((Head::Detached(commit), Some(commit))))
+                    }
+                }
             }
-            None => {
-                let commit_hash = model.commit.ok_or_else(|| BranchStoreError::Corrupt {
-                    name: "HEAD".to_string(),
-                    detail: "detached HEAD is missing commit hash".to_string(),
-                })?;
-                let commit =
-                    parse_ref_commit(commit_hash.as_str(), "HEAD", "detached HEAD commit hash")?;
-                Ok(Some((Head::Detached(commit), Some(commit))))
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                let mut query = reference::Entity::find()
+                    .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+                    .filter(reference::Column::Remote.is_null());
+                query = match worktree_id {
+                    Some(id) => query.filter(reference::Column::WorktreeId.eq(id.to_string())),
+                    None => query.filter(reference::Column::WorktreeId.is_null()),
+                };
+                let Some(model) = query
+                    .one(&db)
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                match model.name {
+                    Some(name) => {
+                        // Branch HEAD: resolve the branch tip commit (shared refs).
+                        let commit = Branch::find_branch_result(&name, None)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|b| b.commit);
+                        Ok(Some((Head::Branch(name), commit)))
+                    }
+                    None => {
+                        let commit_hash =
+                            model.commit.ok_or_else(|| BranchStoreError::Corrupt {
+                                name: "HEAD".to_string(),
+                                detail: "detached HEAD is missing commit hash".to_string(),
+                            })?;
+                        let commit = parse_ref_commit(
+                            commit_hash.as_str(),
+                            "HEAD",
+                            "detached HEAD commit hash",
+                        )?;
+                        Ok(Some((Head::Detached(commit), Some(commit))))
+                    }
+                }
             }
         }
     }
@@ -434,8 +722,20 @@ impl Head {
 
     /// Pool-acquiring counterpart of [`Head::remote_current_result_with_conn`].
     pub async fn remote_current_result(remote: &str) -> Result<Option<Head>, BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        Self::remote_current_result_with_conn(&db_conn, remote).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                Self::remote_current_result_with_conn(&db_conn, remote).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::remote_current_result_with_store(store.as_ref(), remote).await
+            }
+        }
     }
 
     pub async fn remote_current_result_with_conn<C>(
@@ -466,8 +766,20 @@ impl Head {
     }
 
     pub async fn remote_current(remote: &str) -> Option<Head> {
-        let db_conn = get_db_conn_instance().await;
-        Self::remote_current_with_conn(&db_conn, remote).await
+        match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .expect("failed to open redb GitStore for remote HEAD");
+                Self::remote_current_result_with_store(store.as_ref(), remote)
+                    .await
+                    .expect("remote HEAD row in redb store is corrupt")
+            }
+            _ => {
+                let db_conn = get_db_conn_instance().await;
+                Self::remote_current_with_conn(&db_conn, remote).await
+            }
+        }
     }
 
     /// Resolve HEAD to its current commit hash.
@@ -496,8 +808,20 @@ impl Head {
     }
 
     pub async fn current_commit_result() -> Result<Option<ObjectHash>, BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        Self::current_commit_result_with_conn(&db_conn).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                Self::current_commit_result_with_conn(&db_conn).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::current_commit_result_with_store(store.as_ref()).await
+            }
+        }
     }
 
     /// Lossy compatibility wrapper. Prefer `current_commit_result_with_conn`
@@ -518,8 +842,13 @@ impl Head {
     /// Lossy compatibility wrapper. Prefer `current_commit_result` in
     /// production paths so storage failures are not downgraded to `None`.
     pub async fn current_commit() -> Option<ObjectHash> {
-        let db_conn = get_db_conn_instance().await;
-        Self::current_commit_with_conn(&db_conn).await
+        match Self::current_commit_result().await {
+            Ok(commit) => commit,
+            Err(error) => {
+                tracing::error!("failed to resolve HEAD commit: {error}");
+                None
+            }
+        }
     }
 
     pub async fn update_result_with_conn<C>(
@@ -667,17 +996,31 @@ impl Head {
                 "injected branch-attach probe fault".to_string(),
             ));
         }
-        let db = get_db_conn_instance().await;
-        let rows = reference::Entity::find()
-            .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
-            .filter(reference::Column::Remote.is_null())
-            .filter(reference::Column::Name.eq(branch))
-            .all(&db)
-            .await?;
-        Ok(rows
-            .into_iter()
-            .next()
-            .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string())))
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| sea_orm::DbErr::Custom(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                let rows = reference::Entity::find()
+                    .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+                    .filter(reference::Column::Remote.is_null())
+                    .filter(reference::Column::Name.eq(branch))
+                    .all(&db)
+                    .await?;
+                Ok(rows
+                    .into_iter()
+                    .next()
+                    .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string())))
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| sea_orm::DbErr::Custom(err.to_string()))?;
+                Self::branch_checked_out_anywhere_result_with_store(store.as_ref(), branch)
+                    .await
+                    .map_err(|err| sea_orm::DbErr::Custom(err.to_string()))
+            }
+        }
     }
 
     // §C.4.4: the fail-OPEN convenience wrapper that used to live here is
@@ -691,8 +1034,27 @@ impl Head {
     pub async fn branch_checked_out_elsewhere_result(
         branch: &str,
     ) -> Result<Option<String>, sea_orm::DbErr> {
-        let db = get_db_conn_instance().await;
-        Self::branch_checked_out_elsewhere_result_with_conn(&db, branch).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| sea_orm::DbErr::Custom(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::branch_checked_out_elsewhere_result_with_conn(&db, branch).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| sea_orm::DbErr::Custom(err.to_string()))?;
+                let scope = WorktreeScope::current();
+                Self::branch_checked_out_elsewhere_for_scope_result_with_store(
+                    store.as_ref(),
+                    branch,
+                    &scope,
+                )
+                .await
+                .map_err(|err| sea_orm::DbErr::Custom(err.to_string()))
+            }
+        }
     }
 
     /// Transaction-safe form of [`Self::branch_checked_out_elsewhere_result`].
@@ -765,40 +1127,55 @@ impl Head {
         new_head: Self,
         remote: Option<&str>,
     ) -> Result<(), BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        // §C.4.4: the checked-out-elsewhere probe inside
-        // `update_result_with_conn` and the HEAD write must be ONE
-        // transaction. On a pool connection they are two implicit ones, so
-        // two worktrees attaching to the same branch can both pass the probe
-        // and both write — the exact duplicate checkout the guard exists to
-        // prevent. Callers that already hold a transaction (`switch`,
-        // `checkout`, `worktree add`) were always atomic; this closes the
-        // pooled entry point that `symbolic-ref` and `stash branch` use.
-        // HEAD's update reads the current row before replacing it.
-        let txn = crate::internal::db::begin_write_transaction(&db_conn)
-            .await
-            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
-        Self::update_result_with_conn(&txn, new_head, remote).await?;
-        txn.commit()
-            .await
-            .map_err(|e| BranchStoreError::Query(e.to_string()))
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                let txn = crate::internal::db::begin_write_transaction(&db_conn)
+                    .await
+                    .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+                Self::update_result_with_conn(&txn, new_head, remote).await?;
+                txn.commit()
+                    .await
+                    .map_err(|e| BranchStoreError::Query(e.to_string()))
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::update_result_with_store(store.as_ref(), new_head, remote).await
+            }
+        }
     }
 
     /// Delete the persisted remote HEAD row (`refs/remotes/<remote>/HEAD`).
     pub async fn delete_remote_head(remote: &str) -> Result<(), BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        let txn = crate::internal::db::begin_write_transaction(&db_conn)
-            .await
-            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
-        reference::Entity::delete_many()
-            .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
-            .filter(reference::Column::Remote.eq(remote))
-            .exec(&txn)
-            .await
-            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
-        txn.commit()
-            .await
-            .map_err(|e| BranchStoreError::Query(e.to_string()))
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                let txn = crate::internal::db::begin_write_transaction(&db_conn)
+                    .await
+                    .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+                reference::Entity::delete_many()
+                    .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+                    .filter(reference::Column::Remote.eq(remote))
+                    .exec(&txn)
+                    .await
+                    .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+                txn.commit()
+                    .await
+                    .map_err(|e| BranchStoreError::Query(e.to_string()))
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::delete_remote_head_with_store(store.as_ref(), remote).await
+            }
+        }
     }
 
     // HEAD is unique, update if exists, insert if not
@@ -1273,6 +1650,176 @@ mod tests {
             !compact.contains("Head::branch_checked_out_elsewhere_result_with_conn(")
                 && !compact.contains("Head::update_result_with_conn("),
             "restore must not reintroduce an ambient Head call"
+        );
+    }
+
+    /// `RB-13` AC1 & AC5: verify `head`, `branch`, `tag`, `reflog`, `notes`,
+    /// `revision_ordinal`, `dirty`, `metadata`, `workspace`, and `worktree_scope`
+    /// operate cleanly on a pure `Redb` repository with ZERO `.libra/libra.db`.
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(cwd, env)]
+    async fn redb_head_branch_tag_reflog_notes_and_worktree_scope() {
+        let repo = tempdir().expect("create redb repo tempdir");
+        let dot_libra = repo.path().join(".libra");
+        std::fs::create_dir_all(dot_libra.join("objects")).expect("mkdir objects");
+        let paths = crate::storage::runtime::init_redb_repository_storage(&dot_libra)
+            .await
+            .expect("init pure redb repository");
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "pure redb repository must not have libra.db"
+        );
+
+        let _guard = ChangeDirGuard::new(repo.path());
+
+        // AC5: worktree_scope resolves `.libra/redb/git.gen-00000001.redb` from the same observation.
+        let resolved_git = crate::internal::worktree_scope::request_redb_git_path()
+            .expect("worktree_scope must resolve git.gen-00000001.redb without libra.db");
+        assert_eq!(
+            std::fs::canonicalize(&resolved_git).expect("canon resolved"),
+            std::fs::canonicalize(&paths.git_db_path).expect("canon expected")
+        );
+
+        // Head + Branch roundtrip via top-level storage-dispatched facades (zero libra.db).
+        let commit_hex = "1111111111111111111111111111111111111111";
+        Branch::update_branch("main", commit_hex, None)
+            .await
+            .expect("update main branch on redb");
+        Head::update_result(Head::Branch("main".to_string()), None)
+            .await
+            .expect("set HEAD -> main on redb");
+        assert!(matches!(
+            Head::current_result().await.expect("read HEAD"),
+            Head::Branch(ref name) if name == "main"
+        ));
+        assert_eq!(
+            Head::current_commit_result()
+                .await
+                .expect("read HEAD commit")
+                .map(|h| h.to_string()),
+            Some(commit_hex.to_string())
+        );
+        let listed = Branch::list_branches_result(None)
+            .await
+            .expect("list branches on redb");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "main");
+
+        // Tag roundtrip via store + top-level facade.
+        let git_rw = crate::storage::runtime::open_current_git_store_read_write()
+            .await
+            .expect("open redb git store rw");
+        let oid = crate::internal::object_format::parse_repo_oid(commit_hex).expect("parse oid");
+        crate::internal::tag::create_lightweight_with_store(git_rw.as_ref(), "v1.0", oid, false)
+            .await
+            .expect("create tag on redb");
+        let found_tag = crate::internal::tag::find_tag_ref("v1.0")
+            .await
+            .expect("find tag ref on redb")
+            .expect("tag ref present");
+        assert_eq!(found_tag.target.as_deref(), Some(commit_hex));
+
+        // Reflog + Notes + RevisionOrdinal roundtrip via store.
+        let cfg_ro = crate::storage::runtime::open_current_repo_config_store_read_only()
+            .await
+            .expect("open redb config store");
+        let reflog_ctx = crate::internal::reflog::ReflogContext {
+            old_oid: "0000000000000000000000000000000000000000".to_string(),
+            new_oid: commit_hex.to_string(),
+            action: crate::internal::reflog::ReflogAction::Commit {
+                message: "initial redb commit".to_string(),
+            },
+        };
+        let rf_write = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+            cfg_ro.as_ref(),
+            &reflog_ctx,
+            "HEAD",
+        )
+        .await;
+        let head_key = crate::storage::RefKey::LocalHead { worktree_id: None };
+        let head_cur = git_rw.get_ref(&head_key).await.expect("get head");
+        git_rw
+            .update_ref_cas(&head_key, head_cur.as_ref(), head_cur.as_ref(), &[rf_write])
+            .await
+            .expect("append reflog on redb");
+        let reflogs = crate::internal::reflog::Reflog::find_all_with_store(git_rw.as_ref(), "HEAD")
+            .await
+            .expect("read reflog on redb");
+        assert_eq!(reflogs.len(), 1);
+
+        let note_blob = "2222222222222222222222222222222222222222";
+        crate::internal::notes::add_with_store(
+            git_rw.as_ref(),
+            "refs/notes/commits",
+            commit_hex,
+            note_blob,
+            false,
+        )
+        .await
+        .expect("add note on redb");
+        let notes = crate::internal::notes::list_with_store(
+            git_rw.as_ref(),
+            "refs/notes/commits",
+            Some(commit_hex),
+        )
+        .await
+        .expect("list notes on redb");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].note_hash.as_deref(), Some(note_blob));
+
+        // Metadata + Dirty + RevisionOrdinal + Workspace checks on pure redb.
+        crate::internal::metadata::MetadataKv::set(
+            crate::internal::metadata::MetadataScope::Branch,
+            "main",
+            "description",
+            "redb trunk",
+            crate::internal::metadata::MetadataValueType::Text,
+        )
+        .await
+        .expect("set metadata on redb");
+        let got_meta = crate::internal::metadata::MetadataKv::get(
+            crate::internal::metadata::MetadataScope::Branch,
+            "main",
+            "description",
+        )
+        .await
+        .expect("get metadata on redb")
+        .expect("metadata present");
+        assert_eq!(got_meta.value, "redb trunk");
+
+        assert!(
+            crate::internal::dirty::DirtyCache::meta()
+                .await
+                .expect("dirty meta on redb")
+                .is_none()
+        );
+        assert_eq!(
+            crate::internal::revision_ordinal::RevisionOrdinalIndex::count_with_store(
+                git_rw.as_ref(),
+                "refs/heads/main"
+            )
+            .await
+            .expect("count ordinals on redb"),
+            0
+        );
+        let state_ro = crate::storage::runtime::open_current_git_state_store_read_only()
+            .await
+            .expect("open git state store ro");
+        assert!(
+            crate::internal::workspace::WorkspaceStore::list_with_store(
+                state_ro.as_ref(),
+                "rb13-test-repo",
+                None
+            )
+            .await
+            .expect("list workspaces on redb")
+            .is_empty()
+        );
+
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "RB-13 facades must never create or touch libra.db on a redb repository"
         );
     }
 }

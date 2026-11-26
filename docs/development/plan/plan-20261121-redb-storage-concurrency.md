@@ -7602,7 +7602,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区 `../libra-redb-integration` 内，将 `src/internal/` 下 12 个核心存储门面文件（`branch.rs`、`config.rs`、`dirty.rs`、`head.rs`、`metadata.rs`、`notes.rs`、`reflog.rs`、`revision_ordinal.rs`、`tag.rs`、`vault.rs`、`workspace.rs`、`worktree_scope.rs`）按 `ADR-RB-08` 双签名保签模式接入 `crate::storage`：原样保留全部既有 `*_with_conn`（`ConnectionTrait`）签名供 SQLite 与其它 Agent 消费，并行新增 `*_with_store(&dyn GitStore / &dyn ConfigStore)` 路径；`vault.rs` 仅适配 `L263-280` 配置键值调用，保持 `.libra/vault.db` 不变。
 
@@ -7616,18 +7616,18 @@
 | `head.rs:171,324` 暴露接收 `ConnectionTrait` 的公共函数；`vault.rs:40,263-280` 分别使用 `vault.db` 与 `ConfigKv` | `src/internal/head.rs:7,171,324`；`src/internal/vault.rs:40,263-280`；`src/internal/worktree_scope.rs:129` |
 
 **Acceptance criteria:**
-- [ ] 上列 12 个门面文件在 `Redb` 后端下全部经 `GitStore`/`ConfigStore`/`MetadataStore` 执行，不打开 `.libra/libra.db`。
-- [ ] 所有既有 `*_with_conn<C: ConnectionTrait>` 公共签名保持原样且在 `Sqlite` 后端行为不变。
-- [ ] `GlobalConfig` 与 `SystemConfig` 在 `config.rs` 中遵循 `ADR-RB-02` #2（先检作用域 `config-format.json`，再按选定运行时后端分派，纯红库 fail-closed 不返回空配置）。
-- [ ] `vault.rs` 继续由 `libvault` 管理 `.libra/vault.db`，仅配置键读写路径经 `ConfigStore` 适配。
-- [ ] `worktree_scope.rs` 在 `Redb` 仓库上基于同一作用域观测解析 `.libra/redb/git.gen-<id>.redb`（无 `.libra/libra.db` 时正常工作）。
-- [ ] `src/internal/db.rs`、`src/utils/shared_perm.rs` 零改动。
+- [x] 上列 12 个门面文件在 `Redb` 后端下全部经 `GitStore`/`ConfigStore`/`MetadataStore` 执行，不打开 `.libra/libra.db`。
+- [x] 所有既有 `*_with_conn<C: ConnectionTrait>` 公共签名保持原样且在 `Sqlite` 后端行为不变。
+- [x] `GlobalConfig` 与 `SystemConfig` 在 `config.rs` 中遵循 `ADR-RB-02` #2（先检作用域 `config-format.json`，再按选定运行时后端分派，纯红库 fail-closed 不返回空配置）。
+- [x] `vault.rs` 继续由 `libvault` 管理 `.libra/vault.db`，仅配置键读写路径经 `ConfigStore` 适配。
+- [x] `worktree_scope.rs` 在 `Redb` 仓库上基于同一作用域观测解析 `.libra/redb/git.gen-<id>.redb`（无 `.libra/libra.db` 时正常工作）。
+- [x] `src/internal/db.rs`、`src/utils/shared_perm.rs` 零改动。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::head::tests::redb_head_branch_tag_reflog_notes_and_worktree_scope) | test(=internal::config::tests::redb_config_cascade_global_system_fallback_and_vault_kv)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::head::tests::redb_head_branch_tag_reflog_notes_and_worktree_scope)'`（new，覆盖 AC1、AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::config::tests::redb_config_cascade_global_system_fallback_and_vault_kv)'`（new，覆盖 AC3、AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_global_config_schema_future`（覆盖 AC2；AC6 由 `RB-30` 禁改 diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::head::tests::redb_head_branch_tag_reflog_notes_and_worktree_scope) | test(=internal::config::tests::redb_config_cascade_global_system_fallback_and_vault_kv)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::head::tests::redb_head_branch_tag_reflog_notes_and_worktree_scope)'`（new，覆盖 AC1、AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::config::tests::redb_config_cascade_global_system_fallback_and_vault_kv)'`（new，覆盖 AC3、AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_global_config_schema_future`（覆盖 AC2；AC6 由 `RB-30` 禁改 diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`，由 `RB-30` 承接 `T-2` 全量）
 
@@ -7661,7 +7661,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/internal/operation/{middleware,restore,snapshot,store}.rs`（4 文件）、`src/internal/change/{builder,genealogy,import,resolve,store}.rs`（5 文件）与 `src/internal/config/global_migration.rs`（1 文件）按双签名保签模式接入 `crate::storage`，使 OpLog v2、Change 谱系与全局配置路径检测在 `Redb` 下不触碰 `.libra/libra.db`。
 
@@ -7675,17 +7675,17 @@
 | `operation/middleware.rs:70`、`operation/snapshot.rs:423` 与 `config/global_migration.rs:4` 直接拼接 `util::DATABASE` / `config.db` | `src/internal/operation/middleware.rs:70`；`src/internal/operation/snapshot.rs:423`；`src/internal/config/global_migration.rs:4` |
 
 **Acceptance criteria:**
-- [ ] `operation/{middleware,restore,snapshot,store}.rs` 在 `Redb` 仓库上完成操作记录、快照与恢复，不打开 `.libra/libra.db`。
-- [ ] `change/{builder,genealogy,import,resolve,store}.rs` 在 `Redb` 仓库上完成 Change ID 构造、谱系追踪与解析。
-- [ ] `config/global_migration.rs` 按 `ADR-RB-02` 区分 `config.redb` 与未迁移 `config.db` 并遵守 `GC-13` 隔离。
-- [ ] 既有 SQLite `operation_dag` 路径零回归。
-- [ ] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
+- [x] `operation/{middleware,restore,snapshot,store}.rs` 在 `Redb` 仓库上完成操作记录、快照与恢复，不打开 `.libra/libra.db`。
+- [x] `change/{builder,genealogy,import,resolve,store}.rs` 在 `Redb` 仓库上完成 Change ID 构造、谱系追踪与解析。
+- [x] `config/global_migration.rs` 按 `ADR-RB-02` 区分 `config.redb` 与未迁移 `config.db` 并遵守 `GC-13` 隔离。
+- [x] 既有 SQLite `operation_dag` 路径零回归。
+- [x] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::operation::store::tests::redb_oplog_v2_snapshot_and_restore_roundtrip) | test(=internal::change::store::tests::redb_change_genealogy_and_global_migration_compat)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::operation::store::tests::redb_oplog_v2_snapshot_and_restore_roundtrip)'`（new，覆盖 AC1）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::change::store::tests::redb_change_genealogy_and_global_migration_compat)'`（new，覆盖 AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test operation_dag`（覆盖 AC4；AC5 由 `RB-30` 禁改 diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::operation::store::tests::redb_oplog_v2_snapshot_and_restore_roundtrip) | test(=internal::change::store::tests::redb_change_genealogy_and_global_migration_compat)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::operation::store::tests::redb_oplog_v2_snapshot_and_restore_roundtrip)'`（new，覆盖 AC1）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::change::store::tests::redb_change_genealogy_and_global_migration_compat)'`（new，覆盖 AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test operation_dag`（覆盖 AC4；AC5 由 `RB-30` 禁改 diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -7719,7 +7719,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/internal/sequencer/mod.rs`、`src/internal/layer/mod.rs`、`src/internal/sparse/mod.rs` 与 `src/internal/obliteration/mod.rs`（4 目录、4 文件）按双签名保签模式接入 `crate::storage`，使序列器互斥锁、层叠加、稀疏视图与对象抹除围栏在 `Redb` 仓库完整工作。
 
@@ -7733,18 +7733,18 @@
 | `sparse/mod.rs:168`、`obliteration/mod.rs:24`、`sequencer/mod.rs:6` 直接经 SQLite 读写仓库状态表 | `src/internal/sparse/mod.rs:168`；`src/internal/obliteration/mod.rs:24-90`；`src/internal/sequencer/mod.rs:6` |
 
 **Acceptance criteria:**
-- [ ] `sequencer/mod.rs` 在 `Redb` 仓库上按 `worktree_id` 隔离保存/恢复 `sequence_state` 并执行对称互斥检查。
-- [ ] `layer/mod.rs` 在 `Redb` 仓库上完成 `layer`/`layer_path` 读写与清理。
-- [ ] `sparse/mod.rs` 在 `Redb` 仓库上完成 `sparse_view`/`sparse_view_meta` 持久化（不依赖 `libra.db`）。
-- [ ] `obliteration/mod.rs` 在 `Redb` 仓库上读写 `object_obliteration` 围栏并拦截抹除对象。
-- [ ] SQLite 后端既有 `sequencer_snapshot_roundtrip` 路径零回归。
-- [ ] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
+- [x] `sequencer/mod.rs` 在 `Redb` 仓库上按 `worktree_id` 隔离保存/恢复 `sequence_state` 并执行对称互斥检查。
+- [x] `layer/mod.rs` 在 `Redb` 仓库上完成 `layer`/`layer_path` 读写与清理。
+- [x] `sparse/mod.rs` 在 `Redb` 仓库上完成 `sparse_view`/`sparse_view_meta` 持久化（不依赖 `libra.db`）。
+- [x] `obliteration/mod.rs` 在 `Redb` 仓库上读写 `object_obliteration` 围栏并拦截抹除对象。
+- [x] SQLite 后端既有 `sequencer_snapshot_roundtrip` 路径零回归。
+- [x] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::sequencer::tests::redb_sequencer_mutex_and_worktree_isolation) | test(=internal::sparse::tests::redb_layer_sparse_and_obliteration_roundtrip)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::sequencer::tests::redb_sequencer_mutex_and_worktree_isolation)'`（new，覆盖 AC1）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::sparse::tests::redb_layer_sparse_and_obliteration_roundtrip)'`（new，覆盖 AC2、AC3、AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test sequencer_snapshot_roundtrip`（覆盖 AC5；AC6 由 `RB-30` 禁改 diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::sequencer::tests::redb_sequencer_mutex_and_worktree_isolation) | test(=internal::sparse::tests::redb_layer_sparse_and_obliteration_roundtrip)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::sequencer::tests::redb_sequencer_mutex_and_worktree_isolation)'`（new，覆盖 AC1）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::sparse::tests::redb_layer_sparse_and_obliteration_roundtrip)'`（new，覆盖 AC2、AC3、AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test sequencer_snapshot_roundtrip`（覆盖 AC5；AC6 由 `RB-30` 禁改 diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -7778,7 +7778,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/cli.rs`、`src/utils/util.rs` 与 `src/command/status/cache.rs`（3 目录、3 文件）接入 `crate::storage`，使仓库发现（`util.rs:213-224,475-494,808-835`）同时识别 `storage-format.json` / `.libra/redb/` 与 `libra.db`（继续拒绝 `$LIBRA_HOME` 采纳）、status 缓存经只读 `GitStore` 读写，并将 `src/cli.rs` 入口路由至 `crate::storage::backend`（保持 `RB-29a` 前的编译期门控不变）。
 
@@ -7794,17 +7794,17 @@
 | `util.rs:221,491,832` 仅检查 `libra.db` 判断有效存储目录；`src/cli.rs:98,2535` 尚未接入 `crate::storage::backend` | `src/utils/util.rs:213-224,475-494,808-835`；`src/command/status/cache.rs`；`src/cli.rs:98,2535` |
 
 **Acceptance criteria:**
-- [ ] `util.rs` 的 `is_valid_storage_dir` 与 `is_terminal_common_storage` 识别 `storage-format.json`/`.libra/redb/`（无 `libra.db` 时仍正确定位普通仓库）。
-- [ ] `util.rs` 的 bare 仓库探测识别红库 bare 目录（无 `libra.db` 时仍正确定位）。
-- [ ] `util.rs` 对含 `storage-format.json` 或 `redb/` 的 `$LIBRA_HOME` 仍严格拒绝采纳为仓库目录。
-- [ ] `command/status/cache.rs` 在 `Redb` 仓库上经只读 `GitStore` 读写脏树缓存，绝不升写打开。
-- [ ] `src/cli.rs` 将生产 CLI 入口的后端解析与 `finalized == false`/未迁移库检查路由至 `crate::storage::backend`。
-- [ ] `RB-29a` 解锁前，经 `src/cli.rs` 入口传入 `LIBRA_STORAGE_BACKEND=redb` 的真实 CLI 请求无条件返回 `LBR-CLI-003`（承接 `RB-01b` 生产入口门控验收）。
+- [x] `util.rs` 的 `is_valid_storage_dir` 与 `is_terminal_common_storage` 识别 `storage-format.json`/`.libra/redb/`（无 `libra.db` 时仍正确定位普通仓库）。
+- [x] `util.rs` 的 bare 仓库探测识别红库 bare 目录（无 `libra.db` 时仍正确定位）。
+- [x] `util.rs` 对含 `storage-format.json` 或 `redb/` 的 `$LIBRA_HOME` 仍严格拒绝采纳为仓库目录。
+- [x] `command/status/cache.rs` 在 `Redb` 仓库上经只读 `GitStore` 读写脏树缓存，绝不升写打开。
+- [x] `src/cli.rs` 将生产 CLI 入口的后端解析与 `finalized == false`/未迁移库检查路由至 `crate::storage::backend`。
+- [x] `RB-29a` 解锁前，经 `src/cli.rs` 入口传入 `LIBRA_STORAGE_BACKEND=redb` 的真实 CLI 请求无条件返回 `LBR-CLI-003`（承接 `RB-01b` 生产入口门控验收）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=utils::util::tests::redb_repo_discovery_and_home_rejection) | test(=command::status::cache::tests::redb_status_cache_readonly_and_cli_gate_entry)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=utils::util::tests::redb_repo_discovery_and_home_rejection)'`（new，覆盖 AC1、AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::status::cache::tests::redb_status_cache_readonly_and_cli_gate_entry)'`（new，覆盖 AC4、AC5、AC6）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=utils::util::tests::redb_repo_discovery_and_home_rejection) | test(=command::status::cache::tests::redb_status_cache_readonly_and_cli_gate_entry)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=utils::util::tests::redb_repo_discovery_and_home_rejection)'`（new，覆盖 AC1、AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::status::cache::tests::redb_status_cache_readonly_and_cli_gate_entry)'`（new，覆盖 AC4、AC5、AC6）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -7838,7 +7838,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/internal/protocol/{local_client,local_push}.rs` 与 `src/utils/{client_storage,path_case}.rs`（2 目录、4 文件）接入 `crate::storage`，使本地远端拉取/推送、对象索引与路径大小写判定全面支持 `Redb` 后端且零回归 SQLite 本地推送。
 
@@ -7852,16 +7852,16 @@
 | `local_push.rs:49` 与 `path_case.rs:202` 硬编码 `libra.db` | `src/internal/protocol/local_client.rs`；`src/internal/protocol/local_push.rs:49`；`src/utils/client_storage.rs`；`src/utils/path_case.rs:202` |
 
 **Acceptance criteria:**
-- [ ] `local_client.rs` 支持从本地 `Redb` 远端仓库拉取，不要求目标存在 `libra.db`。
-- [ ] `local_push.rs` 支持向本地 `Redb` 远端仓库推送，不要求目标存在 `libra.db`。
-- [ ] `client_storage.rs` 在 `Redb` 仓库上通过 `GitStore` 读写对象索引。
-- [ ] `path_case.rs` 在 `Redb` 仓库上通过 `ConfigStore` 读取大小写配置。
-- [ ] 既有 SQLite `compat_local_push_no_cwd_switch` 零回归（禁改文件零改动由 `GC-RB-06` 与 `RB-30` diff 门保障）。
+- [x] `local_client.rs` 支持从本地 `Redb` 远端仓库拉取，不要求目标存在 `libra.db`。
+- [x] `local_push.rs` 支持向本地 `Redb` 远端仓库推送，不要求目标存在 `libra.db`。
+- [x] `client_storage.rs` 在 `Redb` 仓库上通过 `GitStore` 读写对象索引。
+- [x] `path_case.rs` 在 `Redb` 仓库上通过 `ConfigStore` 读取大小写配置。
+- [x] 既有 SQLite `compat_local_push_no_cwd_switch` 零回归（禁改文件零改动由 `GC-RB-06` 与 `RB-30` diff 门保障）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::protocol::local_push::tests::redb_local_client_push_object_index_and_path_case)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::protocol::local_push::tests::redb_local_client_push_object_index_and_path_case)'`（new，覆盖 AC1–AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_local_push_no_cwd_switch`（覆盖 AC5）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::protocol::local_push::tests::redb_local_client_push_object_index_and_path_case)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::protocol::local_push::tests::redb_local_client_push_object_index_and_path_case)'`（new，覆盖 AC1–AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_local_push_no_cwd_switch`（覆盖 AC5）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 

@@ -397,12 +397,286 @@ impl Branch {
         resolved
     }
 
+    pub async fn list_branches_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        remote: Option<&str>,
+    ) -> Result<Vec<Self>, BranchStoreError> {
+        let records = store
+            .list_refs(None)
+            .await
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+        let mut out = Vec::new();
+        for rec in records {
+            let (name, rec_remote) = match rec.key {
+                crate::storage::RefKey::LocalBranch { name } if remote.is_none() => (name, None),
+                crate::storage::RefKey::RemoteBranch { remote: r, name }
+                    if remote == Some(r.as_str()) =>
+                {
+                    (name, Some(r))
+                }
+                _ => continue,
+            };
+            let crate::storage::RefTarget::Direct(commit_str) = rec.target else {
+                continue;
+            };
+            let commit =
+                crate::internal::object_format::parse_repo_oid(&commit_str).map_err(|err| {
+                    BranchStoreError::Corrupt {
+                        name: name.clone(),
+                        detail: err.to_string(),
+                    }
+                })?;
+            out.push(Self {
+                name,
+                commit,
+                remote: rec_remote,
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn exists_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        branch_name: &str,
+        remote: Option<&str>,
+    ) -> Result<bool, BranchStoreError> {
+        let key = match remote {
+            Some(r) => crate::storage::RefKey::RemoteBranch {
+                remote: r.to_string(),
+                name: branch_name.to_string(),
+            },
+            None => crate::storage::RefKey::LocalBranch {
+                name: branch_name.to_string(),
+            },
+        };
+        store
+            .get_ref(&key)
+            .await
+            .map(|opt| opt.is_some())
+            .map_err(|err| BranchStoreError::Query(err.to_string()))
+    }
+
+    pub async fn find_branch_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        branch_name: &str,
+        remote: Option<&str>,
+    ) -> Result<Option<Self>, BranchStoreError> {
+        let key = match remote {
+            Some(r) => crate::storage::RefKey::RemoteBranch {
+                remote: r.to_string(),
+                name: branch_name.to_string(),
+            },
+            None => crate::storage::RefKey::LocalBranch {
+                name: branch_name.to_string(),
+            },
+        };
+        let Some(target) = store
+            .get_ref(&key)
+            .await
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        match target {
+            crate::storage::RefTarget::Direct(commit_str) => {
+                let commit =
+                    crate::internal::object_format::parse_repo_oid(&commit_str).map_err(|err| {
+                        BranchStoreError::Corrupt {
+                            name: branch_name.to_string(),
+                            detail: err.to_string(),
+                        }
+                    })?;
+                Ok(Some(Self {
+                    name: branch_name.to_string(),
+                    commit,
+                    remote: remote.map(ToOwned::to_owned),
+                }))
+            }
+            crate::storage::RefTarget::Symbolic(_) => Ok(None),
+        }
+    }
+
+    pub async fn search_branch_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        branch_name: &str,
+    ) -> Result<Vec<Self>, BranchStoreError> {
+        if branch_name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::new();
+        if let Some(local) = Self::find_branch_result_with_store(store, branch_name, None).await? {
+            results.push(local);
+        }
+        let mut offset = 0usize;
+        while let Some(rel) = branch_name[offset..].find('/') {
+            let split_idx = offset + rel;
+            let remote_part = &branch_name[..split_idx];
+            let branch_part = &branch_name[split_idx + 1..];
+            if !remote_part.is_empty()
+                && !branch_part.is_empty()
+                && let Some(found) =
+                    Self::find_branch_result_with_store(store, branch_part, Some(remote_part))
+                        .await?
+            {
+                results.push(found);
+            }
+            offset = split_idx + 1;
+        }
+        Ok(results)
+    }
+
+    pub async fn update_branch_with_store(
+        store: &dyn crate::storage::GitStore,
+        branch_name: &str,
+        commit_hash: &str,
+        remote: Option<&str>,
+    ) -> Result<(), BranchStoreError> {
+        if remote.is_none() {
+            let scope = crate::internal::worktree_scope::WorktreeScope::current();
+            if let Some(other) =
+                crate::internal::head::Head::branch_checked_out_elsewhere_for_scope_result_with_store(
+                    store,
+                    branch_name,
+                    &scope,
+                )
+                .await?
+            {
+                return Err(BranchStoreError::CheckedOutElsewhere {
+                    name: branch_name.to_string(),
+                    worktree: other,
+                });
+            }
+        }
+        let key = match remote {
+            Some(r) => crate::storage::RefKey::RemoteBranch {
+                remote: r.to_string(),
+                name: branch_name.to_string(),
+            },
+            None => crate::storage::RefKey::LocalBranch {
+                name: branch_name.to_string(),
+            },
+        };
+        let target = crate::storage::RefTarget::Direct(commit_hash.to_string());
+        for _ in 0..8 {
+            let current = store
+                .get_ref(&key)
+                .await
+                .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+            match store
+                .update_ref_cas(&key, current.as_ref(), Some(&target), &[])
+                .await
+                .map_err(|err| BranchStoreError::Query(err.to_string()))?
+            {
+                crate::storage::RefCasOutcome::Applied { .. } => return Ok(()),
+                crate::storage::RefCasOutcome::CasConflict { .. } => continue,
+            }
+        }
+        Err(BranchStoreError::Query(
+            "failed to update branch after CAS retries".to_string(),
+        ))
+    }
+
+    pub async fn create_branch_exclusive_with_store(
+        store: &dyn crate::storage::GitStore,
+        branch_name: &str,
+        commit_hash: &str,
+        remote: Option<&str>,
+    ) -> Result<(), BranchStoreError> {
+        let key = match remote {
+            Some(r) => crate::storage::RefKey::RemoteBranch {
+                remote: r.to_string(),
+                name: branch_name.to_string(),
+            },
+            None => crate::storage::RefKey::LocalBranch {
+                name: branch_name.to_string(),
+            },
+        };
+        let target = crate::storage::RefTarget::Direct(commit_hash.to_string());
+        match store
+            .update_ref_cas(&key, None, Some(&target), &[])
+            .await
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::RefCasOutcome::Applied { .. } => Ok(()),
+            crate::storage::RefCasOutcome::CasConflict { .. } => {
+                Err(BranchStoreError::AlreadyExists(branch_name.to_string()))
+            }
+        }
+    }
+
+    pub async fn delete_branch_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        branch_name: &str,
+        remote: Option<&str>,
+    ) -> Result<(), BranchStoreError> {
+        if remote.is_none() {
+            let scope = crate::internal::worktree_scope::WorktreeScope::current();
+            if let Some(other) =
+                crate::internal::head::Head::branch_checked_out_elsewhere_for_scope_result_with_store(
+                    store,
+                    branch_name,
+                    &scope,
+                )
+                .await?
+            {
+                return Err(BranchStoreError::CheckedOutElsewhere {
+                    name: branch_name.to_string(),
+                    worktree: other,
+                });
+            }
+        }
+        let key = match remote {
+            Some(r) => crate::storage::RefKey::RemoteBranch {
+                remote: r.to_string(),
+                name: branch_name.to_string(),
+            },
+            None => crate::storage::RefKey::LocalBranch {
+                name: branch_name.to_string(),
+            },
+        };
+        for _ in 0..8 {
+            let Some(current) = store
+                .get_ref(&key)
+                .await
+                .map_err(|err| BranchStoreError::Query(err.to_string()))?
+            else {
+                return Err(BranchStoreError::NotFound(branch_name.to_string()));
+            };
+            match store
+                .update_ref_cas(&key, Some(&current), None, &[])
+                .await
+                .map_err(|err| BranchStoreError::Delete {
+                    name: branch_name.to_string(),
+                    detail: err.to_string(),
+                })? {
+                crate::storage::RefCasOutcome::Applied { .. } => return Ok(()),
+                crate::storage::RefCasOutcome::CasConflict { .. } => continue,
+            }
+        }
+        Err(BranchStoreError::Delete {
+            name: branch_name.to_string(),
+            detail: "failed to delete branch after CAS retries".to_string(),
+        })
+    }
+
     /// Result-returning variant of `list_branches_result_with_conn` that
     /// acquires its own connection from the pool. Use the `_with_conn` form
     /// inside transactions.
     pub async fn list_branches_result(remote: Option<&str>) -> Result<Vec<Self>, BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        Self::list_branches_result_with_conn(&db_conn, remote).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                Self::list_branches_result_with_conn(&db_conn, remote).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::list_branches_result_with_store(store.as_ref(), remote).await
+            }
+        }
     }
 
     /// Result-returning existence check.
@@ -430,8 +704,20 @@ impl Branch {
         branch_name: &str,
         remote: Option<&str>,
     ) -> Result<bool, BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        Self::exists_result_with_conn(&db_conn, branch_name, remote).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                Self::exists_result_with_conn(&db_conn, branch_name, remote).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::exists_result_with_store(store.as_ref(), branch_name, remote).await
+            }
+        }
     }
 
     /// Result-returning branch lookup keyed by `(name, remote)`.
@@ -502,8 +788,20 @@ impl Branch {
         branch_name: &str,
         remote: Option<&str>,
     ) -> Result<Option<Self>, BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        Self::find_branch_or_symref_result_with_conn(&db_conn, branch_name, remote).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                Self::find_branch_or_symref_result_with_conn(&db_conn, branch_name, remote).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::find_branch_result_with_store(store.as_ref(), branch_name, remote).await
+            }
+        }
     }
 
     /// Pool-acquiring counterpart of [`Branch::find_branch_result_with_conn`].
@@ -511,8 +809,20 @@ impl Branch {
         branch_name: &str,
         remote: Option<&str>,
     ) -> Result<Option<Self>, BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        Self::find_branch_result_with_conn(&db_conn, branch_name, remote).await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                Self::find_branch_result_with_conn(&db_conn, branch_name, remote).await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|err| BranchStoreError::Query(err.to_string()))?;
+                Self::find_branch_result_with_store(store.as_ref(), branch_name, remote).await
+            }
+        }
     }
 
     /// Walk every `(remote, branch)` split of an ambiguous slash-delimited name
@@ -867,19 +1177,24 @@ impl Branch {
         commit_hash: &str,
         remote: Option<&str>,
     ) -> Result<(), DbErr> {
-        let db_conn = get_db_conn_instance().await;
-        // §C.4.4: run the checked-out probe and the write in ONE transaction.
-        // On a pool connection they are two implicit transactions, so another
-        // worktree can attach the branch in between — the probe says "free",
-        // the write moves the tip, and that worktree is left pointing at the
-        // old one. SQLite's rollback journal makes the read half of this
-        // transaction block a concurrent attach until we commit, so the pair
-        // is genuinely atomic against it.
-        // The update READS the existing row before writing it, so the write
-        // lock is taken up front (`db::begin_write_transaction`).
-        let txn = crate::internal::db::begin_write_transaction(&db_conn).await?;
-        Self::update_branch_with_conn(&txn, branch_name, commit_hash, remote).await?;
-        txn.commit().await
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|err| DbErr::Custom(err.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                let txn = crate::internal::db::begin_write_transaction(&db_conn).await?;
+                Self::update_branch_with_conn(&txn, branch_name, commit_hash, remote).await?;
+                txn.commit().await
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|err| DbErr::Custom(err.to_string()))?;
+                Self::update_branch_with_store(store.as_ref(), branch_name, commit_hash, remote)
+                    .await
+                    .map_err(|err| DbErr::Custom(err.to_string()))
+            }
+        }
     }
 
     /// Result-returning branch delete.
@@ -960,32 +1275,43 @@ impl Branch {
         branch_name: &str,
         remote: Option<&str>,
     ) -> Result<(), BranchStoreError> {
-        let db_conn = get_db_conn_instance().await;
-        // §C.4.4: probe, delete and metadata cascade in ONE transaction. On a
-        // pool connection they are three implicit transactions, so a worktree
-        // that attaches to this branch after the probe — `switch -C` reaches
-        // this entry point directly — passes its own probe (the branch is
-        // still there), and then loses the branch under it. The same
-        // transaction also makes the metadata cascade atomic with the ref
-        // delete, which the `_with_conn` form could only document as a gap.
-        // Failing to ACQUIRE the write lock (or to commit) is a failure OF
-        // THE DELETE — e.g. a read-only repository database must surface as
-        // "failed to prune/delete branch X" (IoWriteFailed), not as a
-        // query/list failure: `remote prune` maps `Query` to its LIST error
-        // (LBR-IO-001) and `Delete` to the prune error (LBR-IO-002), and the
-        // probe-first transaction had silently moved the read-only failure
-        // from the DELETE statement to the probe (W5-09 gate regression).
-        let txn = crate::internal::db::begin_write_transaction(&db_conn)
-            .await
-            .map_err(|e| BranchStoreError::Delete {
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| {
+            BranchStoreError::Delete {
                 name: branch_name.to_string(),
-                detail: e.to_string(),
-            })?;
-        Self::delete_branch_result_with_conn(&txn, branch_name, remote).await?;
-        txn.commit().await.map_err(|e| BranchStoreError::Delete {
-            name: branch_name.to_string(),
-            detail: e.to_string(),
-        })
+                detail: err.to_string(),
+            }
+        })? {
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_conn = get_db_conn_instance().await;
+                let txn = crate::internal::db::begin_write_transaction(&db_conn)
+                    .await
+                    .map_err(|e| BranchStoreError::Delete {
+                        name: branch_name.to_string(),
+                        detail: e.to_string(),
+                    })?;
+                Self::delete_branch_result_with_conn(&txn, branch_name, remote).await?;
+                txn.commit().await.map_err(|e| BranchStoreError::Delete {
+                    name: branch_name.to_string(),
+                    detail: e.to_string(),
+                })
+            }
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|err| BranchStoreError::Delete {
+                        name: branch_name.to_string(),
+                        detail: err.to_string(),
+                    })?;
+                Self::delete_branch_result_with_store(store.as_ref(), branch_name, remote).await?;
+                if remote.is_none()
+                    && let Ok(meta) =
+                        crate::storage::runtime::open_current_repo_metadata_store_read_write().await
+                {
+                    let _ = meta.delete_metadata_target("branch", branch_name).await;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// ATOMIC tip-conditional delete (W2 §C.4.3 `stash branch` rollback):

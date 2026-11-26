@@ -499,7 +499,7 @@ fn initialize_rb04b_git_tables(wtx: &WriteTransaction) -> StorageResult<()> {
     Ok(())
 }
 
-fn initialize_core_git_tables(wtx: &WriteTransaction) -> StorageResult<()> {
+pub(crate) fn initialize_core_git_tables(wtx: &WriteTransaction) -> StorageResult<()> {
     let _ = wtx
         .open_table(REFERENCE_TABLE)
         .map_err(|err| map_redb_table_err(err, "init reference table"))?;

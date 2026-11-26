@@ -63,15 +63,37 @@ pub(super) async fn run_status_scan(
 
     let index_path =
         path::try_index().map_err(|source| CliError::from(StatusError::Workdir { source }))?;
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
+    let backend = crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
     let mut cache_warnings: Vec<StatusWarning> = Vec::new();
     let pid = std::process::id() as i64;
-    match DirtyCache::try_acquire_scan_lock_with_conn(&db, pid)
-        .await
-        .map_err(|e| dirty_cache_error("lock", e))?
-    {
+    let (db_opt, store_opt, lock_outcome) = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let outcome = DirtyCache::try_acquire_scan_lock_with_store(&*store, pid)
+                .await
+                .map_err(|e| dirty_cache_error("lock", e))?;
+            (None, Some(store), outcome)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let outcome = DirtyCache::try_acquire_scan_lock_with_conn(&db, pid)
+                .await
+                .map_err(|e| dirty_cache_error("lock", e))?;
+            (Some(db), None, outcome)
+        }
+    };
+    match lock_outcome {
         ScanLockOutcome::Acquired { stole } => {
             if stole {
                 cache_warnings.push(cache_warning(
@@ -90,7 +112,18 @@ pub(super) async fn run_status_scan(
     }
     // Everything below must release the lock — including error paths.
     let result = run_status_scan_locked(args, output, &index_path, extras, cache_warnings).await;
-    let _ = DirtyCache::release_scan_lock_with_conn(&db, pid).await;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            if let Some(store) = store_opt.as_deref() {
+                let _ = DirtyCache::release_scan_lock_with_store(store, pid).await;
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            if let Some(db) = db_opt.as_ref() {
+                let _ = DirtyCache::release_scan_lock_with_conn(db, pid).await;
+            }
+        }
+    }
     result?;
     // Re-open a plain connection for the final read in JSON mode is not
     // needed; run_status_scan_locked rendered already.
@@ -273,25 +306,51 @@ async fn run_status_scan_locked_inner(
     }
 
     let row_count = rows.len();
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
-    let txn = db
-        .begin()
-        .await
-        .map_err(|e| dirty_cache_error("open a transaction for", anyhow::anyhow!(e)))?;
-    DirtyCache::replace_all_with_conn(
-        &txn,
-        &rows,
-        &fingerprint_before,
-        head_before.as_deref(),
-        &scan_started_at,
-    )
-    .await
-    .map_err(|e| dirty_cache_error("write", e))?;
-    txn.commit()
-        .await
-        .map_err(|e| dirty_cache_error("commit", anyhow::anyhow!(e)))?;
+    let backend = crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            DirtyCache::replace_all_with_store(
+                &*store,
+                &rows,
+                &fingerprint_before,
+                head_before.as_deref(),
+                &scan_started_at,
+            )
+            .await
+            .map_err(|e| dirty_cache_error("write", e))?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let txn = db
+                .begin()
+                .await
+                .map_err(|e| dirty_cache_error("open a transaction for", anyhow::anyhow!(e)))?;
+            DirtyCache::replace_all_with_conn(
+                &txn,
+                &rows,
+                &fingerprint_before,
+                head_before.as_deref(),
+                &scan_started_at,
+            )
+            .await
+            .map_err(|e| dirty_cache_error("write", e))?;
+            txn.commit()
+                .await
+                .map_err(|e| dirty_cache_error("commit", anyhow::anyhow!(e)))?;
+        }
+    }
 
     // NON-DESTRUCTIVE copy into the render payload: the canonical vec stays
     // intact so the wrapper's fallback still holds the complete set if the
@@ -475,12 +534,35 @@ pub(super) async fn run_status_cache_mode(
         path::try_index().map_err(|source| CliError::from(StatusError::Workdir { source }))?;
     let fingerprint = conversion_index_fingerprint(&index_path);
     let head_oid = Head::current_commit().await.map(|oid| oid.to_string());
-    let db = crate::internal::sequencer::request_db_checked()
-        .await
-        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
-    let meta = DirtyCache::meta_with_conn(&db)
-        .await
-        .map_err(|e| dirty_cache_error("read", e))?;
+    let backend = crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    let (db_opt, ro_store_opt, meta) = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            // Strictly read-only handle: `--cached` never escalates to read-write (ADR-RB-03).
+            let store = crate::storage::runtime::open_current_git_state_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let meta = DirtyCache::meta_with_store(&*store)
+                .await
+                .map_err(|e| dirty_cache_error("read", e))?;
+            (None, Some(store), meta)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::sequencer::request_db_checked()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let meta = DirtyCache::meta_with_conn(&db)
+                .await
+                .map_err(|e| dirty_cache_error("read", e))?;
+            (Some(db), None, meta)
+        }
+    };
     let state = match &fingerprint {
         Ok(fingerprint) => DirtyCache::classify(meta.as_ref(), fingerprint, head_oid.as_deref()),
         Err(_) => CacheState::Stale,
@@ -549,9 +631,24 @@ pub(super) async fn run_status_cache_mode(
     }
 
     let fingerprint = fingerprint.map_err(|e| dirty_cache_error("fingerprint", e))?;
-    let rows = DirtyCache::list_with_conn(&db)
-        .await
-        .map_err(|e| dirty_cache_error("read", e))?;
+    let rows = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = ro_store_opt
+                .as_deref()
+                .ok_or_else(|| dirty_cache_error("read", anyhow::anyhow!("missing redb store")))?;
+            DirtyCache::list_with_store(store)
+                .await
+                .map_err(|e| dirty_cache_error("read", e))?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = db_opt
+                .as_ref()
+                .ok_or_else(|| dirty_cache_error("read", anyhow::anyhow!("missing sqlite db")))?;
+            DirtyCache::list_with_conn(db)
+                .await
+                .map_err(|e| dirty_cache_error("read", e))?
+        }
+    };
     let workdir = util::try_working_dir()
         .map_err(|source| CliError::from(StatusError::Workdir { source }))?;
     let index = load_status_index()?;
@@ -822,16 +919,35 @@ pub(super) async fn run_status_cache_mode(
         confirmed.clear();
     }
     if args.check_dirty && (!pruned.is_empty() || !confirmed.is_empty()) {
-        let txn = db
-            .begin()
-            .await
-            .map_err(|e| dirty_cache_error("open a transaction for", anyhow::anyhow!(e)))?;
-        DirtyCache::prune_and_confirm_with_conn(&txn, &pruned, &confirmed)
-            .await
-            .map_err(|e| dirty_cache_error("update", e))?;
-        txn.commit()
-            .await
-            .map_err(|e| dirty_cache_error("commit", anyhow::anyhow!(e)))?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                drop(ro_store_opt);
+                let rw_store = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| dirty_cache_error("open for write", anyhow::anyhow!(e)))?;
+                DirtyCache::prune_and_confirm_with_store(&*rw_store, &pruned, &confirmed)
+                    .await
+                    .map_err(|e| dirty_cache_error("update", e))?;
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = db_opt.as_ref().ok_or_else(|| {
+                    dirty_cache_error(
+                        "open a transaction for",
+                        anyhow::anyhow!("missing sqlite db"),
+                    )
+                })?;
+                let txn = db
+                    .begin()
+                    .await
+                    .map_err(|e| dirty_cache_error("open a transaction for", anyhow::anyhow!(e)))?;
+                DirtyCache::prune_and_confirm_with_conn(&txn, &pruned, &confirmed)
+                    .await
+                    .map_err(|e| dirty_cache_error("update", e))?;
+                txn.commit()
+                    .await
+                    .map_err(|e| dirty_cache_error("commit", anyhow::anyhow!(e)))?;
+            }
+        }
     }
 
     // Assemble display data: cheap fresh pieces (head/upstream/merge state),
@@ -1060,4 +1176,138 @@ fn conversion_index_fingerprint(index_path: &std::path::Path) -> anyhow::Result<
     let conversion = crate::command::status_io_worker::ConversionScan::new(&workdir, &index)?;
     let (sources, _) = conversion.probe(None)?;
     Ok(format!("{fingerprint}:conversion-v1:{sources}"))
+}
+
+#[cfg(all(test, feature = "storage-redb"))]
+mod tests {
+    use super::*;
+    use crate::{
+        internal::{dirty::DirtyCache, head::Head, worktree_scope::WorktreeScope},
+        storage::{
+            backend::{LIBRA_STORAGE_BACKEND_ENV, REDB_RUNTIME_UNLOCKED},
+            manifest::{StorageFormatManifest, publish_storage_manifest},
+            runtime::{
+                init_redb_repository_storage, open_git_state_store_read_only,
+                open_git_state_store_read_write, open_git_store_read_write,
+            },
+        },
+        utils::test::ChangeDirGuard,
+    };
+
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_status_cache_readonly_and_cli_gate_entry() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let workdir = tmp.path().to_path_buf();
+        let dot_libra = workdir.join(".libra");
+        let _paths = init_redb_repository_storage(&dot_libra)
+            .await
+            .expect("init redb repo");
+        assert!(!dot_libra.join("libra.db").exists());
+        let _cd = ChangeDirGuard::new(&workdir);
+
+        // Seed HEAD + dirty cache snapshot in redb.
+        let git_store = open_git_store_read_write(&dot_libra)
+            .await
+            .expect("open git store");
+        Head::update_for_scope_result_with_store(
+            &*git_store,
+            Head::Branch("main".to_string()),
+            None,
+            &WorktreeScope::Main,
+        )
+        .await
+        .expect("set HEAD");
+        drop(git_store);
+
+        let rw_state = open_git_state_store_read_write(&dot_libra)
+            .await
+            .expect("open rw state");
+        let fp = conversion_index_fingerprint(&dot_libra.join("index"))
+            .unwrap_or_else(|_| "empty:conversion-v1:none".to_string());
+        DirtyCache::replace_all_with_store(
+            &*rw_state,
+            &[(
+                "untracked.txt".to_string(),
+                crate::internal::dirty::KIND_NEW,
+            )],
+            &fp,
+            None,
+            &crate::internal::dirty::now_timestamp(),
+        )
+        .await
+        .expect("seed dirty cache");
+        drop(rw_state);
+
+        // AC4: strictly read-only inspection via open_git_state_store_read_only.
+        let ro_state = open_git_state_store_read_only(&dot_libra)
+            .await
+            .expect("open ro state");
+        let meta = DirtyCache::meta_with_store(&*ro_state)
+            .await
+            .expect("read meta")
+            .expect("meta present");
+        assert_eq!(meta.state, "fresh");
+        let entries = DirtyCache::list_with_store(&*ro_state)
+            .await
+            .expect("list dirty entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "untracked.txt");
+        drop(ro_state);
+
+        // AC5: unfinalized manifest (`finalized == false`) fails closed via cli entry helper.
+        let unfin_dir = tempfile::tempdir().expect("unfin dir");
+        let unfin_libra = unfin_dir.path().join(".libra");
+        std::fs::create_dir_all(&unfin_libra).expect("mkdir unfin");
+        let unfin_manifest = StorageFormatManifest::new_redb_in_progress(
+            1,
+            Some("migration-backup-001".to_string()),
+            crate::storage::manifest::Phase2Progress {
+                git_db: Some(crate::storage::manifest::Phase2DbState::Pending),
+                capture_db: Some(crate::storage::manifest::Phase2DbState::Absent),
+                ..Default::default()
+            },
+            crate::storage::manifest::SourceDigests {
+                git_logical_sha256: Some("0".repeat(64)),
+                git_backup_sha256: Some("1".repeat(64)),
+                spool_manifest_sha256: Some("2".repeat(64)),
+                queue_manifest_sha256: Some("3".repeat(64)),
+                ..Default::default()
+            },
+        )
+        .expect("in-progress manifest");
+        publish_storage_manifest(&unfin_libra, &unfin_manifest).expect("publish staged");
+        let unfin_err = crate::cli::resolve_cli_storage_backend(Some(&unfin_libra))
+            .expect_err("finalized == false manifest must fail closed");
+        assert_ne!(unfin_err.exit_code(), 0);
+
+        // AC6: pre-unlock `LIBRA_STORAGE_BACKEND=redb` via real CLI entry unconditionally
+        // returns `LBR-CLI-003` (`CliInvalidTarget`).
+        let prev_backend = std::env::var_os(LIBRA_STORAGE_BACKEND_ENV);
+        let prev_test = std::env::var_os("LIBRA_TEST");
+        // SAFETY: test holds #[serial_test::serial(cwd, env)].
+        unsafe {
+            std::env::set_var(LIBRA_STORAGE_BACKEND_ENV, "redb");
+            std::env::set_var("LIBRA_TEST", "1");
+        }
+        let gate_result = crate::cli::resolve_cli_storage_backend(None);
+        match prev_backend {
+            Some(v) => unsafe { std::env::set_var(LIBRA_STORAGE_BACKEND_ENV, v) },
+            None => unsafe { std::env::remove_var(LIBRA_STORAGE_BACKEND_ENV) },
+        }
+        match prev_test {
+            Some(v) => unsafe { std::env::set_var("LIBRA_TEST", v) },
+            None => unsafe { std::env::remove_var("LIBRA_TEST") },
+        }
+        if !REDB_RUNTIME_UNLOCKED {
+            let err = gate_result.expect_err("pre-unlock LIBRA_STORAGE_BACKEND=redb must reject");
+            assert_eq!(err.stable_code(), StableErrorCode::CliInvalidTarget);
+        } else {
+            assert_eq!(
+                gate_result.expect("post-unlock redb allowed"),
+                crate::storage::StorageBackendKind::Redb
+            );
+        }
+        assert!(!dot_libra.join("libra.db").exists());
+    }
 }

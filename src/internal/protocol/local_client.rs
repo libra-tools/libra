@@ -230,6 +230,11 @@ impl Drop for HashKindRestoreGuard {
     }
 }
 
+fn is_libra_storage_dir(dir: &Path) -> bool {
+    dir.join("libra.db").try_exists().unwrap_or(false)
+        || crate::storage::runtime::has_redb_storage_markers(dir)
+}
+
 impl ProtocolClient for LocalClient {
     fn from_url(url: &Url) -> Self {
         let path = url
@@ -238,9 +243,7 @@ impl ProtocolClient for LocalClient {
         Self {
             repo_path: path.clone(),
             source_type: {
-                if path.join("libra.db").try_exists().unwrap_or(false)
-                    || path.join(".libra/libra.db").try_exists().unwrap_or(false)
-                {
+                if is_libra_storage_dir(&path) || is_libra_storage_dir(&path.join(".libra")) {
                     RepoType::LibraRepo
                 } else {
                     RepoType::GitRepo
@@ -319,7 +322,7 @@ impl LocalClient {
             )));
         }
         if absolute.join("objects").try_exists().unwrap_or(false) {
-            let is_libra_repo = absolute.join("libra.db").try_exists().unwrap_or(false);
+            let is_libra_repo = is_libra_storage_dir(&absolute);
             let is_git_repo = absolute.join("HEAD").try_exists().unwrap_or(false);
             match (is_libra_repo, is_git_repo) {
                 (true, false) => Ok(Self {
@@ -340,11 +343,7 @@ impl LocalClient {
                 repo_path: absolute.join(".git"),
                 source_type: RepoType::GitRepo,
             })
-        } else if absolute
-            .join(".libra/libra.db")
-            .try_exists()
-            .unwrap_or(false)
-        {
+        } else if is_libra_storage_dir(&absolute.join(".libra")) {
             Ok(Self {
                 repo_path: absolute.join(".libra"),
                 source_type: RepoType::LibraRepo,
@@ -455,30 +454,66 @@ impl LocalClient {
     }
 
     async fn repo_hash_kind(&self) -> Result<HashKind, String> {
-        let db_path = self.repo_path.join(DATABASE);
-        let db_conn = get_db_conn_instance_for_path(&db_path)
-            .await
-            .map_err(|error| {
+        let storage_dir = if is_libra_storage_dir(&self.repo_path) {
+            self.repo_path.clone()
+        } else {
+            self.repo_path.join(".libra")
+        };
+        let backend =
+            crate::storage::runtime::detect_repo_backend(&storage_dir).map_err(|err| {
                 format!(
-                    "failed to open local repository database '{}': {error}",
-                    db_path.display()
+                    "failed to detect backend for local repository '{}': {err}",
+                    storage_dir.display()
                 )
             })?;
-        let object_format = ConfigKv::get_with_conn(&db_conn, "core.objectformat")
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to read core.objectformat from local repository '{}': {error}",
-                    db_path.display()
-                )
-            })?
-            .map(|entry| entry.value)
-            .unwrap_or_else(|| "sha1".to_string());
+        let object_format = match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_repo_config_store_read_only(&storage_dir)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to open local repository config store '{}': {error}",
+                            storage_dir.display()
+                        )
+                    })?;
+                ConfigKv::get_with_store(&*store, "core.objectformat")
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to read core.objectformat from local repository '{}': {error}",
+                            storage_dir.display()
+                        )
+                    })?
+                    .map(|entry| entry.value)
+                    .unwrap_or_else(|| "sha1".to_string())
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db_path = storage_dir.join(DATABASE);
+                let db_conn = get_db_conn_instance_for_path(&db_path)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to open local repository database '{}': {error}",
+                            db_path.display()
+                        )
+                    })?;
+                ConfigKv::get_with_conn(&db_conn, "core.objectformat")
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to read core.objectformat from local repository '{}': {error}",
+                            db_path.display()
+                        )
+                    })?
+                    .map(|entry| entry.value)
+                    .unwrap_or_else(|| "sha1".to_string())
+            }
+        };
 
         crate::internal::object_format::parse_config_value(&object_format).map_err(|_| {
             format!(
                 "unsupported object format '{object_format}' in local repository '{}'",
-                db_path.display()
+                storage_dir.display()
             )
         })
     }

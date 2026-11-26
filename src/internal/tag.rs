@@ -366,79 +366,229 @@ pub enum ListTagError {
     LoadObject { name: String, detail: String },
 }
 
+/// Create or overwrite a tag reference directly against a [`crate::storage::GitStore`].
+pub async fn create_lightweight_with_store(
+    store: &dyn crate::storage::GitStore,
+    name: &str,
+    target_oid: ObjectHash,
+    force: bool,
+) -> Result<CreateTagResult, CreateTagError> {
+    let key = crate::storage::RefKey::Tag {
+        name: format!("{TAG_REF_PREFIX}{name}"),
+    };
+    let existing = store
+        .get_ref(&key)
+        .await
+        .map_err(|err| CreateTagError::CheckExisting(DbErr::Custom(err.to_string())))?;
+    if existing.is_some() && !force {
+        return Err(CreateTagError::AlreadyExists(name.to_string()));
+    }
+    let target = crate::storage::RefTarget::Direct(target_oid.to_string());
+    match store
+        .update_ref_cas(&key, existing.as_ref(), Some(&target), &[])
+        .await
+        .map_err(|err| CreateTagError::PersistReference(DbErr::Custom(err.to_string())))?
+    {
+        crate::storage::RefCasOutcome::Applied { .. } => Ok(CreateTagResult {
+            name: name.to_string(),
+            target: target_oid,
+            annotated: false,
+            message: None,
+        }),
+        crate::storage::RefCasOutcome::CasConflict { .. } => {
+            Err(CreateTagError::AlreadyExists(name.to_string()))
+        }
+    }
+}
+
+/// Find a tag reference row directly against a [`crate::storage::GitStore`].
+pub async fn find_tag_ref_with_store(
+    store: &dyn crate::storage::GitStore,
+    name: &str,
+) -> Result<Option<TagReference>, DbErr> {
+    let key = crate::storage::RefKey::Tag {
+        name: format!("{TAG_REF_PREFIX}{name}"),
+    };
+    let target = store
+        .get_ref(&key)
+        .await
+        .map_err(|err| DbErr::Custom(err.to_string()))?;
+    Ok(target.map(|t| match t {
+        crate::storage::RefTarget::Direct(oid) | crate::storage::RefTarget::Symbolic(oid) => {
+            TagReference { target: Some(oid) }
+        }
+    }))
+}
+
+/// Delete a tag reference directly against a [`crate::storage::GitStore`].
+pub async fn delete_with_store(
+    store: &dyn crate::storage::GitStore,
+    name: &str,
+) -> Result<(), anyhow::Error> {
+    let key = crate::storage::RefKey::Tag {
+        name: format!("{TAG_REF_PREFIX}{name}"),
+    };
+    let Some(existing) = store
+        .get_ref(&key)
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+    else {
+        return Err(anyhow::anyhow!("tag '{}' not found", name));
+    };
+    match store
+        .update_ref_cas(&key, Some(&existing), None, &[])
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+    {
+        crate::storage::RefCasOutcome::Applied { .. } => Ok(()),
+        crate::storage::RefCasOutcome::CasConflict { .. } => {
+            Err(anyhow::anyhow!("tag '{}' modified concurrently", name))
+        }
+    }
+}
+
 /// Lists all tags available in the repository.
 pub async fn list() -> Result<Vec<Tag>, ListTagError> {
-    let db_conn = get_db_conn_instance().await;
-    let models = reference::Entity::find()
-        .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
-        .all(&db_conn)
-        .await?;
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| ListTagError::Query(DbErr::Custom(err.to_string())))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|err| ListTagError::Query(DbErr::Custom(err.to_string())))?;
+            let records = store
+                .list_refs(None)
+                .await
+                .map_err(|err| ListTagError::Query(DbErr::Custom(err.to_string())))?;
+            let mut tags = Vec::new();
+            for rec in records {
+                let crate::storage::RefKey::Tag { name: stored_name } = rec.key else {
+                    continue;
+                };
+                let commit_str = match rec.target {
+                    crate::storage::RefTarget::Direct(s)
+                    | crate::storage::RefTarget::Symbolic(s) => s,
+                };
+                let object_id = crate::internal::object_format::parse_repo_oid(&commit_str)
+                    .map_err(|e| ListTagError::InvalidObjectHash {
+                        name: stored_name.clone(),
+                        detail: e.to_string(),
+                    })?;
+                let object =
+                    load_object_trait(&object_id)
+                        .await
+                        .map_err(|e| ListTagError::LoadObject {
+                            name: stored_name.clone(),
+                            detail: e.to_string(),
+                        })?;
+                let tag_name = stored_name
+                    .strip_prefix(TAG_REF_PREFIX)
+                    .unwrap_or(stored_name.as_str())
+                    .to_string();
+                tags.push(Tag {
+                    name: tag_name,
+                    object,
+                });
+            }
+            Ok(tags)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_conn = get_db_conn_instance().await;
+            let models = reference::Entity::find()
+                .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
+                .all(&db_conn)
+                .await?;
 
-    let mut tags = Vec::new();
-    for m in models {
-        let display_name = m.name.as_deref().unwrap_or(UNKNOWN_TAG).to_string();
-        let commit_str = m
-            .commit
-            .as_ref()
-            .ok_or_else(|| ListTagError::MissingCommit {
-                name: display_name.clone(),
-            })?;
-        let object_id =
-            crate::internal::object_format::parse_repo_oid(commit_str).map_err(|e| {
-                ListTagError::InvalidObjectHash {
-                    name: display_name.clone(),
-                    detail: e.to_string(),
-                }
-            })?;
-        let object = load_object_trait(&object_id)
-            .await
-            .map_err(|e| ListTagError::LoadObject {
-                name: display_name.clone(),
-                detail: e.to_string(),
-            })?;
-        let stored_name = m.name.as_ref().ok_or(ListTagError::MissingName)?;
-        let tag_name = stored_name
-            .strip_prefix(TAG_REF_PREFIX)
-            .unwrap_or(stored_name.as_str())
-            .to_string();
-        tags.push(Tag {
-            name: tag_name,
-            object,
-        });
+            let mut tags = Vec::new();
+            for m in models {
+                let display_name = m.name.as_deref().unwrap_or(UNKNOWN_TAG).to_string();
+                let commit_str = m
+                    .commit
+                    .as_ref()
+                    .ok_or_else(|| ListTagError::MissingCommit {
+                        name: display_name.clone(),
+                    })?;
+                let object_id = crate::internal::object_format::parse_repo_oid(commit_str)
+                    .map_err(|e| ListTagError::InvalidObjectHash {
+                        name: display_name.clone(),
+                        detail: e.to_string(),
+                    })?;
+                let object =
+                    load_object_trait(&object_id)
+                        .await
+                        .map_err(|e| ListTagError::LoadObject {
+                            name: display_name.clone(),
+                            detail: e.to_string(),
+                        })?;
+                let stored_name = m.name.as_ref().ok_or(ListTagError::MissingName)?;
+                let tag_name = stored_name
+                    .strip_prefix(TAG_REF_PREFIX)
+                    .unwrap_or(stored_name.as_str())
+                    .to_string();
+                tags.push(Tag {
+                    name: tag_name,
+                    object,
+                });
+            }
+            Ok(tags)
+        }
     }
-    Ok(tags)
 }
 
 /// Deletes a tag reference from the repository.
 pub async fn delete(name: &str) -> Result<(), anyhow::Error> {
-    let db_conn = get_db_conn_instance().await;
-    let full_ref_name = format!("{}{}", TAG_REF_PREFIX, name);
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            delete_with_store(store.as_ref(), name).await
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_conn = get_db_conn_instance().await;
+            let full_ref_name = format!("{}{}", TAG_REF_PREFIX, name);
 
-    let result = reference::Entity::delete_many()
-        .filter(reference::Column::Name.eq(full_ref_name))
-        .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
-        .exec(&db_conn)
-        .await?;
+            let result = reference::Entity::delete_many()
+                .filter(reference::Column::Name.eq(full_ref_name))
+                .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
+                .exec(&db_conn)
+                .await?;
 
-    if result.rows_affected == 0 {
-        Err(anyhow::anyhow!("tag '{}' not found", name))
-    } else {
-        Ok(())
+            if result.rows_affected == 0 {
+                Err(anyhow::anyhow!("tag '{}' not found", name))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
 /// Finds the raw tag reference row without dereferencing the target object.
 pub async fn find_tag_ref(name: &str) -> Result<Option<TagReference>, DbErr> {
-    let db_conn = get_db_conn_instance().await;
-    let full_ref_name = format!("{}{}", TAG_REF_PREFIX, name);
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| DbErr::Custom(err.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|err| DbErr::Custom(err.to_string()))?;
+            find_tag_ref_with_store(store.as_ref(), name).await
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_conn = get_db_conn_instance().await;
+            let full_ref_name = format!("{}{}", TAG_REF_PREFIX, name);
 
-    let model = reference::Entity::find()
-        .filter(reference::Column::Name.eq(full_ref_name))
-        .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
-        .one(&db_conn)
-        .await?;
+            let model = reference::Entity::find()
+                .filter(reference::Column::Name.eq(full_ref_name))
+                .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
+                .one(&db_conn)
+                .await?;
 
-    Ok(model.map(|m| TagReference { target: m.commit }))
+            Ok(model.map(|m| TagReference { target: m.commit }))
+        }
+    }
 }
 
 /// Finds a tag by name and returns the tag object and the final commit
