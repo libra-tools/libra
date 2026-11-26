@@ -296,3 +296,5 @@ upstream replace cases pass.
 upstream color get and set pass.
 
 invalid colors fail and do not store.
+
+absolute expiry dates match git timestamps.

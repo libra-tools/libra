@@ -627,3 +627,38 @@ fn test_cf_75_predicates() {
     let missing = run_libra_command(&["config", "--local", "--get", "color.new"], repo.path());
     assert_eq!(missing.status.code(), Some(1), "invalid set writes nothing");
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_78_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    for input in [
+        "2024-01-01T00:00:00Z",
+        "Mon, 01 Jan 2024 00:00:00 +0000",
+        "2024-01-01",
+    ] {
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["config", "--local", "date.k", input],
+                repo.path(),
+                &[("TZ", "UTC")],
+            ),
+            "set date",
+        );
+        let out = run_libra_command_with_env(
+            &["config", "--local", "--type=expiry-date", "--get", "date.k"],
+            repo.path(),
+            &[("TZ", "UTC")],
+        );
+        assert_cli_success(&out, input);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "1704067200",
+            "{input}"
+        );
+    }
+}
