@@ -216,3 +216,5 @@ regexp no-match exits 1 with empty stdout.
 single unset of multiple matches exits 5.
 
 invalid get pattern exits 6.
+
+get value pattern miss exits 1.

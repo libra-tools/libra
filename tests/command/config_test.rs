@@ -7660,6 +7660,22 @@ mod value_pattern {
     }
 
     #[test]
+    fn test_cf_43_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        for verb in ["--get", "--get-all"] {
+            let out = run_libra_command(&["config", verb, "multi.k", "nomatch"], repo.path());
+            assert_eq!(out.status.code(), Some(1), "{verb} miss exits 1");
+        }
+    }
+
+    #[test]
     fn test_cf_38_predicates() {
         let repo = tempdir().unwrap();
         assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
