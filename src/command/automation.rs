@@ -161,11 +161,38 @@ async fn run_rules(
             .map_err(|error| CliError::failure(error.to_string()))?
     };
 
-    let db = open_repo_db().await?;
-    for result in &results {
-        AutomationHistory::append(&db, result)
-            .await
-            .map_err(|error| CliError::failure(error.to_string()))?;
+    match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let state_store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|error| CliError::failure(error.to_string()))?;
+            for result in &results {
+                let record = crate::storage::git_state_store::AutomationLogRecord {
+                    id: result.id.clone(),
+                    rule_id: result.rule_id.clone(),
+                    trigger_kind: result.trigger_kind.clone(),
+                    action_kind: result.action_kind.clone(),
+                    status: result.status.as_str().to_string(),
+                    message: result.message.clone(),
+                    started_at: result.started_at.to_rfc3339(),
+                    finished_at: result.finished_at.to_rfc3339(),
+                    details_json: serde_json::to_string(&result.details)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                };
+                state_store
+                    .append_automation_log(&record)
+                    .await
+                    .map_err(|error| CliError::failure(error.to_string()))?;
+            }
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db = open_repo_db().await?;
+            for result in &results {
+                AutomationHistory::append(&db, result)
+                    .await
+                    .map_err(|error| CliError::failure(error.to_string()))?;
+            }
+        }
     }
 
     if output.is_json() {
@@ -184,10 +211,57 @@ async fn run_rules(
 }
 
 async fn list_history(limit: u64, output: &OutputConfig) -> CliResult<()> {
-    let db = open_repo_db().await?;
-    let rows = AutomationHistory::list_recent(&db, limit)
-        .await
-        .map_err(|error| CliError::failure(error.to_string()))?;
+    let rows = match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let state_store = crate::storage::runtime::open_current_git_state_store_read_only()
+                .await
+                .map_err(|error| CliError::failure(error.to_string()))?;
+            let cap = usize::try_from(limit).unwrap_or(usize::MAX);
+            let logs = state_store
+                .list_automation_logs(None, Some(cap))
+                .await
+                .map_err(|error| CliError::failure(error.to_string()))?;
+            logs.into_iter()
+                .map(|row| {
+                    let status = match row.status.as_str() {
+                        "succeeded" => {
+                            crate::internal::ai::automation::AutomationRunStatus::Succeeded
+                        }
+                        "failed" => crate::internal::ai::automation::AutomationRunStatus::Failed,
+                        "approval_required" => {
+                            crate::internal::ai::automation::AutomationRunStatus::ApprovalRequired
+                        }
+                        _ => crate::internal::ai::automation::AutomationRunStatus::Skipped,
+                    };
+                    let started_at = DateTime::parse_from_rfc3339(&row.started_at)
+                        .map(|v| v.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now());
+                    let finished_at = DateTime::parse_from_rfc3339(&row.finished_at)
+                        .map(|v| v.with_timezone(&Utc))
+                        .unwrap_or(started_at);
+                    let details = serde_json::from_str(&row.details_json)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    AutomationRunResult {
+                        id: row.id,
+                        rule_id: row.rule_id,
+                        trigger_kind: row.trigger_kind,
+                        action_kind: row.action_kind,
+                        status,
+                        message: row.message,
+                        details,
+                        started_at,
+                        finished_at,
+                    }
+                })
+                .collect()
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db = open_repo_db().await?;
+            AutomationHistory::list_recent(&db, limit)
+                .await
+                .map_err(|error| CliError::failure(error.to_string()))?
+        }
+    };
     if output.is_json() {
         return emit_json_data(
             "automation.history",

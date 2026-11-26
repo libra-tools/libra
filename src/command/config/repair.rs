@@ -187,9 +187,19 @@ mod supported {
             if path.file_name().is_some_and(|name| name == "libra.db")
                 || parent.join("HEAD").exists()
                 || parent.join("commondir").exists()
+                || parent.join("storage-format.json").exists()
+                || parent.join("redb").is_dir()
             {
                 return Err(refused(
                     "repair target appears to be Repository storage; only a global configuration database may be repaired",
+                ));
+            }
+            if let Ok(Some(manifest)) =
+                crate::storage::config_store::read_config_format_manifest(&parent, ROLE)
+                && manifest.backend == crate::storage::StorageBackendKind::Redb
+            {
+                return Err(refused(
+                    "global configuration uses redb storage; SQLite schema repair is not applicable — run `libra config doctor --global-schema` or `libra-migrate --global`",
                 ));
             }
             // SAFETY: geteuid takes no pointers and has no failure return.

@@ -326,14 +326,140 @@ async fn v2_engine_for_repo(repo_id: &str) -> CliResult<RestoreEngine> {
         ));
     };
     let storage = ClientStorage::try_init_local(scope.storage.join("objects"))?;
-    let db = get_db_conn_instance().await;
-    Ok(RestoreEngine::new(scope, repo_id, db, storage))
+    match crate::storage::runtime::detect_repo_backend(&scope.storage) {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let state_store =
+                crate::storage::runtime::open_git_state_store_read_write(&scope.storage)
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "failed to open redb operation state store: {error}"
+                        ))
+                    })?;
+            Ok(RestoreEngine::new_with_store(
+                scope,
+                repo_id,
+                state_store,
+                storage,
+            ))
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db = get_db_conn_instance().await;
+            Ok(RestoreEngine::new(scope, repo_id, db, storage))
+        }
+    }
 }
 
 async fn v2_engine_and_ref(repo_id: &str, op_ref: &str) -> CliResult<(RestoreEngine, String)> {
     let engine = v2_engine_for_repo(repo_id).await?;
-    let entry = resolve_v2_history_ref(engine.store().db(), repo_id, op_ref).await?;
+    let entry = if let Some(state_store) = engine.store().state_store() {
+        resolve_op_ref_with_store(state_store.as_ref(), repo_id, op_ref).await?
+    } else {
+        resolve_v2_history_ref(engine.store().db(), repo_id, op_ref).await?
+    };
     Ok((engine, entry.op_id))
+}
+
+fn history_entries_from_operation_records(
+    mut rows: Vec<(
+        crate::storage::git_state_store::OperationRecord,
+        Vec<String>,
+    )>,
+) -> Vec<OperationHistoryEntry> {
+    rows.sort_by(|(a, _), (b, _)| {
+        b.end_ts
+            .cmp(&a.end_ts)
+            .then_with(|| b.start_ts.cmp(&a.start_ts))
+            .then_with(|| b.op_id.cmp(&a.op_id))
+    });
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, (rec, _))| {
+            let status = match rec.status.as_str() {
+                "success" => "succeeded".to_string(),
+                "aborted" => "canceled".to_string(),
+                other => other.to_string(),
+            };
+            OperationHistoryEntry {
+                index,
+                op_id: rec.op_id,
+                command_name: rec.command_name.unwrap_or_else(|| rec.kind.clone()),
+                description: rec.description.unwrap_or(rec.kind),
+                actor: rec.actor.unwrap_or_default(),
+                status,
+                start_ts: rec.start_ts.div_euclid(1000),
+                end_ts: rec.end_ts.map(|ts| ts.div_euclid(1000)),
+                view_id: rec.post_view_oid,
+            }
+        })
+        .collect()
+}
+
+async fn query_operation_log_page_with_store(
+    state_store: &dyn crate::storage::git_state_store::GitStateStore,
+    repo_id: &str,
+    query_page: OperationQueryPage,
+    command_filter: Option<&str>,
+) -> CliResult<OperationPage<OperationHistoryEntry>> {
+    let query_page = query_page.normalized();
+    let command_filter = command_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let rows = state_store
+        .list_operations(repo_id)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to query operations: {error}")))?;
+    let ranked = history_entries_from_operation_records(rows);
+    let filtered: Vec<OperationHistoryEntry> = ranked
+        .into_iter()
+        .filter(|entry| command_filter.is_none_or(|cmd| entry.command_name == cmd))
+        .collect();
+    let total = filtered.len() as u64;
+    let offset = usize::try_from(query_page.offset()).unwrap_or(usize::MAX);
+    let limit = usize::try_from(query_page.per_page).unwrap_or(usize::MAX);
+    let items = filtered.into_iter().skip(offset).take(limit).collect();
+    Ok(OperationPage {
+        items,
+        page: query_page.page,
+        per_page: query_page.per_page,
+        total,
+    })
+}
+
+async fn resolve_op_ref_with_store(
+    state_store: &dyn crate::storage::git_state_store::GitStateStore,
+    repo_id: &str,
+    op_ref: &str,
+) -> CliResult<OperationHistoryEntry> {
+    let rows = state_store
+        .list_operations(repo_id)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to resolve operation '{op_ref}': {error}"))
+        })?;
+    let ranked = history_entries_from_operation_records(rows);
+    if let Some(index_text) = op_ref
+        .strip_prefix("@{")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        let index = index_text.parse::<usize>().map_err(|_| {
+            CliError::fatal(format!("invalid operation index: {op_ref}"))
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+        })?;
+        return ranked.into_iter().nth(index).ok_or_else(|| {
+            CliError::fatal(format!("operation index {index} out of range"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use 'libra op log' to see available operations")
+        });
+    }
+    ranked
+        .into_iter()
+        .find(|entry| entry.op_id == op_ref)
+        .ok_or_else(|| {
+            CliError::fatal(format!("operation '{op_ref}' not found"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use 'libra op log' to list available operations")
+        })
 }
 
 async fn handle_op_undo(
@@ -381,9 +507,15 @@ async fn handle_op_revert(
     ensure_transition_clean(force).await?;
     let repo_id = current_repo_id().await?;
     let (restore, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
-    let parent_id = resolve_v2_history_ref(restore.store().db(), &repo_id, &parent)
-        .await?
-        .op_id;
+    let parent_id = if let Some(state_store) = restore.store().state_store() {
+        resolve_op_ref_with_store(state_store.as_ref(), &repo_id, &parent)
+            .await?
+            .op_id
+    } else {
+        resolve_v2_history_ref(restore.store().db(), &repo_id, &parent)
+            .await?
+            .op_id
+    };
     let receipt = UndoEngine::new(restore)
         .revert(op_id, parent_id, dry_run, confirm_repo_wide)
         .await
@@ -397,8 +529,23 @@ async fn handle_op_reconcile(dry_run: bool, output: &OutputConfig) -> CliResult<
         .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
         .ok_or_else(|| CliError::fatal("v2 operation state is unavailable in this repository"))?;
     let storage = ClientStorage::try_init_local(scope.storage.join("objects"))?;
-    let database = get_db_conn_instance().await;
-    let store = OperationStoreV2::new_for_repo(&repo_id, database, storage);
+    let store = match crate::storage::runtime::detect_repo_backend(&scope.storage) {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let state_store =
+                crate::storage::runtime::open_git_state_store_read_write(&scope.storage)
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "failed to open redb operation state store: {error}"
+                        ))
+                    })?;
+            OperationStoreV2::new_for_repo_with_store(&repo_id, state_store, storage)
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let database = get_db_conn_instance().await;
+            OperationStoreV2::new_for_repo(&repo_id, database, storage)
+        }
+    };
     let engine = ReconcileEngine::new(scope, &repo_id, store);
     let outcome = engine
         .reconcile(dry_run)
@@ -580,15 +727,34 @@ async fn handle_op_log(
     verbose: bool,
     output: &OutputConfig,
 ) -> CliResult<()> {
-    let db = get_db_conn_instance().await;
     let repo_id = current_repo_id().await?;
     let query_page = OperationQueryPage {
         page: page.unwrap_or(1),
         per_page: number.unwrap_or(OperationQueryPage::DEFAULT_PER_PAGE),
     };
 
-    let result =
-        query_operation_log_page(&db, &repo_id, query_page, command_filter.as_deref()).await?;
+    let result = match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let state_store = crate::storage::runtime::open_current_git_state_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "failed to open redb operation state store: {error}"
+                    ))
+                })?;
+            query_operation_log_page_with_store(
+                state_store.as_ref(),
+                &repo_id,
+                query_page,
+                command_filter.as_deref(),
+            )
+            .await?
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db = get_db_conn_instance().await;
+            query_operation_log_page(&db, &repo_id, query_page, command_filter.as_deref()).await?
+        }
+    };
 
     let entries: Vec<OpLogEntry> = result.items.iter().map(log_entry_from_item).collect();
     let op_output = OpOutput::Log {
@@ -802,9 +968,23 @@ fn operation_history_entry_from_row(
 
 /// Render one `op show` request after resolving the supplied operation reference.
 async fn handle_op_show(op_ref: String, show_view: bool, output: &OutputConfig) -> CliResult<()> {
-    let db = get_db_conn_instance().await;
     let repo_id = current_repo_id().await?;
-    let entry = resolve_op_ref(&db, &repo_id, &op_ref).await?;
+    let entry = match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let state_store = crate::storage::runtime::open_current_git_state_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "failed to open redb operation state store: {error}"
+                    ))
+                })?;
+            resolve_op_ref_with_store(state_store.as_ref(), &repo_id, &op_ref).await?
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db = get_db_conn_instance().await;
+            resolve_op_ref(&db, &repo_id, &op_ref).await?
+        }
+    };
     let op_output = OpOutput::Show {
         op_id: entry.op_id.clone(),
         command_name: entry.command_name.clone(),
@@ -852,8 +1032,23 @@ async fn print_v2_view_snapshot(repo_id: &str, op_id: &str) -> CliResult<()> {
         ));
     };
     let storage = ClientStorage::try_init_local(scope.storage.join("objects"))?;
-    let db = get_db_conn_instance().await;
-    let store = OperationStoreV2::new_for_repo(repo_id, db, storage);
+    let store = match crate::storage::runtime::detect_repo_backend(&scope.storage) {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let state_store =
+                crate::storage::runtime::open_git_state_store_read_only(&scope.storage)
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "failed to open redb operation state store: {error}"
+                        ))
+                    })?;
+            OperationStoreV2::new_for_repo_with_store(repo_id, state_store, storage)
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db = get_db_conn_instance().await;
+            OperationStoreV2::new_for_repo(repo_id, db, storage)
+        }
+    };
     let operation = store
         .load_operation(op_id)
         .await
@@ -931,20 +1126,100 @@ async fn handle_op_restore(
     confirm_repo_wide: bool,
     output: &OutputConfig,
 ) -> CliResult<()> {
-    let db = get_db_conn_instance().await;
     let repo_id = current_repo_id().await?;
-    let target_entry = resolve_op_ref(&db, &repo_id, &op_ref).await?;
-    handle_v2_restore(
-        &db,
-        &repo_id,
-        &target_entry.op_id,
-        force,
-        what,
-        dry_run,
-        confirm_repo_wide,
-        output,
-    )
-    .await
+    match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let (engine, op_id) = v2_engine_and_ref(&repo_id, &op_ref).await?;
+            let store = engine.store().clone();
+            let operation = store
+                .load_operation(&op_id)
+                .await
+                .map_err(|error| CliError::fatal(format!("failed to load v2 operation: {error}")))?
+                .ok_or_else(|| CliError::fatal(format!("v2 operation '{op_id}' not found")))?;
+            engine
+                .validate_target(
+                    op_id.clone(),
+                    operation.post_view_oid,
+                    OperationKind::Restore,
+                    confirm_repo_wide,
+                )
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("v2 restore failed: {error}"))
+                        .with_stable_code(restore_error_code(&error))
+                })?;
+            if !force && !status::is_clean().await {
+                return Err(CliError::fatal("working tree has uncommitted changes")
+                    .with_stable_code(StableErrorCode::ConflictUnresolved)
+                    .with_hint("use --force to restore anyway, or commit/stash changes first"));
+            }
+            let receipt = engine
+                .restore(
+                    op_id,
+                    operation.post_view_oid,
+                    what,
+                    dry_run,
+                    confirm_repo_wide,
+                )
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("v2 restore failed: {error}"))
+                        .with_stable_code(restore_error_code(&error))
+                })?;
+            if output.is_json() {
+                if receipt.dry_run {
+                    emit_json_data("op", &OpOutput::RestoreV2 { receipt }, output)?;
+                } else {
+                    let new_op_id = receipt.new_op_id.clone().unwrap_or_default();
+                    let target_short =
+                        receipt.target_op_id[..8.min(receipt.target_op_id.len())].to_string();
+                    emit_json_data(
+                        "op",
+                        &OpOutput::Restore {
+                            target_op_id: receipt.target_op_id,
+                            new_op_id,
+                            message: format!("Restored to operation {target_short}"),
+                        },
+                        output,
+                    )?;
+                }
+            } else if !output.quiet {
+                let target_short = &receipt.target_op_id[..8.min(receipt.target_op_id.len())];
+                let description = operation
+                    .metadata
+                    .description
+                    .as_deref()
+                    .unwrap_or("operation view");
+                if receipt.dry_run {
+                    render_restore_preview_with_backend(&store, &operation, None).await?;
+                } else {
+                    println!("Restored to operation {target_short} ({description})");
+                    if let Some(new_op_id) = &receipt.new_op_id {
+                        println!(
+                            "New operation recorded: {}",
+                            &new_op_id[..8.min(new_op_id.len())]
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let db = get_db_conn_instance().await;
+            let target_entry = resolve_op_ref(&db, &repo_id, &op_ref).await?;
+            handle_v2_restore(
+                &db,
+                &repo_id,
+                &target_entry.op_id,
+                force,
+                what,
+                dry_run,
+                confirm_repo_wide,
+                output,
+            )
+            .await
+        }
+    }
 }
 
 /// Restore through the Operation v2 engine and never synthesize a v2 view from
@@ -1053,6 +1328,14 @@ async fn render_restore_preview(
     operation: &crate::internal::operation::OperationV2,
     db: &sea_orm::DatabaseConnection,
 ) -> CliResult<()> {
+    render_restore_preview_with_backend(store, operation, Some(db)).await
+}
+
+async fn render_restore_preview_with_backend(
+    store: &OperationStoreV2,
+    operation: &crate::internal::operation::OperationV2,
+    db: Option<&sea_orm::DatabaseConnection>,
+) -> CliResult<()> {
     let target_short = &operation.op_id[..8.min(operation.op_id.len())];
     let description = operation
         .metadata
@@ -1155,7 +1438,10 @@ async fn render_restore_preview(
                 .map(str::to_string)
         })
         .collect::<HashSet<_>>();
-    let pruned = local_branches_to_prune(db, &keep).await?;
+    let pruned = match db {
+        Some(conn) => local_branches_to_prune(conn, &keep).await?,
+        None => local_branches_to_prune_redb(&keep).await?,
+    };
     if pruned.is_empty() {
         println!("No branches would be pruned.");
     } else {
@@ -1165,6 +1451,28 @@ async fn render_restore_preview(
         }
     }
     Ok(())
+}
+
+async fn local_branches_to_prune_redb(keep: &HashSet<String>) -> CliResult<Vec<String>> {
+    let git_store = crate::storage::runtime::open_current_git_store_read_only()
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to inspect local branches: {error}")))?;
+    let refs = git_store
+        .list_refs(None)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to inspect local branches: {error}")))?;
+    let mut branches = Vec::new();
+    for record in refs {
+        if let crate::storage::RefKey::LocalBranch { name } = record.key
+            && !keep.contains(&name)
+            && !crate::internal::branch::is_locked_branch(&name)
+            && !name.starts_with("libra/")
+        {
+            branches.push(name);
+        }
+    }
+    branches.sort();
+    Ok(branches)
 }
 
 async fn local_branches_to_prune(

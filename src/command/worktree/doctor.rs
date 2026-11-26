@@ -130,7 +130,7 @@ pub(crate) async fn finish_repair_operation<T>(
 }
 
 pub(crate) async fn collect_worktree_scope_report(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &WorktreeDb,
 ) -> CliResult<WorktreeDoctorOutput> {
     let listed = run_list_worktrees().map_err(WorktreeError::into_cli_error)?;
     // Which identities are claimed by more than one entry, and by which paths.
@@ -555,29 +555,49 @@ pub(crate) fn paths_are_same(left: &str, right: &str) -> bool {
 }
 
 pub(crate) async fn stale_fence_capture_finding(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &WorktreeDb,
     record: &WorkspaceRecord,
 ) -> Option<ScopeDiagnostic> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    let mut stale = 0i64;
-    for table in ["agent_session", "agent_export_job", "agent_import_identity"] {
-        let row = conn
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                format!(
-                    "SELECT COUNT(*) AS n FROM {table} \
-                      WHERE scope_state = 'scoped' AND workspace_id = ? \
-                        AND workspace_fence <> ?"
-                ),
-                [
-                    record.workspace_id.clone().into(),
-                    record.lease_fence.into(),
-                ],
-            ))
-            .await
-            .ok()??;
-        stale += row.try_get_by::<i64, _>("n").unwrap_or(0);
-    }
+    let stale: i64 = match conn {
+        WorktreeDb::Redb { .. } => {
+            let storage = crate::storage::runtime::current_repo_storage_dir().ok()?;
+            let cap = crate::storage::runtime::open_capture_store_read_only(&storage)
+                .await
+                .ok()?;
+            let sessions = cap.list_sessions_by_started_desc().await.ok()?;
+            sessions
+                .into_iter()
+                .filter(|s| {
+                    s.scope_state == crate::storage::capture_store::CaptureScopeState::Scoped
+                        && s.workspace_id.as_deref() == Some(record.workspace_id.as_str())
+                        && s.workspace_fence != Some(record.lease_fence)
+                })
+                .count() as i64
+        }
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let mut count = 0i64;
+            for table in ["agent_session", "agent_export_job", "agent_import_identity"] {
+                let row = conn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        format!(
+                            "SELECT COUNT(*) AS n FROM {table} \
+                              WHERE scope_state = 'scoped' AND workspace_id = ? \
+                                AND workspace_fence <> ?"
+                        ),
+                        [
+                            record.workspace_id.clone().into(),
+                            record.lease_fence.into(),
+                        ],
+                    ))
+                    .await
+                    .ok()??;
+                count += row.try_get_by::<i64, _>("n").unwrap_or(0);
+            }
+            count
+        }
+    };
     (stale > 0).then(|| {
         ScopeDiagnostic::warning(
             "capture_rows_stale_fence",
@@ -748,6 +768,90 @@ pub(crate) async fn adopt_or_clear_legacy_approved_project(
     };
     require_repair_confirmation(confirm, action)?;
 
+    if matches!(
+        crate::storage::runtime::detect_current_repo_backend(),
+        Ok(crate::storage::StorageBackendKind::Redb)
+    ) {
+        let state = crate::storage::runtime::open_current_git_state_store_read_write()
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "cannot open the redb state store for approved_permission recovery: {error}"
+                ))
+            })?;
+        let config = crate::storage::runtime::open_current_repo_config_store_read_write()
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "cannot open the redb config store for approved_permission recovery: {error}"
+                ))
+            })?;
+        let repo_id =
+            crate::internal::workspace::RepoIdentity::resolve_or_init_with_store(config.as_ref())
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "cannot resolve libra.repoid for approved_permission recovery: {error}"
+                    ))
+                })?
+                .as_str()
+                .to_string();
+        let rows = state
+            .list_approved_permissions(legacy_project_id)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "cannot list approved_permission rows for '{legacy_project_id}': {error}"
+                ))
+            })?;
+        let mut affected = 0usize;
+        for mut row in rows {
+            let _ = state
+                .delete_approved_permission(&row.project_id, &row.permission, &row.pattern)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "cannot update approved_permission '{legacy_project_id}': {error}"
+                    ))
+                })?;
+            if !clear {
+                row.project_id = repo_id.clone();
+                state
+                    .upsert_approved_permission(&row)
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "cannot adopt approved_permission '{legacy_project_id}': {error}"
+                        ))
+                    })?;
+            }
+            affected += 1;
+        }
+        let payload = serde_json::json!({
+            "action": if clear { "clear" } else { "adopt" },
+            "legacy_project_id": legacy_project_id,
+            "rows_affected": affected,
+        });
+        if output.is_json() {
+            let command = if clear {
+                "worktree.doctor.clear_approved_project"
+            } else {
+                "worktree.doctor.adopt_approved_project"
+            };
+            return emit_json_data(command, &payload, output);
+        }
+        if clear {
+            println!(
+                "cleared {affected} approved_permission row(s) under legacy project_id '{legacy_project_id}'"
+            );
+        } else {
+            println!(
+                "adopted {affected} approved_permission row(s) from legacy project_id '{legacy_project_id}' onto libra.repoid"
+            );
+        }
+        return Ok(());
+    }
+
     let db_path = crate::utils::path::database();
     let conn = crate::internal::db::get_db_conn_instance_for_path(&db_path)
         .await
@@ -848,6 +952,38 @@ pub(crate) async fn adopt_legacy_capture_scope(
             "legacy capture adoption changes persistent ownership; re-run with --confirm after \
               verifying the workspace and session",
         ));
+    }
+    if matches!(
+        crate::storage::runtime::detect_current_repo_backend(),
+        Ok(crate::storage::StorageBackendKind::Redb)
+    ) {
+        let storage = crate::storage::runtime::current_repo_storage_dir().map_err(|error| {
+            CliError::fatal(format!("cannot resolve repository storage: {error}"))
+        })?;
+        let state = crate::storage::runtime::open_git_state_store_read_only(&storage)
+            .await
+            .map_err(|error| CliError::fatal(format!("cannot open redb state store: {error}")))?;
+        let record = WorkspaceStore::get_with_store(state.as_ref(), workspace_id)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("cannot read workspace '{workspace_id}': {error}"))
+            })?
+            .ok_or_else(|| {
+                CliError::fatal(format!(
+                    "no workspace matches id '{workspace_id}'; list them with `libra worktree doctor`"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+            })?;
+        if !record.state.holds_identity() || record.lease_owner.is_none() || record.lease_fence <= 0
+        {
+            return Err(CliError::fatal(format!(
+                "workspace '{workspace_id}' has no live lease fence; refuse to attribute capture \
+                  state to a released, orphaned, or unleased scope"
+            )));
+        }
+        return Err(CliError::fatal(format!(
+            "capture session identifier '{session_id}' has no legacy unscoped capture row"
+        )));
     }
     let db_path = crate::utils::path::database();
     let conn = crate::internal::db::get_db_conn_instance_for_path(&db_path)
@@ -1078,39 +1214,58 @@ pub(crate) async fn adopt_legacy_capture_scope(
     Ok(())
 }
 
-pub(crate) async fn legacy_capture_scope_exists(
-    conn: &sea_orm::DatabaseConnection,
-) -> CliResult<bool> {
-    let result = conn
-        .query_one_raw(Statement::from_string(
-            conn.get_database_backend(),
-            "SELECT 1 FROM (
-                  SELECT 1 FROM agent_session WHERE scope_state = 'legacy_unknown'
-                  UNION ALL
-                  SELECT 1 FROM agent_export_job WHERE scope_state = 'legacy_unknown'
-                  UNION ALL
-                  SELECT 1 FROM agent_import_identity WHERE scope_state = 'legacy_unknown'
-              ) LIMIT 1"
-                .to_string(),
-        ))
-        .await;
-    match result {
-        Ok(row) => Ok(row.is_some()),
-        Err(error)
-            if error
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("no such column")
-                || error
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("no such table") =>
-        {
-            Ok(false)
+pub(crate) async fn legacy_capture_scope_exists(conn: &WorktreeDb) -> CliResult<bool> {
+    match conn {
+        WorktreeDb::Redb { .. } => {
+            let Ok(storage) = crate::storage::runtime::current_repo_storage_dir() else {
+                return Ok(false);
+            };
+            let Ok(cap) = crate::storage::runtime::open_capture_store_read_only(&storage).await
+            else {
+                return Ok(false);
+            };
+            let sessions = cap.list_sessions_by_started_desc().await.map_err(|error| {
+                doctor_scope_corrupt(format!(
+                    "cannot inspect legacy capture scope state: {error}"
+                ))
+            })?;
+            Ok(sessions.iter().any(|s| {
+                s.scope_state == crate::storage::capture_store::CaptureScopeState::LegacyUnknown
+            }))
         }
-        Err(error) => Err(doctor_scope_corrupt(format!(
-            "cannot inspect legacy capture scope state: {error}"
-        ))),
+        WorktreeDb::Sqlite(conn) => {
+            let result = conn
+                .query_one_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT 1 FROM (
+                          SELECT 1 FROM agent_session WHERE scope_state = 'legacy_unknown'
+                          UNION ALL
+                          SELECT 1 FROM agent_export_job WHERE scope_state = 'legacy_unknown'
+                          UNION ALL
+                          SELECT 1 FROM agent_import_identity WHERE scope_state = 'legacy_unknown'
+                      ) LIMIT 1"
+                        .to_string(),
+                ))
+                .await;
+            match result {
+                Ok(row) => Ok(row.is_some()),
+                Err(error)
+                    if error
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("no such column")
+                        || error
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .contains("no such table") =>
+                {
+                    Ok(false)
+                }
+                Err(error) => Err(doctor_scope_corrupt(format!(
+                    "cannot inspect legacy capture scope state: {error}"
+                ))),
+            }
+        }
     }
 }
 
@@ -1144,20 +1299,25 @@ pub(crate) fn print_legacy_approved_project_guidance(output: &OutputConfig, lega
 }
 
 pub(crate) async fn list_legacy_approved_project_ids_readonly(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &WorktreeDb,
 ) -> CliResult<Vec<String>> {
-    use crate::internal::ai::permission::ApprovedRulesetStore;
+    match conn {
+        WorktreeDb::Redb { .. } => Ok(Vec::new()),
+        WorktreeDb::Sqlite(conn) => {
+            use crate::internal::ai::permission::ApprovedRulesetStore;
 
-    match ApprovedRulesetStore::list_legacy_project_ids(conn).await {
-        Ok(ids) => Ok(ids),
-        Err(error) => {
-            let text = error.to_string().to_ascii_lowercase();
-            if text.contains("no such table") || text.contains("no such column") {
-                Ok(Vec::new())
-            } else {
-                Err(doctor_scope_corrupt(format!(
-                    "cannot list legacy approved_permission project_id values: {error}"
-                )))
+            match ApprovedRulesetStore::list_legacy_project_ids(conn).await {
+                Ok(ids) => Ok(ids),
+                Err(error) => {
+                    let text = error.to_string().to_ascii_lowercase();
+                    if text.contains("no such table") || text.contains("no such column") {
+                        Ok(Vec::new())
+                    } else {
+                        Err(doctor_scope_corrupt(format!(
+                            "cannot list legacy approved_permission project_id values: {error}"
+                        )))
+                    }
+                }
             }
         }
     }
@@ -1191,31 +1351,35 @@ pub(crate) async fn run_worktree_doctor(
     // schema, `doctor` is the one command you must be able to run without
     // committing to an upgrade. `cli.rs` already exempts this command from
     // the schema guard for the same reason.
-    let db_path = crate::utils::path::database();
-    let conn = crate::internal::db::open_database_without_migrations(&db_path)
+    let conn = WorktreeDb::open_current_read_only()
         .await
-        .map_err(|error| {
-            doctor_scope_corrupt(format!(
-                "cannot open the repository database at '{}': {error}",
-                db_path.display()
-            ))
-        })?;
+        .map_err(doctor_scope_corrupt)?;
     let now = workspace::now_ms();
     let legacy_capture_exists = legacy_capture_scope_exists(&conn).await?;
     let legacy_approved_ids = list_legacy_approved_project_ids_readonly(&conn).await?;
 
     if let Some(workspace_id) = workspace_id {
-        let record = match WorkspaceStore::doctor_record_with_conn(&conn, &workspace_id).await {
-            Ok(record) => record,
-            // Same special case as the paginated path below: a repository
-            // that never ran the workspace migration has no records — its
-            // TRUE state, not scope corruption, and the actionable answer
-            // is "no such workspace", not LBR-WORKTREE-002.
-            Err(error) if workspace_table_absent(&error) => None,
-            Err(error) => {
-                return Err(doctor_scope_corrupt(format!(
-                    "cannot read the workspace record '{workspace_id}': {error}"
-                )));
+        let record = match &conn {
+            WorktreeDb::Redb { state, .. } => {
+                WorkspaceStore::get_with_store(state.as_ref(), &workspace_id)
+                    .await
+                    .map_err(|error| {
+                        doctor_scope_corrupt(format!(
+                            "cannot read the workspace record '{workspace_id}': {error}"
+                        ))
+                    })?
+                    .map(workspace_record_from_row)
+            }
+            WorktreeDb::Sqlite(sql_conn) => {
+                match WorkspaceStore::doctor_record_with_conn(sql_conn, &workspace_id).await {
+                    Ok(record) => record,
+                    Err(error) if workspace_table_absent(&error) => None,
+                    Err(error) => {
+                        return Err(doctor_scope_corrupt(format!(
+                            "cannot read the workspace record '{workspace_id}': {error}"
+                        )));
+                    }
+                }
             }
         }
         .ok_or_else(|| {
@@ -1237,19 +1401,61 @@ pub(crate) async fn run_worktree_doctor(
     }
 
     let after = cursor.as_deref().map(decode_doctor_cursor).transpose()?;
-    let page = match WorkspaceStore::doctor_page_with_conn(&conn, limit, after.as_deref()).await {
-        Ok(page) => page,
-        // A repository that has not yet run the workspace migration has no
-        // records to diagnose — that is its true state, not a corrupt one.
-        // Every other read failure still fails closed.
-        Err(error) if workspace_table_absent(&error) => workspace::WorkspacePage {
-            items: Vec::new(),
-            next_cursor: None,
-        },
-        Err(error) => {
-            return Err(doctor_scope_corrupt(format!(
-                "cannot read the workspace registry: {error}"
-            )));
+    let page = match &conn {
+        WorktreeDb::Redb { state, config, .. } => {
+            let repo_id = config
+                .get("libra.repoid")
+                .await
+                .map_err(|error| {
+                    doctor_scope_corrupt(format!("cannot read libra.repoid: {error}"))
+                })?
+                .map(|e| e.value)
+                .unwrap_or_default();
+            let mut all: Vec<WorkspaceRecord> = if repo_id.trim().is_empty() {
+                Vec::new()
+            } else {
+                WorkspaceStore::list_with_store(state.as_ref(), &repo_id, None)
+                    .await
+                    .map_err(|error| {
+                        doctor_scope_corrupt(format!("cannot read the workspace registry: {error}"))
+                    })?
+                    .into_iter()
+                    .map(workspace_record_from_row)
+                    .collect()
+            };
+            all.sort_by(|a, b| a.workspace_id.cmp(&b.workspace_id));
+            if let Some(after_id) = after.as_deref() {
+                all.retain(|r| r.workspace_id.as_str() > after_id);
+            }
+            let cap = limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX));
+            let next_cursor = cap.and_then(|c| {
+                if all.len() > c {
+                    all.get(c.saturating_sub(1)).map(|r| r.workspace_id.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(c) = cap {
+                all.truncate(c);
+            }
+            workspace::WorkspacePage {
+                items: all,
+                next_cursor,
+            }
+        }
+        WorktreeDb::Sqlite(sql_conn) => {
+            match WorkspaceStore::doctor_page_with_conn(sql_conn, limit, after.as_deref()).await {
+                Ok(page) => page,
+                Err(error) if workspace_table_absent(&error) => workspace::WorkspacePage {
+                    items: Vec::new(),
+                    next_cursor: None,
+                },
+                Err(error) => {
+                    return Err(doctor_scope_corrupt(format!(
+                        "cannot read the workspace registry: {error}"
+                    )));
+                }
+            }
         }
     };
     // The human doctor also renders the W0 worktree-scope report on the same
@@ -1302,16 +1508,27 @@ pub(crate) fn workspace_table_absent(error: &workspace::WorkspaceError) -> bool 
     text.contains("no such table") && text.contains("workspace_record")
 }
 
-pub(crate) async fn doctor_repo_identity(conn: &sea_orm::DatabaseConnection) -> CliResult<String> {
-    RepoIdentity::resolve(conn)
-        .await
-        .map(|identity| identity.as_str().to_string())
-        .map_err(|error| {
-            doctor_scope_corrupt(format!(
-                "cannot read this repository's identity, so workspace records cannot be \
-                  attributed: {error}"
-            ))
-        })
+pub(crate) async fn doctor_repo_identity(conn: &WorktreeDb) -> CliResult<String> {
+    match conn {
+        WorktreeDb::Redb { config, .. } => RepoIdentity::resolve_with_store(config.as_ref())
+            .await
+            .map(|identity| identity.as_str().to_string())
+            .map_err(|error| {
+                doctor_scope_corrupt(format!(
+                    "cannot read this repository's identity, so workspace records cannot be \
+                          attributed: {error}"
+                ))
+            }),
+        WorktreeDb::Sqlite(sql_conn) => RepoIdentity::resolve(sql_conn)
+            .await
+            .map(|identity| identity.as_str().to_string())
+            .map_err(|error| {
+                doctor_scope_corrupt(format!(
+                    "cannot read this repository's identity, so workspace records cannot be \
+                      attributed: {error}"
+                ))
+            }),
+    }
 }
 
 pub(crate) fn render_doctor_single(
@@ -1473,7 +1690,9 @@ pub(crate) async fn migrate_layout_run_locked(
     // any database access, so this connection never resolves on the read-only
     // path. (Migrations were already applied by the CLI preflight and the
     // dispatch-time open — the §C.7 contract for confirmed repair actions.)
-    let db = crate::internal::db::get_db_conn_instance().await;
+    let db = WorktreeDb::open_current_read_write()
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
 
     // Preconditions shared by every target (§C.6.2 step 4): the SHARED
     // index must be conflict-free, no repository-global (main-scope)
@@ -1524,7 +1743,7 @@ pub(crate) async fn migrate_layout_run_locked(
 }
 
 pub(crate) async fn migrate_one_worktree(
-    db: &sea_orm::DatabaseConnection,
+    db: &WorktreeDb,
     state: &mut WorktreeState,
     index: usize,
     head_commit: git_internal::hash::ObjectHash,
@@ -1583,13 +1802,10 @@ pub(crate) async fn migrate_one_worktree(
     )
     .await
     .map_err(WorktreeError::OperationBlocked)?;
-    let set_stage = |stage: &'static str| {
-        let db = db.clone();
-        async move {
-            journal_set_stage(&db, journal_id, stage)
-                .await
-                .map_err(WorktreeError::OperationBlocked)
-        }
+    let set_stage = |stage: &'static str| async move {
+        journal_set_stage(db, journal_id, stage)
+            .await
+            .map_err(WorktreeError::OperationBlocked)
     };
 
     // Step 2: prepared gitdir with identity marker, fsynced.
@@ -2275,7 +2491,9 @@ pub(crate) async fn repair_worktrees_locked() -> WorktreeResult<WorktreeRepairOu
     // §C.7 W3-s1b recovery, in dependency order: stale intents first (they
     // may settle an interrupted detach/move/re-attach), then tombstone
     // retries, then marker + lifecycle-mirror reconciliation.
-    let db = crate::internal::db::get_db_conn_instance().await;
+    let db = WorktreeDb::open_current_read_write()
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
     let journal_recovered =
         recover_pending_intents(&db, &mut state, &mut changed, &mut notes).await?;
     let (tombstones_cleaned, tombstones_pending) =
@@ -2297,7 +2515,7 @@ pub(crate) async fn repair_worktrees_locked() -> WorktreeResult<WorktreeRepairOu
 }
 
 pub(crate) async fn recover_pending_intents(
-    db: &sea_orm::DatabaseConnection,
+    db: &WorktreeDb,
     state: &mut WorktreeState,
     changed: &mut bool,
     notes: &mut Vec<String>,
@@ -3235,7 +3453,7 @@ pub(crate) async fn finish_migration_recovery(
 }
 
 pub(crate) async fn retry_tombstones(
-    db: &sea_orm::DatabaseConnection,
+    db: &WorktreeDb,
     state: &mut WorktreeState,
     changed: &mut bool,
     notes: &mut Vec<String>,
@@ -3289,7 +3507,7 @@ pub(crate) async fn retry_tombstones(
 }
 
 pub(crate) async fn reconcile_lifecycle(
-    db: &sea_orm::DatabaseConnection,
+    db: &WorktreeDb,
     state: &mut WorktreeState,
     notes: &mut Vec<String>,
 ) {

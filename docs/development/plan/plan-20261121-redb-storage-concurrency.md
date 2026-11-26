@@ -8183,7 +8183,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/config.rs`、`src/command/config/doctor.rs` 与 `src/command/config/repair.rs`（2 目录、3 文件）接入 `crate::storage`，按 `ADR-RB-02` #2 分支 B 落实 `Redb` 运行时在仓库/`--global`/`--system` 作用域的配置读写、诊断与拒收策略。
 
@@ -8198,16 +8198,16 @@
 | `config.rs:49` 与 `config/repair.rs:187` 直接引用 `util::DATABASE` / `config.db` | `src/command/config.rs:49,257-295`；`src/command/config/repair.rs:187`；`ADR-RB-02` #2 |
 
 **Acceptance criteria:**
-- [ ] `config`、`config/doctor` 与 `config/repair` 在 `Redb` 运行时下于 `Redb` 仓库上按 `crate::storage` 正确诊断与读写（不打开 `.libra/libra.db`）。
-- [ ] `config` 命令在 `Redb` 运行时下于隔离 `--global` 夹具上按 `ADR-RB-02` #2 分支 B 正确执行读写/拒绝策略。
-- [ ] `config` 命令在 `Redb` 运行时下于隔离 `--system` 夹具上按 `ADR-RB-02` #2 分支 B 正确执行读写/拒绝策略。
-- [ ] SQLite 既有 `compat_global_config_schema_future` 路径零回归。
-- [ ] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
+- [x] `config`、`config/doctor` 与 `config/repair` 在 `Redb` 运行时下于 `Redb` 仓库上按 `crate::storage` 正确诊断与读写（不打开 `.libra/libra.db`）。
+- [x] `config` 命令在 `Redb` 运行时下于隔离 `--global` 夹具上按 `ADR-RB-02` #2 分支 B 正确执行读写/拒绝策略。
+- [x] `config` 命令在 `Redb` 运行时下于隔离 `--system` 夹具上按 `ADR-RB-02` #2 分支 B 正确执行读写/拒绝策略。
+- [x] SQLite 既有 `compat_global_config_schema_future` 路径零回归。
+- [x] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=command::config::tests::redb_repo_global_system_config_doctor_and_repair)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=command::config::tests::redb_repo_global_system_config_doctor_and_repair)'`（new，覆盖 AC1–AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_global_config_schema_future`（覆盖 AC4；AC5 由 `RB-30` 禁改 diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=command::config::tests::redb_repo_global_system_config_doctor_and_repair)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=command::config::tests::redb_repo_global_system_config_doctor_and_repair)'`（new，覆盖 AC1–AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_global_config_schema_future`（覆盖 AC4；AC5 由 `RB-30` 禁改 diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8241,7 +8241,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区于 `src/command/config.rs` 落实并逐域实证 `ADR-RB-02` #2 分支 A：双特性构建 + 默认 `Sqlite` 运行时（`RB-30`/`RB-32` 默认态）下，`libra config set --global` 与 `libra config set --system` 经 `config-migration.lock` 校验后分别对既有 `config.db` 正常读写以及在空目录新建 `config.db` + `config-format.json(backend="sqlite", finalized=true)`（绝不创建 `config.redb`）。
 
@@ -8255,14 +8255,14 @@
 | `RB-30`/`RB-32` 双特性默认 SQLite 态须对 `--global` 与 `--system` 各自独立验证既有库与空目录零破坏 | `src/command/config.rs:49,257-295`；`ADR-RB-02` #2 分支 A |
 
 **Acceptance criteria:**
-- [ ] 双特性构建 + `Sqlite` 运行时下，`libra config set --global` 经 `config-migration.lock` 校验后对已有 `config.db` 正常读写（绝不创建 `config.redb`）。
-- [ ] 双特性构建 + `Sqlite` 运行时下，`libra config set --system` 经 `config-migration.lock` 校验后对已有 `config.db` 正常读写（绝不创建 `config.redb`）。
-- [ ] 双特性构建 + `Sqlite` 运行时下，目标全局目录为空时 `libra config set --global` 新建 `config.db` + `config-format.json(backend="sqlite", finalized=true)`（绝不创建 `config.redb`）。
-- [ ] 双特性构建 + `Sqlite` 运行时下，目标系统目录为空时 `libra config set --system` 新建 `config.db` + `config-format.json(backend="sqlite", finalized=true)`（绝不创建 `config.redb`）。
+- [x] 双特性构建 + `Sqlite` 运行时下，`libra config set --global` 经 `config-migration.lock` 校验后对已有 `config.db` 正常读写（绝不创建 `config.redb`）。
+- [x] 双特性构建 + `Sqlite` 运行时下，`libra config set --system` 经 `config-migration.lock` 校验后对已有 `config.db` 正常读写（绝不创建 `config.redb`）。
+- [x] 双特性构建 + `Sqlite` 运行时下，目标全局目录为空时 `libra config set --global` 新建 `config.db` + `config-format.json(backend="sqlite", finalized=true)`（绝不创建 `config.redb`）。
+- [x] 双特性构建 + `Sqlite` 运行时下，目标系统目录为空时 `libra config set --system` 新建 `config.db` + `config-format.json(backend="sqlite", finalized=true)`（绝不创建 `config.redb`）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=command::config::tests::dual_feature_global_system_config_cli_runtime_dispatch)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=command::config::tests::dual_feature_global_system_config_cli_runtime_dispatch)'`（new，覆盖 AC1–AC4）
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=command::config::tests::dual_feature_global_system_config_cli_runtime_dispatch)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=command::config::tests::dual_feature_global_system_config_cli_runtime_dispatch)'`（new，覆盖 AC1–AC4）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8296,7 +8296,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/{op,worktree,worktree-fuse,memory,automation,hooks}.rs`（6 文件）、`src/command/worktree/{doctor,operations}.rs`（2 文件）与 `src/command/rebase/state.rs`（1 文件）共 3 目录、9 文件接入 `crate::storage`，完成 Git 命令侧 100% 接线闭环。
 
@@ -8310,16 +8310,16 @@
 | `worktree.rs:633`、`worktree/doctor.rs:751`、`hooks.rs:328`、`memory.rs:114` 直接引用 `util::DATABASE` | `src/command/worktree.rs:633`；`src/command/worktree/doctor.rs:751`；`src/command/hooks.rs:328`；`src/command/memory.rs:114` |
 
 **Acceptance criteria:**
-- [ ] `worktree`、`worktree-fuse`、`worktree/{doctor,operations}` 在主工作树与 linked worktree 共享 `.libra/redb/` 下全链路通过。
-- [ ] `op`（`log`/`undo`/`redo`/`restore`）与 `rebase/state` 在 `Redb` 仓库上完成操作恢复。
-- [ ] `memory`、`automation` 与 `hooks` 在 `Redb` 仓库上经 `crate::storage` 读写（不打开 `.libra/libra.db`）。
-- [ ] 既有 SQLite `op_undo_redo` 路径零回归。
-- [ ] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
+- [x] `worktree`、`worktree-fuse`、`worktree/{doctor,operations}` 在主工作树与 linked worktree 共享 `.libra/redb/` 下全链路通过。
+- [x] `op`（`log`/`undo`/`redo`/`restore`）与 `rebase/state` 在 `Redb` 仓库上完成操作恢复。
+- [x] `memory`、`automation` 与 `hooks` 在 `Redb` 仓库上经 `crate::storage` 读写（不打开 `.libra/libra.db`）。
+- [x] 既有 SQLite `op_undo_redo` 路径零回归。
+- [x] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=command::worktree::tests::redb_worktree_op_memory_automation_and_hooks)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=command::worktree::tests::redb_worktree_op_memory_automation_and_hooks)'`（new，覆盖 AC1、AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test op_undo_redo`（覆盖 AC4；AC5 由 `RB-30` 禁改 diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=command::worktree::tests::redb_worktree_op_memory_automation_and_hooks)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=command::worktree::tests::redb_worktree_op_memory_automation_and_hooks)'`（new，覆盖 AC1、AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test op_undo_redo`（覆盖 AC4；AC5 由 `RB-30` 禁改 diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 

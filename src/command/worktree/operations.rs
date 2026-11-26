@@ -408,7 +408,9 @@ pub(crate) async fn add_worktree_locked(
     // sparse filters would silently re-gate ls-files/diff/hydrate, stale
     // layer ownership would block staging. Sweep the scope STRICTLY before
     // seeding; a sweep failure fails the add (fail closed, nothing seeded).
-    let db = crate::internal::db::get_db_conn_instance().await;
+    let db = WorktreeDb::open_current_read_write()
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
     gc_worktree_scoped_rows_strict(&db, &worktree_id, true, &state, &canonical_target)
         .await
         .map_err(|e| {
@@ -777,7 +779,9 @@ pub(crate) async fn reattach_worktree(
     index: usize,
     target: &Path,
 ) -> WorktreeResult<WorktreeAddOutput> {
-    let db = crate::internal::db::get_db_conn_instance().await;
+    let db = WorktreeDb::open_current_read_write()
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
     let Some(expected_id) = state.entries[index].worktree_id.clone() else {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot re-attach '{}': the registry entry has no persisted worktree id; run \
@@ -872,70 +876,310 @@ pub(crate) fn render_add_worktree(
     Ok(())
 }
 
+pub(crate) enum WorktreeDb {
+    Sqlite(sea_orm::DatabaseConnection),
+    Redb {
+        git: std::sync::Arc<dyn crate::storage::GitStore>,
+        state: std::sync::Arc<dyn crate::storage::GitStateStore>,
+        config: std::sync::Arc<dyn crate::storage::ConfigStore>,
+    },
+}
+
+pub(crate) fn workspace_record_from_row(
+    row: crate::storage::WorkspaceRecordRow,
+) -> crate::internal::workspace::WorkspaceRecord {
+    use crate::{
+        internal::workspace::{WorkspaceKind, WorkspaceOwnerKind, WorkspaceRecord, WorkspaceState},
+        storage::{WorkspaceRecordKind, WorkspaceRecordOwnerKind, WorkspaceRecordState},
+    };
+    let kind = match row.kind {
+        WorkspaceRecordKind::Linked => WorkspaceKind::Linked,
+        WorkspaceRecordKind::TaskCopy => WorkspaceKind::TaskCopy,
+        WorkspaceRecordKind::TaskFuse => WorkspaceKind::TaskFuse,
+        WorkspaceRecordKind::Remote => WorkspaceKind::Remote,
+    };
+    let owner_kind = match row.owner_kind {
+        WorkspaceRecordOwnerKind::Human => WorkspaceOwnerKind::Human,
+        WorkspaceRecordOwnerKind::Agent => WorkspaceOwnerKind::Agent,
+        WorkspaceRecordOwnerKind::Automation => WorkspaceOwnerKind::Automation,
+    };
+    let state = match row.state {
+        WorkspaceRecordState::Provisioning => WorkspaceState::Provisioning,
+        WorkspaceRecordState::Active => WorkspaceState::Active,
+        WorkspaceRecordState::Releasing => WorkspaceState::Releasing,
+        WorkspaceRecordState::Released => WorkspaceState::Released,
+        WorkspaceRecordState::Orphaned => WorkspaceState::Orphaned,
+    };
+    WorkspaceRecord {
+        workspace_id: row.workspace_id,
+        repo_id: row.repo_id,
+        kind,
+        worktree_id: row.worktree_id,
+        path: row.path,
+        owner_kind,
+        owner_id: row.owner_id,
+        task_id: row.task_id,
+        session_id: row.session_id,
+        base_commit: row.base_commit,
+        branch: row.branch,
+        state,
+        lease_owner: row.lease_owner,
+        lease_fence: row.lease_fence,
+        lease_expires_at: row.lease_expires_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+impl WorktreeDb {
+    pub(crate) async fn open_current_read_write() -> Result<Self, String> {
+        match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                let git = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|e| format!("cannot open redb git store: {e}"))?;
+                let state = crate::storage::runtime::open_current_git_state_store_read_write()
+                    .await
+                    .map_err(|e| format!("cannot open redb state store: {e}"))?;
+                let config = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|e| format!("cannot open redb config store: {e}"))?;
+                Ok(Self::Redb { git, state, config })
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => Ok(Self::Sqlite(
+                crate::internal::db::get_db_conn_instance().await,
+            )),
+        }
+    }
+
+    pub(crate) async fn open_current_read_only() -> Result<Self, String> {
+        match crate::storage::runtime::detect_current_repo_backend() {
+            Ok(crate::storage::StorageBackendKind::Redb) => {
+                let git = crate::storage::runtime::open_current_git_store_read_only()
+                    .await
+                    .map_err(|e| format!("cannot open redb git store: {e}"))?;
+                let state = crate::storage::runtime::open_current_git_state_store_read_only()
+                    .await
+                    .map_err(|e| format!("cannot open redb state store: {e}"))?;
+                let config = crate::storage::runtime::open_current_repo_config_store_read_only()
+                    .await
+                    .map_err(|e| format!("cannot open redb config store: {e}"))?;
+                Ok(Self::Redb { git, state, config })
+            }
+            Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+                let db_path = crate::utils::path::database();
+                let conn = crate::internal::db::open_database_without_migrations(&db_path)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "cannot open the repository database at '{}': {error}",
+                            db_path.display()
+                        )
+                    })?;
+                Ok(Self::Sqlite(conn))
+            }
+        }
+    }
+
+    pub(crate) async fn find_live_linked(
+        &self,
+        worktree_id: &str,
+    ) -> Result<
+        Option<crate::internal::workspace::WorkspaceRecord>,
+        crate::internal::workspace::WorkspaceError,
+    > {
+        match self {
+            Self::Redb { state, config, .. } => {
+                let Some(repo_id) = config
+                    .get("libra.repoid")
+                    .await
+                    .map_err(|e| {
+                        crate::internal::workspace::WorkspaceError::ReadFailed(e.to_string())
+                    })?
+                    .map(|e| e.value)
+                    .filter(|v| !v.trim().is_empty())
+                else {
+                    return Ok(None);
+                };
+                let records = crate::internal::workspace::WorkspaceStore::list_with_store(
+                    state.as_ref(),
+                    &repo_id,
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    crate::internal::workspace::WorkspaceError::ReadFailed(e.to_string())
+                })?;
+                Ok(records
+                    .into_iter()
+                    .map(workspace_record_from_row)
+                    .find(|r| {
+                        r.state.holds_identity() && r.worktree_id.as_deref() == Some(worktree_id)
+                    }))
+            }
+            Self::Sqlite(conn) => {
+                crate::internal::workspace::WorkspaceStore::find_live_linked_with_conn(
+                    conn,
+                    worktree_id,
+                )
+                .await
+            }
+        }
+    }
+
+    pub(crate) async fn find_live_by_path(
+        &self,
+        path: &Path,
+    ) -> Result<
+        Option<crate::internal::workspace::WorkspaceRecord>,
+        crate::internal::workspace::WorkspaceError,
+    > {
+        match self {
+            Self::Redb { state, config, .. } => {
+                let Some(repo_id) = config
+                    .get("libra.repoid")
+                    .await
+                    .map_err(|e| {
+                        crate::internal::workspace::WorkspaceError::ReadFailed(e.to_string())
+                    })?
+                    .map(|e| e.value)
+                    .filter(|v| !v.trim().is_empty())
+                else {
+                    return Ok(None);
+                };
+                let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                let records = crate::internal::workspace::WorkspaceStore::list_with_store(
+                    state.as_ref(),
+                    &repo_id,
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    crate::internal::workspace::WorkspaceError::ReadFailed(e.to_string())
+                })?;
+                Ok(records
+                    .into_iter()
+                    .map(workspace_record_from_row)
+                    .find(|r| {
+                        if !r.state.holds_identity() {
+                            return false;
+                        }
+                        let rp = Path::new(&r.path);
+                        rp == path
+                            || rp == canon
+                            || fs::canonicalize(rp).ok().as_deref() == Some(canon.as_path())
+                    }))
+            }
+            Self::Sqlite(conn) => {
+                crate::internal::workspace::WorkspaceStore::find_live_by_path_with_conn(conn, path)
+                    .await
+            }
+        }
+    }
+}
+
 pub(crate) async fn lifecycle_upsert(
-    db: &sea_orm::DatabaseConnection,
+    db: &WorktreeDb,
     worktree_id: &str,
     state: &str,
     path: &str,
 ) -> Result<(), String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let now = chrono::Utc::now().timestamp_millis();
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, updated_at) \
-          VALUES (?, ?, ?, ?, ?) \
-          ON CONFLICT(worktree_id) DO UPDATE SET state = excluded.state, \
-          path = excluded.path, updated_at = excluded.updated_at",
-        [
-            worktree_id.into(),
-            state.into(),
-            path.into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
-    .await
-    .map_err(|error| format!("cannot record worktree lifecycle state: {error}"))?;
-    Ok(())
-}
-
-pub(crate) async fn lifecycle_delete(
-    db: &sea_orm::DatabaseConnection,
-    worktree_id: &str,
-) -> Result<(), String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "DELETE FROM worktree_lifecycle WHERE worktree_id = ?",
-        [worktree_id.into()],
-    ))
-    .await
-    .map_err(|error| format!("cannot clear worktree lifecycle state: {error}"))?;
-    Ok(())
-}
-
-pub(crate) async fn lifecycle_rows(
-    db: &sea_orm::DatabaseConnection,
-) -> Result<Vec<(String, String)>, String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT worktree_id, state FROM worktree_lifecycle".to_string(),
-        ))
-        .await
-        .map_err(|error| format!("cannot read the worktree lifecycle mirror: {error}"))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let id: String = row
-            .try_get_by_index(0)
-            .map_err(|error| format!("corrupt lifecycle row: {error}"))?;
-        let state: String = row
-            .try_get_by_index(1)
-            .map_err(|error| format!("corrupt lifecycle row: {error}"))?;
-        out.push((id, state));
+    match db {
+        WorktreeDb::Redb { state: store, .. } => {
+            let parsed_state = crate::storage::WorktreeLifecycleState::parse(state)
+                .map_err(|e| format!("invalid worktree lifecycle state '{state}': {e}"))?;
+            let rec = crate::storage::WorktreeLifecycleRecord {
+                worktree_id: worktree_id.to_string(),
+                state: parsed_state,
+                path: path.to_string(),
+                reason: None,
+                created_at: now,
+                updated_at: now,
+            };
+            store
+                .upsert_worktree_lifecycle(&rec)
+                .await
+                .map_err(|error| format!("cannot record worktree lifecycle state: {error}"))
+        }
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            conn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, updated_at) \
+                  VALUES (?, ?, ?, ?, ?) \
+                  ON CONFLICT(worktree_id) DO UPDATE SET state = excluded.state, \
+                  path = excluded.path, updated_at = excluded.updated_at",
+                [
+                    worktree_id.into(),
+                    state.into(),
+                    path.into(),
+                    now.into(),
+                    now.into(),
+                ],
+            ))
+            .await
+            .map_err(|error| format!("cannot record worktree lifecycle state: {error}"))?;
+            Ok(())
+        }
     }
-    Ok(out)
+}
+
+pub(crate) async fn lifecycle_delete(db: &WorktreeDb, worktree_id: &str) -> Result<(), String> {
+    match db {
+        WorktreeDb::Redb { state: store, .. } => store
+            .delete_worktree_lifecycle(worktree_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("cannot clear worktree lifecycle state: {error}")),
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            conn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM worktree_lifecycle WHERE worktree_id = ?",
+                [worktree_id.into()],
+            ))
+            .await
+            .map_err(|error| format!("cannot clear worktree lifecycle state: {error}"))?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) async fn lifecycle_rows(db: &WorktreeDb) -> Result<Vec<(String, String)>, String> {
+    match db {
+        WorktreeDb::Redb { state: store, .. } => {
+            let rows = store
+                .list_worktree_lifecycles()
+                .await
+                .map_err(|error| format!("cannot read the worktree lifecycle mirror: {error}"))?;
+            Ok(rows
+                .into_iter()
+                .map(|r| (r.worktree_id, r.state.as_str().to_string()))
+                .collect())
+        }
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let rows = conn
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT worktree_id, state FROM worktree_lifecycle".to_string(),
+                ))
+                .await
+                .map_err(|error| format!("cannot read the worktree lifecycle mirror: {error}"))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let id: String = row
+                    .try_get_by_index(0)
+                    .map_err(|error| format!("corrupt lifecycle row: {error}"))?;
+                let state: String = row
+                    .try_get_by_index(1)
+                    .map_err(|error| format!("corrupt lifecycle row: {error}"))?;
+                out.push((id, state));
+            }
+            Ok(out)
+        }
+    }
 }
 
 pub(crate) fn probe_path(path: &Path) -> PathPresence {
@@ -947,134 +1191,202 @@ pub(crate) fn probe_path(path: &Path) -> PathPresence {
 }
 
 pub(crate) async fn journal_append(
-    db: &sea_orm::DatabaseConnection,
+    db: &WorktreeDb,
     op: &str,
     worktree_id: Option<&str>,
     payload: &serde_json::Value,
 ) -> Result<i64, String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let now = chrono::Utc::now().timestamp_millis();
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
-              VALUES (?, ?, ?, ?)",
-            [
-                op.into(),
-                worktree_id.into(),
-                payload.to_string().into(),
-                now.into(),
-            ],
-        ))
-        .await
-        .map_err(|error| format!("cannot record the {op} intent journal entry: {error}"))?;
-    Ok(result.last_insert_id() as i64)
-}
-
-pub(crate) async fn journal_set_stage(
-    db: &sea_orm::DatabaseConnection,
-    id: i64,
-    stage: &str,
-) -> Result<(), String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE worktree_intent_journal SET stage = ? WHERE id = ?",
-        [stage.into(), id.into()],
-    ))
-    .await
-    .map_err(|error| format!("cannot record migration stage {stage}: {error}"))?;
-    Ok(())
-}
-
-pub(crate) async fn journal_resolve(
-    db: &sea_orm::DatabaseConnection,
-    id: i64,
-) -> Result<(), String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "DELETE FROM worktree_intent_journal WHERE id = ?",
-        [id.into()],
-    ))
-    .await
-    .map_err(|error| format!("cannot resolve intent journal entry {id}: {error}"))?;
-    Ok(())
-}
-
-pub(crate) async fn journal_pending(
-    db: &sea_orm::DatabaseConnection,
-) -> Result<Vec<PendingIntent>, String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT id, op, worktree_id, payload FROM worktree_intent_journal ORDER BY id"
-                .to_string(),
-        ))
-        .await
-        .map_err(|error| format!("cannot read the intent journal: {error}"))?;
-    let mut pending = Vec::new();
-    for row in rows {
-        let id: i64 = row
-            .try_get_by_index(0)
-            .map_err(|error| format!("corrupt intent journal row (id): {error}"))?;
-        let op: String = row
-            .try_get_by_index(1)
-            .map_err(|error| format!("corrupt intent journal row (op): {error}"))?;
-        let worktree_id: Option<String> = row
-            .try_get_by_index(2)
-            .map_err(|error| format!("corrupt intent journal row (worktree_id): {error}"))?;
-        let payload_raw: String = row
-            .try_get_by_index(3)
-            .map_err(|error| format!("corrupt intent journal row (payload): {error}"))?;
-        let payload = serde_json::from_str(&payload_raw)
-            .map_err(|error| format!("corrupt intent journal payload (id {id}): {error}"))?;
-        pending.push(PendingIntent {
-            id,
-            op,
-            worktree_id,
-            payload,
-        });
-    }
-    Ok(pending)
-}
-
-pub(crate) async fn scoped_state_active(
-    db: &sea_orm::DatabaseConnection,
-    worktree_id: &str,
-) -> bool {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    for table in ["sequence_state", "rebase_state", "bisect_state"] {
-        let query = format!("SELECT COUNT(*) FROM {table} WHERE worktree_id = ?");
-        match db
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                &query,
-                [worktree_id.into()],
-            ))
-            .await
-        {
-            Ok(Some(row)) => match row.try_get_by_index::<i64>(0) {
-                Ok(0) => {}
-                Ok(_) => return true,
-                Err(_) => return true,
-            },
-            Ok(None) => {}
-            Err(_) => return true,
+    match db {
+        WorktreeDb::Redb { state: store, .. } => {
+            let parsed_op = crate::storage::WorktreeIntentOp::parse(op)
+                .map_err(|e| format!("invalid worktree intent op '{op}': {e}"))?;
+            let write = crate::storage::WorktreeIntentWrite {
+                op: parsed_op,
+                worktree_id: worktree_id.map(str::to_string),
+                payload: payload.to_string(),
+                stage: None,
+                created_at: now,
+            };
+            let rec = store
+                .append_worktree_intent(&write)
+                .await
+                .map_err(|error| format!("cannot record the {op} intent journal entry: {error}"))?;
+            Ok(rec.id)
+        }
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let result = conn
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+                      VALUES (?, ?, ?, ?)",
+                    [
+                        op.into(),
+                        worktree_id.into(),
+                        payload.to_string().into(),
+                        now.into(),
+                    ],
+                ))
+                .await
+                .map_err(|error| format!("cannot record the {op} intent journal entry: {error}"))?;
+            Ok(result.last_insert_id() as i64)
         }
     }
-    false
+}
+
+pub(crate) async fn journal_set_stage(db: &WorktreeDb, id: i64, stage: &str) -> Result<(), String> {
+    match db {
+        WorktreeDb::Redb { state: store, .. } => store
+            .update_worktree_intent_stage(id, Some(stage))
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("cannot record migration stage {stage}: {error}")),
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            conn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE worktree_intent_journal SET stage = ? WHERE id = ?",
+                [stage.into(), id.into()],
+            ))
+            .await
+            .map_err(|error| format!("cannot record migration stage {stage}: {error}"))?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) async fn journal_resolve(db: &WorktreeDb, id: i64) -> Result<(), String> {
+    match db {
+        WorktreeDb::Redb { state: store, .. } => store
+            .resolve_worktree_intent(id)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("cannot resolve intent journal entry {id}: {error}")),
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            conn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM worktree_intent_journal WHERE id = ?",
+                [id.into()],
+            ))
+            .await
+            .map_err(|error| format!("cannot resolve intent journal entry {id}: {error}"))?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) async fn journal_pending(db: &WorktreeDb) -> Result<Vec<PendingIntent>, String> {
+    match db {
+        WorktreeDb::Redb { state: store, .. } => {
+            let rows = store
+                .list_worktree_intents()
+                .await
+                .map_err(|error| format!("cannot read the intent journal: {error}"))?;
+            let mut pending = Vec::with_capacity(rows.len());
+            for row in rows {
+                let payload = serde_json::from_str(&row.payload).map_err(|error| {
+                    format!("corrupt intent journal payload (id {}): {error}", row.id)
+                })?;
+                pending.push(PendingIntent {
+                    id: row.id,
+                    op: row.op.as_str().to_string(),
+                    worktree_id: row.worktree_id,
+                    payload,
+                });
+            }
+            Ok(pending)
+        }
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let rows = conn
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT id, op, worktree_id, payload FROM worktree_intent_journal ORDER BY id"
+                        .to_string(),
+                ))
+                .await
+                .map_err(|error| format!("cannot read the intent journal: {error}"))?;
+            let mut pending = Vec::new();
+            for row in rows {
+                let id: i64 = row
+                    .try_get_by_index(0)
+                    .map_err(|error| format!("corrupt intent journal row (id): {error}"))?;
+                let op: String = row
+                    .try_get_by_index(1)
+                    .map_err(|error| format!("corrupt intent journal row (op): {error}"))?;
+                let worktree_id: Option<String> = row.try_get_by_index(2).map_err(|error| {
+                    format!("corrupt intent journal row (worktree_id): {error}")
+                })?;
+                let payload_raw: String = row
+                    .try_get_by_index(3)
+                    .map_err(|error| format!("corrupt intent journal row (payload): {error}"))?;
+                let payload = serde_json::from_str(&payload_raw).map_err(|error| {
+                    format!("corrupt intent journal payload (id {id}): {error}")
+                })?;
+                pending.push(PendingIntent {
+                    id,
+                    op,
+                    worktree_id,
+                    payload,
+                });
+            }
+            Ok(pending)
+        }
+    }
+}
+
+pub(crate) async fn scoped_state_active(db: &WorktreeDb, worktree_id: &str) -> bool {
+    match db {
+        WorktreeDb::Redb { state: store, .. } => {
+            match store.get_sequence_state(worktree_id).await {
+                Ok(Some(_)) | Err(_) => return true,
+                Ok(None) => {}
+            }
+            match store.get_rebase_state(worktree_id).await {
+                Ok(Some(_)) | Err(_) => return true,
+                Ok(None) => {}
+            }
+            match store.get_bisect_state(worktree_id).await {
+                Ok(Some(_)) | Err(_) => return true,
+                Ok(None) => {}
+            }
+            false
+        }
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            for table in ["sequence_state", "rebase_state", "bisect_state"] {
+                let query = format!("SELECT COUNT(*) FROM {table} WHERE worktree_id = ?");
+                match conn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        &query,
+                        [worktree_id.into()],
+                    ))
+                    .await
+                {
+                    Ok(Some(row)) => match row.try_get_by_index::<i64>(0) {
+                        Ok(0) => {}
+                        Ok(_) => return true,
+                        Err(_) => return true,
+                    },
+                    Ok(None) => {}
+                    Err(_) => return true,
+                }
+            }
+            false
+        }
+    }
 }
 
 pub(crate) async fn gc_worktree_scoped_rows_strict(
-    db: &sea_orm::DatabaseConnection,
+    db: &WorktreeDb,
     worktree_id: &str,
     directory_gone: bool,
     state: &WorktreeState,
     target: &Path,
 ) -> Result<(), String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
     // A legacy identity collision can leave two entries with the same scope,
     // even after both have been detached. Never GC another registered entry's
     // rows, including from repair of an old pending journal or tombstone.
@@ -1088,56 +1400,121 @@ pub(crate) async fn gc_worktree_scoped_rows_strict(
             other.path
         ));
     }
-    let mut stmts = vec![
-        "DELETE FROM reference WHERE worktree_id = ? AND kind = 'Head'",
-        "DELETE FROM reflog WHERE worktree_id = ?",
-        "DELETE FROM sequence_state WHERE worktree_id = ?",
-        "DELETE FROM rebase_state WHERE worktree_id = ?",
-        "DELETE FROM working_dirty WHERE worktree_id = ?",
-        "DELETE FROM working_dirty_meta WHERE worktree_id = ?",
-    ];
-    // Layer registrations/ownership and the sparse view (W1 §C.4.1.1):
-    // purged ONLY when the worktree directory is actually gone
-    // (`--delete-dir`, prune, or it had already vanished). A default
-    // `remove` RETAINS the directory — and a retained `.libra` still
-    // operates as a repository — so its layer ownership rows must survive
-    // to keep the still-materialized overlay files un-stageable
-    // (never-enters-commit), and its sparse view keeps filtering that
-    // directory's queries. The retained directory cannot be re-registered
-    // while non-empty (`worktree add` refuses), so the rows guard it until
-    // the directory is cleared; orphaned rows are then reclaimed by the W3
-    // worktree doctor (they are invisible to every live scope meanwhile).
-    if directory_gone {
-        stmts.push("DELETE FROM layer WHERE worktree_id = ?");
-        stmts.push("DELETE FROM layer_path WHERE worktree_id = ?");
-        stmts.push("DELETE FROM sparse_view WHERE worktree_id = ?");
-        stmts.push("DELETE FROM sparse_view_meta WHERE worktree_id = ?");
+    match db {
+        WorktreeDb::Redb {
+            git, state: store, ..
+        } => {
+            let head_key = crate::storage::RefKey::LocalHead {
+                worktree_id: Some(worktree_id.to_string()),
+            };
+            if let Some(existing) = git
+                .get_ref(&head_key)
+                .await
+                .map_err(|e| format!("inspect worktree HEAD: {e}"))?
+            {
+                let _ = git
+                    .update_ref_cas(&head_key, Some(&existing), None, &[])
+                    .await
+                    .map_err(|e| format!("delete worktree HEAD: {e}"))?;
+            }
+            let reflogs = git
+                .list_reflog("HEAD", Some(worktree_id), None)
+                .await
+                .map_err(|e| format!("list worktree reflog: {e}"))?;
+            let ids: Vec<i64> = reflogs.into_iter().map(|r| r.id).collect();
+            if !ids.is_empty() {
+                let _ = git
+                    .delete_reflog_entries("HEAD", Some(worktree_id), &ids)
+                    .await
+                    .map_err(|e| format!("delete worktree reflog: {e}"))?;
+            }
+            let _ = store
+                .delete_sequence_state(worktree_id)
+                .await
+                .map_err(|e| format!("delete worktree sequence_state: {e}"))?;
+            let _ = store
+                .delete_rebase_state(worktree_id)
+                .await
+                .map_err(|e| format!("delete worktree rebase_state: {e}"))?;
+            let _ = store
+                .delete_bisect_state(worktree_id)
+                .await
+                .map_err(|e| format!("delete worktree bisect_state: {e}"))?;
+            let empty_dirty = crate::storage::WorkingDirtyMetaRecord {
+                worktree_id: worktree_id.to_string(),
+                state: "clean".to_string(),
+                index_fingerprint: None,
+                head_oid: None,
+                scanned_at: None,
+                scan_lock_pid: None,
+                scan_lock_at: None,
+            };
+            store
+                .replace_working_dirty_snapshot(&empty_dirty, &[])
+                .await
+                .map_err(|e| format!("clear worktree working_dirty: {e}"))?;
+            if directory_gone {
+                let layers = store
+                    .list_layers(worktree_id)
+                    .await
+                    .map_err(|e| format!("list worktree layers: {e}"))?;
+                for layer in layers {
+                    let _ = store
+                        .delete_layer(worktree_id, &layer.name)
+                        .await
+                        .map_err(|e| format!("delete worktree layer: {e}"))?;
+                }
+                store
+                    .replace_layer_paths(worktree_id, &[])
+                    .await
+                    .map_err(|e| format!("clear worktree layer_paths: {e}"))?;
+                store
+                    .clear_sparse_view(worktree_id)
+                    .await
+                    .map_err(|e| format!("clear worktree sparse_view: {e}"))?;
+            }
+            Ok(())
+        }
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let mut stmts = vec![
+                "DELETE FROM reference WHERE worktree_id = ? AND kind = 'Head'",
+                "DELETE FROM reflog WHERE worktree_id = ?",
+                "DELETE FROM sequence_state WHERE worktree_id = ?",
+                "DELETE FROM rebase_state WHERE worktree_id = ?",
+                "DELETE FROM working_dirty WHERE worktree_id = ?",
+                "DELETE FROM working_dirty_meta WHERE worktree_id = ?",
+            ];
+            if directory_gone {
+                stmts.push("DELETE FROM layer WHERE worktree_id = ?");
+                stmts.push("DELETE FROM layer_path WHERE worktree_id = ?");
+                stmts.push("DELETE FROM sparse_view WHERE worktree_id = ?");
+                stmts.push("DELETE FROM sparse_view_meta WHERE worktree_id = ?");
+            }
+            let has_bisect_table = conn
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bisect_state'",
+                ))
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if has_bisect_table {
+                stmts.push("DELETE FROM bisect_state WHERE worktree_id = ?");
+            }
+            for sql in stmts {
+                conn.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    sql,
+                    [worktree_id.into()],
+                ))
+                .await
+                .map_err(|e| format!("{sql}: {e}"))?;
+            }
+            Ok(())
+        }
     }
-    // `bisect_state` is owned by migration `2026072301`, but bare or
-    // pre-migration test databases may still lack it — only purge when the
-    // table exists (a DELETE on a missing table would log a spurious warn).
-    let has_bisect_table = db
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bisect_state'",
-        ))
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-    if has_bisect_table {
-        stmts.push("DELETE FROM bisect_state WHERE worktree_id = ?");
-    }
-    for sql in stmts {
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            sql,
-            [worktree_id.into()],
-        ))
-        .await
-        .map_err(|e| format!("{sql}: {e}"))?;
-    }
-    Ok(())
 }
 
 pub(crate) fn create_worktree_gitdir(
@@ -1646,7 +2023,9 @@ pub(crate) async fn move_worktree_locked(
     // the relocated (still-unmigrated) state — refuse until repair settles
     // it.
     {
-        let db = crate::internal::db::get_db_conn_instance().await;
+        let db = WorktreeDb::open_current_read_write()
+            .await
+            .map_err(WorktreeError::OperationBlocked)?;
         let pending = journal_pending(&db)
             .await
             .map_err(WorktreeError::OperationBlocked)?;
@@ -1678,7 +2057,9 @@ pub(crate) async fn move_worktree_locked(
         "src": src_path.to_string_lossy(),
         "dest": dest_path.to_string_lossy(),
     });
-    let db = crate::internal::db::get_db_conn_instance().await;
+    let db = WorktreeDb::open_current_read_write()
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
     let journal_id = journal_append(
         &db,
         WorktreeControl::Move.declare(),
@@ -1795,7 +2176,9 @@ pub(crate) async fn prune_worktrees_locked() -> WorktreeResult<WorktreePruneOutp
     let mut pruned: Vec<String> = Vec::new();
     let mut tombstoned: Vec<String> = Vec::new();
     if !to_prune.is_empty() {
-        let db = crate::internal::db::get_db_conn_instance().await;
+        let db = WorktreeDb::open_current_read_write()
+            .await
+            .map_err(WorktreeError::OperationBlocked)?;
         // An entry with ACTIVE sequencer/bisect state is never pruned —
         // its rows anchor the interrupted operation's objects.
         let mut eligible: Vec<(String, Option<String>)> = Vec::new();
@@ -1814,11 +2197,7 @@ pub(crate) async fn prune_worktrees_locked() -> WorktreeResult<WorktreePruneOutp
             // match a path that no longer exists — which is every prune
             // candidate.
             if let Some(id_str) = id.as_deref() {
-                match crate::internal::workspace::WorkspaceStore::find_live_linked_with_conn(
-                    &db, id_str,
-                )
-                .await
-                {
+                match db.find_live_linked(id_str).await {
                     Ok(Some(record)) => {
                         let now = chrono::Utc::now().timestamp_millis();
                         if record.lease_expires_at.is_some_and(|expiry| expiry > now) {
@@ -2478,7 +2857,9 @@ pub(crate) async fn remove_worktree_locked(
     // human's to detach or delete out from under it — the lease's fenced
     // owner is mid-work there. Release or let the lease lapse first.
     {
-        let db = crate::internal::db::get_db_conn_instance().await;
+        let db = WorktreeDb::open_current_read_write()
+            .await
+            .map_err(WorktreeError::OperationBlocked)?;
         // FAIL CLOSED on a store that cannot be read: swallowing the error
         // would disable this protection exactly when the leased agent is
         // busy writing the same database.
@@ -2489,16 +2870,9 @@ pub(crate) async fn remove_worktree_locked(
                 target.display()
             ))
         };
-        let by_path =
-            crate::internal::workspace::WorkspaceStore::find_live_by_path_with_conn(&db, &target)
-                .await
-                .map_err(lease_error)?;
+        let by_path = db.find_live_by_path(&target).await.map_err(lease_error)?;
         let by_id = match entry.worktree_id.as_deref() {
-            Some(id) => {
-                crate::internal::workspace::WorkspaceStore::find_live_linked_with_conn(&db, id)
-                    .await
-                    .map_err(lease_error)?
-            }
+            Some(id) => db.find_live_linked(id).await.map_err(lease_error)?,
             None => None,
         };
         // An EXPIRED lease does not block: nothing may run the scavenger for
@@ -2543,7 +2917,9 @@ pub(crate) async fn remove_worktree_locked(
     // Resolve the pooled connection ONCE, while the cwd-based path lookup
     // is still valid — later steps may write the detached marker, after
     // which any cwd-based storage resolution inside the target would fail.
-    let db = crate::internal::db::get_db_conn_instance().await;
+    let db = WorktreeDb::open_current_read_write()
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
 
     // §C.7: a worktree with ACTIVE sequencer/rebase/bisect state refuses
     // both remove modes — detaching would strand a half-finished operation
@@ -2588,7 +2964,7 @@ pub(crate) async fn remove_worktree_locked(
 }
 
 async fn remove_worktree_detach(
-    db: &sea_orm::DatabaseConnection,
+    db: &WorktreeDb,
     state: &mut WorktreeState,
     index: usize,
     target: &Path,
@@ -2656,7 +3032,7 @@ async fn remove_worktree_detach(
 
 #[allow(clippy::too_many_arguments)]
 async fn remove_worktree_delete_dir(
-    db: &sea_orm::DatabaseConnection,
+    db: &WorktreeDb,
     state: &mut WorktreeState,
     index: usize,
     target: &Path,

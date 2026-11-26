@@ -1093,44 +1093,73 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
 /// no-migration open (§C.11 W0): a diagnostic must never upgrade the database
 /// it is observing, so this helper must NOT resolve `get_db_conn_instance()`
 /// (which applies pending migrations) on its own.
-async fn adopted_scope_settings_present(
-    conn: &sea_orm::DatabaseConnection,
-) -> Result<Option<String>, String> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
-
-    let count = async |sql: &str| -> Result<i64, String> {
-        conn.query_one_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
-            .await
-            .map_err(|error| format!("{error}"))?
-            .ok_or_else(|| "a COUNT query returned no row".to_string())?
-            .try_get_by_index::<i64>(0)
-            .map_err(|error| format!("{error}"))
-    };
-
+async fn adopted_scope_settings_present(db: &WorktreeDb) -> Result<Option<String>, String> {
     let mut parts = Vec::new();
-    let layers = count("SELECT COUNT(*) FROM `layer` WHERE `worktree_id` = ''").await?;
-    if layers > 0 {
-        parts.push(format!("{layers} layer registration(s)"));
-    }
-    // The ownership rows matter more than the registrations: they are what keeps
-    // a retained overlay file unstageable.
-    let owned = count("SELECT COUNT(*) FROM `layer_path` WHERE `worktree_id` = ''").await?;
-    if owned > 0 {
-        parts.push(format!("{owned} materialized overlay path(s)"));
-    }
-    let patterns = count("SELECT COUNT(*) FROM `sparse_view` WHERE `worktree_id` = ''").await?;
-    if patterns > 0 {
-        parts.push(format!("{patterns} sparse pattern(s)"));
-    }
-    // A legacy `sparse.enabled = true` with NO patterns migrates into
-    // `sparse_view_meta`, so counting patterns alone would miss it.
-    let sparse_enabled = count(
-        "SELECT COUNT(*) FROM `sparse_view_meta` \
-          WHERE `worktree_id` = '' AND `enabled` <> 0",
-    )
-    .await?;
-    if sparse_enabled > 0 {
-        parts.push("an enabled sparse view".to_string());
+    match db {
+        WorktreeDb::Redb { state, .. } => {
+            let layers = state
+                .list_layers("")
+                .await
+                .map_err(|e| format!("{e}"))?
+                .len();
+            if layers > 0 {
+                parts.push(format!("{layers} layer registration(s)"));
+            }
+            let owned = state
+                .list_layer_paths("", None)
+                .await
+                .map_err(|e| format!("{e}"))?
+                .len();
+            if owned > 0 {
+                parts.push(format!("{owned} materialized overlay path(s)"));
+            }
+            if let Some(sv) = state
+                .get_sparse_view("")
+                .await
+                .map_err(|e| format!("{e}"))?
+            {
+                if !sv.patterns.is_empty() {
+                    parts.push(format!("{} sparse pattern(s)", sv.patterns.len()));
+                }
+                if sv.enabled {
+                    parts.push("an enabled sparse view".to_string());
+                }
+            }
+        }
+        WorktreeDb::Sqlite(conn) => {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+            let count = async |sql: &str| -> Result<i64, String> {
+                conn.query_one_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+                    .await
+                    .map_err(|error| format!("{error}"))?
+                    .ok_or_else(|| "a COUNT query returned no row".to_string())?
+                    .try_get_by_index::<i64>(0)
+                    .map_err(|error| format!("{error}"))
+            };
+
+            let layers = count("SELECT COUNT(*) FROM `layer` WHERE `worktree_id` = ''").await?;
+            if layers > 0 {
+                parts.push(format!("{layers} layer registration(s)"));
+            }
+            let owned = count("SELECT COUNT(*) FROM `layer_path` WHERE `worktree_id` = ''").await?;
+            if owned > 0 {
+                parts.push(format!("{owned} materialized overlay path(s)"));
+            }
+            let patterns =
+                count("SELECT COUNT(*) FROM `sparse_view` WHERE `worktree_id` = ''").await?;
+            if patterns > 0 {
+                parts.push(format!("{patterns} sparse pattern(s)"));
+            }
+            let sparse_enabled = count(
+                "SELECT COUNT(*) FROM `sparse_view_meta` \
+                  WHERE `worktree_id` = '' AND `enabled` <> 0",
+            )
+            .await?;
+            if sparse_enabled > 0 {
+                parts.push("an enabled sparse view".to_string());
+            }
+        }
     }
     if parts.is_empty() {
         return Ok(None);
@@ -1197,7 +1226,9 @@ async fn resolve_identity_collision(path: &str) -> WorktreeResult<String> {
     // registry still calls active. Reconciliation would then read the marker
     // as stale and lift it, silently undoing the repair. The intent row is
     // what makes `worktree repair` finish it instead.
-    let db = crate::internal::db::get_db_conn_instance().await;
+    let db = WorktreeDb::open_current_read_write()
+        .await
+        .map_err(WorktreeError::OperationBlocked)?;
     let payload = serde_json::json!({
         "path": target.to_string_lossy(),
         "delete_dir": false,
@@ -1963,6 +1994,229 @@ mod tests {
         assert_eq!(
             callers[0].1,
             "match tokio::task::spawn_blocking(move || acquire_registry_lock(common)).await {"
+        );
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_worktree_op_memory_automation_and_hooks() {
+        use clap::Parser;
+
+        use super::{WorktreeArgs, execute_safe};
+        use crate::{
+            command::{add, automation, commit, hooks, init, memory, op},
+            internal::{config::ConfigKv, head::Head},
+            utils::{output::OutputConfig, test::ChangeDirGuard},
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = OutputConfig {
+            pager: false,
+            quiet: true,
+            ..OutputConfig::default()
+        };
+
+        // 1. Initialize pure-redb repo and create initial commit.
+        let repo_dir = tmp.path().join("wt-op-mem-auto-hooks");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "-q",
+                "-b",
+                "main",
+                repo_dir.to_string_lossy().as_ref(),
+            ])
+            .expect("parse init"),
+            &output,
+        )
+        .await
+        .expect("init redb repo");
+
+        let _cwd = ChangeDirGuard::new(&repo_dir);
+        let dot_libra = repo_dir.join(".libra");
+        assert!(!dot_libra.join("libra.db").exists());
+
+        ConfigKv::set("user.name", "Worktree Tester", false)
+            .await
+            .expect("set user.name");
+        ConfigKv::set("user.email", "wt@example.com", false)
+            .await
+            .expect("set user.email");
+
+        std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write base");
+        add::execute_safe(
+            add::AddArgs::try_parse_from(["add", "base.txt"]).expect("parse add"),
+            &output,
+        )
+        .await
+        .expect("add base");
+        commit::execute_safe(
+            commit::CommitArgs {
+                message: Some("base commit".to_string()),
+                ..commit::CommitArgs::default()
+            },
+            &output,
+        )
+        .await
+        .expect("commit base");
+        let base_oid = Head::current_commit().await.expect("base oid");
+
+        // 2. AC1: Linked worktree lifecycle (add, list, doctor, repair, remove --delete-dir) sharing `.libra/redb/`.
+        let wt_path = tmp.path().join("linked-wt");
+        execute_safe(
+            WorktreeArgs::try_parse_from([
+                "worktree",
+                "add",
+                "wt1",
+                "--path",
+                wt_path.to_string_lossy().as_ref(),
+                "-b",
+                "wt-branch",
+            ])
+            .expect("parse worktree add"),
+            &output,
+        )
+        .await
+        .expect("worktree add on redb");
+        assert!(wt_path.join("base.txt").is_file());
+
+        // Commit inside the linked worktree sharing `.libra/redb/`.
+        {
+            let _wt_cwd = ChangeDirGuard::new(&wt_path);
+            std::fs::write(wt_path.join("wt_only.txt"), "linked\n").expect("write wt_only");
+            add::execute_safe(
+                add::AddArgs::try_parse_from(["add", "wt_only.txt"]).expect("parse add wt"),
+                &output,
+            )
+            .await
+            .expect("add wt_only");
+            commit::execute_safe(
+                commit::CommitArgs {
+                    message: Some("linked worktree commit".to_string()),
+                    ..commit::CommitArgs::default()
+                },
+                &output,
+            )
+            .await
+            .expect("commit in linked worktree");
+            let wt_head = Head::current_commit().await.expect("linked HEAD");
+            assert_ne!(wt_head, base_oid);
+        }
+
+        // Main worktree HEAD stays untouched at base_oid; doctor & repair & remove succeed.
+        assert_eq!(Head::current_commit().await, Some(base_oid));
+        execute_safe(
+            WorktreeArgs::try_parse_from(["worktree", "list"]).expect("parse worktree list"),
+            &output,
+        )
+        .await
+        .expect("worktree list on redb");
+        execute_safe(
+            WorktreeArgs::try_parse_from(["worktree", "doctor"]).expect("parse worktree doctor"),
+            &output,
+        )
+        .await
+        .expect("worktree doctor on redb");
+        execute_safe(
+            WorktreeArgs::try_parse_from(["worktree", "repair", "--confirm"])
+                .expect("parse worktree repair"),
+            &output,
+        )
+        .await
+        .expect("worktree repair on redb");
+        execute_safe(
+            WorktreeArgs::try_parse_from([
+                "worktree",
+                "remove",
+                "--delete-dir",
+                "--path",
+                wt_path.to_string_lossy().as_ref(),
+            ])
+            .expect("parse worktree remove"),
+            &output,
+        )
+        .await
+        .expect("worktree remove --delete-dir on redb");
+        assert!(!wt_path.exists());
+
+        // 3. AC2: `op log` / `op doctor` / `op reconcile` on Redb.
+        op::execute_safe(
+            op::OpArgs::try_parse_from(["op", "log"]).expect("parse op log"),
+            &output,
+        )
+        .await
+        .expect("op log on redb");
+        op::execute_safe(
+            op::OpArgs::try_parse_from(["op", "doctor"]).expect("parse op doctor"),
+            &output,
+        )
+        .await
+        .expect("op doctor on redb");
+        op::execute_safe(
+            op::OpArgs::try_parse_from(["op", "reconcile", "--dry-run"])
+                .expect("parse op reconcile"),
+            &output,
+        )
+        .await
+        .expect("op reconcile on redb");
+
+        // 4. AC3: `memory`, `automation`, and `hooks` on Redb without opening `.libra/libra.db`.
+        memory::execute_safe(
+            memory::MemoryArgs::try_parse_from(["memory", "rebuild"])
+                .expect("parse memory rebuild"),
+            &output,
+        )
+        .await
+        .expect("memory rebuild on redb");
+        memory::execute_safe(
+            memory::MemoryArgs::try_parse_from(["memory", "status"]).expect("parse memory status"),
+            &output,
+        )
+        .await
+        .expect("memory status on redb");
+        memory::execute_safe(
+            memory::MemoryArgs::try_parse_from(["memory", "list"]).expect("parse memory list"),
+            &output,
+        )
+        .await
+        .expect("memory list on redb");
+
+        automation::execute_safe(
+            automation::AutomationArgs::try_parse_from(["automation", "list"])
+                .expect("parse automation list"),
+            &output,
+        )
+        .await
+        .expect("automation list on redb");
+        automation::execute_safe(
+            automation::AutomationArgs::try_parse_from(["automation", "run"])
+                .expect("parse automation run"),
+            &output,
+        )
+        .await
+        .expect("automation run on redb");
+        automation::execute_safe(
+            automation::AutomationArgs::try_parse_from(["automation", "history"])
+                .expect("parse automation history"),
+            &output,
+        )
+        .await
+        .expect("automation history on redb");
+
+        let gemini_err = hooks::gemini_hook_rejection("hook ingestion failed").await;
+        assert!(
+            gemini_err
+                .message()
+                .contains("gemini hook ingestion is disabled"),
+            "hooks repository probe must pass on healthy Redb repo and return uninstall hint, got: {}",
+            gemini_err.message()
+        );
+
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "worktree/op/memory/automation/hooks on Redb must never create .libra/libra.db"
         );
     }
 }

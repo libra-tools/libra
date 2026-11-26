@@ -131,9 +131,35 @@ impl ConfigScope {
 
     pub async fn ensure_config_exists(&self) -> Result<(), String> {
         if *self != ConfigScope::Local {
+            if ScopedConfig::open_storage_for_write(*self).await?.is_some() {
+                return Ok(());
+            }
             ScopedConfig::get_connection(*self).await?;
         }
         Ok(())
+    }
+}
+
+fn config_scope_runtime_backend() -> Result<crate::storage::StorageBackendKind, String> {
+    if crate::storage::backend::REDB_RUNTIME_UNLOCKED {
+        crate::storage::StorageBackendKind::resolve_without_repo().map_err(|e| e.to_string())
+    } else {
+        Ok(crate::storage::StorageBackendKind::compiled_default())
+    }
+}
+
+fn is_standard_config_scope_filename(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name == crate::storage::config_store::CONFIG_SQLITE_FILE_NAME
+            || name == crate::storage::config_store::CONFIG_REDB_FILE_NAME
+    })
+}
+
+fn config_kv_entry_from_storage(entry: crate::storage::ConfigEntry) -> ConfigKvEntry {
+    ConfigKvEntry {
+        key: entry.key,
+        value: entry.value,
+        encrypted: entry.encrypted,
     }
 }
 
@@ -305,6 +331,148 @@ impl ScopedConfig {
         Ok(conn)
     }
 
+    async fn open_storage_for_read(
+        scope: ConfigScope,
+    ) -> Result<Option<std::sync::Arc<dyn crate::storage::ConfigStore>>, String> {
+        use crate::storage::{
+            StorageBackendKind,
+            config_store::{config_scope_dir_from_db_path, open_config_scope_for_read},
+            error::StorageBackendError,
+        };
+
+        match scope {
+            ConfigScope::Local => {
+                let storage = try_get_storage_path(None).map_err(|_| {
+                    "fatal: not a libra repository (or any of the parent directories): .libra"
+                        .to_string()
+                })?;
+                match crate::storage::runtime::detect_repo_backend(&storage) {
+                    Ok(StorageBackendKind::Redb) => {
+                        let store =
+                            crate::storage::runtime::open_repo_config_store_read_only(&storage)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        Ok(Some(store))
+                    }
+                    Ok(StorageBackendKind::Sqlite) => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+            ConfigScope::Global | ConfigScope::System => {
+                let config_path = match scope {
+                    ConfigScope::Global => {
+                        crate::internal::config::global_config_path_for_read().await
+                    }
+                    _ => scope.get_config_path(),
+                };
+                let Some(config_path) = config_path else {
+                    return Err(format!(
+                        "Could not determine config path for {} scope",
+                        scope_name(scope)
+                    ));
+                };
+                let runtime_backend = config_scope_runtime_backend()?;
+                let use_storage_layer = match runtime_backend {
+                    StorageBackendKind::Redb => true,
+                    StorageBackendKind::Sqlite => {
+                        cfg!(feature = "storage-redb")
+                            && is_standard_config_scope_filename(&config_path)
+                    }
+                };
+                if !use_storage_layer {
+                    return Ok(None);
+                }
+                let scope_dir =
+                    config_scope_dir_from_db_path(&config_path).map_err(|e| e.to_string())?;
+                match open_config_scope_for_read(&scope_dir, scope.database_role(), runtime_backend)
+                    .await
+                {
+                    Ok(store) => Ok(Some(store)),
+                    Err(StorageBackendError::NotFound { .. }) => {
+                        Err(format!("NOT_FOUND:{}", config_path.display()))
+                    }
+                    Err(err) if err.io_kind() == Some(std::io::ErrorKind::PermissionDenied) => Err(
+                        format!("UNREADABLE:{}:Permission denied", config_path.display()),
+                    ),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+        }
+    }
+
+    async fn open_storage_for_write(
+        scope: ConfigScope,
+    ) -> Result<Option<std::sync::Arc<dyn crate::storage::ConfigStore>>, String> {
+        use crate::storage::{
+            StorageBackendKind,
+            config_store::{
+                DEFAULT_CONFIG_SCOPE_LOCK_TIMEOUT, config_scope_dir_from_db_path,
+                open_or_create_locked_config_scope_for_write,
+            },
+        };
+
+        match scope {
+            ConfigScope::Local => {
+                let storage = try_get_storage_path(None).map_err(|_| {
+                    "fatal: not a libra repository (or any of the parent directories): .libra"
+                        .to_string()
+                })?;
+                match crate::storage::runtime::detect_repo_backend(&storage) {
+                    Ok(StorageBackendKind::Redb) => {
+                        let store =
+                            crate::storage::runtime::open_repo_config_store_read_write(&storage)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        Ok(Some(store))
+                    }
+                    Ok(StorageBackendKind::Sqlite) => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+            ConfigScope::Global | ConfigScope::System => {
+                let config_path = match scope {
+                    ConfigScope::Global => {
+                        crate::internal::config::global_config_path_for_write().await?
+                    }
+                    _ => scope.get_config_path(),
+                };
+                let Some(config_path) = config_path else {
+                    return Err(format!(
+                        "Could not determine config path for {} scope",
+                        scope_name(scope)
+                    ));
+                };
+                let runtime_backend = config_scope_runtime_backend()?;
+                let use_storage_layer = match runtime_backend {
+                    StorageBackendKind::Redb => true,
+                    StorageBackendKind::Sqlite => {
+                        cfg!(feature = "storage-redb")
+                            && is_standard_config_scope_filename(&config_path)
+                    }
+                };
+                if !use_storage_layer {
+                    return Ok(None);
+                }
+                let scope_dir =
+                    config_scope_dir_from_db_path(&config_path).map_err(|e| e.to_string())?;
+                let locked = open_or_create_locked_config_scope_for_write(
+                    &scope_dir,
+                    scope.database_role(),
+                    runtime_backend,
+                    DEFAULT_CONFIG_SCOPE_LOCK_TIMEOUT,
+                )
+                .await
+                .map_err(|err| {
+                    format!(
+                        "Failed to connect to {} config database: {err}",
+                        scope_name(scope)
+                    )
+                })?;
+                Ok(Some(locked.store_arc()))
+            }
+        }
+    }
+
     // ── ConfigKv wrappers with scope ─────────────────────────────────
 
     async fn begin_mutation(scope: ConfigScope) -> Result<DatabaseTransaction, String> {
@@ -335,6 +503,13 @@ impl ScopedConfig {
     }
 
     pub async fn get(scope: ConfigScope, key: &str) -> Result<Option<ConfigKvEntry>, String> {
+        if let Some(store) = Self::open_storage_for_read(scope).await? {
+            return store
+                .get(key)
+                .await
+                .map(|opt| opt.map(config_kv_entry_from_storage))
+                .map_err(|e| e.to_string());
+        }
         let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::get_with_conn(&conn, key)
             .await
@@ -342,6 +517,13 @@ impl ScopedConfig {
     }
 
     pub async fn get_all(scope: ConfigScope, key: &str) -> Result<Vec<ConfigKvEntry>, String> {
+        if let Some(store) = Self::open_storage_for_read(scope).await? {
+            return store
+                .get_all(key)
+                .await
+                .map(|rows| rows.into_iter().map(config_kv_entry_from_storage).collect())
+                .map_err(|e| e.to_string());
+        }
         let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::get_all_with_conn(&conn, key)
             .await
@@ -352,6 +534,13 @@ impl ScopedConfig {
         scope: ConfigScope,
         key: &str,
     ) -> Result<Vec<ConfigKvEntry>, String> {
+        if let Some(store) = Self::open_storage_for_write(scope).await? {
+            return store
+                .get_all(key)
+                .await
+                .map(|rows| rows.into_iter().map(config_kv_entry_from_storage).collect())
+                .map_err(|error| error.to_string());
+        }
         let conn = Self::get_connection(scope).await?;
         ConfigKv::select_set_replacement_with_conn(&conn, key)
             .await
@@ -370,6 +559,23 @@ impl ScopedConfig {
                 "core.objectformat cannot be changed after init; the object format is fixed at fresh init"
                     .to_string(),
             );
+        }
+        if let Some(store) = Self::open_storage_for_write(scope).await? {
+            if !encrypted {
+                let existing = store
+                    .get_all(key)
+                    .await
+                    .map_err(|e| format!("failed to set config '{key}': {e}"))?;
+                if existing.iter().any(|entry| entry.encrypted) {
+                    return Err(format!(
+                        "failed to set config '{key}': {PLAINTEXT_ENCRYPTED_REPLACEMENT}"
+                    ));
+                }
+            }
+            return store
+                .set(key, value, encrypted)
+                .await
+                .map_err(|e| format!("failed to set config '{key}': {e}"));
         }
         let txn = Self::begin_mutation(scope).await?;
         if let Err(error) = ConfigKv::set_prepared_with_conn(&txn, key, value, encrypted).await {
@@ -395,6 +601,12 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
+        if let Some(store) = Self::open_storage_for_write(scope).await? {
+            return store
+                .add(key, value, encrypted)
+                .await
+                .map_err(|e| format!("failed to add config '{key}': {e}"));
+        }
         let txn = Self::begin_mutation(scope).await?;
         ConfigKv::add_with_conn(&txn, key, value, encrypted)
             .await
@@ -410,6 +622,12 @@ impl ScopedConfig {
                 "core.objectformat cannot be changed after init; the object format is fixed at fresh init"
                     .to_string(),
             );
+        }
+        if let Some(store) = Self::open_storage_for_write(scope).await? {
+            return store
+                .unset(key)
+                .await
+                .map_err(|e| format!("failed to unset config '{key}': {e}"));
         }
         let txn = Self::begin_mutation(scope).await?;
         let removed = ConfigKv::unset_with_conn(&txn, key)
@@ -433,6 +651,34 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
+        if let Some(store) = Self::open_storage_for_write(scope).await? {
+            let entries = store
+                .get_all(key)
+                .await
+                .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+            let mut kept = Vec::with_capacity(entries.len());
+            let mut removed = 0usize;
+            for entry in entries {
+                if matcher(&entry.value) {
+                    removed += 1;
+                } else {
+                    kept.push(entry);
+                }
+            }
+            if removed > 0 {
+                store
+                    .unset_all(key)
+                    .await
+                    .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+                for entry in kept {
+                    store
+                        .add(key, &entry.value, entry.encrypted)
+                        .await
+                        .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+                }
+            }
+            return Ok(removed);
+        }
         let txn = Self::begin_mutation(scope).await?;
         let removed = ConfigKv::unset_matching_with_conn(&txn, key, matcher)
             .await
@@ -450,6 +696,16 @@ impl ScopedConfig {
                 "core.objectformat cannot be changed after init; the object format is fixed at fresh init"
                     .to_string(),
             );
+        }
+        if let Some(store) = Self::open_storage_for_write(scope).await? {
+            store
+                .unset_all(key)
+                .await
+                .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+            return store
+                .set(key, value, false)
+                .await
+                .map_err(|e| format!("failed to replace config '{key}': {e}"));
         }
         let txn = Self::begin_mutation(scope).await?;
         ConfigKv::unset_all_with_conn(&txn, key)
@@ -491,6 +747,36 @@ impl ScopedConfig {
             };
             matched_entries.push((entry, matches));
         }
+        if let Some(store) = Self::open_storage_for_write(scope).await? {
+            store
+                .unset_all(key)
+                .await
+                .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+            let mut replaced = 0usize;
+            for (entry, matches) in matched_entries {
+                if matches {
+                    if replaced == 0 {
+                        store
+                            .add(key, value, encrypted)
+                            .await
+                            .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                    }
+                    replaced += 1;
+                } else {
+                    store
+                        .add(key, &entry.value, entry.encrypted)
+                        .await
+                        .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                }
+            }
+            if replaced == 0 {
+                store
+                    .add(key, value, encrypted)
+                    .await
+                    .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+            }
+            return Ok(replaced);
+        }
         let txn = Self::begin_mutation(scope).await?;
         ConfigKv::unset_all_with_conn(&txn, key)
             .await
@@ -528,6 +814,12 @@ impl ScopedConfig {
                     .to_string(),
             );
         }
+        if let Some(store) = Self::open_storage_for_write(scope).await? {
+            return store
+                .unset_all(key)
+                .await
+                .map_err(|e| format!("failed to unset config '{key}': {e}"));
+        }
         let txn = Self::begin_mutation(scope).await?;
         let removed = ConfigKv::unset_all_with_conn(&txn, key)
             .await
@@ -539,6 +831,13 @@ impl ScopedConfig {
     }
 
     pub async fn list_all(scope: ConfigScope) -> Result<Vec<ConfigKvEntry>, String> {
+        if let Some(store) = Self::open_storage_for_read(scope).await? {
+            return store
+                .list_all()
+                .await
+                .map(|rows| rows.into_iter().map(config_kv_entry_from_storage).collect())
+                .map_err(|e| e.to_string());
+        }
         let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::list_all_with_conn(&conn)
             .await
@@ -549,6 +848,13 @@ impl ScopedConfig {
         scope: ConfigScope,
         prefix: &str,
     ) -> Result<Vec<ConfigKvEntry>, String> {
+        if let Some(store) = Self::open_storage_for_read(scope).await? {
+            return store
+                .get_by_prefix(prefix)
+                .await
+                .map(|rows| rows.into_iter().map(config_kv_entry_from_storage).collect())
+                .map_err(|e| e.to_string());
+        }
         let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::get_by_prefix_with_conn(&conn, prefix)
             .await
@@ -559,6 +865,16 @@ impl ScopedConfig {
         scope: ConfigScope,
         pattern: &str,
     ) -> Result<Vec<ConfigKvEntry>, String> {
+        if let Some(store) = Self::open_storage_for_read(scope).await? {
+            let re = regex::Regex::new(pattern)
+                .map_err(|e| format!("invalid regex pattern '{pattern}': {e}"))?;
+            let rows = store.list_all().await.map_err(|e| e.to_string())?;
+            return Ok(rows
+                .into_iter()
+                .filter(|r| re.is_match(&r.key))
+                .map(config_kv_entry_from_storage)
+                .collect());
+        }
         let conn = Self::get_connection_for_read(scope).await?;
         ConfigKv::get_regexp_with_conn(&conn, pattern)
             .await
@@ -3847,8 +4163,32 @@ fn scope_origin_path(scope: ConfigScope) -> Option<PathBuf> {
     match scope {
         ConfigScope::Local => crate::utils::util::try_get_storage_path(None)
             .ok()
-            .map(|storage| storage.join(crate::utils::util::DATABASE)),
-        other => other.get_config_path(),
+            .map(|storage| {
+                #[cfg(feature = "storage-redb")]
+                if matches!(
+                    crate::storage::runtime::detect_repo_backend(&storage),
+                    Ok(crate::storage::StorageBackendKind::Redb)
+                ) && let Ok(path) = crate::storage::runtime::resolve_repo_git_redb_path(&storage)
+                {
+                    return path;
+                }
+                storage.join(crate::utils::util::DATABASE)
+            }),
+        other => {
+            let path = other.get_config_path()?;
+            if let Some(scope_dir) = path.parent()
+                && let Ok(crate::storage::config_store::ConfigScopeAuthority::Manifest {
+                    db_path,
+                    ..
+                }) = crate::storage::config_store::inspect_config_scope_authority(
+                    scope_dir,
+                    other.database_role(),
+                )
+            {
+                return Some(db_path);
+            }
+            Some(path)
+        }
     }
 }
 
@@ -4462,28 +4802,61 @@ async fn handle_remove_section(
     if scope == ConfigScope::Local && is_exact_core_section(name) {
         return Err(core_objectformat_mutation_error("config --remove-section"));
     }
-    // Lock before reading; the compatibility marker rolls back with deletes.
-    let txn = ScopedConfig::begin_mutation(scope)
+    let removed = if let Some(store) = ScopedConfig::open_storage_for_write(scope)
         .await
-        .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
-
-    let keys = section_member_keys(&txn, name).await?;
-    if keys.is_empty() {
-        return Err(
-            CliError::from_legacy_string(format!("error: No such section: {name}"))
-                .with_exit_code(128),
-        );
-    }
-
-    let mut removed = 0usize;
-    for key in &keys {
-        removed += ConfigKv::unset_all_with_conn(&txn, key)
+        .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?
+    {
+        let prefix = format!("{name}.");
+        let entries = store
+            .get_by_prefix(&prefix)
             .await
-            .map_err(|e| config_write_cli_error(format!("failed to remove '{key}': {e}")))?;
-    }
-    txn.commit()
-        .await
-        .map_err(|e| config_write_cli_error(format!("failed to commit config transaction: {e}")))?;
+            .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?;
+        let mut keys: Vec<String> = entries
+            .into_iter()
+            .filter(|e| key_in_section(&e.key, name))
+            .map(|e| e.key)
+            .collect();
+        keys.sort();
+        keys.dedup();
+        if keys.is_empty() {
+            return Err(
+                CliError::from_legacy_string(format!("error: No such section: {name}"))
+                    .with_exit_code(128),
+            );
+        }
+        let mut removed = 0usize;
+        for key in &keys {
+            removed += store
+                .unset_all(key)
+                .await
+                .map_err(|e| config_write_cli_error(format!("failed to remove '{key}': {e}")))?;
+        }
+        removed
+    } else {
+        // Lock before reading; the compatibility marker rolls back with deletes.
+        let txn = ScopedConfig::begin_mutation(scope).await.map_err(|e| {
+            config_write_cli_error(format!("failed to start config transaction: {e}"))
+        })?;
+
+        let keys = section_member_keys(&txn, name).await?;
+        if keys.is_empty() {
+            return Err(
+                CliError::from_legacy_string(format!("error: No such section: {name}"))
+                    .with_exit_code(128),
+            );
+        }
+
+        let mut removed = 0usize;
+        for key in &keys {
+            removed += ConfigKv::unset_all_with_conn(&txn, key)
+                .await
+                .map_err(|e| config_write_cli_error(format!("failed to remove '{key}': {e}")))?;
+        }
+        txn.commit().await.map_err(|e| {
+            config_write_cli_error(format!("failed to commit config transaction: {e}"))
+        })?;
+        removed
+    };
 
     if output.is_json() {
         emit_json_data(
@@ -4524,77 +4897,152 @@ async fn handle_rename_section(
         .with_exit_code(2));
     }
 
-    let txn = ScopedConfig::begin_mutation(scope)
+    let old_keys: Vec<String> = if let Some(store) = ScopedConfig::open_storage_for_write(scope)
         .await
-        .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
-
-    // Read source members transactionally (exact section semantics). Use the
-    // full entries (value + encrypted) in insertion order for the re-add.
-    let old_prefix = format!("{old}.");
-    let source: Vec<ConfigKvEntry> = ConfigKv::get_by_prefix_with_conn(&txn, &old_prefix)
-        .await
-        .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
-        .into_iter()
-        .filter(|e| key_in_section(&e.key, old))
-        .collect();
-    if source.is_empty() {
-        return Err(
-            CliError::from_legacy_string(format!("error: No such section: {old}"))
-                .with_exit_code(128),
-        );
-    }
-
-    // Refuse to write into a destination section that already exists, so every
-    // re-added key is fresh (preserving the source's exact value + encrypted
-    // flag, and avoiding silent multi-value merges).
-    if !section_member_keys(&txn, new).await?.is_empty() {
-        return Err(CliError::from_legacy_string(format!(
-            "error: destination section already exists: {new}"
-        ))
-        .with_exit_code(128));
-    }
-
-    // System scope holds no vault: refuse a rename that would either carry an
-    // encrypted source row into it or land a key under a vault/secret namespace
-    // (which direct `set --system` also rejects).
-    if scope == ConfigScope::System {
+        .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?
+    {
+        let old_prefix = format!("{old}.");
+        let source: Vec<ConfigKvEntry> = store
+            .get_by_prefix(&old_prefix)
+            .await
+            .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
+            .into_iter()
+            .map(config_kv_entry_from_storage)
+            .filter(|e| key_in_section(&e.key, old))
+            .collect();
+        if source.is_empty() {
+            return Err(
+                CliError::from_legacy_string(format!("error: No such section: {old}"))
+                    .with_exit_code(128),
+            );
+        }
+        let new_prefix = format!("{new}.");
+        let dest_exists = store
+            .get_by_prefix(&new_prefix)
+            .await
+            .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
+            .into_iter()
+            .any(|e| key_in_section(&e.key, new));
+        if dest_exists {
+            return Err(CliError::from_legacy_string(format!(
+                "error: destination section already exists: {new}"
+            ))
+            .with_exit_code(128));
+        }
+        if scope == ConfigScope::System {
+            for e in &source {
+                let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
+                let new_key = format!("{new}.{name}");
+                if e.encrypted
+                    || new_key.to_ascii_lowercase().starts_with("vault.")
+                    || is_sensitive_key(&new_key)
+                {
+                    return Err(CliError::command_usage(
+                        "vault-encrypted secrets are not supported in --system scope",
+                    )
+                    .with_hint(
+                        "rename into a vault/secret namespace is rejected in --system; use --global or --local",
+                    ));
+                }
+            }
+        }
         for e in &source {
             let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
             let new_key = format!("{new}.{name}");
-            if e.encrypted
-                || new_key.to_ascii_lowercase().starts_with("vault.")
-                || is_sensitive_key(&new_key)
-            {
-                return Err(CliError::command_usage(
-                    "vault-encrypted secrets are not supported in --system scope",
-                )
-                .with_hint(
-                    "rename into a vault/secret namespace is rejected in --system; use --global or --local",
-                ));
+            store
+                .add(&new_key, &e.value, e.encrypted)
+                .await
+                .map_err(|err| {
+                    config_write_cli_error(format!("failed to write '{new_key}': {err}"))
+                })?;
+        }
+        let mut old_keys: Vec<String> = source.iter().map(|e| e.key.clone()).collect();
+        old_keys.sort();
+        old_keys.dedup();
+        for key in &old_keys {
+            store.unset_all(key).await.map_err(|err| {
+                config_write_cli_error(format!("failed to remove '{key}': {err}"))
+            })?;
+        }
+        old_keys
+    } else {
+        let txn = ScopedConfig::begin_mutation(scope).await.map_err(|e| {
+            config_write_cli_error(format!("failed to start config transaction: {e}"))
+        })?;
+
+        // Read source members transactionally (exact section semantics). Use the
+        // full entries (value + encrypted) in insertion order for the re-add.
+        let old_prefix = format!("{old}.");
+        let source: Vec<ConfigKvEntry> = ConfigKv::get_by_prefix_with_conn(&txn, &old_prefix)
+            .await
+            .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
+            .into_iter()
+            .filter(|e| key_in_section(&e.key, old))
+            .collect();
+        if source.is_empty() {
+            return Err(
+                CliError::from_legacy_string(format!("error: No such section: {old}"))
+                    .with_exit_code(128),
+            );
+        }
+
+        // Refuse to write into a destination section that already exists, so every
+        // re-added key is fresh (preserving the source's exact value + encrypted
+        // flag, and avoiding silent multi-value merges).
+        if !section_member_keys(&txn, new).await?.is_empty() {
+            return Err(CliError::from_legacy_string(format!(
+                "error: destination section already exists: {new}"
+            ))
+            .with_exit_code(128));
+        }
+
+        // System scope holds no vault: refuse a rename that would either carry an
+        // encrypted source row into it or land a key under a vault/secret namespace
+        // (which direct `set --system` also rejects).
+        if scope == ConfigScope::System {
+            for e in &source {
+                let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
+                let new_key = format!("{new}.{name}");
+                if e.encrypted
+                    || new_key.to_ascii_lowercase().starts_with("vault.")
+                    || is_sensitive_key(&new_key)
+                {
+                    return Err(CliError::command_usage(
+                        "vault-encrypted secrets are not supported in --system scope",
+                    )
+                    .with_hint(
+                        "rename into a vault/secret namespace is rejected in --system; use --global or --local",
+                    ));
+                }
             }
         }
-    }
 
-    for e in &source {
-        // Exact members all begin with `{old}.`; the remainder is the key name
-        // under the section (which itself may contain dots for nested names).
-        let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
-        let new_key = format!("{new}.{name}");
-        ConfigKv::add_with_conn(&txn, &new_key, &e.value, e.encrypted)
-            .await
-            .map_err(|err| config_write_cli_error(format!("failed to write '{new_key}': {err}")))?;
-    }
-    let mut old_keys: Vec<String> = source.iter().map(|e| e.key.clone()).collect();
-    old_keys.sort();
-    old_keys.dedup();
-    for key in &old_keys {
-        ConfigKv::unset_all_with_conn(&txn, key)
-            .await
-            .map_err(|err| config_write_cli_error(format!("failed to remove '{key}': {err}")))?;
-    }
-    txn.commit()
-        .await
-        .map_err(|e| config_write_cli_error(format!("failed to commit config transaction: {e}")))?;
+        for e in &source {
+            // Exact members all begin with `{old}.`; the remainder is the key name
+            // under the section (which itself may contain dots for nested names).
+            let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
+            let new_key = format!("{new}.{name}");
+            ConfigKv::add_with_conn(&txn, &new_key, &e.value, e.encrypted)
+                .await
+                .map_err(|err| {
+                    config_write_cli_error(format!("failed to write '{new_key}': {err}"))
+                })?;
+        }
+        let mut old_keys: Vec<String> = source.iter().map(|e| e.key.clone()).collect();
+        old_keys.sort();
+        old_keys.dedup();
+        for key in &old_keys {
+            ConfigKv::unset_all_with_conn(&txn, key)
+                .await
+                .map_err(|err| {
+                    config_write_cli_error(format!("failed to remove '{key}': {err}"))
+                })?;
+        }
+        txn.commit().await.map_err(|e| {
+            config_write_cli_error(format!("failed to commit config transaction: {e}"))
+        })?;
+        old_keys
+    };
 
     if output.is_json() {
         emit_json_data(
@@ -4899,14 +5347,42 @@ async fn handle_path(scope: ConfigScope, output: &OutputConfig) -> CliResult<()>
                     "error: not a libra repository (or any parent up to /)\n\nhint: use --global to read/write user-level config without a repository\nhint: use libra init to create a repository here",
                 )
             })?;
-            storage.join(DATABASE)
+            match crate::storage::runtime::detect_repo_backend(&storage) {
+                Ok(crate::storage::StorageBackendKind::Redb) => {
+                    #[cfg(feature = "storage-redb")]
+                    {
+                        crate::storage::runtime::resolve_repo_git_redb_path(&storage)
+                            .unwrap_or_else(|_| storage.join(DATABASE))
+                    }
+                    #[cfg(not(feature = "storage-redb"))]
+                    {
+                        storage.join(DATABASE)
+                    }
+                }
+                Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => storage.join(DATABASE),
+            }
         }
-        ConfigScope::Global | ConfigScope::System => scope.get_config_path().ok_or_else(|| {
-            CliError::from_legacy_string(format!(
-                "error: could not determine {} config path",
-                scope_name(scope)
-            ))
-        })?,
+        ConfigScope::Global | ConfigScope::System => {
+            let configured = scope.get_config_path().ok_or_else(|| {
+                CliError::from_legacy_string(format!(
+                    "error: could not determine {} config path",
+                    scope_name(scope)
+                ))
+            })?;
+            if let Some(scope_dir) = configured.parent()
+                && let Ok(crate::storage::config_store::ConfigScopeAuthority::Manifest {
+                    db_path,
+                    ..
+                }) = crate::storage::config_store::inspect_config_scope_authority(
+                    scope_dir,
+                    scope.database_role(),
+                )
+            {
+                db_path
+            } else {
+                configured
+            }
+        }
     };
 
     let exists = path.exists();
@@ -6059,6 +6535,482 @@ mod args_tests {
     fn git_compat_list_flag() {
         let args = ConfigArgs::try_parse_from(["config", "-l"]).unwrap();
         assert!(args.list);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_repo_global_system_config_doctor_and_repair() {
+        use crate::{
+            command::init,
+            storage::{
+                StorageBackendKind,
+                config_store::{
+                    CONFIG_FORMAT_MANIFEST_FILE, CONFIG_REDB_FILE_NAME, CONFIG_SQLITE_FILE_NAME,
+                    is_config_sqlite_tombstone_sentinel, read_config_format_manifest,
+                },
+            },
+            utils::test::ChangeDirGuard,
+        };
+
+        struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl EnvGuard {
+            fn set(pairs: &[(&'static str, Option<&Path>)]) -> Self {
+                let mut prev = Vec::new();
+                for &(k, v) in pairs {
+                    prev.push((k, std::env::var_os(k)));
+                    // SAFETY: serialized via #[serial_test::serial(cwd, env)].
+                    unsafe {
+                        match v {
+                            Some(p) => std::env::set_var(k, p),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                }
+                Self(prev)
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, v) in self.0.drain(..).rev() {
+                    // SAFETY: serialized via #[serial_test::serial(cwd, env)].
+                    unsafe {
+                        match v {
+                            Some(val) => std::env::set_var(k, val),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = OutputConfig {
+            pager: false,
+            quiet: true,
+            ..OutputConfig::default()
+        };
+
+        // 1. AC1: Repo config read/write/remove-section/rename-section on pure-redb repo.
+        let repo_dir = tmp.path().join("cfg-repo-redb");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "-q",
+                "-b",
+                "main",
+                repo_dir.to_string_lossy().as_ref(),
+            ])
+            .expect("parse init"),
+            &output,
+        )
+        .await
+        .expect("init redb repo");
+
+        let global_dir = tmp.path().join("global-redb");
+        let system_dir = tmp.path().join("system-redb");
+        let global_db = global_dir.join(CONFIG_SQLITE_FILE_NAME);
+        let system_db = system_dir.join(CONFIG_SQLITE_FILE_NAME);
+        let _env = EnvGuard::set(&[
+            ("LIBRA_CONFIG_GLOBAL_DB", Some(&global_db)),
+            ("LIBRA_CONFIG_SYSTEM_DB", Some(&system_db)),
+        ]);
+        let _cwd = ChangeDirGuard::new(&repo_dir);
+
+        execute_safe(
+            ConfigArgs::try_parse_from(["config", "set", "custom.alpha", "v1"])
+                .expect("parse local set"),
+            &output,
+        )
+        .await
+        .expect("local set on redb");
+        let got_local = ScopedConfig::get(ConfigScope::Local, "custom.alpha")
+            .await
+            .expect("local get")
+            .expect("local entry");
+        assert_eq!(got_local.value, "v1");
+
+        execute_safe(
+            ConfigArgs::try_parse_from(["config", "rename-section", "custom", "renamed"])
+                .expect("parse rename-section"),
+            &output,
+        )
+        .await
+        .expect("rename-section on redb");
+        assert_eq!(
+            ScopedConfig::get(ConfigScope::Local, "renamed.alpha")
+                .await
+                .expect("get renamed")
+                .expect("renamed entry")
+                .value,
+            "v1"
+        );
+        execute_safe(
+            ConfigArgs::try_parse_from(["config", "remove-section", "renamed"])
+                .expect("parse remove-section"),
+            &output,
+        )
+        .await
+        .expect("remove-section on redb");
+        assert!(
+            ScopedConfig::get(ConfigScope::Local, "renamed.alpha")
+                .await
+                .expect("get after remove")
+                .is_none()
+        );
+        assert!(
+            !repo_dir.join(".libra/libra.db").exists(),
+            "repo config on Redb must never create .libra/libra.db"
+        );
+
+        // 2. AC2: Global config on Redb runtime (ADR-RB-02 #2 branch B) + doctor + repair refusal.
+        execute_safe(
+            ConfigArgs::try_parse_from(["config", "set", "--global", "user.name", "Redb Global"])
+                .expect("parse global set"),
+            &output,
+        )
+        .await
+        .expect("global set on redb");
+        assert!(global_dir.join(CONFIG_REDB_FILE_NAME).is_file());
+        assert!(global_dir.join(CONFIG_FORMAT_MANIFEST_FILE).is_file());
+        assert!(
+            is_config_sqlite_tombstone_sentinel(&global_db)
+                .expect("check global tombstone sentinel")
+        );
+        let g_manifest = read_config_format_manifest(&global_dir, DatabaseRole::GlobalConfig)
+            .expect("read global manifest")
+            .expect("global manifest present");
+        assert_eq!(g_manifest.backend, StorageBackendKind::Redb);
+        assert!(g_manifest.finalized);
+        assert!(g_manifest.legacy_sqlite_tombstone);
+        assert_eq!(
+            ScopedConfig::get(ConfigScope::Global, "user.name")
+                .await
+                .expect("global get")
+                .expect("global entry")
+                .value,
+            "Redb Global"
+        );
+
+        // `config doctor --global-schema` succeeds on finalized Redb global config.
+        execute_safe(
+            ConfigArgs::try_parse_from(["config", "doctor", "--global-schema"])
+                .expect("parse config doctor"),
+            &output,
+        )
+        .await
+        .expect("config doctor on redb global scope");
+
+        // `config repair --global-schema --confirm <path>` refuses Redb global scope cleanly.
+        let canonical_global = std::fs::canonicalize(&global_db).expect("canonical global");
+        let repair_err = repair::execute(&canonical_global, &output).await;
+        assert!(
+            repair_err.is_err(),
+            "SQLite schema repair must refuse finalized redb global scope"
+        );
+
+        // Unmigrated legacy SQLite global `config.db` must be rejected fail-closed on Redb runtime.
+        let legacy_global_dir = tmp.path().join("legacy-global");
+        std::fs::create_dir_all(&legacy_global_dir).expect("mkdir legacy global");
+        let legacy_global_db = legacy_global_dir.join(CONFIG_SQLITE_FILE_NAME);
+        std::fs::write(&legacy_global_db, b"SQLite format 3\0legacy-bytes")
+            .expect("write synthetic legacy sqlite");
+        {
+            let _legacy_env = EnvGuard::set(&[("LIBRA_CONFIG_GLOBAL_DB", Some(&legacy_global_db))]);
+            let set_res = execute_safe(
+                ConfigArgs::try_parse_from(["config", "set", "--global", "user.name", "Denied"])
+                    .expect("parse legacy global set"),
+                &output,
+            )
+            .await;
+            assert!(
+                set_res.is_err(),
+                "Redb runtime must refuse writing over unmigrated legacy global config.db"
+            );
+            assert!(
+                !legacy_global_dir.join(CONFIG_REDB_FILE_NAME).exists(),
+                "must never create competing config.redb alongside legacy global config.db"
+            );
+        }
+
+        // 3. AC3: System config on Redb runtime (ADR-RB-02 #2 branch B).
+        execute_safe(
+            ConfigArgs::try_parse_from(["config", "set", "--system", "core.editor", "vim"])
+                .expect("parse system set"),
+            &output,
+        )
+        .await
+        .expect("system set on redb");
+        assert!(system_dir.join(CONFIG_REDB_FILE_NAME).is_file());
+        assert!(
+            is_config_sqlite_tombstone_sentinel(&system_db)
+                .expect("check system tombstone sentinel")
+        );
+        let s_manifest = read_config_format_manifest(&system_dir, DatabaseRole::SystemConfig)
+            .expect("read system manifest")
+            .expect("system manifest present");
+        assert_eq!(s_manifest.backend, StorageBackendKind::Redb);
+        assert!(s_manifest.finalized);
+        assert!(s_manifest.legacy_sqlite_tombstone);
+        assert_eq!(
+            ScopedConfig::get(ConfigScope::System, "core.editor")
+                .await
+                .expect("system get")
+                .expect("system entry")
+                .value,
+            "vim"
+        );
+
+        let legacy_system_dir = tmp.path().join("legacy-system");
+        std::fs::create_dir_all(&legacy_system_dir).expect("mkdir legacy system");
+        let legacy_system_db = legacy_system_dir.join(CONFIG_SQLITE_FILE_NAME);
+        std::fs::write(&legacy_system_db, b"SQLite format 3\0legacy-bytes")
+            .expect("write synthetic legacy system sqlite");
+        {
+            let _legacy_env = EnvGuard::set(&[("LIBRA_CONFIG_SYSTEM_DB", Some(&legacy_system_db))]);
+            let set_res = execute_safe(
+                ConfigArgs::try_parse_from(["config", "set", "--system", "core.editor", "nano"])
+                    .expect("parse legacy system set"),
+                &output,
+            )
+            .await;
+            assert!(
+                set_res.is_err(),
+                "Redb runtime must refuse writing over unmigrated legacy system config.db"
+            );
+            assert!(
+                !legacy_system_dir.join(CONFIG_REDB_FILE_NAME).exists(),
+                "must never create competing config.redb alongside legacy system config.db"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn dual_feature_global_system_config_cli_runtime_dispatch() {
+        use crate::storage::{
+            StorageBackendKind,
+            config_store::{
+                CONFIG_FORMAT_MANIFEST_FILE, CONFIG_MIGRATION_LOCK_FILE, CONFIG_REDB_FILE_NAME,
+                CONFIG_SQLITE_FILE_NAME, read_config_format_manifest,
+            },
+            sqlite::SqliteConfigStore,
+        };
+
+        struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl EnvGuard {
+            fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+                let mut prev = Vec::new();
+                for &(k, v) in pairs {
+                    prev.push((k, std::env::var_os(k)));
+                    // SAFETY: serialized via #[serial_test::serial(cwd, env)].
+                    unsafe {
+                        match v {
+                            Some(val) => std::env::set_var(k, val),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                }
+                Self(prev)
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, v) in self.0.drain(..).rev() {
+                    // SAFETY: serialized via #[serial_test::serial(cwd, env)].
+                    unsafe {
+                        match v {
+                            Some(val) => std::env::set_var(k, val),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output = OutputConfig {
+            pager: false,
+            quiet: true,
+            ..OutputConfig::default()
+        };
+
+        // Ensure Sqlite runtime is active even after RB-33 switches compiled_default().
+        let backend_override = if crate::storage::backend::REDB_RUNTIME_UNLOCKED {
+            Some("sqlite")
+        } else {
+            None
+        };
+
+        // AC1: Existing Global SQLite config.db read/write via config-migration.lock, never creates config.redb.
+        let g_existing_dir = tmp.path().join("global-existing");
+        std::fs::create_dir_all(&g_existing_dir).expect("mkdir g_existing");
+        let g_existing_db = g_existing_dir.join(CONFIG_SQLITE_FILE_NAME);
+        {
+            let store = SqliteConfigStore::create(&g_existing_db, DatabaseRole::GlobalConfig)
+                .await
+                .expect("seed existing global config.db");
+            crate::storage::ConfigStore::set(&store, "user.initial", "g0", false)
+                .await
+                .expect("seed g0");
+        }
+
+        // AC2: Existing System SQLite config.db read/write via config-migration.lock, never creates config.redb.
+        let s_existing_dir = tmp.path().join("system-existing");
+        std::fs::create_dir_all(&s_existing_dir).expect("mkdir s_existing");
+        let s_existing_db = s_existing_dir.join(CONFIG_SQLITE_FILE_NAME);
+        {
+            let store = SqliteConfigStore::create(&s_existing_db, DatabaseRole::SystemConfig)
+                .await
+                .expect("seed existing system config.db");
+            crate::storage::ConfigStore::set(&store, "core.initial", "s0", false)
+                .await
+                .expect("seed s0");
+        }
+
+        {
+            let g_str = g_existing_db.to_string_lossy().into_owned();
+            let s_str = s_existing_db.to_string_lossy().into_owned();
+            let _env = EnvGuard::set(&[
+                ("LIBRA_STORAGE_BACKEND", backend_override),
+                ("LIBRA_CONFIG_GLOBAL_DB", Some(&g_str)),
+                ("LIBRA_CONFIG_SYSTEM_DB", Some(&s_str)),
+            ]);
+
+            execute_safe(
+                ConfigArgs::try_parse_from([
+                    "config",
+                    "set",
+                    "--global",
+                    "user.name",
+                    "Sqlite Global",
+                ])
+                .expect("parse set --global"),
+                &output,
+            )
+            .await
+            .expect("AC1: set --global on existing config.db");
+            assert_eq!(
+                ScopedConfig::get(ConfigScope::Global, "user.initial")
+                    .await
+                    .expect("read g0")
+                    .expect("g0 present")
+                    .value,
+                "g0"
+            );
+            assert_eq!(
+                ScopedConfig::get(ConfigScope::Global, "user.name")
+                    .await
+                    .expect("read global user.name")
+                    .expect("user.name present")
+                    .value,
+                "Sqlite Global"
+            );
+            assert!(g_existing_dir.join(CONFIG_MIGRATION_LOCK_FILE).is_file());
+            assert!(
+                !g_existing_dir.join(CONFIG_REDB_FILE_NAME).exists(),
+                "AC1: must never create config.redb"
+            );
+
+            execute_safe(
+                ConfigArgs::try_parse_from([
+                    "config",
+                    "set",
+                    "--system",
+                    "core.editor",
+                    "sqlite-vim",
+                ])
+                .expect("parse set --system"),
+                &output,
+            )
+            .await
+            .expect("AC2: set --system on existing config.db");
+            assert_eq!(
+                ScopedConfig::get(ConfigScope::System, "core.initial")
+                    .await
+                    .expect("read s0")
+                    .expect("s0 present")
+                    .value,
+                "s0"
+            );
+            assert_eq!(
+                ScopedConfig::get(ConfigScope::System, "core.editor")
+                    .await
+                    .expect("read system core.editor")
+                    .expect("core.editor present")
+                    .value,
+                "sqlite-vim"
+            );
+            assert!(s_existing_dir.join(CONFIG_MIGRATION_LOCK_FILE).is_file());
+            assert!(
+                !s_existing_dir.join(CONFIG_REDB_FILE_NAME).exists(),
+                "AC2: must never create config.redb"
+            );
+        }
+
+        // AC3 & AC4: Empty global and system directories create config.db + config-format.json(backend="sqlite", finalized=true), never config.redb.
+        let g_empty_dir = tmp.path().join("global-empty");
+        let s_empty_dir = tmp.path().join("system-empty");
+        let g_empty_db = g_empty_dir.join(CONFIG_SQLITE_FILE_NAME);
+        let s_empty_db = s_empty_dir.join(CONFIG_SQLITE_FILE_NAME);
+        {
+            let g_str = g_empty_db.to_string_lossy().into_owned();
+            let s_str = s_empty_db.to_string_lossy().into_owned();
+            let _env = EnvGuard::set(&[
+                ("LIBRA_STORAGE_BACKEND", backend_override),
+                ("LIBRA_CONFIG_GLOBAL_DB", Some(&g_str)),
+                ("LIBRA_CONFIG_SYSTEM_DB", Some(&s_str)),
+            ]);
+
+            execute_safe(
+                ConfigArgs::try_parse_from([
+                    "config",
+                    "set",
+                    "--global",
+                    "user.email",
+                    "g@example.com",
+                ])
+                .expect("parse set --global empty"),
+                &output,
+            )
+            .await
+            .expect("AC3: set --global in empty dir");
+            assert!(g_empty_db.is_file());
+            assert!(g_empty_dir.join(CONFIG_FORMAT_MANIFEST_FILE).is_file());
+            assert!(g_empty_dir.join(CONFIG_MIGRATION_LOCK_FILE).is_file());
+            assert!(!g_empty_dir.join(CONFIG_REDB_FILE_NAME).exists());
+            let gm = read_config_format_manifest(&g_empty_dir, DatabaseRole::GlobalConfig)
+                .expect("read empty global manifest")
+                .expect("global manifest created");
+            assert_eq!(gm.backend, StorageBackendKind::Sqlite);
+            assert!(gm.finalized);
+
+            execute_safe(
+                ConfigArgs::try_parse_from(["config", "set", "--system", "core.autocrlf", "false"])
+                    .expect("parse set --system empty"),
+                &output,
+            )
+            .await
+            .expect("AC4: set --system in empty dir");
+            assert!(s_empty_db.is_file());
+            assert!(s_empty_dir.join(CONFIG_FORMAT_MANIFEST_FILE).is_file());
+            assert!(s_empty_dir.join(CONFIG_MIGRATION_LOCK_FILE).is_file());
+            assert!(!s_empty_dir.join(CONFIG_REDB_FILE_NAME).exists());
+            let sm = read_config_format_manifest(&s_empty_dir, DatabaseRole::SystemConfig)
+                .expect("read empty system manifest")
+                .expect("system manifest created");
+            assert_eq!(sm.backend, StorageBackendKind::Sqlite);
+            assert!(sm.finalized);
+        }
     }
 }
 

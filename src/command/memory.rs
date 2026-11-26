@@ -87,25 +87,301 @@ pub async fn execute_safe(args: MemoryArgs, output: &OutputConfig) -> CliResult<
     if util::require_repo().is_err() {
         return Err(CliError::repo_not_found());
     }
-    let connection = open_repo_db().await?;
-    let repo_id = current_repo_id(&connection).await?;
-
-    match args.command {
-        MemoryCommand::Status => status(&connection, &repo_id, args.allow_stale, output).await,
-        MemoryCommand::List => list(&connection, &repo_id, args.allow_stale, output).await,
-        MemoryCommand::Show { episode_id, reveal } => {
-            show(
-                &connection,
-                &repo_id,
-                &episode_id,
-                reveal,
-                args.allow_stale,
-                output,
-            )
-            .await
+    match crate::storage::runtime::detect_current_repo_backend() {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let repo_id = ConfigKv::get("libra.repoid")
+                .await
+                .map_err(|e| CliError::fatal(format!("failed to read repository id: {e}")))?
+                .map(|entry| entry.value)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    CliError::fatal("repository id is missing")
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                        .with_hint("run 'libra init' to initialize repository metadata")
+                })?;
+            match args.command {
+                MemoryCommand::Status => status_redb(&repo_id, args.allow_stale, output).await,
+                MemoryCommand::List => list_redb(&repo_id, args.allow_stale, output).await,
+                MemoryCommand::Show { episode_id, reveal } => {
+                    show_redb(&repo_id, &episode_id, reveal, args.allow_stale, output).await
+                }
+                MemoryCommand::Rebuild => rebuild_redb(&repo_id, output).await,
+            }
         }
-        MemoryCommand::Rebuild => rebuild(&connection, &repo_id, output).await,
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let connection = open_repo_db().await?;
+            let repo_id = current_repo_id(&connection).await?;
+
+            match args.command {
+                MemoryCommand::Status => {
+                    status(&connection, &repo_id, args.allow_stale, output).await
+                }
+                MemoryCommand::List => list(&connection, &repo_id, args.allow_stale, output).await,
+                MemoryCommand::Show { episode_id, reveal } => {
+                    show(
+                        &connection,
+                        &repo_id,
+                        &episode_id,
+                        reveal,
+                        args.allow_stale,
+                        output,
+                    )
+                    .await
+                }
+                MemoryCommand::Rebuild => rebuild(&connection, &repo_id, output).await,
+            }
+        }
     }
+}
+
+async fn status_redb(repo_id: &str, allow_stale: bool, output: &OutputConfig) -> CliResult<()> {
+    let state_store = crate::storage::runtime::open_current_git_state_store_read_only()
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to open redb memory store: {e}")))?;
+    let projection = state_store
+        .get_memory_projection_state(repo_id, crate::storage::MemorySourceKind::Commit)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to read memory projection status: {e}")))?;
+    let Some(projection) = projection else {
+        let report = StatusOutput {
+            schema_version: 0,
+            stale: true,
+            selector_version: crate::internal::ai::memory::EPISODE_SELECTOR_VERSION,
+            rules_version: 0,
+            horizon_truncated: false,
+            revoked_count: 0,
+            aged_out_count: 0,
+            rebuilt_at: 0,
+        };
+        return emit_status(report, true, allow_stale, output);
+    };
+    let stale = projection.schema_version <= 0;
+    if stale && !allow_stale {
+        return Err(CliError::failure(
+            "the memory projection is stale; run 'libra memory rebuild' or pass --allow-stale",
+        )
+        .with_stable_code(StableErrorCode::MemoryProjectionStale)
+        .with_hint("run 'libra memory rebuild' to refresh the projection"));
+    }
+    let report = StatusOutput {
+        schema_version: projection.schema_version,
+        stale,
+        selector_version: crate::internal::ai::memory::EPISODE_SELECTOR_VERSION,
+        rules_version: projection.rules_version,
+        horizon_truncated: projection.horizon_truncated,
+        revoked_count: projection.revoked_count,
+        aged_out_count: projection.aged_out_count,
+        rebuilt_at: projection.rebuilt_at,
+    };
+    emit_status(report, stale, allow_stale, output)
+}
+
+async fn episode_view_from_redb(
+    state_store: &dyn crate::storage::git_state_store::GitStateStore,
+    rec: crate::storage::MemoryEpisodeRecord,
+) -> CliResult<EpisodeView> {
+    let evidence_rows = state_store
+        .list_memory_episode_evidence(&rec.episode_id)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to read memory episode evidence: {e}")))?;
+    let path_rows = state_store
+        .list_memory_episode_paths(&rec.episode_id)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to read memory episode paths: {e}")))?;
+    let evidence = evidence_rows
+        .into_iter()
+        .map(|row| crate::internal::ai::memory::reader::EvidenceView {
+            kind: row.kind.as_str().to_string(),
+            ref_id: row.ref_id,
+            link_confidence: row.link_confidence.as_str().to_string(),
+            resolution_status: row.resolution_status.as_str().to_string(),
+        })
+        .collect();
+    let paths = path_rows
+        .into_iter()
+        .map(|row| crate::internal::ai::memory::reader::PathView {
+            code_path: crate::internal::ai::memory::render_code_path(&row.code_path),
+            change_kind: row.change_kind.as_str().to_string(),
+            blob_oid_at_end: row.blob_oid_at_end,
+            ended_at: row.ended_at,
+        })
+        .collect();
+    Ok(EpisodeView {
+        episode_id: rec.episode_id,
+        repo_id: rec.repo_id,
+        source_kind: rec.source_kind.as_str().to_string(),
+        source_key: rec.source_key,
+        outcome: rec.outcome.as_str().to_string(),
+        actor: rec.actor,
+        started_at: rec.started_at,
+        ended_at: rec.ended_at,
+        anchor_commit: rec.anchor_commit,
+        change_id: rec.change_id,
+        title: rec.title,
+        body: rec.body,
+        content_digest: rec.content_digest,
+        producer: rec.producer,
+        rules_version: rec.rules_version,
+        evidence,
+        paths,
+    })
+}
+
+async fn list_redb(repo_id: &str, allow_stale: bool, output: &OutputConfig) -> CliResult<()> {
+    let state_store = crate::storage::runtime::open_current_git_state_store_read_only()
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to open redb memory store: {e}")))?;
+    if let Some(proj) = state_store
+        .get_memory_projection_state(repo_id, crate::storage::MemorySourceKind::Commit)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to read memory projection freshness: {e}")))?
+        && proj.schema_version <= 0
+        && !allow_stale
+    {
+        return Err(CliError::failure(
+            "the memory projection is stale; run 'libra memory rebuild' or pass --allow-stale",
+        )
+        .with_stable_code(StableErrorCode::MemoryProjectionStale)
+        .with_hint("run 'libra memory rebuild' to refresh the projection"));
+    }
+    let rows = state_store
+        .list_memory_episodes(repo_id)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to list memory episodes: {e}")))?;
+    let mut episodes = Vec::with_capacity(rows.len());
+    for row in rows {
+        episodes.push(episode_view_from_redb(state_store.as_ref(), row).await?);
+    }
+    let report = ListOutput { episodes };
+    if output.is_json() {
+        return emit_json_data("memory", &report, output);
+    }
+    if output.quiet {
+        return Ok(());
+    }
+    for episode in &report.episodes {
+        println!(
+            "{}\t{}\t{}",
+            episode.episode_id, episode.source_kind, episode.title
+        );
+    }
+    Ok(())
+}
+
+async fn show_redb(
+    repo_id: &str,
+    episode_id: &str,
+    reveal: bool,
+    allow_stale: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let state_store = crate::storage::runtime::open_current_git_state_store_read_only()
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to open redb memory store: {e}")))?;
+    let episode = state_store
+        .get_memory_episode(episode_id)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to read memory episode: {e}")))?
+        .filter(|ep| ep.repo_id == repo_id);
+    let Some(episode) = episode else {
+        return Err(CliError::failure(format!(
+            "memory episode '{episode_id}' not found in this repository"
+        ))
+        .with_stable_code(StableErrorCode::MemoryEpisodeNotFound)
+        .with_hint("run 'libra memory list' to see available episode ids"));
+    };
+    if let Some(proj) = state_store
+        .get_memory_projection_state(repo_id, crate::storage::MemorySourceKind::Commit)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to read memory projection freshness: {e}")))?
+        && proj.schema_version <= 0
+        && !allow_stale
+    {
+        return Err(CliError::failure(
+            "the memory projection is stale; run 'libra memory rebuild' or pass --allow-stale",
+        )
+        .with_stable_code(StableErrorCode::MemoryProjectionStale)
+        .with_hint("run 'libra memory rebuild' to refresh the projection"));
+    }
+    let view = episode_view_from_redb(state_store.as_ref(), episode).await?;
+    if output.is_json() {
+        return emit_json_data("memory", &view, output);
+    }
+    if output.quiet {
+        return Ok(());
+    }
+    print_episode_human(&view, reveal);
+    Ok(())
+}
+
+async fn rebuild_redb(repo_id: &str, output: &OutputConfig) -> CliResult<()> {
+    let horizon = match ConfigKv::get("memory.horizon").await {
+        Ok(Some(entry)) => entry
+            .value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                CliError::failure(format!(
+                    "invalid memory.horizon value '{}': expected a positive integer",
+                    entry.value
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+            })?,
+        Ok(None) => DEFAULT_HORIZON,
+        Err(error) => {
+            return Err(
+                CliError::failure(format!("failed to read memory.horizon: {error}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed),
+            );
+        }
+    };
+    let state_store = crate::storage::runtime::open_current_git_state_store_read_write()
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to open redb memory store: {e}")))?;
+    let existing = state_store
+        .list_memory_episodes(repo_id)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to read existing memory episodes: {e}")))?;
+    let projected = existing.len().min(horizon);
+    let horizon_truncated = existing.len() > horizon;
+    let now = chrono::Utc::now().timestamp();
+    let proj = crate::storage::MemoryProjectionStateRecord {
+        repo_id: repo_id.to_string(),
+        source_kind: crate::storage::MemorySourceKind::Commit,
+        cursor_json: "{}".to_string(),
+        fingerprint: format!("redb-rebuild-{projected}-{now}"),
+        rules_version: 1,
+        schema_version: 1,
+        horizon_truncated,
+        revoked_count: 0,
+        aged_out_count: 0,
+        rebuilt_at: now,
+    };
+    state_store
+        .upsert_memory_projection_state(&proj)
+        .await
+        .map_err(|e| CliError::fatal(format!("memory rebuild failed: {e}")))?;
+    let report = crate::internal::ai::memory::RebuildReport {
+        repo_id: repo_id.to_string(),
+        projected,
+        horizon_truncated,
+        revoked_count: 0,
+        aged_out_count: 0,
+    };
+    if output.is_json() {
+        return emit_json_data("memory", &report, output);
+    }
+    if output.quiet {
+        return Ok(());
+    }
+    println!("memory projection rebuilt");
+    println!("projected:         {}", report.projected);
+    println!("horizon_truncated: {}", report.horizon_truncated);
+    println!("revoked_count:     {}", report.revoked_count);
+    println!("aged_out_count:    {}", report.aged_out_count);
+    Ok(())
 }
 
 /// Open the repository database (same pattern as `automation`).

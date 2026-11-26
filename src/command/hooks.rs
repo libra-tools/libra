@@ -325,28 +325,51 @@ pub(crate) async fn gemini_hook_rejection(context: &str) -> CliError {
 async fn probe_active_repository_database(
     storage: &std::path::Path,
 ) -> Option<ActiveRepositoryFailureClass> {
-    let database = storage.join(crate::utils::util::DATABASE);
-    let Some(database) = database.to_str() else {
-        return Some(ActiveRepositoryFailureClass::DatabaseUnavailable);
-    };
-    let conn = match crate::internal::db::establish_connection(database).await {
-        Ok(conn) => conn,
-        Err(error) => {
-            return Some(ActiveRepositoryFailureClass::for_database_open(
-                error.kind(),
-            ));
+    match crate::storage::runtime::detect_repo_backend(storage) {
+        Ok(crate::storage::StorageBackendKind::Redb) => {
+            let store =
+                match crate::storage::runtime::open_repo_config_store_read_only(storage).await {
+                    Ok(store) => store,
+                    Err(crate::storage::StorageBackendError::NotFound { .. }) => {
+                        return Some(ActiveRepositoryFailureClass::DatabaseMissing);
+                    }
+                    Err(_) => return Some(ActiveRepositoryFailureClass::DatabaseUnavailable),
+                };
+            match store.get("core.objectformat").await {
+                Ok(None) => None,
+                Ok(Some(entry)) => match entry.value.trim().to_ascii_lowercase().as_str() {
+                    "sha1" | "sha256" => None,
+                    _ => Some(ActiveRepositoryFailureClass::ObjectFormatUnsupported),
+                },
+                Err(_) => Some(ActiveRepositoryFailureClass::ObjectFormatUnreadable),
+            }
         }
-    };
-    let object_format = crate::internal::ai::capture::live::read_repository_hash_kind(&conn).await;
-    // Best-effort close of this private probe connection; the
-    // classification above is already decided.
-    let _ = conn.close().await;
-    match object_format {
-        Ok(_) => None,
-        Err(error) => Some(
-            active_repository_failure_class(&error)
-                .unwrap_or(ActiveRepositoryFailureClass::ObjectFormatUnreadable),
-        ),
+        Ok(crate::storage::StorageBackendKind::Sqlite) | Err(_) => {
+            let database = storage.join(crate::utils::util::DATABASE);
+            let Some(database) = database.to_str() else {
+                return Some(ActiveRepositoryFailureClass::DatabaseUnavailable);
+            };
+            let conn = match crate::internal::db::establish_connection(database).await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    return Some(ActiveRepositoryFailureClass::for_database_open(
+                        error.kind(),
+                    ));
+                }
+            };
+            let object_format =
+                crate::internal::ai::capture::live::read_repository_hash_kind(&conn).await;
+            // Best-effort close of this private probe connection; the
+            // classification above is already decided.
+            let _ = conn.close().await;
+            match object_format {
+                Ok(_) => None,
+                Err(error) => Some(
+                    active_repository_failure_class(&error)
+                        .unwrap_or(ActiveRepositoryFailureClass::ObjectFormatUnreadable),
+                ),
+            }
+        }
     }
 }
 

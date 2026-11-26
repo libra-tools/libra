@@ -286,7 +286,85 @@ async fn inspect_snapshot(path: &Path, report: &mut Report) -> io::Result<()> {
     Ok(())
 }
 
+async fn inspect_redb_scope(scope_dir: &Path, report: &mut Report) -> io::Result<bool> {
+    use crate::storage::{
+        StorageBackendKind,
+        config_store::{
+            ConfigScopeAuthority, inspect_config_scope_authority, open_config_scope_for_read,
+        },
+        error::StorageBackendError,
+    };
+
+    let authority = match inspect_config_scope_authority(scope_dir, ROLE) {
+        Ok(auth) => auth,
+        Err(StorageBackendError::ManifestNotFinalized { .. }) => {
+            report.exists = Some(true);
+            report.classification = "unreadable";
+            report.hints = vec![
+                "Global configuration manifest (config-format.json) is unfinalized; resume migration with `libra-migrate --global`.",
+            ];
+            return Ok(true);
+        }
+        Err(_) => return Ok(false),
+    };
+
+    match authority {
+        ConfigScopeAuthority::Manifest { manifest, db_path }
+            if manifest.backend == StorageBackendKind::Redb =>
+        {
+            report.exists = Some(true);
+            if let Ok(canonical) = db_path.canonicalize() {
+                report.canonical_path = Some(canonical.to_string_lossy().into_owned());
+                if let Ok(Some(stamp)) = regular_file_stamp(&canonical) {
+                    report.size_bytes = Some(stamp.len);
+                    report.modified_at_utc = utc_time(stamp.modified);
+                }
+            }
+            match open_config_scope_for_read(scope_dir, ROLE, StorageBackendKind::Redb).await {
+                Ok(_store) => {
+                    report.classification = "compatible";
+                    report.configuration.readable = true;
+                    report.producer_disposition = "redb_manifest_finalized";
+                    report.hints = vec![
+                        "Global configuration uses finalized redb storage (config.redb); SQLite schema repair does not apply.",
+                    ];
+                }
+                Err(_) => {
+                    report.classification = "unreadable";
+                    report.hints = vec![UNREADABLE_HINT];
+                }
+            }
+            Ok(true)
+        }
+        ConfigScopeAuthority::Empty
+            if StorageBackendKind::compiled_default() == StorageBackendKind::Redb =>
+        {
+            report.exists = Some(false);
+            report.classification = "absent";
+            report.hints =
+                vec!["No global configuration file exists at this path; nothing was created."];
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 async fn inspect(path: &Path, report: &mut Report) -> io::Result<()> {
+    if let Some(scope_dir) = path.parent()
+        && inspect_redb_scope(scope_dir, report).await?
+    {
+        return Ok(());
+    }
+    match crate::storage::StorageBackendKind::compiled_default() {
+        crate::storage::StorageBackendKind::Redb if !crate::storage::has_sqlite_backend() => {
+            report.classification = "unreadable";
+            report.hints = vec![
+                "Legacy SQLite global configuration detected under redb-only runtime; run `libra-migrate --global` to migrate to config.redb.",
+            ];
+            return Ok(());
+        }
+        crate::storage::StorageBackendKind::Redb | crate::storage::StorageBackendKind::Sqlite => {}
+    }
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             report.exists = Some(false);
