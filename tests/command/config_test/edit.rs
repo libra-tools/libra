@@ -277,3 +277,40 @@ fn test_cf_97_predicates() {
     let after = run_libra_command(&["config", "--local", "--list"], &repo);
     assert_eq!(before.stdout, after.stdout, "no editor writes nothing");
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_96_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], &repo),
+        "init",
+    );
+    let cfg = repo.join("explicit.cfg");
+    fs::write(&cfg, "[a]\nb = c\n").unwrap();
+    let script = editor_script(temp.path(), "file-edit.sh", "sed -i 's/= c/= d/' \"$1\"");
+    let out = run_libra_command_with_env(
+        &["config", "--file", "explicit.cfg", "--edit"],
+        &repo,
+        &[("GIT_EDITOR", script.as_str())],
+    );
+    assert_cli_success(&out, "file edit");
+    assert_eq!(fs::read_to_string(&cfg).unwrap(), "[a]\nb = d\n");
+
+    let stdin = run_libra_command_with_env(
+        &["config", "--file", "-", "--edit"],
+        &repo,
+        &[("GIT_EDITOR", script.as_str())],
+    );
+    assert!(!stdin.status.success());
+    assert!(String::from_utf8_lossy(&stdin.stderr).contains("editing stdin is not supported"));
+    let blob = run_libra_command_with_env(
+        &["config", "--blob", "HEAD:explicit.cfg", "--edit"],
+        &repo,
+        &[("GIT_EDITOR", script.as_str())],
+    );
+    assert!(!blob.status.success());
+    assert!(String::from_utf8_lossy(&blob.stderr).contains("editing blobs is not supported"));
+}

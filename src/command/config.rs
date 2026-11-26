@@ -924,6 +924,9 @@ pub struct ConfigArgs {
     /// (`git config --file`). Read-only.
     #[clap(short = 'f', long = "file", value_name = "PATH", hide = true)]
     pub file: Option<String>,
+    /// Read configuration from a blob (`<rev>:<path>`)
+    #[clap(long = "blob", value_name = "BLOB", hide = true)]
+    pub blob: Option<String>,
     /// Show only key names (`git config --name-only`)
     #[clap(long("name-only"), hide = true)]
     pub name_only: bool,
@@ -1346,8 +1349,18 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
 
     // `--file <path>` reads/writes a Git-style INI file instead of the stores
     // (Git's one-off script form). Writes never touch the SQLite store.
+    if let Some(blob) = args.blob.as_deref() {
+        if matches!(cmd, ResolvedCommand::Edit) {
+            return Err(CliError::command_usage("editing blobs is not supported")
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+        return Err(
+            CliError::command_usage(format!("--blob '{blob}' is not supported yet"))
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
     if let Some(path) = args.file.as_deref() {
-        return serve_config_file(path, &cmd, &args, output);
+        return serve_config_file(path, &cmd, &args, output).await;
     }
 
     // Reserved `upgrade.*` namespace, step 2: route every resolved command
@@ -3867,12 +3880,39 @@ fn write_config_file(
     Ok(())
 }
 
-fn serve_config_file(
+async fn serve_config_file(
     path: &str,
     cmd: &ResolvedCommand,
     args: &ConfigArgs,
     output: &OutputConfig,
 ) -> CliResult<()> {
+    if matches!(cmd, ResolvedCommand::Edit) {
+        if path == "-" {
+            return Err(CliError::command_usage("editing stdin is not supported")
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+        let editor = std::env::var("GIT_EDITOR")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var("VISUAL").ok().filter(|v| !v.is_empty()))
+            .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| "vi".to_string());
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{} {}", editor, shell_quote(path)))
+            .status()
+            .map_err(|error| {
+                CliError::fatal(format!("failed to launch editor '{editor}': {error}"))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+            })?;
+        if !status.success() {
+            return Err(
+                CliError::fatal(format!("editor '{editor}' exited with status {status}"))
+                    .with_stable_code(StableErrorCode::IoWriteFailed),
+            );
+        }
+        return Ok(());
+    }
     if let Some(mutation) = config_file_write_mutation(cmd)? {
         if path == "-" {
             return Err(CliError::command_usage(
