@@ -4123,8 +4123,7 @@ fn relative_outside_and_missing_prefix() {
 /// implicit cover letter requested by `--commit-list-format` (#900, #909).
 #[test]
 fn format_cover_letter_auto_config() {
-    use std::collections::BTreeSet;
-    use std::process::Command;
+    use std::{collections::BTreeSet, process::Command};
 
     fn seed(root: &std::path::Path, libra: bool) {
         let run = |args: &[&str]| {
@@ -4511,8 +4510,7 @@ fn cover_letter_includes_diffstat() {
 /// them; `--no-renames` emits delete+add and still writes a cover letter.
 #[test]
 fn rename_options_and_cover_inherit() {
-    use std::collections::BTreeSet;
-    use std::process::Command;
+    use std::{collections::BTreeSet, process::Command};
 
     fn seed(root: &std::path::Path, libra: bool) {
         let run = |args: &[&str]| {
@@ -6116,8 +6114,7 @@ fn base_block_rides_on_first_mail() {
 /// combines with a CLI format (#899, #900, #909).
 #[test]
 fn commit_list_format_config_and_full() {
-    use std::collections::BTreeSet;
-    use std::process::Command;
+    use std::{collections::BTreeSet, process::Command};
 
     fn seed(root: &std::path::Path, libra: bool) {
         let run = |args: &[&str]| {
@@ -7957,8 +7954,7 @@ fn interdiff_single_patch_placement() {
 /// file output carries the interdiff block (#901).
 #[test]
 fn reroll_filename_prefix() {
-    use std::collections::BTreeSet;
-    use std::process::Command;
+    use std::{collections::BTreeSet, process::Command};
 
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -8245,8 +8241,7 @@ fn generated_paths_on_stdout() {
 /// the way Git does (#903).
 #[test]
 fn reroll_non_integer() {
-    use std::collections::BTreeSet;
-    use std::process::Command;
+    use std::{collections::BTreeSet, process::Command};
 
     fn seed(root: &std::path::Path, libra: bool) {
         let run = |args: &[&str]| {

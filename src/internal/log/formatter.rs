@@ -1018,8 +1018,9 @@ mod tests {
 
 #[cfg(test)]
 mod fixed_date_tests {
-    use super::*;
     use git_internal::hash::ObjectHash;
+
+    use super::*;
 
     fn fixed_commit() -> Commit {
         let mut commit = Commit::from_tree_id(
