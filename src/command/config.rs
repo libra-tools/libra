@@ -3672,7 +3672,7 @@ fn compile_config_regexp(pattern: &str) -> CliResult<regex::Regex> {
     regex::Regex::new(pattern).map_err(|error| {
         CliError::failure(format!("invalid pattern '{pattern}': {error}"))
             .with_stable_code(StableErrorCode::CliInvalidArguments)
-            .with_exit_code(2)
+            .with_exit_code(6)
     })
 }
 

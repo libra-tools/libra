@@ -7586,6 +7586,22 @@ mod value_pattern {
     }
 
     #[test]
+    fn test_cf_67_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        let out = run_libra_command(
+            &["config", "set", "--value", "(", "multi.k", "x"],
+            repo.path(),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(6),
+            "invalid set pattern exits 6: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
     fn test_cf_38_predicates() {
         let repo = tempdir().unwrap();
         assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");

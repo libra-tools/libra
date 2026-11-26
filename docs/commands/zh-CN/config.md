@@ -877,3 +877,5 @@ HTTPS和Git传输没有这一特定上限。若服务器提供HTTPS端点，SSH�
 pattern unset with no match exits 5.
 
 value pattern replaces one matching value.
+
+invalid set pattern exits 6.

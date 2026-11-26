@@ -1039,3 +1039,5 @@ arbitrary-descendant cleanup guarantee is implied.
 pattern unset with no match exits 5.
 
 value pattern replaces one matching value.
+
+invalid set pattern exits 6.
