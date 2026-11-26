@@ -2,7 +2,7 @@
 
 use super::state::SourceState;
 
-/// Repository context shown in the window header.
+/// Repository context used by the status bar and repository views.
 ///
 /// Paths are display labels relative to the repository; absolute host paths
 /// never reach the window (ADR-UID-04).

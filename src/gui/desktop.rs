@@ -17,7 +17,7 @@ use super::{
     data::{DataHandle, Snapshot},
     screens,
     view::SessionsWindow,
-    widgets::{badge, muted, nav, row},
+    widgets::{mono, muted, nav, row},
 };
 
 gpui::actions!(libra_desktop, [OpenSearch, CloseOverlay]);
@@ -196,32 +196,6 @@ pub fn reset_page_for_new_snapshot() -> usize {
 /// Page state after a replacement snapshot is delivered: always page one.
 pub fn delivered_page(_previous: usize) -> usize {
     reset_page_for_new_snapshot()
-}
-
-/// The window's status label (UID-07 A6).
-pub const WINDOW_LABEL: &str = "Read-only preview";
-
-/// Pages that still render bundled demonstration content (UID-07 A8).
-pub fn is_demo_page(page: Page) -> bool {
-    matches!(
-        page,
-        Page::SplashError
-            | Page::Settings
-            | Page::Mega
-            | Page::Deps
-            | Page::Views
-            | Page::Cloud
-            | Page::Rebase
-            | Page::Refs
-            | Page::Bisect
-            | Page::Blame
-            | Page::Conflict
-            | Page::Automation
-            | Page::Review
-            | Page::Agents
-            | Page::Lanes
-            | Page::Search
-    )
 }
 
 impl Desktop {
@@ -485,14 +459,6 @@ impl Render for Desktop {
             .flex()
             .flex_col()
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(context_bar(self.snapshot.as_ref(), &p))
-                    .child(badge(WINDOW_LABEL, 0x5b6474, 0xf4f5f7)),
-            )
-            .child(
                 FocusScope::new(&self.focus)
                     .root()
                     .flex_1()
@@ -537,13 +503,9 @@ impl Render for Desktop {
                                         })
                                     }),
                                 )
-                                .when(is_demo_page(self.page), |nav| {
-                                    nav.child(badge("demo", 0x5b6474, 0xf4f5f7))
-                                })
                                 .child(div().flex_1())
                                 .child(nav(Page::Search, cx))
                                 .child(nav(Page::Settings, cx))
-                                .child(badge(WINDOW_LABEL, 0x5b6474, 0xf4f5f7))
                                 .child(
                                     Button::new("theme", if dark { "Light" } else { "Dark" })
                                         .size(ControlSize::Sm)
@@ -589,41 +551,45 @@ impl Render for Desktop {
                         )
                     }),
             )
+            .child(status_bar(self.snapshot.as_ref(), &p))
     }
 }
 
-/// Repository context bar: shows the snapshot state or the real context.
-fn context_bar(snapshot: Option<&Snapshot>, p: &ely_gpui_component::theme::Palette) -> gpui::Div {
-    let text = match snapshot {
-        None => "Reading repository…".to_string(),
-        Some(snapshot) => match (&snapshot.state, &snapshot.context) {
-            (super::data::SourceState::Available, Some(context)) => format!(
-                "{} · {} · {} · {} · {}",
-                context.worktree_label,
-                context.storage_label,
-                context.branch,
-                context.head,
-                context.object_format
-            ),
-            (state, _) => {
-                let mut text = state.label().to_string();
-                if let Some(message) = snapshot.message.as_deref() {
-                    text.push_str(" — ");
-                    text.push_str(message);
-                }
-                if let Some(hint) = state.hint() {
-                    text.push_str(" — ");
-                    text.push_str(hint);
-                }
-                text
-            }
-        },
-    };
-    row()
+/// The shared footer stays below the page and its transient notices.
+fn status_bar(snapshot: Option<&Snapshot>, p: &ely_gpui_component::theme::Palette) -> gpui::Div {
+    let bar = row()
+        .w_full()
         .h(px(26.0))
         .px_4()
-        .border_b_1()
+        .border_t_1()
         .border_color(p.border)
-        .bg(p.surface)
-        .child(muted(text, p).overflow_hidden().text_ellipsis())
+        .bg(p.surface);
+    let Some(snapshot) = snapshot else {
+        return bar.child(muted("Reading repository…", p));
+    };
+
+    if let (super::data::SourceState::Available, Some(context)) =
+        (&snapshot.state, &snapshot.context)
+    {
+        let location = format!("{}  ·  {}", context.worktree_label, context.branch);
+        let revision = if context.head_oid.is_some() {
+            format!("HEAD {}", context.head)
+        } else {
+            "No commits yet".to_string()
+        };
+        return bar
+            .child(muted(location, p).flex_1().min_w(px(0.0)).truncate())
+            .child(mono(revision).text_color(p.fg_muted).flex_none());
+    }
+
+    let mut status = snapshot.state.label().to_string();
+    if let Some(message) = &snapshot.message {
+        status.push_str(" — ");
+        status.push_str(message);
+    }
+    if let Some(hint) = snapshot.state.hint() {
+        status.push_str(" — ");
+        status.push_str(hint);
+    }
+    bar.child(muted(status, p).min_w(px(0.0)).truncate())
 }

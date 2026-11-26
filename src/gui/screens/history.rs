@@ -181,7 +181,7 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
         .flex_none()
         .p_3()
         .bg(p.bg)
-        .child(label("WORKSPACE · demo", p))
+        .child(label("WORKSPACE", p))
         .children(
             [
                 Page::Lanes,
@@ -480,7 +480,7 @@ fn inspector_body(s: &Desktop, cx: &Context<Desktop>, p: &Palette, c: &RowView) 
     if s.tab == 2 {
         return vec![
             code(format!(
-                "commit {}\nauthor {}\n\n{}\n\nDemonstration record",
+                "commit {}\nauthor {}\n\n{}",
                 c.short, c.author, c.subject
             ))
             .into_any_element(),
@@ -513,7 +513,7 @@ fn inspector_body(s: &Desktop, cx: &Context<Desktop>, p: &Palette, c: &RowView) 
                 "Add a token-bucket rate limiter to the gateway. 100 requests per minute per API key, configurable in \
                  gateway.toml. Keep the existing middleware order."
             } else {
-                "Captured demonstration prompt associated with this agent's commit."
+                "Prompt text unavailable."
             },
             p,
         )
@@ -552,7 +552,7 @@ fn inspector_body(s: &Desktop, cx: &Context<Desktop>, p: &Palette, c: &RowView) 
             .child(action("export", "Export redacted…", true, cx))
             .into_any_element(),
         muted(
-            "Session, prompt and tool content is demonstration until capture details are connected. Libra does not infer plans, test results or approvals.",
+            "Session and checkpoint counts come from the capture catalog. Prompt and tool details are examples.",
             p,
         )
         .into_any_element(),
