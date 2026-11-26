@@ -1117,7 +1117,7 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `in-progress` / 空（已推送 main `835cfc5`；family child 无独立发布，所以不是 done。session `95af8652-b4f3-4116-8eba-16ae3237a780` 已准入 `fetch.rs`、`pull.rs`、`clone.rs`；实现审查 `72196c7f-6172-41c8-ae03-c5d1ccb2dccf` VERDICT PASS）
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`autofollow_storage_read_error_is_not_a_missing_tag` 复跑 1/1；本卡不 bump、不打 tag，D 组按 family child 继承。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** AutoFollow 用一次 `exist_checked_many` 判断标签对象是否已在本地。`Ok(true)` 保留标签。`Ok(false)` 仍丢弃。无法解析的哈希仍丢弃。读取失败或结果缺键是 `FetchError::TagObjectProbe`，稳定错误码仍是 `StableErrorCode::IoReadFailed`。不新增错误码。
 
@@ -1127,12 +1127,12 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Acceptance criteria:**
 
-- [ ] AC-1: 存储读取失败是 `TagObjectProbe` / `IoReadFailed`，Display 模板不含 missing、absent 或 not found。`Ok(false)` 仍丢弃标签。
-- [ ] AC-2: `pull` 与 `clone` 把该变体映射为 `IoReadFailed`，不落到网络不可用。
+- [x] AC-1: 存储读取失败是 `TagObjectProbe` / `IoReadFailed`，Display 模板不含 missing/absent/not found；`Ok(false)` 仍丢弃标签（`autofollow_storage_read_error_is_not_a_missing_tag`）。
+- [x] AC-2: `pull` 与 `clone` 把该变体映射为 `IoReadFailed`，不落到网络不可用。
 
 **Verification:**
 
-- [ ] VER-1: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(autofollow_storage_read_error_is_not_a_missing_tag)' --no-fail-fast --retries 0`
+- [x] VER-1: 同上命令（1/1 passed，2026-11-25 复跑）。
 
 **Full-suite trigger:** `N/A`（本卡不改 `sql/**`、`src/cli.rs`、稳定错误码表或版本面）。
 
