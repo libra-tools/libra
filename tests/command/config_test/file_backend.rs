@@ -5,7 +5,7 @@ use std::fs;
 use serial_test::serial;
 use tempfile::tempdir;
 
-use crate::command::{assert_cli_success, run_libra_command};
+use crate::command::{assert_cli_success, run_libra_command, run_libra_command_with_stdin};
 
 /// CF-13 (M-FILEW X1..X7): `--file` writes follow Git placement/quoting,
 /// replace atomically, and refuse vault/stdin writes.
@@ -442,5 +442,101 @@ fn test_cf_90_predicates() {
     assert_eq!(blob.status.code(), Some(128));
     assert!(
         String::from_utf8_lossy(&blob.stderr).contains("writing config blobs is not supported")
+    );
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_85_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.name", "T"], repo.path()),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.email", "t@t.io"], repo.path()),
+        "email",
+    );
+    fs::write(repo.path().join("cfg"), "[blob]\n\tkey = value\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "cfg"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "cfg"], repo.path()),
+        "commit",
+    );
+    let list = run_libra_command(&["config", "--blob", "HEAD:cfg", "--list"], repo.path());
+    assert_cli_success(&list, "blob list");
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout).trim(),
+        "blob.key=value"
+    );
+    let missing = run_libra_command(
+        &["config", "--blob", "HEAD:missing.cfg", "--list"],
+        repo.path(),
+    );
+    assert_eq!(missing.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("unable to resolve config blob"),
+        "stderr: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_86_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.name", "T"], repo.path()),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.email", "t@t.io"], repo.path()),
+        "email",
+    );
+    fs::write(repo.path().join("cfg"), "[a]\n\tb = c\n").unwrap();
+    let file = run_libra_command(
+        &["config", "--file", "cfg", "--show-origin", "--list"],
+        repo.path(),
+    );
+    assert_cli_success(&file, "file origin");
+    assert_eq!(
+        String::from_utf8_lossy(&file.stdout).trim(),
+        "file:cfg\ta.b=c"
+    );
+    let file_scope = run_libra_command(
+        &["config", "--file", "cfg", "--show-scope", "--list"],
+        repo.path(),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&file_scope.stdout).trim(),
+        "command\ta.b=c"
+    );
+
+    let stdin = run_libra_command_with_stdin(
+        &["config", "--file", "-", "--show-origin", "--list"],
+        repo.path(),
+        "[a]\n\tb = c\n",
+    );
+    assert_cli_success(&stdin, "stdin origin");
+    assert_eq!(
+        String::from_utf8_lossy(&stdin.stdout).trim(),
+        "standard input:\ta.b=c"
+    );
+
+    assert_cli_success(&run_libra_command(&["add", "cfg"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "cfg"], repo.path()),
+        "commit",
+    );
+    let blob = run_libra_command(
+        &["config", "--blob", "HEAD:cfg", "--show-origin", "--list"],
+        repo.path(),
+    );
+    assert_cli_success(&blob, "blob origin");
+    assert_eq!(
+        String::from_utf8_lossy(&blob.stdout).trim(),
+        "blob:HEAD:cfg\ta.b=c"
     );
 }

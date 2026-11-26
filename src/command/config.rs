@@ -1480,10 +1480,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             return Err(CliError::fatal("writing config blobs is not supported")
                 .with_stable_code(StableErrorCode::IoWriteFailed));
         }
-        return Err(
-            CliError::command_usage(format!("--blob '{blob}' is not supported yet"))
-                .with_stable_code(StableErrorCode::CliInvalidArguments),
-        );
+        return serve_config_file(&format!("blob:{blob}"), &cmd, &args, output).await;
     }
     if let Some(path) = args.file.as_deref() {
         return serve_config_file(path, &cmd, &args, output).await;
@@ -4012,6 +4009,84 @@ fn write_config_file(
     Ok(())
 }
 
+async fn read_config_blob(spec: &str) -> CliResult<String> {
+    use git_internal::internal::object::{
+        blob::Blob,
+        commit::Commit,
+        tree::{Tree, TreeItemMode},
+    };
+
+    let (rev, path) = spec.split_once(':').ok_or_else(|| {
+        CliError::fatal(format!(
+            "unable to resolve config blob '{spec}': expected <rev>:<path>"
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    let commit_id = crate::utils::util::get_commit_base_typed(rev)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("unable to resolve config blob '{spec}': {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    let commit: Commit = crate::command::load_object(&commit_id).map_err(|error| {
+        CliError::fatal(format!("unable to resolve config blob '{spec}': {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    let mut tree: Tree = crate::command::load_object(&commit.tree_id).map_err(|error| {
+        CliError::fatal(format!("unable to resolve config blob '{spec}': {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    let mut components = path.split('/').filter(|part| !part.is_empty()).peekable();
+    if components.peek().is_none() {
+        return Err(CliError::fatal(format!(
+            "unable to resolve config blob '{spec}': path is empty"
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed));
+    }
+    while let Some(component) = components.next() {
+        let Some(item) = tree
+            .tree_items
+            .iter()
+            .find(|candidate| candidate.name == component)
+        else {
+            return Err(CliError::fatal(format!(
+                "unable to resolve config blob '{spec}': path not found"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed));
+        };
+        if components.peek().is_none() {
+            if item.mode != TreeItemMode::Blob && item.mode != TreeItemMode::BlobExecutable {
+                return Err(CliError::fatal(format!(
+                    "unable to resolve config blob '{spec}': not a blob"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed));
+            }
+            let blob: Blob = crate::command::load_object(&item.id).map_err(|error| {
+                CliError::fatal(format!("unable to resolve config blob '{spec}': {error}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            return String::from_utf8(blob.data).map_err(|error| {
+                CliError::fatal(format!("unable to resolve config blob '{spec}': {error}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            });
+        }
+        if item.mode != TreeItemMode::Tree {
+            return Err(CliError::fatal(format!(
+                "unable to resolve config blob '{spec}': path not found"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed));
+        }
+        tree = crate::command::load_object(&item.id).map_err(|error| {
+            CliError::fatal(format!("unable to resolve config blob '{spec}': {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    }
+    Err(CliError::fatal(format!(
+        "unable to resolve config blob '{spec}': path not found"
+    ))
+    .with_stable_code(StableErrorCode::IoReadFailed))
+}
+
 async fn serve_config_file(
     path: &str,
     cmd: &ResolvedCommand,
@@ -4052,7 +4127,8 @@ async fn serve_config_file(
         }
         return write_config_file(path, &mutation, args, output);
     }
-    if path != "-" && !Path::new(path).exists() {
+    let blob_spec = path.strip_prefix("blob:");
+    if blob_spec.is_none() && path != "-" && !Path::new(path).exists() {
         if matches!(cmd, ResolvedCommand::List { .. }) {
             return Err(CliError::fatal(format!(
                 "unable to read config file '{}': No such file or directory",
@@ -4064,7 +4140,9 @@ async fn serve_config_file(
     }
     let show_origin = args.show_origin;
     let show_scope = args.show_scope;
-    let entries = if path == "-" {
+    let entries = if let Some(spec) = blob_spec {
+        parse_git_config_text(&read_config_blob(spec).await?)
+    } else if path == "-" {
         let mut text = String::new();
         use std::io::Read as _;
         std::io::stdin()
@@ -4079,9 +4157,15 @@ async fn serve_config_file(
     } else {
         read_git_config_file(Path::new(path))?
     };
-    let origin = format!("file:{path}");
+    let origin = if blob_spec.is_some() {
+        path.to_string()
+    } else if path == "-" {
+        "standard input:".to_string()
+    } else {
+        format!("file:{path}")
+    };
     let prefix = if show_scope {
-        "command line".to_string()
+        "command".to_string()
     } else if show_origin {
         origin.clone()
     } else {
