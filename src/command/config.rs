@@ -3481,6 +3481,11 @@ async fn handle_get(
     }
 
     if regexp {
+        regex::Regex::new(key).map_err(|error| {
+            CliError::failure(format!("invalid key pattern '{key}': {error}"))
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_exit_code(6)
+        })?;
         // Regex search across all keys
         let mut entries: Vec<(ConfigKvEntry, ConfigScope)> = if use_cascade {
             let mut all_entries = Vec::new();

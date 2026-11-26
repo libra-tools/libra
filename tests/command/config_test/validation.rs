@@ -453,3 +453,17 @@ fn test_cf_107_predicates() {
         assert_eq!(before.stdout, after.stdout, "zero write: {args:?}");
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_27_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for pattern in ["(", "["] {
+        let out = run_libra_command(&["config", "--get-regexp", pattern], repo.path());
+        assert_eq!(out.status.code(), Some(6), "{pattern}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("invalid key pattern"), "{stderr}");
+        assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+    }
+}
