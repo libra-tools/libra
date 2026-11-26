@@ -934,3 +934,5 @@ edit uses core.editor and fails closed without one.
 config unset subcommand matches legacy unset.
 
 config list subcommand matches the legacy flags.
+
+config get without a section exits 1.

@@ -3466,8 +3466,8 @@ fn config_bare_read_missing_key_error_code() {
     let bare = run_libra_command(&["config", "nosuch.key"], p);
     let stderr = String::from_utf8_lossy(&bare.stderr);
     assert!(
-        stderr.contains("LBR-CLI-002"),
-        "missing key must be a CLI error, not LBR-INTERNAL-001: {stderr}"
+        stderr.contains("LBR-CLI-003"),
+        "missing key uses the key-not-found code, not LBR-INTERNAL-001: {stderr}"
     );
     assert!(
         !stderr.contains("LBR-INTERNAL-001"),
@@ -3590,7 +3590,7 @@ fn config_bare_read_output_shape_json() {
     assert_eq!(err.status.code(), Some(1), "json failure exit code");
     let ebody = String::from_utf8_lossy(&err.stderr);
     assert!(
-        ebody.contains("\"ok\": false") && ebody.contains("LBR-CLI-002"),
+        ebody.contains("\"ok\": false") && ebody.contains("LBR-CLI-003"),
         "json failure payload: {ebody}"
     );
     assert!(

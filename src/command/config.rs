@@ -1843,20 +1843,29 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 show_origin,
                 show_scope,
                 default,
-            } => ResolvedCommand::Get {
-                key: key.clone(),
-                all: *all,
-                reveal: *reveal,
-                regexp: *regexp,
-                value_pattern: value_pattern.clone(),
-                fixed_value: *fixed_value,
-                show_origin: *show_origin,
-                show_scope: *show_scope,
-                default: default.clone(),
-                null: args.null,
-                value_type,
-                name_only: args.name_only,
-            },
+            } => {
+                if !*regexp && !key.contains('.') {
+                    return Err(CliError::failure(format!(
+                        "key does not contain a section: {key}"
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_exit_code(1));
+                }
+                ResolvedCommand::Get {
+                    key: key.clone(),
+                    all: *all,
+                    reveal: *reveal,
+                    regexp: *regexp,
+                    value_pattern: value_pattern.clone(),
+                    fixed_value: *fixed_value,
+                    show_origin: *show_origin,
+                    show_scope: *show_scope,
+                    default: default.clone(),
+                    null: args.null,
+                    value_type,
+                    name_only: args.name_only,
+                }
+            }
             ConfigCommand::List {
                 name_only,
                 show_origin,
@@ -3240,7 +3249,7 @@ async fn handle_get(
                     }
                     msg.push_str("\nhint: use libra config list to see all configured keys");
                     return Err(CliError::failure(msg)
-                        .with_stable_code(StableErrorCode::CliInvalidArguments)
+                        .with_stable_code(StableErrorCode::CliInvalidTarget)
                         .with_exit_code(1));
                 }
             }
