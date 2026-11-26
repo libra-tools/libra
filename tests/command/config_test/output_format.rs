@@ -280,3 +280,29 @@ fn test_cf_105_predicates() {
     assert_cli_success(&sub, "config list");
     assert_eq!(legacy.stdout, sub.stdout, "same order and formatting");
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_47_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "alpha.one", "v1"], repo.path()),
+        "set",
+    );
+    let list = run_libra_command(&["config", "--local", "-z", "--list"], repo.path());
+    assert_cli_success(&list, "-z --list");
+    assert!(
+        list.stdout
+            .windows(b"alpha.one\nv1\0".len())
+            .any(|w| w == b"alpha.one\nv1\0"),
+        "NUL list record is key\\nvalue\\0: {:?}",
+        list.stdout
+    );
+    let regexp = run_libra_command(
+        &["config", "--local", "-z", "--get-regexp", "^alpha\\."],
+        repo.path(),
+    );
+    assert_cli_success(&regexp, "-z --get-regexp");
+    assert_eq!(regexp.stdout, b"alpha.one\nv1\0");
+}
