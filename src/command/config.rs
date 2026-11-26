@@ -753,6 +753,9 @@ pub enum ConfigCommand {
         /// Show only key names
         #[clap(long("name-only"))]
         name_only: bool,
+        /// Canonicalize each listed value to this type (`--type=color`)
+        #[clap(long = "type", value_name = "TYPE")]
+        value_type: Option<String>,
         /// Show scope origin for each entry
         #[clap(long("show-origin"))]
         show_origin: bool,
@@ -1860,6 +1863,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 vault,
                 ssh_keys,
                 gpg_keys,
+                value_type: list_type,
             } => ResolvedCommand::List {
                 name_only: *name_only,
                 show_origin: *show_origin,
@@ -1868,7 +1872,10 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 ssh_keys: *ssh_keys,
                 gpg_keys: *gpg_keys,
                 null: args.null,
-                value_type,
+                value_type: match list_type.as_deref() {
+                    Some(name) => Some(parse_value_type_name(name)?),
+                    None => value_type,
+                },
             },
             ConfigCommand::Unset {
                 key,
@@ -2727,14 +2734,20 @@ fn resolve_value_type(args: &ConfigArgs) -> CliResult<Option<ConfigValueType>> {
     }
     match args.value_type.as_deref() {
         None => Ok(None),
-        Some("bool") => Ok(Some(ConfigValueType::Bool)),
-        Some("int") => Ok(Some(ConfigValueType::Int)),
-        Some("path") => Ok(Some(ConfigValueType::Path)),
-        Some("bool-or-str") => Ok(Some(ConfigValueType::BoolOrStr)),
-        Some("bool-or-int") => Ok(Some(ConfigValueType::BoolOrInt)),
-        Some("color") => Ok(Some(ConfigValueType::Color)),
-        Some("expiry-date") => Ok(Some(ConfigValueType::ExpiryDate)),
-        Some(other) => Err(CliError::command_usage(format!(
+        Some(name) => parse_value_type_name(name).map(Some),
+    }
+}
+
+fn parse_value_type_name(name: &str) -> CliResult<ConfigValueType> {
+    match name {
+        "bool" => Ok(ConfigValueType::Bool),
+        "int" => Ok(ConfigValueType::Int),
+        "path" => Ok(ConfigValueType::Path),
+        "bool-or-str" => Ok(ConfigValueType::BoolOrStr),
+        "bool-or-int" => Ok(ConfigValueType::BoolOrInt),
+        "color" => Ok(ConfigValueType::Color),
+        "expiry-date" => Ok(ConfigValueType::ExpiryDate),
+        other => Err(CliError::command_usage(format!(
             "error: unsupported --type '{other}' (expected bool, int, path, bool-or-str, bool-or-int, color, or expiry-date)"
         ))
         .with_stable_code(StableErrorCode::CliInvalidArguments)),

@@ -915,3 +915,5 @@ missing global store follows the recorded git result.
 corrupt config stores keep the migration classification.
 
 replace-all rewrites every matching value.
+
+color list and json emit ansi.

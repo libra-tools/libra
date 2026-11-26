@@ -471,3 +471,43 @@ fn test_cf_73_predicates() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_76_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "color.good", "red"], repo.path()),
+        "valid color",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "color.bad", "bogus"], repo.path()),
+        "invalid color",
+    );
+    let listed = run_libra_command(&["config", "list", "--local", "--type=color"], repo.path());
+    assert_cli_success(&listed, "list --type=color");
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains("color.good=\x1b[31m"), "{text:?}");
+    assert!(
+        !text.contains("color.bad"),
+        "only parseable values: {text:?}"
+    );
+    let json = run_libra_command(
+        &[
+            "--machine",
+            "config",
+            "--local",
+            "--type=color",
+            "--get",
+            "color.good",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&json, "machine get");
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(parsed["data"]["value"], "\u{1b}[31m");
+}
