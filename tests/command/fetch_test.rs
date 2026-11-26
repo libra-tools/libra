@@ -5629,3 +5629,56 @@ fn tag_refspec_short_source_precedence_branch_then_tag_then_oid() {
         "OID precedence"
     );
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_set_upstream_invalid_url_and_url_remote() {
+    let (_temp, repo_dir, current_branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "main".to_string(),
+    };
+
+    // Invalid URL: fetch fails and no branch config is written.
+    let invalid = run_libra_command(
+        &[
+            "fetch",
+            "--set-upstream",
+            "/nonexistent/libra-fetch-source",
+            current_branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert!(!invalid.status.success(), "invalid URL must fail");
+    assert!(
+        ConfigKv::get(&format!("branch.{current}.remote"))
+            .await
+            .expect("read branch remote")
+            .is_none(),
+        "failed fetch must not write upstream"
+    );
+
+    // URL as the remote: the URL itself is recorded as branch.<cur>.remote.
+    let remote_url = repo_dir
+        .parent()
+        .expect("fixture parent")
+        .join("remote.git")
+        .to_string_lossy()
+        .to_string();
+    let url_fetch = run_libra_command(
+        &[
+            "fetch",
+            "--set-upstream",
+            &remote_url,
+            current_branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&url_fetch, "URL remote fetch");
+    let remote = ConfigKv::get(&format!("branch.{current}.remote"))
+        .await
+        .expect("read branch remote")
+        .map(|entry| entry.value);
+    assert_eq!(remote.as_deref(), Some(remote_url.as_str()));
+}

@@ -1958,7 +1958,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     }
 
     let prune = resolve_prune_mode(&remote_config.name, prune_cli).await?;
-    let remote_name_for_set_upstream = remote_config.name.clone();
+    let remote_name_for_set_upstream = remote.clone();
     let result = fetch_repository_with_result(
         remote_config,
         refspec.clone(),
