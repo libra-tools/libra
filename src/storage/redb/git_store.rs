@@ -2079,6 +2079,59 @@ impl GitStore for RedbGitStore {
         .await
     }
 
+    async fn delete_reflog_entries(
+        &self,
+        ref_name: &str,
+        worktree_id: Option<&str>,
+        ids: &[i64],
+    ) -> StorageResult<usize> {
+        if ref_name.is_empty() || ref_name.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "reflog ref_name must be non-empty".to_string(),
+            });
+        }
+        validate_worktree_filter(worktree_id)?;
+        if ref_name != REFLOG_HEAD_REF_NAME && worktree_id.is_some() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "non-HEAD reflog mutations must not specify a worktree_id".to_string(),
+            });
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let ref_name_owned = ref_name.to_string();
+        let wt_scope = worktree_id.unwrap_or_default().to_string();
+        let ids_owned: Vec<u64> = ids
+            .iter()
+            .filter_map(|&id| u64::try_from(id).ok())
+            .collect();
+
+        self.run_write_conditional(move |wtx| {
+            let mut idx_table = wtx
+                .open_table(REFLOG_BY_REF_INDEX)
+                .map_err(|err| map_redb_table_err(err, "open reflog_by_ref index"))?;
+            let mut reflog_table = wtx
+                .open_table(REFLOG_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open reflog table"))?;
+
+            let mut deleted = 0usize;
+            for id in ids_owned {
+                let removed_idx = idx_table
+                    .remove((ref_name_owned.as_str(), wt_scope.as_str(), id))
+                    .map_err(|err| map_redb_storage_err(err, "remove reflog_by_ref index entry"))?
+                    .is_some();
+                if removed_idx {
+                    let _ = reflog_table
+                        .remove(id)
+                        .map_err(|err| map_redb_storage_err(err, "remove reflog primary row"))?;
+                    deleted += 1;
+                }
+            }
+            Ok((true, deleted))
+        })
+        .await
+    }
+
     async fn prepare_bridge_publication(
         &self,
         operation_id: &str,

@@ -6,8 +6,9 @@
 //! (`git.gen-00000001.redb` + `capture.gen-00000001.redb` + dual-lane queue +
 //! `0400` spool tombstones + finalized `storage-format.json`).
 
+#[cfg(feature = "storage-redb")]
+use std::{fs, io};
 use std::{
-    fs, io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -17,6 +18,11 @@ use crate::storage::{
     capture_store::RedbCaptureStore,
     git_state_store::RedbGitStateStore,
     git_store::RedbGitStore,
+    manifest::{
+        INITIAL_STORAGE_GENERATION, RedbGenerationPaths, StorageFormatManifest,
+        canonical_capture_redb_rel_path, canonical_git_redb_rel_path, publish_storage_manifest,
+        resolve_redb_generation_paths,
+    },
     meta::init_meta_schema,
     opener::{RedbRepairContext, begin_write_bounded_blocking, create_redb_writable},
     queue::{init_capture_queue, init_redb_capture_spool_tombstones},
@@ -32,10 +38,8 @@ use crate::{
         git_state_store::GitStateStore,
         git_store::GitStore,
         manifest::{
-            INITIAL_STORAGE_GENERATION, PRIVATE_SUBDIR, REDB_SUBDIR, RedbGenerationPaths,
-            STORAGE_FORMAT_MANIFEST_FILE, StorageAuthority, StorageFormatManifest,
-            canonical_capture_redb_rel_path, canonical_git_redb_rel_path, detect_storage_authority,
-            publish_storage_manifest, resolve_redb_generation_paths,
+            PRIVATE_SUBDIR, REDB_SUBDIR, STORAGE_FORMAT_MANIFEST_FILE, StorageAuthority,
+            detect_storage_authority,
         },
     },
 };
@@ -60,6 +64,20 @@ pub fn detect_repo_backend(common_storage: &Path) -> StorageResult<StorageBacken
         StorageAuthority::Manifest(layout) => Ok(layout.backend),
         StorageAuthority::LegacySqlite { .. } => Ok(StorageBackendKind::Sqlite),
         StorageAuthority::FreshEmpty => Ok(StorageBackendKind::compiled_default()),
+    }
+}
+
+/// Select the storage backend for fresh repository initialization (`init`/`clone`).
+///
+/// Once `REDB_RUNTIME_UNLOCKED` is enabled (`RB-29a`), honors `LIBRA_STORAGE_BACKEND`
+/// via [`StorageBackendKind::resolve`]. Prior to unlock, uses [`detect_repo_backend`]
+/// so pure-`redb` tests can initialize `redb` repos directly while production CLI
+/// entry points continue to enforce the pre-release gate in `src/cli.rs`.
+pub fn select_init_backend(common_storage: &Path) -> StorageResult<StorageBackendKind> {
+    if crate::storage::backend::REDB_RUNTIME_UNLOCKED {
+        StorageBackendKind::resolve(common_storage)
+    } else {
+        detect_repo_backend(common_storage)
     }
 }
 

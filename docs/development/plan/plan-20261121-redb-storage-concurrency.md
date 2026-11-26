@@ -7895,7 +7895,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/init.rs` 与 `src/command/clone.rs`（1 目录、2 文件）接入 `crate::storage`，在 `Redb` 后端下初始化 `.libra/redb/git.gen-00000001.redb`、`.libra/private/capture.gen-00000001.redb`、`.libra/storage-format.json` 并同步调用 `init_redb_capture_spool_tombstones` 建立 `0400` spool 墓碑，扩展 `clone.rs:786` `REPO_MARKERS` 识别红库目录，同时严禁改动 `src/command/init.rs:1-20` 受保护头部与导入块（`GC-RB-06`）。
 
@@ -7910,17 +7910,17 @@
 | `clone.rs:786` `REPO_MARKERS` 仅列 `libra.db`；`init.rs:1-20` 顶部导入块受 `GC-RB-06` 保护 | `src/command/clone.rs:786`；`src/command/init.rs:1-20` |
 
 **Acceptance criteria:**
-- [ ] `init` 在 `Redb` 后端下初始化 `.libra/redb/git.gen-00000001.redb`、`.libra/private/capture.gen-00000001.redb` 与 `.libra/storage-format.json`（不创建 `libra.db`）。
-- [ ] `init` 在 `Redb` 后端下同步调用 `init_redb_capture_spool_tombstones` 建立 `.libra/private/capture-spool/{tmp,ready,quarantine}` `0400` 墓碑（旧 SQLite Hook 调 `ensure_spool` 立即 fail-closed）。
-- [ ] `clone` 在 `Redb` 后端下完成红库初始化并同步建立 `0400` `capture-spool` 墓碑。
-- [ ] `clone.rs` `REPO_MARKERS` 识别已初始化红库目录（`storage-format.json`/`redb`）。
-- [ ] `src/command/init.rs:1-20` 受保护导入块零改动（`GC-RB-06`）。
-- [ ] 既有 SQLite `compat_checkout_branch_startpoint` 路径零回归。
+- [x] `init` 在 `Redb` 后端下初始化 `.libra/redb/git.gen-00000001.redb`、`.libra/private/capture.gen-00000001.redb` 与 `.libra/storage-format.json`（不创建 `libra.db`）。
+- [x] `init` 在 `Redb` 后端下同步调用 `init_redb_capture_spool_tombstones` 建立 `.libra/private/capture-spool/{tmp,ready,quarantine}` `0400` 墓碑（旧 SQLite Hook 调 `ensure_spool` 立即 fail-closed）。
+- [x] `clone` 在 `Redb` 后端下完成红库初始化并同步建立 `0400` `capture-spool` 墓碑。
+- [x] `clone.rs` `REPO_MARKERS` 识别已初始化红库目录（`storage-format.json`/`redb`）。
+- [x] `src/command/init.rs:1-20` 受保护导入块零改动（`GC-RB-06`）。
+- [x] 既有 SQLite `compat_checkout_branch_startpoint` 路径零回归。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::init::tests::redb_init_and_clone_with_spool_tombstones_and_repo_markers)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::init::tests::redb_init_and_clone_with_spool_tombstones_and_repo_markers)'`（new，覆盖 AC1–AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_checkout_branch_startpoint`（覆盖 AC6；AC5 由 `RB-30` `init.rs:1-20` `diff -u` 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::init::tests::redb_init_and_clone_with_spool_tombstones_and_repo_markers)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::init::tests::redb_init_and_clone_with_spool_tombstones_and_repo_markers)'`（new，覆盖 AC1–AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_checkout_branch_startpoint`（覆盖 AC6；AC5 由 `RB-30` `init.rs:1-20` `diff -u` 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -7954,7 +7954,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/command/` 下其余 10 个高频核心命令（`commit.rs`、`branch.rs`、`tag.rs`、`switch.rs`、`reset.rs`、`log.rs`、`reflog.rs`、`remote.rs`、`revision.rs`、`update_ref.rs`）接入 `crate::storage`，确保只读命令（`log`/`reflog`/`revision`）严格走 `open_read_only`（`ADR-RB-03`）并在并发写入下线性化无锁错。
 
@@ -7968,17 +7968,17 @@
 | `log.rs:1567`、`reset.rs:32`、`switch.rs:18,475`、`commit.rs:2394` 直接打开 SQLite | `src/command/log.rs:1567`；`src/command/reset.rs:32`；`src/command/switch.rs:18,475`；`src/command/commit.rs:2394` |
 
 **Acceptance criteria:**
-- [ ] `commit`、`branch`、`tag`、`switch`、`reset`、`remote`、`update_ref` 在 `Redb` 仓库上完成全链路写操作，不创建或打开 `.libra/libra.db`。
-- [ ] `log`、`reflog`、`revision` 通过 `open_read_only` 无锁执行，在另一进程持续写入期间零锁错。
-- [ ] 多进程并发验证：8 进程并发 `log`/`status` + 2 进程循环 `commit`/`update_ref` 全部退出 0 并保持引用线性化。
-- [ ] 既有 SQLite `compat_commit_identity_date` 路径零回归。
-- [ ] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
+- [x] `commit`、`branch`、`tag`、`switch`、`reset`、`remote`、`update_ref` 在 `Redb` 仓库上完成全链路写操作，不创建或打开 `.libra/libra.db`。
+- [x] `log`、`reflog`、`revision` 通过 `open_read_only` 无锁执行，在另一进程持续写入期间零锁错。
+- [x] 多进程并发验证：8 进程并发 `log`/`status` + 2 进程循环 `commit`/`update_ref` 全部退出 0 并保持引用线性化。
+- [x] 既有 SQLite `compat_commit_identity_date` 路径零回归。
+- [x] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::commit::tests::redb_porcelain_commit_branch_tag_switch_reset_roundtrip) | test(=command::log::tests::redb_multiprocess_readonly_log_with_concurrent_commits)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::commit::tests::redb_porcelain_commit_branch_tag_switch_reset_roundtrip)'`（new，覆盖 AC1）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::log::tests::redb_multiprocess_readonly_log_with_concurrent_commits)'`（new，覆盖 AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_commit_identity_date`（覆盖 AC4；AC5 由 `RB-30` 禁改 diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::commit::tests::redb_porcelain_commit_branch_tag_switch_reset_roundtrip) | test(=command::log::tests::redb_multiprocess_readonly_log_with_concurrent_commits)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::commit::tests::redb_porcelain_commit_branch_tag_switch_reset_roundtrip)'`（new，覆盖 AC1）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=command::log::tests::redb_multiprocess_readonly_log_with_concurrent_commits)'`（new，覆盖 AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test compat_commit_identity_date`（覆盖 AC4；AC5 由 `RB-30` 禁改 diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 

@@ -839,6 +839,39 @@ impl GitStore for SqliteGitStore {
             .collect())
     }
 
+    async fn delete_reflog_entries(
+        &self,
+        ref_name: &str,
+        worktree_id: Option<&str>,
+        ids: &[i64],
+    ) -> StorageResult<usize> {
+        if ref_name.is_empty() || ref_name.contains('\0') {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "reflog ref_name must be non-empty".to_string(),
+            });
+        }
+        validate_worktree_filter(worktree_id)?;
+        if ref_name != REFLOG_HEAD_REF_NAME && worktree_id.is_some() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "non-HEAD reflog mutations must not specify a worktree_id".to_string(),
+            });
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut del = reflog::Entity::delete_many()
+            .filter(reflog::Column::RefName.eq(ref_name))
+            .filter(reflog::Column::Id.is_in(ids.iter().copied()));
+        del = match worktree_id {
+            Some(wt) => del.filter(reflog::Column::WorktreeId.eq(wt)),
+            None => del.filter(reflog::Column::WorktreeId.is_null()),
+        };
+        let res = del.exec(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "delete reflog rows", err)
+        })?;
+        Ok(usize::try_from(res.rows_affected).unwrap_or(usize::MAX))
+    }
+
     async fn prepare_bridge_publication(
         &self,
         operation_id: &str,

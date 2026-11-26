@@ -848,21 +848,50 @@ async fn run_add_remote(
     // `remote set-head`, this is written unconditionally at add time (the
     // tracking ref does not exist yet, matching Git's `remote add -m`).
     if let Some(branch) = &master {
-        let db = get_db_conn_instance().await;
-        let txn_name = name.clone();
-        let txn_branch = branch.clone();
-        write_transaction::<_, _, (), DbErr>(&db, move |txn| {
-            Box::pin(async move {
-                Head::update_result_with_conn(txn, Head::Branch(txn_branch), Some(&txn_name))
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+            RemoteError::ConfigWrite {
+                detail: e.to_string(),
+            }
+        })? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
                     .await
-                    .map_err(|e| DbErr::Custom(e.to_string()))?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(|e| RemoteError::ConfigWrite {
-            detail: e.to_string(),
-        })?;
+                    .map_err(|e| RemoteError::ConfigWrite {
+                        detail: e.to_string(),
+                    })?;
+                Head::update_for_scope_result_with_store(
+                    &*store,
+                    Head::Branch(branch.clone()),
+                    Some(&name),
+                    &crate::internal::worktree_scope::WorktreeScope::Main,
+                )
+                .await
+                .map_err(|e| RemoteError::ConfigWrite {
+                    detail: e.to_string(),
+                })?;
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                let txn_name = name.clone();
+                let txn_branch = branch.clone();
+                write_transaction::<_, _, (), DbErr>(&db, move |txn| {
+                    Box::pin(async move {
+                        Head::update_result_with_conn(
+                            txn,
+                            Head::Branch(txn_branch),
+                            Some(&txn_name),
+                        )
+                        .await
+                        .map_err(|e| DbErr::Custom(e.to_string()))?;
+                        Ok(())
+                    })
+                })
+                .await
+                .map_err(|e| RemoteError::ConfigWrite {
+                    detail: e.to_string(),
+                })?;
+            }
+        }
     }
 
     // `-f`/`--fetch`: pull from the new remote right after registering it. The
@@ -905,79 +934,220 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
         .map(|e| e.value == old)
         .unwrap_or(false);
 
-    let db = get_db_conn_instance().await;
-    let old_for_txn = old.clone();
-    let new_for_txn = new.clone();
-    let new_for_error = new.clone();
-    write_transaction::<_, _, (), anyhow::Error>(&db, move |txn| {
-        Box::pin(async move {
-            let target_rows = reference::Entity::find()
-                .filter(reference::Column::Remote.eq(&new_for_txn))
-                .all(txn)
-                .await?;
-            // A refspec can create `refs/remotes/<new>/...` rows whose `remote`
-            // column still names the *source* remote, so also match by name.
-            use sea_orm::Condition;
-            let prefixed_rows = reference::Entity::find()
-                .filter(
-                    Condition::any()
-                        .add(reference::Column::Name.like(format!("refs/remotes/{new_for_txn}/%")))
-                        .add(reference::Column::Name.like(format!("{new_for_txn}/%"))),
-                )
-                .all(txn)
-                .await?;
-            if !target_rows.is_empty() || !prefixed_rows.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "tracking reference namespace for remote '{}' already exists",
-                    new_for_txn
-                ));
-            }
-
-            ConfigKv::rename_remote_with_conn(txn, &old_for_txn, &new_for_txn).await?;
-
-            let old_tracking_prefix = format!("refs/remotes/{old_for_txn}/");
-            let new_tracking_prefix = format!("refs/remotes/{new_for_txn}/");
-            let rows = reference::Entity::find()
-                .filter(reference::Column::Remote.eq(&old_for_txn))
-                .all(txn)
-                .await?;
-            for row in rows {
-                let mut active: reference::ActiveModel = row.into();
-                active.remote = Set(Some(new_for_txn.clone()));
-                if let Some(name) = active.name.as_ref()
-                    && let Some(suffix) = name.strip_prefix(&old_tracking_prefix)
-                {
-                    active.name = Set(Some(format!("{new_tracking_prefix}{suffix}")));
-                }
-                active.update(txn).await?;
-            }
-
-            let reflog_rows = reflog::Entity::find()
-                .filter(reflog::Column::RefName.starts_with(&old_tracking_prefix))
-                .all(txn)
-                .await?;
-            for row in reflog_rows {
-                let new_ref_name =
-                    row.ref_name
-                        .replacen(&old_tracking_prefix, &new_tracking_prefix, 1);
-                let mut active: reflog::ActiveModel = row.into();
-                active.ref_name = Set(new_ref_name);
-                active.update(txn).await?;
-            }
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|error| {
-        let detail = error.to_string();
-        if detail.contains("SSH key namespace for remote") {
-            RemoteError::SshKeyNamespaceExists {
-                name: new_for_error,
-            }
-        } else {
-            RemoteError::ConfigWrite { detail }
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        RemoteError::ConfigRead {
+            detail: error.to_string(),
         }
-    })?;
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            use crate::storage::git_store::{RefKey, ReflogWrite};
+
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| RemoteError::ConfigWrite {
+                    detail: error.to_string(),
+                })?;
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|error| RemoteError::ConfigWrite {
+                    detail: error.to_string(),
+                })?;
+
+            let all_refs =
+                git_store
+                    .list_refs(None)
+                    .await
+                    .map_err(|error| RemoteError::ConfigRead {
+                        detail: error.to_string(),
+                    })?;
+            let new_tracking_prefix = format!("refs/remotes/{new}/");
+            let new_short_prefix = format!("{new}/");
+            let namespace_conflict = all_refs.iter().any(|rec| match &rec.key {
+                RefKey::RemoteHead { remote } => remote == &new,
+                RefKey::RemoteBranch { remote, name } => {
+                    remote == &new
+                        || name.starts_with(&new_tracking_prefix)
+                        || name.starts_with(&new_short_prefix)
+                }
+                RefKey::LocalBranch { name } => {
+                    name.starts_with(&new_tracking_prefix) || name.starts_with(&new_short_prefix)
+                }
+                _ => false,
+            });
+            if namespace_conflict {
+                return Err(RemoteError::ConfigWrite {
+                    detail: format!(
+                        "tracking reference namespace for remote '{}' already exists",
+                        new
+                    ),
+                });
+            }
+
+            ConfigKv::rename_remote_with_store(&*config_store, &old, &new)
+                .await
+                .map_err(|error| {
+                    let detail = error.to_string();
+                    if detail.contains("SSH key namespace for remote") {
+                        RemoteError::SshKeyNamespaceExists { name: new.clone() }
+                    } else {
+                        RemoteError::ConfigWrite { detail }
+                    }
+                })?;
+
+            let old_tracking_prefix = format!("refs/remotes/{old}/");
+            for rec in all_refs {
+                match &rec.key {
+                    RefKey::RemoteHead { remote } if remote == &old => {
+                        let new_key = RefKey::RemoteHead {
+                            remote: new.clone(),
+                        };
+                        git_store
+                            .update_ref_cas(&new_key, None, Some(&rec.target), &[])
+                            .await
+                            .map_err(|error| RemoteError::ConfigWrite {
+                                detail: error.to_string(),
+                            })?;
+                        git_store
+                            .update_ref_cas(&rec.key, Some(&rec.target), None, &[])
+                            .await
+                            .map_err(|error| RemoteError::ConfigWrite {
+                                detail: error.to_string(),
+                            })?;
+                    }
+                    RefKey::RemoteBranch { remote, name } if remote == &old => {
+                        let new_name = name
+                            .strip_prefix(&old_tracking_prefix)
+                            .map(|suffix| format!("{new_tracking_prefix}{suffix}"))
+                            .unwrap_or_else(|| name.clone());
+                        let old_ref_name = if name.starts_with("refs/") {
+                            name.clone()
+                        } else {
+                            format!("{old_tracking_prefix}{name}")
+                        };
+                        let new_ref_name =
+                            old_ref_name.replacen(&old_tracking_prefix, &new_tracking_prefix, 1);
+                        let mut existing_reflogs = git_store
+                            .list_reflog(&old_ref_name, None, None)
+                            .await
+                            .map_err(|error| RemoteError::ConfigRead {
+                                detail: error.to_string(),
+                            })?;
+                        // `list_reflog` is newest-first; reverse so oldest entries are appended first.
+                        existing_reflogs.reverse();
+                        let migrated_reflogs: Vec<ReflogWrite> = existing_reflogs
+                            .into_iter()
+                            .map(|entry| ReflogWrite {
+                                ref_name: new_ref_name.clone(),
+                                old_oid: entry.old_oid,
+                                new_oid: entry.new_oid,
+                                timestamp: entry.timestamp,
+                                committer_name: entry.committer_name,
+                                committer_email: entry.committer_email,
+                                action: entry.action,
+                                message: entry.message,
+                                worktree_id: None,
+                            })
+                            .collect();
+                        let new_key = RefKey::RemoteBranch {
+                            remote: new.clone(),
+                            name: new_name,
+                        };
+                        git_store
+                            .update_ref_cas(&new_key, None, Some(&rec.target), &migrated_reflogs)
+                            .await
+                            .map_err(|error| RemoteError::ConfigWrite {
+                                detail: error.to_string(),
+                            })?;
+                        git_store
+                            .update_ref_cas(&rec.key, Some(&rec.target), None, &[])
+                            .await
+                            .map_err(|error| RemoteError::ConfigWrite {
+                                detail: error.to_string(),
+                            })?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let old_for_txn = old.clone();
+            let new_for_txn = new.clone();
+            let new_for_error = new.clone();
+            write_transaction::<_, _, (), anyhow::Error>(&db, move |txn| {
+                Box::pin(async move {
+                    let target_rows = reference::Entity::find()
+                        .filter(reference::Column::Remote.eq(&new_for_txn))
+                        .all(txn)
+                        .await?;
+                    // A refspec can create `refs/remotes/<new>/...` rows whose `remote`
+                    // column still names the *source* remote, so also match by name.
+                    use sea_orm::Condition;
+                    let prefixed_rows = reference::Entity::find()
+                        .filter(
+                            Condition::any()
+                                .add(
+                                    reference::Column::Name
+                                        .like(format!("refs/remotes/{new_for_txn}/%")),
+                                )
+                                .add(reference::Column::Name.like(format!("{new_for_txn}/%"))),
+                        )
+                        .all(txn)
+                        .await?;
+                    if !target_rows.is_empty() || !prefixed_rows.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "tracking reference namespace for remote '{}' already exists",
+                            new_for_txn
+                        ));
+                    }
+
+                    ConfigKv::rename_remote_with_conn(txn, &old_for_txn, &new_for_txn).await?;
+
+                    let old_tracking_prefix = format!("refs/remotes/{old_for_txn}/");
+                    let new_tracking_prefix = format!("refs/remotes/{new_for_txn}/");
+                    let rows = reference::Entity::find()
+                        .filter(reference::Column::Remote.eq(&old_for_txn))
+                        .all(txn)
+                        .await?;
+                    for row in rows {
+                        let mut active: reference::ActiveModel = row.into();
+                        active.remote = Set(Some(new_for_txn.clone()));
+                        if let Some(name) = active.name.as_ref()
+                            && let Some(suffix) = name.strip_prefix(&old_tracking_prefix)
+                        {
+                            active.name = Set(Some(format!("{new_tracking_prefix}{suffix}")));
+                        }
+                        active.update(txn).await?;
+                    }
+
+                    let reflog_rows = reflog::Entity::find()
+                        .filter(reflog::Column::RefName.starts_with(&old_tracking_prefix))
+                        .all(txn)
+                        .await?;
+                    for row in reflog_rows {
+                        let new_ref_name =
+                            row.ref_name
+                                .replacen(&old_tracking_prefix, &new_tracking_prefix, 1);
+                        let mut active: reflog::ActiveModel = row.into();
+                        active.ref_name = Set(new_ref_name);
+                        active.update(txn).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|error| {
+                let detail = error.to_string();
+                if detail.contains("SSH key namespace for remote") {
+                    RemoteError::SshKeyNamespaceExists {
+                        name: new_for_error,
+                    }
+                } else {
+                    RemoteError::ConfigWrite { detail }
+                }
+            })?;
+        }
+    }
 
     // Git parity: a global/system-scoped `remote.pushDefault` that names the
     // renamed remote is left unchanged and warned about; only a local-scope
@@ -1580,16 +1750,36 @@ async fn run_show_remote(name: String, no_query: bool) -> Result<RemoteOutput, R
 /// Read the cached remote HEAD branch from `refs/remotes/<name>/HEAD` (a `Head`
 /// row). A detached or absent remote HEAD yields `None`.
 async fn load_cached_remote_head(name: &str) -> Result<Option<String>, RemoteError> {
-    let db = get_db_conn_instance().await;
-    Head::remote_current_result_with_conn(&db, name)
-        .await
-        .map_err(|error| RemoteError::BranchList {
+    let head = match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        RemoteError::BranchList {
             detail: error.to_string(),
-        })
-        .map(|head| match head {
-            Some(Head::Branch(branch)) => Some(branch),
-            Some(Head::Detached(_)) | None => None,
-        })
+        }
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| RemoteError::BranchList {
+                    detail: error.to_string(),
+                })?;
+            Head::remote_current_result_with_store(&*store, name)
+                .await
+                .map_err(|error| RemoteError::BranchList {
+                    detail: error.to_string(),
+                })?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            Head::remote_current_result_with_conn(&db, name)
+                .await
+                .map_err(|error| RemoteError::BranchList {
+                    detail: error.to_string(),
+                })?
+        }
+    };
+    Ok(match head {
+        Some(Head::Branch(branch)) => Some(branch),
+        Some(Head::Detached(_)) | None => None,
+    })
 }
 
 /// Collect the cached remote-tracking branch OIDs for `<name>` as
@@ -1752,28 +1942,57 @@ async fn run_set_branches(
         .collect();
 
     let key = format!("remote.{name}.fetch");
-    let db = get_db_conn_instance().await;
-    let txn_key = key.clone();
-    let txn_refspecs = refspecs.clone();
-    write_transaction::<_, _, (), DbErr>(&db, move |txn| {
-        Box::pin(async move {
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        RemoteError::ConfigWrite {
+            detail: e.to_string(),
+        }
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|e| RemoteError::ConfigWrite {
+                    detail: e.to_string(),
+                })?;
             if !add {
-                ConfigKv::unset_all_with_conn(txn, &txn_key)
+                ConfigKv::unset_all_with_store(&*store, &key)
                     .await
-                    .map_err(|e| DbErr::Custom(e.to_string()))?;
+                    .map_err(|e| RemoteError::ConfigWrite {
+                        detail: e.to_string(),
+                    })?;
             }
-            for spec in &txn_refspecs {
-                ConfigKv::add_with_conn(txn, &txn_key, spec, false)
+            for spec in &refspecs {
+                ConfigKv::add_with_store(&*store, &key, spec, false)
                     .await
-                    .map_err(|e| DbErr::Custom(e.to_string()))?;
+                    .map_err(|e| RemoteError::ConfigWrite {
+                        detail: e.to_string(),
+                    })?;
             }
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|e| RemoteError::ConfigWrite {
-        detail: e.to_string(),
-    })?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let txn_key = key.clone();
+            let txn_refspecs = refspecs.clone();
+            write_transaction::<_, _, (), DbErr>(&db, move |txn| {
+                Box::pin(async move {
+                    if !add {
+                        ConfigKv::unset_all_with_conn(txn, &txn_key)
+                            .await
+                            .map_err(|e| DbErr::Custom(e.to_string()))?;
+                    }
+                    for spec in &txn_refspecs {
+                        ConfigKv::add_with_conn(txn, &txn_key, spec, false)
+                            .await
+                            .map_err(|e| DbErr::Custom(e.to_string()))?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| RemoteError::ConfigWrite {
+                detail: e.to_string(),
+            })?;
+        }
+    }
 
     Ok(RemoteOutput::SetBranches {
         name,
@@ -1793,26 +2012,60 @@ async fn run_set_head(
     branch: Option<String>,
 ) -> Result<RemoteOutput, RemoteError> {
     ensure_remote_exists(&name).await?;
-    let db = get_db_conn_instance().await;
+    let backend = crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        RemoteError::ConfigWrite {
+            detail: e.to_string(),
+        }
+    })?;
 
     if delete {
-        let txn_name = name.clone();
-        db.transaction::<_, (), DbErr>(move |txn| {
-            Box::pin(async move {
-                // Remote HEAD is a `Head` row (refs/remotes/<name>/HEAD), not a
-                // `Branch` row — delete it directly. Absent row is a no-op.
-                reference::Entity::delete_many()
-                    .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
-                    .filter(reference::Column::Remote.eq(txn_name))
-                    .exec(txn)
-                    .await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(|e| RemoteError::ConfigWrite {
-            detail: e.to_string(),
-        })?;
+        match backend {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_git_store_read_write()
+                    .await
+                    .map_err(|e| RemoteError::ConfigWrite {
+                        detail: e.to_string(),
+                    })?;
+                let key = crate::storage::git_store::RefKey::RemoteHead {
+                    remote: name.clone(),
+                };
+                if let Some(existing) =
+                    store
+                        .get_ref(&key)
+                        .await
+                        .map_err(|e| RemoteError::ConfigWrite {
+                            detail: e.to_string(),
+                        })?
+                {
+                    let _ = store
+                        .update_ref_cas(&key, Some(&existing), None, &[])
+                        .await
+                        .map_err(|e| RemoteError::ConfigWrite {
+                            detail: e.to_string(),
+                        })?;
+                }
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                let txn_name = name.clone();
+                db.transaction::<_, (), DbErr>(move |txn| {
+                    Box::pin(async move {
+                        // Remote HEAD is a `Head` row (refs/remotes/<name>/HEAD), not a
+                        // `Branch` row — delete it directly. Absent row is a no-op.
+                        reference::Entity::delete_many()
+                            .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+                            .filter(reference::Column::Remote.eq(txn_name))
+                            .exec(txn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .await
+                .map_err(|e| RemoteError::ConfigWrite {
+                    detail: e.to_string(),
+                })?;
+            }
+        }
         return Ok(RemoteOutput::SetHead {
             name,
             mode: SetHeadMode::Delete,
@@ -1852,20 +2105,42 @@ async fn run_set_head(
         });
     }
 
-    let txn_name = name.clone();
-    let txn_branch = branch.clone();
-    write_transaction::<_, _, (), DbErr>(&db, move |txn| {
-        Box::pin(async move {
-            Head::update_result_with_conn(txn, Head::Branch(txn_branch), Some(&txn_name))
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
                 .await
-                .map_err(|e| DbErr::Custom(e.to_string()))?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|e| RemoteError::ConfigWrite {
-        detail: e.to_string(),
-    })?;
+                .map_err(|e| RemoteError::ConfigWrite {
+                    detail: e.to_string(),
+                })?;
+            Head::update_for_scope_result_with_store(
+                &*store,
+                Head::Branch(branch.clone()),
+                Some(&name),
+                &crate::internal::worktree_scope::WorktreeScope::Main,
+            )
+            .await
+            .map_err(|e| RemoteError::ConfigWrite {
+                detail: e.to_string(),
+            })?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let txn_name = name.clone();
+            let txn_branch = branch.clone();
+            write_transaction::<_, _, (), DbErr>(&db, move |txn| {
+                Box::pin(async move {
+                    Head::update_result_with_conn(txn, Head::Branch(txn_branch), Some(&txn_name))
+                        .await
+                        .map_err(|e| DbErr::Custom(e.to_string()))?;
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| RemoteError::ConfigWrite {
+                detail: e.to_string(),
+            })?;
+        }
+    }
 
     Ok(RemoteOutput::SetHead {
         name,

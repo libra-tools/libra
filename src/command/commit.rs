@@ -1572,9 +1572,10 @@ async fn run_commit_with_index(
         drop(bridge_publish_lock);
         sequence_warnings.extend(agent_config_warning);
         if let Some(snapshot) = &agent_snapshot
+            && let Some(conn) = snapshot.conn.as_ref()
             && let Err(error) =
                 crate::internal::ai::history::link_authorized_agent_sessions_to_commit(
-                    &snapshot.conn,
+                    conn,
                     &snapshot.session_ids,
                     commit.id,
                     &snapshot.scope,
@@ -1765,8 +1766,9 @@ async fn run_commit_with_index(
     drop(bridge_publish_lock);
     sequence_warnings.extend(agent_config_warning);
     if let Some(snapshot) = &agent_snapshot
+        && let Some(conn) = snapshot.conn.as_ref()
         && let Err(error) = crate::internal::ai::history::link_authorized_agent_sessions_to_commit(
-            &snapshot.conn,
+            conn,
             &snapshot.session_ids,
             commit.id,
             &snapshot.scope,
@@ -2342,7 +2344,7 @@ pub(crate) fn append_trailers(message: &str, trailers: &[String]) -> String {
 }
 
 struct AgentCommitSnapshot {
-    conn: DbConn,
+    conn: Option<DbConn>,
     storage_root: PathBuf,
     scope: crate::internal::ai::capture_scope::CaptureScope,
     session_ids: Vec<String>,
@@ -2408,6 +2410,39 @@ async fn snapshot_agent_sessions_for_commit(
             .map_err(|error| CommitError::AgentAssociation(format!("resolve worktree: {error}")))?;
         (storage, root)
     };
+    let backend = crate::storage::runtime::detect_repo_backend(&storage_root).map_err(|error| {
+        CommitError::AgentAssociation(format!("detect repository backend: {error}"))
+    })?;
+    if matches!(backend, crate::storage::StorageBackendKind::Redb) {
+        // Under Redb, capture sessions live in CaptureStore (wired in RB-21/RB-22);
+        // until an active capture session is linked, return an empty snapshot without
+        // touching `libra.db`.
+        let config_store = crate::storage::runtime::open_repo_config_store_read_only(&storage_root)
+            .await
+            .map_err(|error| {
+                CommitError::AgentAssociation(format!("open repository config store: {error}"))
+            })?;
+        let repo_id =
+            crate::internal::config::ConfigKv::get_with_store(&*config_store, "libra.repoid")
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.value)
+                .unwrap_or_default();
+        let wt_id = crate::utils::util::current_worktree_id().unwrap_or_default();
+        let scope = crate::internal::ai::capture_scope::CaptureScope {
+            repo_id,
+            worktree_id: wt_id.clone(),
+            workspace_id: Some(wt_id),
+            workspace_fence: Some(0),
+        };
+        return Ok(AgentCommitSnapshot {
+            conn: None,
+            storage_root,
+            scope,
+            session_ids: Vec::new(),
+        });
+    }
     let conn =
         crate::internal::db::get_db_conn_instance_for_path(&storage_root.join(util::DATABASE))
             .await
@@ -2489,7 +2524,7 @@ async fn snapshot_agent_sessions_for_commit(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(AgentCommitSnapshot {
-        conn,
+        conn: Some(conn),
         storage_root,
         scope,
         session_ids,
@@ -4056,7 +4091,10 @@ async fn mark_agent_journal_linked(
     if snapshot.session_ids.is_empty() {
         return Ok(());
     }
-    let txn = crate::internal::db::begin_write_transaction(&snapshot.conn).await?;
+    let Some(conn) = snapshot.conn.as_ref() else {
+        return Ok(());
+    };
+    let txn = crate::internal::db::begin_write_transaction(conn).await?;
     crate::internal::ai::history::authorize_agent_commit_links_in_txn(
         &txn,
         &snapshot.session_ids,
@@ -4156,86 +4194,185 @@ async fn update_head_and_reflog(
 ) -> Result<(), CommitError> {
     let reflog_context = new_reflog_context(commit_id, commit_message).await;
     let commit_id = commit_id.to_string();
-    with_reflog(
-        reflog_context,
-        |txn| {
-            Box::pin(async move {
-                if let Some((record, storage_root)) = &journal
-                    && !record.session_ids.is_empty()
-                {
-                    crate::internal::ai::history::authorize_agent_commit_links_in_txn(
-                        txn, &record.session_ids, &record.scope,
-                    ).await.map_err(|error| sea_orm::DbErr::Custom(format!(
-                        "agent commit journal authorization failed before ref update: {error:#}"
-                    )))?;
-                    crate::internal::ai::commit_journal::append(storage_root, record)
-                        .map_err(|error| sea_orm::DbErr::Custom(format!(
-                            "agent commit journal could not be durably written before ref update: {error:#}"
-                        )))?;
-                }
-                crate::internal::ai::agent_bridge::publication::check_expected_head_in_txn(txn).await?;
-                if let Some(prepared) =
-                    crate::internal::ai::agent_bridge::publication::prepared_oid_in_txn(txn).await?
-                    && prepared != commit_id
-                {
-                    return Err(sea_orm::DbErr::Custom(format!(
-                        "bridge operation prepared commit {prepared}, not {commit_id}; the ref was not moved"
-                    )));
-                }
-                if let Some(prepared) =
-                    crate::internal::ai::agent_bridge::publication::prepared_oid_in_txn(txn).await?
-                {
-                    use crate::utils::object_ext::CommitExt;
-                    let loaded = git_internal::internal::object::commit::Commit::load(
-                        &crate::internal::object_format::parse_repo_oid(&prepared).map_err(|error| {
-                            sea_orm::DbErr::Custom(format!(
-                                "prepared commit id is invalid: {error}"
-                            ))
-                        })?,
-                    )
-                    .map_err(|error| {
-                        sea_orm::DbErr::Custom(format!("prepared commit could not be read: {error}"))
-                    })?;
-                    let parent = loaded
-                        .parent_commit_ids
-                        .first()
-                        .map(|oid| oid.to_string())
-                        .unwrap_or_default();
-                    let head = crate::internal::head::Head::current_commit_result_with_conn(txn)
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| CommitError::HeadUpdate(error.to_string()))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| CommitError::HeadUpdate(error.to_string()))?;
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|error| CommitError::HeadUpdate(error.to_string()))?;
+            let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+            let head = Head::current_for_scope_result_with_store(&*git_store, &scope)
+                .await
+                .map_err(|error| CommitError::HeadUpdate(error.to_string()))?;
+            let head_reflog = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                &*config_store,
+                &reflog_context,
+                crate::internal::reflog::HEAD,
+            )
+            .await;
+            match head {
+                Head::Branch(branch_name) => {
+                    let branch_reflog =
+                        crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                            &*config_store,
+                            &reflog_context,
+                            &format!("refs/heads/{branch_name}"),
+                        )
+                        .await;
+                    let key = crate::storage::git_store::RefKey::LocalBranch {
+                        name: branch_name.clone(),
+                    };
+                    let existing = git_store
+                        .get_ref(&key)
                         .await
-                        .map_err(|error| {
-                            sea_orm::DbErr::Custom(format!(
-                                "prepared commit could not read HEAD: {error}"
-                            ))
-                        })?
-                        .map(|oid| oid.to_string())
-                        .unwrap_or_default();
-                    if parent != head {
-                        return Err(sea_orm::DbErr::Custom(
-                            "prepared commit parent is not current HEAD; the ref was not moved"
-                                .to_string(),
+                        .map_err(|error| CommitError::HeadUpdate(error.to_string()))?;
+                    let new_target =
+                        crate::storage::git_store::RefTarget::Direct(commit_id.clone());
+                    let outcome = git_store
+                        .update_ref_cas(
+                            &key,
+                            existing.as_ref(),
+                            Some(&new_target),
+                            &[head_reflog, branch_reflog],
+                        )
+                        .await
+                        .map_err(|error| CommitError::HeadUpdate(error.to_string()))?;
+                    if !matches!(
+                        outcome,
+                        crate::storage::git_store::RefCasOutcome::Applied { .. }
+                    ) {
+                        return Err(CommitError::HeadUpdate(format!(
+                            "concurrent ref update while committing to branch '{branch_name}'"
+                        )));
+                    }
+                }
+                Head::Detached(_) => {
+                    let key = crate::storage::git_store::RefKey::LocalHead {
+                        worktree_id: scope.worktree_id().map(str::to_string),
+                    };
+                    let existing = git_store
+                        .get_ref(&key)
+                        .await
+                        .map_err(|error| CommitError::HeadUpdate(error.to_string()))?;
+                    let new_target =
+                        crate::storage::git_store::RefTarget::Direct(commit_id.clone());
+                    let outcome = git_store
+                        .update_ref_cas(&key, existing.as_ref(), Some(&new_target), &[head_reflog])
+                        .await
+                        .map_err(|error| CommitError::HeadUpdate(error.to_string()))?;
+                    if !matches!(
+                        outcome,
+                        crate::storage::git_store::RefCasOutcome::Applied { .. }
+                    ) {
+                        return Err(CommitError::HeadUpdate(
+                            "concurrent ref update while committing to detached HEAD".to_string(),
                         ));
                     }
                 }
-                update_head(txn, &commit_id)
-                    .await
-                    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
-                // Bridge publications bind the operation id in this same
-                // transaction. Ordinary commits have no scope and do nothing.
-                crate::internal::ai::agent_bridge::publication::bind_in_txn(txn, &commit_id).await
-            })
-        },
-        true,
-    )
-    .await
-    .map_err(|error| match error {
-        crate::internal::reflog::ReflogError::DatabaseError(sea_orm::DbErr::Custom(ref message))
-            if message == crate::internal::ai::agent_bridge::publication::STALE_HEAD_MARKER =>
-        {
-            CommitError::BridgeFenceChanged
+            }
+            Ok(())
         }
-        other => CommitError::HeadUpdate(format!("failed to update reflog: {other}")),
-    })
+        crate::storage::StorageBackendKind::Sqlite => with_reflog(
+            reflog_context,
+            |txn| {
+                Box::pin(async move {
+                    if let Some((record, storage_root)) = &journal
+                        && !record.session_ids.is_empty()
+                    {
+                        crate::internal::ai::history::authorize_agent_commit_links_in_txn(
+                            txn,
+                            &record.session_ids,
+                            &record.scope,
+                        )
+                        .await
+                        .map_err(|error| {
+                            sea_orm::DbErr::Custom(format!(
+                                "agent commit journal authorization failed before ref update: {error:#}"
+                            ))
+                        })?;
+                        crate::internal::ai::commit_journal::append(storage_root, record)
+                            .map_err(|error| {
+                                sea_orm::DbErr::Custom(format!(
+                                    "agent commit journal could not be durably written before ref update: {error:#}"
+                                ))
+                            })?;
+                    }
+                    crate::internal::ai::agent_bridge::publication::check_expected_head_in_txn(txn)
+                        .await?;
+                    if let Some(prepared) =
+                        crate::internal::ai::agent_bridge::publication::prepared_oid_in_txn(txn)
+                            .await?
+                        && prepared != commit_id
+                    {
+                        return Err(sea_orm::DbErr::Custom(format!(
+                            "bridge operation prepared commit {prepared}, not {commit_id}; the ref was not moved"
+                        )));
+                    }
+                    if let Some(prepared) =
+                        crate::internal::ai::agent_bridge::publication::prepared_oid_in_txn(txn)
+                            .await?
+                    {
+                        use crate::utils::object_ext::CommitExt;
+                        let loaded = git_internal::internal::object::commit::Commit::load(
+                            &crate::internal::object_format::parse_repo_oid(&prepared).map_err(
+                                |error| {
+                                    sea_orm::DbErr::Custom(format!(
+                                        "prepared commit id is invalid: {error}"
+                                    ))
+                                },
+                            )?,
+                        )
+                        .map_err(|error| {
+                            sea_orm::DbErr::Custom(format!(
+                                "prepared commit could not be read: {error}"
+                            ))
+                        })?;
+                        let parent = loaded
+                            .parent_commit_ids
+                            .first()
+                            .map(|oid| oid.to_string())
+                            .unwrap_or_default();
+                        let head = crate::internal::head::Head::current_commit_result_with_conn(txn)
+                            .await
+                            .map_err(|error| {
+                                sea_orm::DbErr::Custom(format!(
+                                    "prepared commit could not read HEAD: {error}"
+                                ))
+                            })?
+                            .map(|oid| oid.to_string())
+                            .unwrap_or_default();
+                        if parent != head {
+                            return Err(sea_orm::DbErr::Custom(
+                                "prepared commit parent is not current HEAD; the ref was not moved"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    update_head(txn, &commit_id)
+                        .await
+                        .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+                    // Bridge publications bind the operation id in this same
+                    // transaction. Ordinary commits have no scope and do nothing.
+                    crate::internal::ai::agent_bridge::publication::bind_in_txn(txn, &commit_id)
+                        .await
+                })
+            },
+            true,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::internal::reflog::ReflogError::DatabaseError(sea_orm::DbErr::Custom(
+                ref message,
+            )) if message == crate::internal::ai::agent_bridge::publication::STALE_HEAD_MARKER => {
+                CommitError::BridgeFenceChanged
+            }
+            other => CommitError::HeadUpdate(format!("failed to update reflog: {other}")),
+        }),
+    }
 }
 
 async fn new_reflog_context(commit_id: &str, message: &str) -> ReflogContext {
@@ -4998,6 +5135,145 @@ mod test {
             err.hints().iter().any(|h| h.as_str().contains("issues")),
             "TreeCreation must include the GitHub Issues URL hint, got hints: {:?}",
             err.hints()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "storage-redb", not(feature = "storage-sqlite")))]
+mod tests {
+    use super::*;
+    use crate::{
+        command::{branch, init, reset, switch, tag, update_ref},
+        internal::{config::ConfigKv, head::Head},
+        utils::{output::OutputConfig, test::ChangeDirGuard},
+    };
+
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_porcelain_commit_branch_tag_switch_reset_roundtrip() {
+        use clap::Parser;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tmp.path().join("porcelain-redb");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        let output = OutputConfig::default();
+        init::execute_safe(
+            init::InitArgs::try_parse_from([
+                "init",
+                "-q",
+                "-b",
+                "main",
+                repo_dir.to_string_lossy().as_ref(),
+            ])
+            .expect("parse InitArgs"),
+            &output,
+        )
+        .await
+        .expect("init redb repo");
+
+        let _cwd = ChangeDirGuard::new(&repo_dir);
+        let dot_libra = repo_dir.join(".libra");
+        assert!(!dot_libra.join("libra.db").exists());
+
+        ConfigKv::set("user.name", "Redb Tester", false)
+            .await
+            .expect("set user.name");
+        ConfigKv::set("user.email", "redb@example.com", false)
+            .await
+            .expect("set user.email");
+
+        // 1. Commit #1 (c1) on main
+        std::fs::write(repo_dir.join("a.txt"), b"v1\n").expect("write a.txt");
+        crate::command::add::execute_safe(
+            crate::command::add::AddArgs::try_parse_from(["add", "a.txt"]).expect("parse AddArgs"),
+            &output,
+        )
+        .await
+        .expect("add a.txt");
+        execute_safe(
+            CommitArgs {
+                message: Some("first redb commit".to_string()),
+                ..CommitArgs::default()
+            },
+            &output,
+        )
+        .await
+        .expect("commit #1");
+        let c1 = Head::current_commit().await.expect("c1 HEAD");
+
+        // 2. Branch create + tag + switch
+        branch::execute_safe(
+            branch::BranchArgs::try_parse_from(["branch", "topic"]).expect("parse BranchArgs"),
+            &output,
+        )
+        .await
+        .expect("create topic branch");
+        tag::execute_safe(
+            tag::TagArgs::try_parse_from(["tag", "v0.1.0"]).expect("parse TagArgs"),
+            &output,
+        )
+        .await
+        .expect("create tag v0.1.0");
+
+        // 3. Switch to topic, make Commit #2 (c2)
+        switch::execute_safe(
+            switch::SwitchArgs::try_parse_from(["switch", "topic"]).expect("parse SwitchArgs"),
+            &output,
+        )
+        .await
+        .expect("switch to topic");
+        assert!(matches!(Head::current().await, Head::Branch(ref b) if b == "topic"));
+        std::fs::write(repo_dir.join("a.txt"), b"v2\n").expect("write v2");
+        crate::command::add::execute_safe(
+            crate::command::add::AddArgs::try_parse_from(["add", "a.txt"])
+                .expect("parse AddArgs v2"),
+            &output,
+        )
+        .await
+        .expect("add v2");
+        execute_safe(
+            CommitArgs {
+                message: Some("second redb commit".to_string()),
+                ..CommitArgs::default()
+            },
+            &output,
+        )
+        .await
+        .expect("commit #2");
+        let c2 = Head::current_commit().await.expect("c2 HEAD");
+        assert_ne!(c1, c2);
+
+        // 4. update-ref moves a ref with CAS on Redb
+        update_ref::execute_safe(
+            update_ref::UpdateRefArgs::try_parse_from([
+                "update-ref",
+                "-m",
+                "rb17b cas",
+                "refs/heads/cas-ref",
+                &c2.to_string(),
+            ])
+            .expect("parse UpdateRefArgs"),
+            &output,
+        )
+        .await
+        .expect("update-ref create");
+
+        // 5. Reset --hard back to c1
+        reset::execute_safe(
+            reset::ResetArgs::try_parse_from(["reset", "--hard", &c1.to_string()])
+                .expect("parse ResetArgs"),
+            &output,
+        )
+        .await
+        .expect("reset --hard c1");
+        assert_eq!(Head::current_commit().await, Some(c1));
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.join("a.txt")).expect("read a.txt"),
+            "v1\n"
+        );
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "porcelain roundtrip on Redb must never create libra.db"
         );
     }
 }

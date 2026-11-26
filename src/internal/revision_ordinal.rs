@@ -134,6 +134,116 @@ impl RevisionOrdinalIndex {
             .map_err(|err| anyhow!("failed to prune revision ordinals in store: {err}"))
     }
 
+    /// Ensure the ordinal index for `ref_name` is up to date for `current_tip`
+    /// on a [`GitStore`] backend handle (fast-forward append or full rebuild).
+    pub async fn ensure_fresh_with_store(
+        store: &dyn crate::storage::GitStore,
+        ref_name: &str,
+        current_tip: &ObjectHash,
+    ) -> Result<OrdinalMeta> {
+        let replace_snapshot = crate::command::replace::snapshot();
+        let replace_sig = crate::command::replace::signature_of(&replace_snapshot);
+        let tip_text = current_tip.to_string();
+        let existing = Self::meta_with_store(store, ref_name).await?;
+        if let Some(meta) = &existing
+            && meta.tip_oid == tip_text
+            && meta.replace_sig == replace_sig
+        {
+            return Ok(meta.clone());
+        }
+        if let Some(meta) = &existing
+            && meta.replace_sig == replace_sig
+        {
+            let (suffix_tip_first, reached_old_tip) =
+                crate::command::replace::with_pinned_snapshot_sync(
+                    replace_snapshot.clone(),
+                    || walk_first_parents(current_tip, Some(meta.tip_oid.as_str())),
+                )?;
+            if reached_old_tip && !suffix_tip_first.is_empty() {
+                let suffix_root_first: Vec<String> =
+                    suffix_tip_first.iter().rev().cloned().collect();
+                let new_max =
+                    meta.max_ordinal + i64::try_from(suffix_root_first.len()).unwrap_or(0);
+                let built_at =
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+                let new_meta = crate::storage::git_store::RevisionOrdinalMeta {
+                    ref_name: ref_name.to_string(),
+                    tip_oid: tip_text.clone(),
+                    replace_sig: replace_sig.clone(),
+                    max_ordinal: new_max,
+                    built_at: built_at.clone(),
+                };
+                match store
+                    .append_revision_ordinals(
+                        ref_name,
+                        &meta.tip_oid,
+                        &meta.replace_sig,
+                        &new_meta,
+                        &suffix_root_first,
+                    )
+                    .await
+                    .map_err(|err| anyhow!("failed to append revision ordinals: {err}"))?
+                {
+                    crate::storage::git_store::RevisionOrdinalAppendOutcome::Applied { meta } => {
+                        return Ok(OrdinalMeta {
+                            ref_name: meta.ref_name,
+                            tip_oid: meta.tip_oid,
+                            replace_sig: meta.replace_sig,
+                            max_ordinal: meta.max_ordinal,
+                            built_at: meta.built_at,
+                        });
+                    }
+                    crate::storage::git_store::RevisionOrdinalAppendOutcome::Stale { .. } => {}
+                }
+            }
+        }
+        Self::rebuild_with_store(store, ref_name, current_tip).await
+    }
+
+    /// Full deterministic rebuild of the ordinal index for `ref_name` on a
+    /// [`GitStore`] backend handle.
+    pub async fn rebuild_with_store(
+        store: &dyn crate::storage::GitStore,
+        ref_name: &str,
+        current_tip: &ObjectHash,
+    ) -> Result<OrdinalMeta> {
+        let replace_snapshot = crate::command::replace::snapshot();
+        let replace_sig = crate::command::replace::signature_of(&replace_snapshot);
+        let tip_text = current_tip.to_string();
+        let (chain_tip_first, _) =
+            crate::command::replace::with_pinned_snapshot_sync(replace_snapshot, || {
+                walk_first_parents(current_tip, None)
+            })?;
+        let mut ordinal = 0i64;
+        let entries: Vec<(i64, String)> = chain_tip_first
+            .iter()
+            .rev()
+            .map(|oid| {
+                ordinal += 1;
+                (ordinal, oid.clone())
+            })
+            .collect();
+        let built_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let new_meta = crate::storage::git_store::RevisionOrdinalMeta {
+            ref_name: ref_name.to_string(),
+            tip_oid: tip_text,
+            replace_sig,
+            max_ordinal: ordinal,
+            built_at,
+        };
+        store
+            .replace_revision_ordinals(&new_meta, &entries)
+            .await
+            .map_err(|err| anyhow!("failed to replace revision ordinals: {err}"))?;
+        Ok(OrdinalMeta {
+            ref_name: new_meta.ref_name,
+            tip_oid: new_meta.tip_oid,
+            replace_sig: new_meta.replace_sig,
+            max_ordinal: new_meta.max_ordinal,
+            built_at: new_meta.built_at,
+        })
+    }
+
     pub async fn meta_with_conn<C: ConnectionTrait>(
         db: &C,
         ref_name: &str,

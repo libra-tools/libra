@@ -799,12 +799,27 @@ pub async fn load_unseal_key_for_db_path(db_path: &Path) -> Option<Vec<u8>> {
         return hex::decode(hex_key).ok();
     }
 
-    use crate::internal::{config::ConfigKv, db::get_db_conn_instance_for_path};
-    let conn = get_db_conn_instance_for_path(db_path).await.ok()?;
-    let entry = ConfigKv::get_with_conn(&conn, "vault.unsealkey")
-        .await
-        .ok()??;
-    hex::decode(entry.value).ok()
+    use crate::internal::config::ConfigKv;
+    let storage_dir = db_path.parent()?;
+    match crate::storage::runtime::detect_repo_backend(storage_dir).ok()? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_repo_config_store_read_only(storage_dir)
+                .await
+                .ok()?;
+            let entry = ConfigKv::get_with_store(&*store, "vault.unsealkey")
+                .await
+                .ok()??;
+            hex::decode(entry.value).ok()
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            use crate::internal::db::get_db_conn_instance_for_path;
+            let conn = get_db_conn_instance_for_path(db_path).await.ok()?;
+            let entry = ConfigKv::get_with_conn(&conn, "vault.unsealkey")
+                .await
+                .ok()??;
+            hex::decode(entry.value).ok()
+        }
+    }
 }
 
 /// File name of the global unseal key in both the new and the legacy layout.
@@ -1172,14 +1187,33 @@ async fn current_repo_id() -> Result<String> {
 }
 
 async fn repo_id_for_db_path(db_path: &Path) -> Result<String> {
-    use crate::internal::{config::ConfigKv, db::get_db_conn_instance_for_path};
-    let conn = get_db_conn_instance_for_path(db_path)
-        .await
-        .context("failed to open repository config database")?;
-    ConfigKv::get_with_conn(&conn, "libra.repoid")
-        .await?
-        .map(|e| e.value)
-        .ok_or_else(|| anyhow!("libra.repoid not set — was the repo initialized?"))
+    use crate::internal::config::ConfigKv;
+    let storage_dir = db_path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid repository database path"))?;
+    match crate::storage::runtime::detect_repo_backend(storage_dir)
+        .map_err(|err| anyhow!("failed to detect repository backend: {err}"))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_repo_config_store_read_only(storage_dir)
+                .await
+                .map_err(|err| anyhow!("failed to open repository config store: {err}"))?;
+            ConfigKv::get_with_store(&*store, "libra.repoid")
+                .await?
+                .map(|e| e.value)
+                .ok_or_else(|| anyhow!("libra.repoid not set — was the repo initialized?"))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            use crate::internal::db::get_db_conn_instance_for_path;
+            let conn = get_db_conn_instance_for_path(db_path)
+                .await
+                .context("failed to open repository config database")?;
+            ConfigKv::get_with_conn(&conn, "libra.repoid")
+                .await?
+                .map(|e| e.value)
+                .ok_or_else(|| anyhow!("libra.repoid not set — was the repo initialized?"))
+        }
+    }
 }
 
 fn unseal_key_path_for_repo_id(repo_id: &str) -> Result<std::path::PathBuf> {
@@ -2056,62 +2090,116 @@ pub async fn persist_imported_gpg_key(
     unseal_key: &[u8],
     material: &ImportedKeyMaterial,
 ) -> Result<()> {
-    use sea_orm::TransactionTrait;
-
     use crate::internal::config::ConfigKv;
 
-    // ADR-VG-02/03: every write below is part of one transaction, so a failure
-    // at any step — including the sensitive secret-key write — leaves the
-    // repository exactly as it was instead of half-switched to the imported key.
-    let db = crate::internal::db::get_db_conn_instance().await;
-    let txn = db
-        .begin()
-        .await
-        .context("failed to start the imported GPG key transaction")?;
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| anyhow!("failed to detect repository backend: {err}"))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|err| anyhow!("failed to open repository config store: {err}"))?;
+            snapshot_active_key_to_history_with_store(&*store).await?;
 
-    // VG-13 G1/G2: record the current active key (and a generated snapshot when
-    // needed) before any overwrite.
-    snapshot_active_key_to_history_with_conn(&txn).await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_default();
+            let seckey_hex = hex::encode(encrypt_token(
+                unseal_key,
+                material.rebuilt_armor.as_bytes(),
+            )?);
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_default();
-    let seckey_hex = hex::encode(encrypt_token(
-        unseal_key,
-        material.rebuilt_armor.as_bytes(),
-    )?);
+            ConfigKv::set_with_store(&*store, "vault.gpg.pubkey", &material.pubkey_armor, false)
+                .await?;
+            ConfigKv::set_with_store(
+                &*store,
+                "vault.gpg.fingerprint",
+                &material.fingerprint,
+                false,
+            )
+            .await?;
+            ConfigKv::set_with_store(
+                &*store,
+                "vault.gpg.signing_key_id",
+                &material.signing_key_id,
+                false,
+            )
+            .await?;
+            ConfigKv::set_with_store(&*store, "vault.gpg.uid", &material.uid, false).await?;
+            ConfigKv::set_with_store(&*store, "vault.gpg.imported_at", &now, false).await?;
+            ConfigKv::set_with_store(&*store, "vault.gpg.seckey_enc", &seckey_hex, true).await?;
+            ConfigKv::set_with_store(&*store, "vault.gpg.source", "imported", false).await?;
 
-    ConfigKv::set_with_conn(&txn, "vault.gpg.pubkey", &material.pubkey_armor, false).await?;
-    ConfigKv::set_with_conn(&txn, "vault.gpg.fingerprint", &material.fingerprint, false).await?;
-    ConfigKv::set_with_conn(
-        &txn,
-        "vault.gpg.signing_key_id",
-        &material.signing_key_id,
-        false,
-    )
-    .await?;
-    ConfigKv::set_with_conn(&txn, "vault.gpg.uid", &material.uid, false).await?;
-    ConfigKv::set_with_conn(&txn, "vault.gpg.imported_at", &now, false).await?;
-    ConfigKv::set_with_conn(&txn, "vault.gpg.seckey_enc", &seckey_hex, true).await?;
-    // source last: presence of `imported` is the commit point.
-    ConfigKv::set_with_conn(&txn, "vault.gpg.source", "imported", false).await?;
+            let signing = ConfigKv::get_with_store(&*store, "vault.signing")
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.value);
+            if signing.is_none() {
+                ConfigKv::set_with_store(&*store, "vault.signing", "true", false).await?;
+            }
+            Ok(())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            use sea_orm::TransactionTrait;
 
-    // ADR-VG-12: first import with `vault.signing` unset enables signing; an
-    // explicit `false` stays off (the caller prints the hint).
-    let signing = ConfigKv::get_with_conn(&txn, "vault.signing")
-        .await
-        .ok()
-        .flatten()
-        .map(|e| e.value);
-    if signing.is_none() {
-        ConfigKv::set_with_conn(&txn, "vault.signing", "true", false).await?;
+            // ADR-VG-02/03: every write below is part of one transaction, so a failure
+            // at any step — including the sensitive secret-key write — leaves the
+            // repository exactly as it was instead of half-switched to the imported key.
+            let db = crate::internal::db::get_db_conn_instance().await;
+            let txn = db
+                .begin()
+                .await
+                .context("failed to start the imported GPG key transaction")?;
+
+            // VG-13 G1/G2: record the current active key (and a generated snapshot when
+            // needed) before any overwrite.
+            snapshot_active_key_to_history_with_conn(&txn).await?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_default();
+            let seckey_hex = hex::encode(encrypt_token(
+                unseal_key,
+                material.rebuilt_armor.as_bytes(),
+            )?);
+
+            ConfigKv::set_with_conn(&txn, "vault.gpg.pubkey", &material.pubkey_armor, false)
+                .await?;
+            ConfigKv::set_with_conn(&txn, "vault.gpg.fingerprint", &material.fingerprint, false)
+                .await?;
+            ConfigKv::set_with_conn(
+                &txn,
+                "vault.gpg.signing_key_id",
+                &material.signing_key_id,
+                false,
+            )
+            .await?;
+            ConfigKv::set_with_conn(&txn, "vault.gpg.uid", &material.uid, false).await?;
+            ConfigKv::set_with_conn(&txn, "vault.gpg.imported_at", &now, false).await?;
+            ConfigKv::set_with_conn(&txn, "vault.gpg.seckey_enc", &seckey_hex, true).await?;
+            // source last: presence of `imported` is the commit point.
+            ConfigKv::set_with_conn(&txn, "vault.gpg.source", "imported", false).await?;
+
+            // ADR-VG-12: first import with `vault.signing` unset enables signing; an
+            // explicit `false` stays off (the caller prints the hint).
+            let signing = ConfigKv::get_with_conn(&txn, "vault.signing")
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.value);
+            if signing.is_none() {
+                ConfigKv::set_with_conn(&txn, "vault.signing", "true", false).await?;
+            }
+
+            txn.commit()
+                .await
+                .context("failed to commit the imported GPG key")?;
+            Ok(())
+        }
     }
-
-    txn.commit()
-        .await
-        .context("failed to commit the imported GPG key")?;
-    Ok(())
 }
 
 /// plan-20260921 VG-14 G1–G6: `#[cfg(test)]`-only injection point so each step
@@ -2145,8 +2233,61 @@ fn clear_generate_fail_at() {
 /// by fingerprint). When `source == generated` and no `vault.gpg.generated_pubkey`
 /// snapshot exists yet, snapshot it first (ADR-VG-04 §4 / VG-13 G2).
 async fn snapshot_active_key_to_history() -> Result<()> {
-    let db = crate::internal::db::get_db_conn_instance().await;
-    snapshot_active_key_to_history_with_conn(&db).await
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| anyhow!("failed to detect repository backend: {err}"))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|err| anyhow!("failed to open repository config store: {err}"))?;
+            snapshot_active_key_to_history_with_store(&*store).await
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::db::get_db_conn_instance().await;
+            snapshot_active_key_to_history_with_conn(&db).await
+        }
+    }
+}
+
+async fn snapshot_active_key_to_history_with_store(
+    store: &dyn crate::storage::ConfigStore,
+) -> Result<()> {
+    use crate::internal::config::ConfigKv;
+
+    let active = match ConfigKv::get_with_store(store, "vault.gpg.pubkey")
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(e) if !e.value.is_empty() => e.value,
+        _ => return Ok(()),
+    };
+
+    let source = ConfigKv::get_with_store(store, "vault.gpg.source")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value);
+    if source.as_deref() == Some("generated") {
+        let snapshot = ConfigKv::get_with_store(store, "vault.gpg.generated_pubkey")
+            .await
+            .ok()
+            .flatten()
+            .map(|e| e.value);
+        if snapshot.is_none() {
+            ConfigKv::set_with_store(store, "vault.gpg.generated_pubkey", &active, false).await?;
+        }
+    }
+
+    let fp = key_fingerprint_from_armor(&active).unwrap_or_else(|_| String::new());
+    if fp.is_empty() {
+        return Ok(());
+    }
+    let key = format!("vault.gpg.history.{fp}.pubkey");
+    if ConfigKv::get_with_store(store, &key).await?.is_none() {
+        ConfigKv::set_with_store(store, &key, &active, false).await?;
+    }
+    Ok(())
 }
 
 /// plan-20260921 VG-08 G9–G12: `#[cfg(test)]`-only injection point so each of
@@ -2235,56 +2376,97 @@ pub async fn gpg_source() -> Option<String> {
 /// (ADR-VG-06 §3/4). Deletes only the allowlist keys; `history.*`,
 /// `generated_pubkey` and `generated_key_name` are never touched.
 pub async fn remove_imported_gpg_key() -> Result<()> {
-    use sea_orm::TransactionTrait;
-
     use crate::internal::config::ConfigKv;
 
-    // plan-20260921 VG-08 G9–G12: the removal is ONE transaction, so a failure
-    // at any of the four steps (archive the active key, drop the imported
-    // metadata, restore the generated public half, switch `source`) rolls back
-    // and leaves the imported key exactly as it was. Without the transaction a
-    // mid-way failure would leave, say, `source=imported` with the secret key
-    // already deleted — signing would then fail far from the cause.
-    let db = crate::internal::db::get_db_conn_instance().await;
-    let txn = db
-        .begin()
-        .await
-        .context("failed to start the GPG key removal transaction")?;
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| anyhow!("failed to detect repository backend: {err}"))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|err| anyhow!("failed to open repository config store: {err}"))?;
+            snapshot_active_key_to_history_with_store(&*store).await?;
+            remove_failpoint(1)?;
 
-    snapshot_active_key_to_history_with_conn(&txn).await?;
-    remove_failpoint(1)?;
+            for key in [
+                "vault.gpg.seckey_enc",
+                "vault.gpg.fingerprint",
+                "vault.gpg.signing_key_id",
+                "vault.gpg.uid",
+                "vault.gpg.imported_at",
+            ] {
+                ConfigKv::unset_with_store(&*store, key).await?;
+            }
+            remove_failpoint(2)?;
 
-    for key in [
-        "vault.gpg.seckey_enc",
-        "vault.gpg.fingerprint",
-        "vault.gpg.signing_key_id",
-        "vault.gpg.uid",
-        "vault.gpg.imported_at",
-    ] {
-        ConfigKv::unset_with_conn(&txn, key).await?;
-    }
-    remove_failpoint(2)?;
+            let generated = ConfigKv::get_with_store(&*store, "vault.gpg.generated_pubkey")
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.value);
+            match generated.filter(|g| !g.is_empty()) {
+                Some(g) => ConfigKv::set_with_store(&*store, "vault.gpg.pubkey", &g, false).await?,
+                None => {
+                    let _ = ConfigKv::unset_with_store(&*store, "vault.gpg.pubkey").await;
+                }
+            }
+            remove_failpoint(3)?;
 
-    let generated = ConfigKv::get_with_conn(&txn, "vault.gpg.generated_pubkey")
-        .await
-        .ok()
-        .flatten()
-        .map(|e| e.value);
-    match generated.filter(|g| !g.is_empty()) {
-        Some(g) => ConfigKv::set_with_conn(&txn, "vault.gpg.pubkey", &g, false).await?,
-        None => {
-            let _ = ConfigKv::unset_with_conn(&txn, "vault.gpg.pubkey").await;
+            ConfigKv::set_with_store(&*store, "vault.gpg.source", "generated", false).await?;
+            remove_failpoint(4)?;
+            Ok(())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            use sea_orm::TransactionTrait;
+
+            // plan-20260921 VG-08 G9–G12: the removal is ONE transaction, so a failure
+            // at any of the four steps (archive the active key, drop the imported
+            // metadata, restore the generated public half, switch `source`) rolls back
+            // and leaves the imported key exactly as it was. Without the transaction a
+            // mid-way failure would leave, say, `source=imported` with the secret key
+            // already deleted — signing would then fail far from the cause.
+            let db = crate::internal::db::get_db_conn_instance().await;
+            let txn = db
+                .begin()
+                .await
+                .context("failed to start the GPG key removal transaction")?;
+
+            snapshot_active_key_to_history_with_conn(&txn).await?;
+            remove_failpoint(1)?;
+
+            for key in [
+                "vault.gpg.seckey_enc",
+                "vault.gpg.fingerprint",
+                "vault.gpg.signing_key_id",
+                "vault.gpg.uid",
+                "vault.gpg.imported_at",
+            ] {
+                ConfigKv::unset_with_conn(&txn, key).await?;
+            }
+            remove_failpoint(2)?;
+
+            let generated = ConfigKv::get_with_conn(&txn, "vault.gpg.generated_pubkey")
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.value);
+            match generated.filter(|g| !g.is_empty()) {
+                Some(g) => ConfigKv::set_with_conn(&txn, "vault.gpg.pubkey", &g, false).await?,
+                None => {
+                    let _ = ConfigKv::unset_with_conn(&txn, "vault.gpg.pubkey").await;
+                }
+            }
+            remove_failpoint(3)?;
+
+            ConfigKv::set_with_conn(&txn, "vault.gpg.source", "generated", false).await?;
+            remove_failpoint(4)?;
+
+            txn.commit()
+                .await
+                .context("failed to commit the GPG key removal")?;
+            Ok(())
         }
     }
-    remove_failpoint(3)?;
-
-    ConfigKv::set_with_conn(&txn, "vault.gpg.source", "generated", false).await?;
-    remove_failpoint(4)?;
-
-    txn.commit()
-        .await
-        .context("failed to commit the GPG key removal")?;
-    Ok(())
 }
 
 #[cfg(test)]

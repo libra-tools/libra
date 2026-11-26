@@ -422,10 +422,21 @@ impl Head {
         }
     }
 
-    pub async fn current_commit_result_with_store(
+    pub async fn remote_current_with_store(
         store: &dyn crate::storage::GitStore,
+        remote: &str,
+    ) -> Option<Head> {
+        Self::remote_current_result_with_store(store, remote)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn current_commit_for_scope_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        scope: &WorktreeScope,
     ) -> Result<Option<ObjectHash>, BranchStoreError> {
-        match Self::current_result_with_store(store).await? {
+        match Self::current_for_scope_result_with_store(store, scope).await? {
             Head::Branch(name) => {
                 let key = crate::storage::RefKey::LocalBranch { name: name.clone() };
                 let Some(target) = store
@@ -447,6 +458,21 @@ impl Head {
             }
             Head::Detached(commit_hash) => Ok(Some(commit_hash)),
         }
+    }
+
+    pub async fn current_commit_result_with_store(
+        store: &dyn crate::storage::GitStore,
+    ) -> Result<Option<ObjectHash>, BranchStoreError> {
+        let scope = WorktreeScope::current();
+        Self::current_commit_for_scope_result_with_store(store, &scope).await
+    }
+
+    pub async fn branch_checked_out_elsewhere_result_with_store(
+        store: &dyn crate::storage::GitStore,
+        branch: &str,
+    ) -> Result<Option<String>, BranchStoreError> {
+        let scope = WorktreeScope::current();
+        Self::branch_checked_out_elsewhere_for_scope_result_with_store(store, branch, &scope).await
     }
 
     pub async fn branch_checked_out_anywhere_result_with_store(

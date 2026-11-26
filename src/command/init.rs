@@ -1068,15 +1068,8 @@ async fn run_init_internal(
     let init_result: Result<InitOutput, InitError> = async {
         progress.emit("Initializing database ...");
         let database_path = root_dir.join(DATABASE);
-        // INVARIANT: the database must exist before refs, config, conversion, or
-        // vault setup run; those later stages persist their durable state through
-        // this connection/path and assume schema bootstrap has completed.
-        let conn = create_database_connection(&database_path).await?;
-        #[cfg(windows)]
-        if is_git_conversion {
-            conversion_db_for_rollback = Some(conn.clone());
-        }
-        conversion_gate(init_conversion::ConversionStage::AfterDatabase)?;
+        let target_backend = crate::storage::runtime::select_init_backend(&root_dir)
+            .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
         // Probe the actual filesystem (root_dir already exists at this point):
         // non-bare repos probe the parent of `.libra`; bare repos have no
         // worktree, so case handling is moot — record false.
@@ -1088,21 +1081,72 @@ async fn run_init_internal(
                 .map(crate::utils::path_case::probe_dir_ignore_case)
                 .unwrap_or(false)
         };
-        let repo_id = init_config(
-            &conn,
-            args.bare,
-            &object_format,
-            &ref_format,
-            ignore_case,
-            shared_mode.as_ref(),
-        )
-        .await?;
+        let repo_id = match target_backend {
+            crate::storage::StorageBackendKind::Redb => {
+                #[cfg(feature = "storage-redb")]
+                {
+                    let _paths = crate::storage::runtime::init_redb_repository_storage(&root_dir)
+                        .await
+                        .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
+                    conversion_gate(init_conversion::ConversionStage::AfterDatabase)?;
+                    let config_store =
+                        crate::storage::runtime::open_repo_config_store_read_write(&root_dir)
+                            .await
+                            .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
+                    let repo_id = init_config_with_store(
+                        &*config_store,
+                        args.bare,
+                        &object_format,
+                        &ref_format,
+                        ignore_case,
+                        shared_mode.as_ref(),
+                    )
+                    .await?;
+                    drop(config_store);
 
-        progress.emit("Setting up refs ...");
-        // INVARIANT: refs are initialized after core config so HEAD/branch rows are
-        // tied to the repository identity and hash/ref-format choices already stored
-        // in config.
-        initialize_refs(&conn, &initial_branch_name).await?;
+                    progress.emit("Setting up refs ...");
+                    let git_store = crate::storage::runtime::open_git_store_read_write(&root_dir)
+                        .await
+                        .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
+                    initialize_refs_with_store(&*git_store, &initial_branch_name).await?;
+                    drop(git_store);
+                    repo_id
+                }
+                #[cfg(not(feature = "storage-redb"))]
+                {
+                    return Err(InitError::Io(io::Error::other(
+                        "this Libra binary was compiled without `storage-redb`",
+                    )));
+                }
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                // INVARIANT: the database must exist before refs, config, conversion, or
+                // vault setup run; those later stages persist their durable state through
+                // this connection/path and assume schema bootstrap has completed.
+                let conn = create_database_connection(&database_path).await?;
+                #[cfg(windows)]
+                if is_git_conversion {
+                    conversion_db_for_rollback = Some(conn.clone());
+                }
+                conversion_gate(init_conversion::ConversionStage::AfterDatabase)?;
+                let repo_id = init_config(
+                    &conn,
+                    args.bare,
+                    &object_format,
+                    &ref_format,
+                    ignore_case,
+                    shared_mode.as_ref(),
+                )
+                .await?;
+
+                progress.emit("Setting up refs ...");
+                // INVARIANT: refs are initialized after core config so HEAD/branch rows are
+                // tied to the repository identity and hash/ref-format choices already stored
+                // in config.
+                initialize_refs(&conn, &initial_branch_name).await?;
+                repo_id
+            }
+        };
 
         set_dir_hidden(&root_dir)?;
         if let Some(shared_mode) = shared_mode.as_ref() {
@@ -1160,7 +1204,7 @@ async fn run_init_internal(
             let _guard = CurrentDirGuard::change_to(&target_guard_path)?;
             init_vault_for_repo(&root_dir, &database_path).await?;
         } else {
-            set_vault_signing_value(&database_path, false).await?;
+            set_vault_signing_value(&root_dir, &database_path, false).await?;
         }
 
         set_hash_kind(
@@ -1326,15 +1370,33 @@ async fn reinitialize_existing(
 
     // ADR-B3-01: compare stored objectformat via a read-only, no-migration
     // connection BEFORE layout/DB upgrade side effects.
+    let backend = crate::storage::runtime::detect_repo_backend(root_dir)
+        .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
     let database_path = root_dir.join(DATABASE);
-    let inspect_conn = crate::internal::db::open_database_without_migrations(&database_path)
-        .await
-        .map_err(InitError::Io)?;
-    let stored_object_format = read_config_string(&inspect_conn, "core.objectformat")
-        .await?
-        .unwrap_or_else(|| "sha1".to_string());
-    // Drop the inspect connection before opening the migrating one.
-    let _ = inspect_conn.close().await;
+    let stored_object_format = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_repo_config_store_read_only(root_dir)
+                .await
+                .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
+            ConfigKv::get_with_store(&*store, "core.objectformat")
+                .await
+                .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))?
+                .map(|entry| entry.value)
+                .unwrap_or_else(|| "sha1".to_string())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let inspect_conn =
+                crate::internal::db::open_database_without_migrations(&database_path)
+                    .await
+                    .map_err(InitError::Io)?;
+            let val = read_config_string(&inspect_conn, "core.objectformat")
+                .await?
+                .unwrap_or_else(|| "sha1".to_string());
+            // Drop the inspect connection before opening the migrating one.
+            let _ = inspect_conn.close().await;
+            val
+        }
+    };
 
     if crate::internal::object_format::parse_config_value(&stored_object_format).is_err() {
         return Err(InitError::UnknownObjectFormat {
@@ -1365,46 +1427,112 @@ async fn reinitialize_existing(
         apply_shared(root_dir, shared_mode)?;
     }
 
-    // Connect to the EXISTING database (schema auto-upgrades on open); never recreate
-    // it — `create_database_connection` would reject an existing file.
-    let conn = get_db_conn_instance_for_path(&database_path)
-        .await
-        .map_err(InitError::Io)?;
-    if let Some(shared_mode) = shared_mode {
-        persist_shared_repository(&conn, shared_mode).await?;
-        // Persisting the new value may touch the storage directory; re-apply
-        // so switching modes (e.g. all -> numeric) leaves the final modes.
-        // Drop the cached pre-reinit value before the final sweep.
-        crate::utils::shared_perm::clear_cached_repo_shared_mode(Some(root_dir));
-        apply_shared(root_dir, shared_mode)?;
-    }
-
     let object_format = stored_object_format;
-    let ref_format = read_config_string(&conn, "core.initrefformat")
-        .await?
-        .unwrap_or_else(|| RefFormat::Strict.as_str().to_string());
-    let repo_id = read_config_string(&conn, "libra.repoid")
-        .await?
-        .unwrap_or_default();
-    let bare = read_config_string(&conn, "core.bare")
-        .await?
-        .and_then(|value| crate::internal::config::parse_git_bool(&value))
-        .unwrap_or(args.bare);
-    let vault_signing = read_config_string(&conn, "vault.signing")
-        .await?
-        .map(|value| value == "true")
-        .unwrap_or(false);
-    // Use the fallible HEAD reader so a missing/corrupt HEAD surfaces a structured
-    // error rather than panicking.
-    let initial_branch = match Head::current_result_with_conn(&conn)
-        .await
-        .map_err(|error| {
-            InitError::Database(DbErr::Custom(format!(
-                "failed to read HEAD during re-initialization: {error}"
-            )))
-        })? {
-        Head::Branch(name) => name,
-        Head::Detached(_) => "HEAD".to_string(),
+    let (ref_format, repo_id, bare, vault_signing, initial_branch) = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            if let Some(shared_mode) = shared_mode {
+                if shared_mode.should_persist() {
+                    let store =
+                        crate::storage::runtime::open_repo_config_store_read_write(root_dir)
+                            .await
+                            .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
+                    ConfigKv::set_with_store(
+                        &*store,
+                        "core.sharedRepository",
+                        shared_mode.config_value(),
+                        false,
+                    )
+                    .await
+                    .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))?;
+                }
+                crate::utils::shared_perm::clear_cached_repo_shared_mode(Some(root_dir));
+                apply_shared(root_dir, shared_mode)?;
+            }
+            let store = crate::storage::runtime::open_repo_config_store_read_only(root_dir)
+                .await
+                .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
+            let ref_format = ConfigKv::get_with_store(&*store, "core.initrefformat")
+                .await
+                .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))?
+                .map(|entry| entry.value)
+                .unwrap_or_else(|| RefFormat::Strict.as_str().to_string());
+            let repo_id = ConfigKv::get_with_store(&*store, "libra.repoid")
+                .await
+                .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))?
+                .map(|entry| entry.value)
+                .unwrap_or_default();
+            let bare = ConfigKv::get_with_store(&*store, "core.bare")
+                .await
+                .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))?
+                .and_then(|entry| crate::internal::config::parse_git_bool(&entry.value))
+                .unwrap_or(args.bare);
+            let vault_signing = ConfigKv::get_with_store(&*store, "vault.signing")
+                .await
+                .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))?
+                .map(|entry| entry.value == "true")
+                .unwrap_or(false);
+            let git_store = crate::storage::runtime::open_git_store_read_only(root_dir)
+                .await
+                .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
+            let initial_branch = match Head::current_for_scope_result_with_store(
+                &*git_store,
+                &crate::internal::worktree_scope::WorktreeScope::Main,
+            )
+            .await
+            .map_err(|error| {
+                InitError::Database(DbErr::Custom(format!(
+                    "failed to read HEAD during re-initialization: {error}"
+                )))
+            })? {
+                Head::Branch(name) => name,
+                Head::Detached(_) => "HEAD".to_string(),
+            };
+            (ref_format, repo_id, bare, vault_signing, initial_branch)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            // Connect to the EXISTING database (schema auto-upgrades on open); never recreate
+            // it — `create_database_connection` would reject an existing file.
+            let conn = get_db_conn_instance_for_path(&database_path)
+                .await
+                .map_err(InitError::Io)?;
+            if let Some(shared_mode) = shared_mode {
+                persist_shared_repository(&conn, shared_mode).await?;
+                // Persisting the new value may touch the storage directory; re-apply
+                // so switching modes (e.g. all -> numeric) leaves the final modes.
+                // Drop the cached pre-reinit value before the final sweep.
+                crate::utils::shared_perm::clear_cached_repo_shared_mode(Some(root_dir));
+                apply_shared(root_dir, shared_mode)?;
+            }
+
+            let ref_format = read_config_string(&conn, "core.initrefformat")
+                .await?
+                .unwrap_or_else(|| RefFormat::Strict.as_str().to_string());
+            let repo_id = read_config_string(&conn, "libra.repoid")
+                .await?
+                .unwrap_or_default();
+            let bare = read_config_string(&conn, "core.bare")
+                .await?
+                .and_then(|value| crate::internal::config::parse_git_bool(&value))
+                .unwrap_or(args.bare);
+            let vault_signing = read_config_string(&conn, "vault.signing")
+                .await?
+                .map(|value| value == "true")
+                .unwrap_or(false);
+            // Use the fallible HEAD reader so a missing/corrupt HEAD surfaces a structured
+            // error rather than panicking.
+            let initial_branch =
+                match Head::current_result_with_conn(&conn)
+                    .await
+                    .map_err(|error| {
+                        InitError::Database(DbErr::Custom(format!(
+                            "failed to read HEAD during re-initialization: {error}"
+                        )))
+                    })? {
+                    Head::Branch(name) => name,
+                    Head::Detached(_) => "HEAD".to_string(),
+                };
+            (ref_format, repo_id, bare, vault_signing, initial_branch)
+        }
     };
 
     set_hash_kind(
@@ -1851,6 +1979,7 @@ fn refuse_convert_object_format_combination(
 fn is_reinit(target_dir: &Path, bare: bool) -> bool {
     if bare {
         return target_dir.join(DATABASE).exists()
+            || crate::storage::runtime::has_redb_storage_markers(target_dir)
             || target_dir.join("objects").exists()
             || target_dir.join("info").exists()
             || target_dir.join("hooks").exists();
@@ -2356,6 +2485,80 @@ async fn initialize_refs(conn: &DbConn, initial_branch_name: &str) -> Result<(),
     Ok(())
 }
 
+#[cfg(feature = "storage-redb")]
+async fn initialize_refs_with_store(
+    store: &dyn crate::storage::git_store::GitStore,
+    initial_branch_name: &str,
+) -> Result<(), InitError> {
+    Head::update_for_scope_result_with_store(
+        store,
+        Head::Branch(initial_branch_name.to_string()),
+        None,
+        &crate::internal::worktree_scope::WorktreeScope::Main,
+    )
+    .await
+    .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))
+}
+
+#[cfg(feature = "storage-redb")]
+async fn init_config_with_store(
+    store: &dyn crate::storage::config_store::ConfigStore,
+    is_bare: bool,
+    object_format: &str,
+    ref_format: &RefFormat,
+    ignore_case: bool,
+    shared_mode: Option<&SharedMode>,
+) -> Result<String, DbErr> {
+    let ignorecase_text = if ignore_case { "true" } else { "false" };
+    #[cfg(not(target_os = "windows"))]
+    let entries = [
+        ("repositoryformatversion", "0"),
+        ("filemode", "true"),
+        ("bare", if is_bare { "true" } else { "false" }),
+        ("logallrefupdates", "true"),
+        ("ignorecase", ignorecase_text),
+    ];
+
+    #[cfg(target_os = "windows")]
+    let entries = [
+        ("repositoryformatversion", "0"),
+        ("filemode", "false"),
+        ("bare", if is_bare { "true" } else { "false" }),
+        ("logallrefupdates", "true"),
+        ("symlinks", "false"),
+        ("ignorecase", ignorecase_text),
+    ];
+
+    let repo_id = uuid::Uuid::new_v4().to_string();
+    for (key, value) in &entries {
+        ConfigKv::set_with_store(store, &format!("core.{key}"), value, false)
+            .await
+            .map_err(|error| DbErr::Custom(error.to_string()))?;
+    }
+    ConfigKv::set_with_store(store, "core.objectformat", object_format, false)
+        .await
+        .map_err(|error| DbErr::Custom(error.to_string()))?;
+    ConfigKv::set_with_store(store, "core.initrefformat", ref_format.as_str(), false)
+        .await
+        .map_err(|error| DbErr::Custom(error.to_string()))?;
+    ConfigKv::set_with_store(store, "libra.repoid", &repo_id, false)
+        .await
+        .map_err(|error| DbErr::Custom(error.to_string()))?;
+    if let Some(shared_mode) = shared_mode
+        && shared_mode.should_persist()
+    {
+        ConfigKv::set_with_store(
+            store,
+            "core.sharedRepository",
+            shared_mode.config_value(),
+            false,
+        )
+        .await
+        .map_err(|error| DbErr::Custom(error.to_string()))?;
+    }
+    Ok(repo_id)
+}
+
 async fn init_config(
     conn: &DbConn,
     is_bare: bool,
@@ -2444,12 +2647,22 @@ fn set_dir_hidden(_dir: &Path) -> io::Result<()> {
 async fn init_vault_for_repo(root_dir: &Path, database_path: &Path) -> Result<(), InitError> {
     use crate::internal::vault;
 
-    let identity_sources =
-        resolve_user_identity_sources(LocalIdentityTarget::ExplicitDb(database_path))
-            .await
-            .map_err(|error| InitError::VaultInitializationFailed {
-                message: format!("{error:#}"),
-            })?;
+    let backend = crate::storage::runtime::detect_repo_backend(root_dir).map_err(|error| {
+        InitError::VaultInitializationFailed {
+            message: error.to_string(),
+        }
+    })?;
+    let identity_target = match backend {
+        crate::storage::StorageBackendKind::Redb => LocalIdentityTarget::CurrentRepo,
+        crate::storage::StorageBackendKind::Sqlite => {
+            LocalIdentityTarget::ExplicitDb(database_path)
+        }
+    };
+    let identity_sources = resolve_user_identity_sources(identity_target)
+        .await
+        .map_err(|error| InitError::VaultInitializationFailed {
+            message: format!("{error:#}"),
+        })?;
     let user_name = identity_sources
         .config_name
         .or(identity_sources.env_name)
@@ -2492,23 +2705,48 @@ async fn init_vault_for_repo(root_dir: &Path, database_path: &Path) -> Result<()
         });
     }
 
-    set_vault_signing_value(database_path, true).await
+    set_vault_signing_value(root_dir, database_path, true).await
 }
 
-async fn set_vault_signing_value(database_path: &Path, enabled: bool) -> Result<(), InitError> {
-    let conn = get_db_conn_instance_for_path(database_path)
-        .await
-        .map_err(InitError::Io)?;
-    ConfigKv::set_with_conn(
-        &conn,
-        "vault.signing",
-        if enabled { "true" } else { "false" },
-        false,
-    )
-    .await
-    .map_err(|error| InitError::VaultInitializationFailed {
-        message: format!("{error:#}"),
-    })
+async fn set_vault_signing_value(
+    root_dir: &Path,
+    database_path: &Path,
+    enabled: bool,
+) -> Result<(), InitError> {
+    let backend = crate::storage::runtime::detect_repo_backend(root_dir)
+        .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_repo_config_store_read_write(root_dir)
+                .await
+                .map_err(|error| InitError::Io(io::Error::other(error.to_string())))?;
+            ConfigKv::set_with_store(
+                &*store,
+                "vault.signing",
+                if enabled { "true" } else { "false" },
+                false,
+            )
+            .await
+            .map_err(|error| InitError::VaultInitializationFailed {
+                message: format!("{error:#}"),
+            })
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let conn = get_db_conn_instance_for_path(database_path)
+                .await
+                .map_err(InitError::Io)?;
+            ConfigKv::set_with_conn(
+                &conn,
+                "vault.signing",
+                if enabled { "true" } else { "false" },
+                false,
+            )
+            .await
+            .map_err(|error| InitError::VaultInitializationFailed {
+                message: format!("{error:#}"),
+            })
+        }
+    }
 }
 
 async fn rollback_failed_vault_init(root_dir: &Path) {
@@ -2870,5 +3108,113 @@ mod tests {
         // Bogus string
         let err = SharedMode::parse("bogus").expect_err("bogus must fail");
         assert!(err.to_string().contains("invalid shared mode 'bogus'"));
+    }
+
+    #[cfg(all(feature = "storage-redb", not(feature = "storage-sqlite")))]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_init_and_clone_with_spool_tombstones_and_repo_markers() {
+        use clap::Parser;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tmp.path().join("fresh-redb");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+        // AC1 + AC2: `init` under Redb initializes git.gen-00000001.redb,
+        // capture.gen-00000001.redb, storage-format.json, and 0400 capture-spool
+        // tombstones (never creates libra.db).
+        let args = InitArgs::try_parse_from([
+            "init",
+            "-q",
+            "-b",
+            "main",
+            repo_dir.to_string_lossy().as_ref(),
+        ])
+        .expect("parse InitArgs");
+        let out = run_init(args).await.expect("redb init");
+        assert!(!out.reinitialized);
+        assert_eq!(out.initial_branch, "main");
+        let dot_libra = repo_dir.join(".libra");
+        assert!(!dot_libra.join("libra.db").exists());
+        assert!(dot_libra.join("redb/git.gen-00000001.redb").is_file());
+        assert!(
+            dot_libra
+                .join("private/capture.gen-00000001.redb")
+                .is_file()
+        );
+        assert!(dot_libra.join("storage-format.json").is_file());
+        for lane in ["tmp", "ready", "quarantine"] {
+            let tomb = dot_libra.join("private/capture-spool").join(lane);
+            assert!(
+                tomb.is_file(),
+                "expected 0400 file tombstone at {}",
+                tomb.display()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&tomb)
+                    .expect("stat tombstone")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode,
+                    0o400,
+                    "tombstone {} must be mode 0400",
+                    tomb.display()
+                );
+            }
+        }
+        // Re-initializing the redb repo preserves identity without creating libra.db.
+        let reinit_args =
+            InitArgs::try_parse_from(["init", "-q", repo_dir.to_string_lossy().as_ref()])
+                .expect("parse reinit InitArgs");
+        let reinit_out = run_init(reinit_args).await.expect("redb reinit");
+        assert!(reinit_out.reinitialized);
+        assert_eq!(reinit_out.repo_id, out.repo_id);
+        assert!(!dot_libra.join("libra.db").exists());
+
+        // AC4: clone::REPO_MARKERS recognizes redb storage markers.
+        assert!(crate::command::clone::has_repo_markers(&dot_libra));
+        let marker_only = tmp.path().join("marker-only");
+        std::fs::create_dir_all(&marker_only).expect("mkdir marker_only");
+        std::fs::write(marker_only.join("storage-format.json"), b"{}").expect("write marker");
+        assert!(crate::command::clone::has_repo_markers(&marker_only));
+
+        // AC3: `clone` under Redb creates redb storage + 0400 capture-spool tombstones without libra.db.
+        let clone_dest = tmp.path().join("cloned-redb");
+        let clone_args = crate::command::clone::CloneArgs::try_parse_from([
+            "clone",
+            "--no-checkout",
+            "--no-progress",
+            repo_dir.to_string_lossy().as_ref(),
+            clone_dest.to_string_lossy().as_ref(),
+        ])
+        .expect("parse CloneArgs");
+        let clone_res = crate::command::clone::execute_safe(
+            clone_args,
+            &crate::utils::output::OutputConfig::default(),
+        )
+        .await;
+        assert!(clone_res.is_ok(), "redb clone failed: {clone_res:?}");
+        let clone_libra = clone_dest.join(".libra");
+        assert!(!clone_libra.join("libra.db").exists());
+        assert!(clone_libra.join("redb/git.gen-00000001.redb").is_file());
+        assert!(
+            clone_libra
+                .join("private/capture.gen-00000001.redb")
+                .is_file()
+        );
+        assert!(clone_libra.join("storage-format.json").is_file());
+        for lane in ["tmp", "ready", "quarantine"] {
+            assert!(
+                clone_libra
+                    .join("private/capture-spool")
+                    .join(lane)
+                    .is_file(),
+                "clone must create 0400 capture-spool/{lane} tombstone"
+            );
+        }
     }
 }

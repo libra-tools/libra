@@ -472,11 +472,46 @@ fn previous_checkout_invalid_error(detail: impl Into<String>) -> SwitchError {
 /// display value.
 pub(crate) async fn resolve_previous_checkout_target() -> Result<PreviousCheckoutTarget, SwitchError>
 {
-    let db = get_db_conn_instance().await;
-    let entry = Reflog::find_latest_navigation(&db)
-        .await
-        .map_err(|error| previous_checkout_read_error(error.to_string()))?
-        .ok_or_else(previous_checkout_unavailable_error)?;
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| previous_checkout_read_error(error.to_string()))?;
+    let (entry, source_branch) = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| previous_checkout_read_error(error.to_string()))?;
+            let entry = Reflog::find_latest_navigation_with_store(&*store)
+                .await
+                .map_err(|error| previous_checkout_read_error(error.to_string()))?
+                .ok_or_else(previous_checkout_unavailable_error)?;
+            let (source, _) = previous_checkout_source(&entry.message).ok_or_else(|| {
+                previous_checkout_invalid_error(format!(
+                    "{} entry {} has a malformed movement message",
+                    entry.action, entry.id
+                ))
+            })?;
+            let branch = Branch::find_branch_result_with_store(&*store, source, None)
+                .await
+                .map_err(map_branch_store_error)?;
+            (entry, branch)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let entry = Reflog::find_latest_navigation(&db)
+                .await
+                .map_err(|error| previous_checkout_read_error(error.to_string()))?
+                .ok_or_else(previous_checkout_unavailable_error)?;
+            let (source, _) = previous_checkout_source(&entry.message).ok_or_else(|| {
+                previous_checkout_invalid_error(format!(
+                    "{} entry {} has a malformed movement message",
+                    entry.action, entry.id
+                ))
+            })?;
+            let branch = Branch::find_branch_result_with_conn(&db, source, None)
+                .await
+                .map_err(map_branch_store_error)?;
+            (entry, branch)
+        }
+    };
     let (source, _) = previous_checkout_source(&entry.message).ok_or_else(|| {
         previous_checkout_invalid_error(format!(
             "{} entry {} has a malformed movement message",
@@ -484,10 +519,7 @@ pub(crate) async fn resolve_previous_checkout_target() -> Result<PreviousCheckou
         ))
     })?;
 
-    if let Some(branch) = Branch::find_branch_result_with_conn(&db, source, None)
-        .await
-        .map_err(map_branch_store_error)?
-    {
+    if let Some(branch) = source_branch {
         if is_internal_switch_target(&branch.name) {
             return Err(SwitchError::InternalBranchBlocked(branch.name));
         }
@@ -629,8 +661,28 @@ async fn resolve_guess_enabled(guess: bool, no_guess: bool) -> Result<bool, Swit
     if guess {
         return Ok(true);
     }
-    let db = get_db_conn_instance().await;
-    match ConfigKv::get_bool_with_conn(&db, "checkout.guess").await {
+    let val = match crate::storage::runtime::detect_current_repo_backend().map_err(|err| {
+        SwitchError::DelegatedCli(
+            CliError::fatal(err.to_string()).with_stable_code(StableErrorCode::IoReadFailed),
+        )
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|err| {
+                    SwitchError::DelegatedCli(
+                        CliError::fatal(err.to_string())
+                            .with_stable_code(StableErrorCode::IoReadFailed),
+                    )
+                })?;
+            ConfigKv::get_bool_with_store(&*store, "checkout.guess").await
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            ConfigKv::get_bool_with_conn(&db, "checkout.guess").await
+        }
+    };
+    match val {
         Ok(value) => Ok(value.unwrap_or(true)),
         Err(err) => Err(SwitchError::DelegatedCli(
             CliError::fatal(format!("invalid checkout.guess configuration: {err}"))
@@ -1369,12 +1421,107 @@ where
     Ok((old_oid, from))
 }
 
+async fn current_navigation_state_auto() -> Result<(String, String), SwitchError> {
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| SwitchError::HeadUpdate(error.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| SwitchError::HeadUpdate(error.to_string()))?;
+            let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+            let old_oid = Head::current_commit_for_scope_result_with_store(&*store, &scope)
+                .await
+                .map_err(map_branch_store_error)?
+                .map(|oid| oid.to_string())
+                .unwrap_or_else(|| {
+                    ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string()
+                });
+            let from = match Head::current_for_scope_result_with_store(&*store, &scope)
+                .await
+                .map_err(map_branch_store_error)?
+            {
+                Head::Branch(name) => name,
+                Head::Detached(hash) => short_object_id(hash),
+            };
+            Ok((old_oid, from))
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            current_navigation_state(&db).await
+        }
+    }
+}
+
+async fn update_head_with_reflog_auto(
+    new_head: Head,
+    context: ReflogContext,
+) -> Result<(), SwitchError> {
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| SwitchError::HeadUpdate(error.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| SwitchError::HeadUpdate(error.to_string()))?;
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|error| SwitchError::HeadUpdate(error.to_string()))?;
+            let head_reflog = Reflog::build_reflog_write_with_store(
+                &*config_store,
+                &context,
+                crate::internal::reflog::HEAD,
+            )
+            .await;
+            let key = crate::storage::git_store::RefKey::LocalHead {
+                worktree_id: crate::utils::util::current_worktree_id(),
+            };
+            let existing = git_store
+                .get_ref(&key)
+                .await
+                .map_err(|error| SwitchError::HeadUpdate(error.to_string()))?;
+            let target = match new_head {
+                Head::Branch(name) => crate::storage::git_store::RefTarget::Symbolic(name),
+                Head::Detached(oid) => {
+                    crate::storage::git_store::RefTarget::Direct(oid.to_string())
+                }
+            };
+            let outcome = git_store
+                .update_ref_cas(&key, existing.as_ref(), Some(&target), &[head_reflog])
+                .await
+                .map_err(|error| SwitchError::HeadUpdate(error.to_string()))?;
+            if !matches!(
+                outcome,
+                crate::storage::git_store::RefCasOutcome::Applied { .. }
+            ) {
+                return Err(SwitchError::HeadUpdate(
+                    "concurrent HEAD update during switch".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        crate::storage::StorageBackendKind::Sqlite => with_reflog(
+            context,
+            move |txn: &sea_orm::DatabaseTransaction| {
+                let new_head = new_head.clone();
+                Box::pin(async move {
+                    Head::update_result_with_conn(txn, new_head, None)
+                        .await
+                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
+                })
+            },
+            false,
+        )
+        .await
+        .map_err(|error| SwitchError::HeadUpdate(error.to_string())),
+    }
+}
+
 async fn switch_head_to_unborn_branch(
     branch_name: &str,
     navigation_command: NavigationCommand,
 ) -> Result<(), SwitchError> {
-    let db = get_db_conn_instance().await;
-    let (old_oid, from_ref_name) = current_navigation_state(&db).await?;
+    let (old_oid, from_ref_name) = current_navigation_state_auto().await?;
 
     let action =
         navigation_reflog_action(navigation_command, from_ref_name, branch_name.to_string());
@@ -1383,22 +1530,7 @@ async fn switch_head_to_unborn_branch(
         new_oid: ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
         action,
     };
-    let branch_name = branch_name.to_string();
-
-    with_reflog(
-        context,
-        move |txn: &sea_orm::DatabaseTransaction| {
-            let branch_name = branch_name.clone();
-            Box::pin(async move {
-                Head::update_result_with_conn(txn, Head::Branch(branch_name), None)
-                    .await
-                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
-            })
-        },
-        false,
-    )
-    .await
-    .map_err(|error| SwitchError::HeadUpdate(error.to_string()))
+    update_head_with_reflog_auto(Head::Branch(branch_name.to_string()), context).await
 }
 
 /// change the working directory to the version of commit_hash
@@ -1421,8 +1553,7 @@ async fn move_to_commit(
     navigation_command: NavigationCommand,
     output: &OutputConfig,
 ) -> Result<ObjectHash, SwitchError> {
-    let db = get_db_conn_instance().await;
-    let (old_oid, from_ref_name) = current_navigation_state(&db).await?;
+    let (old_oid, from_ref_name) = current_navigation_state_auto().await?;
 
     // Case-collision preflight BEFORE any mutation — refusing after the
     // HEAD update would strand HEAD on the target with an unrestored tree.
@@ -1445,22 +1576,7 @@ async fn move_to_commit(
         action,
     };
 
-    if let Err(e) = with_reflog(
-        context,
-        move |txn: &sea_orm::DatabaseTransaction| {
-            Box::pin(async move {
-                let new_head = Head::Detached(commit_hash);
-                Head::update_result_with_conn(txn, new_head, None)
-                    .await
-                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
-            })
-        },
-        false,
-    )
-    .await
-    {
-        return Err(SwitchError::HeadUpdate(e.to_string()));
-    };
+    update_head_with_reflog_auto(Head::Detached(commit_hash), context).await?;
 
     // Only restore the working directory *after* HEAD has been successfully updated.
     restore_to_commit(commit_hash, output).await?;
@@ -1474,8 +1590,7 @@ pub(crate) async fn detach_head_in_place(
     commit_hash: ObjectHash,
     navigation_command: NavigationCommand,
 ) -> Result<ObjectHash, SwitchError> {
-    let db = get_db_conn_instance().await;
-    let (old_oid, from_ref_name) = current_navigation_state(&db).await?;
+    let (old_oid, from_ref_name) = current_navigation_state_auto().await?;
     let action = navigation_reflog_action(
         navigation_command,
         from_ref_name,
@@ -1487,21 +1602,7 @@ pub(crate) async fn detach_head_in_place(
         action,
     };
 
-    if let Err(error) = with_reflog(
-        context,
-        move |txn: &sea_orm::DatabaseTransaction| {
-            Box::pin(async move {
-                Head::update_result_with_conn(txn, Head::Detached(commit_hash), None)
-                    .await
-                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
-            })
-        },
-        false,
-    )
-    .await
-    {
-        return Err(SwitchError::HeadUpdate(error.to_string()));
-    }
+    update_head_with_reflog_auto(Head::Detached(commit_hash), context).await?;
     Ok(commit_hash)
 }
 
@@ -1547,8 +1648,7 @@ async fn move_to_resolved_branch(
         name: branch_name,
         commit: target_commit_id,
     } = target_branch;
-    let db = get_db_conn_instance().await;
-    let (old_oid, from_ref_name) = current_navigation_state(&db).await?;
+    let (old_oid, from_ref_name) = current_navigation_state_auto().await?;
 
     if from_ref_name == branch_name {
         // No-op: already on the target branch. The "Already on" message is
@@ -1614,22 +1714,7 @@ async fn move_to_resolved_branch(
     };
 
     // `log_for_branch` is `false`. This is the key insight for `switch`/`checkout`.
-    if let Err(e) = with_reflog(
-        context,
-        move |txn: &sea_orm::DatabaseTransaction| {
-            Box::pin(async move {
-                let new_head = Head::Branch(branch_name.clone());
-                Head::update_result_with_conn(txn, new_head, None)
-                    .await
-                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
-            })
-        },
-        false,
-    )
-    .await
-    {
-        return Err(SwitchError::HeadUpdate(e.to_string()));
-    }
+    update_head_with_reflog_auto(Head::Branch(branch_name.clone()), context).await?;
     drop(_attach_lock);
 
     restore_to_commit(target_commit_id, output).await?;

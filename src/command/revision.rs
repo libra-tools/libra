@@ -156,14 +156,32 @@ pub async fn execute_safe(args: RevisionArgs, output: &OutputConfig) -> CliResul
                     "history import requires a current operation; invoke libra revision import",
                 )
             })?;
-            let receipt = crate::internal::change::import::import_history(
-                &get_db_conn_instance().await,
-                &manifest,
-                &digest,
-                &op_id,
-            )
-            .await
-            .map_err(map_import)?;
+            let backend = crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+                CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            let receipt = match backend {
+                crate::storage::StorageBackendKind::Redb => {
+                    let storage_root = crate::utils::util::storage_path();
+                    crate::internal::change::import::import_history_with_store(
+                        &storage_root,
+                        &manifest,
+                        &digest,
+                        &op_id,
+                    )
+                    .await
+                    .map_err(map_import)?
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    crate::internal::change::import::import_history(
+                        &get_db_conn_instance().await,
+                        &manifest,
+                        &digest,
+                        &op_id,
+                    )
+                    .await
+                    .map_err(map_import)?
+                }
+            };
             if output.is_json() {
                 emit_json_data("revision", &receipt, output)?;
             } else if !output.quiet {
@@ -186,18 +204,68 @@ pub async fn execute_safe(args: RevisionArgs, output: &OutputConfig) -> CliResul
                 CliError::fatal("branch tip is not a valid OID")
                     .with_stable_code(StableErrorCode::RepoCorrupt)
             })?;
-            let db = get_db_conn_instance().await;
-            // Freshness + lookup in ONE transaction (never-lie).
-            let txn = crate::internal::db::begin_write_transaction(&db)
-                .await
-                .map_err(map_db)?;
-            let meta = RevisionOrdinalIndex::ensure_fresh_with_conn(&txn, &ref_name, &tip_oid)
-                .await
-                .map_err(map_index)?;
-            let hit = RevisionOrdinalIndex::find_by_ordinal_with_conn(&txn, &ref_name, number)
-                .await
-                .map_err(map_index)?;
-            txn.commit().await.map_err(map_db)?;
+            let backend = crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+                CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            let (meta, hit) = match backend {
+                crate::storage::StorageBackendKind::Redb => {
+                    // Strictly read-only fast path (`ADR-RB-03`): if cached index
+                    // is fresh for `tip_oid`, never open writable. Fall back to
+                    // read-only first-parent walk so `revision find` stays 100% read-only.
+                    let ro = crate::storage::runtime::open_current_git_store_read_only()
+                        .await
+                        .map_err(|e| {
+                            CliError::fatal(e.to_string())
+                                .with_stable_code(StableErrorCode::IoReadFailed)
+                        })?;
+                    let meta = RevisionOrdinalIndex::meta_with_store(&*ro, &ref_name)
+                        .await
+                        .map_err(map_index)?;
+                    if let Some(m) = meta.filter(|m| m.tip_oid == tip_oid.to_string()) {
+                        let hit = RevisionOrdinalIndex::find_by_ordinal_with_store(
+                            &*ro, &ref_name, number,
+                        )
+                        .await
+                        .map_err(map_index)?;
+                        (m, hit)
+                    } else {
+                        let chain = walk_first_parent_chain_readonly(&tip_oid)?;
+                        let max_ordinal = chain.len() as i64;
+                        let hit = if number <= max_ordinal {
+                            Some(chain[(number - 1) as usize].to_string())
+                        } else {
+                            None
+                        };
+                        (
+                            crate::internal::revision_ordinal::OrdinalMeta {
+                                ref_name: ref_name.clone(),
+                                tip_oid: tip_oid.to_string(),
+                                replace_sig: String::new(),
+                                max_ordinal,
+                                built_at: chrono::Utc::now().to_rfc3339(),
+                            },
+                            hit,
+                        )
+                    }
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    let db = get_db_conn_instance().await;
+                    // Freshness + lookup in ONE transaction (never-lie).
+                    let txn = crate::internal::db::begin_write_transaction(&db)
+                        .await
+                        .map_err(map_db)?;
+                    let meta =
+                        RevisionOrdinalIndex::ensure_fresh_with_conn(&txn, &ref_name, &tip_oid)
+                            .await
+                            .map_err(map_index)?;
+                    let hit =
+                        RevisionOrdinalIndex::find_by_ordinal_with_conn(&txn, &ref_name, number)
+                            .await
+                            .map_err(map_index)?;
+                    txn.commit().await.map_err(map_db)?;
+                    (meta, hit)
+                }
+            };
             let Some(oid) = hit else {
                 return Err(CliError::failure(format!(
                     "revision {number} not found on {ref_name} (first-parent chain has {} revisions)",
@@ -232,18 +300,69 @@ pub async fn execute_safe(args: RevisionArgs, output: &OutputConfig) -> CliResul
                 CliError::fatal("branch tip is not a valid OID")
                     .with_stable_code(StableErrorCode::RepoCorrupt)
             })?;
-            let db = get_db_conn_instance().await;
-            let txn = crate::internal::db::begin_write_transaction(&db)
-                .await
-                .map_err(map_db)?;
-            let meta = RevisionOrdinalIndex::ensure_fresh_with_conn(&txn, &ref_name, &tip_oid)
-                .await
-                .map_err(map_index)?;
-            let hit =
-                RevisionOrdinalIndex::ordinal_of_with_conn(&txn, &ref_name, &target.to_string())
+            let backend = crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+                CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            let (meta, hit) = match backend {
+                crate::storage::StorageBackendKind::Redb => {
+                    // Strictly read-only (`ADR-RB-03`).
+                    let ro = crate::storage::runtime::open_current_git_store_read_only()
+                        .await
+                        .map_err(|e| {
+                            CliError::fatal(e.to_string())
+                                .with_stable_code(StableErrorCode::IoReadFailed)
+                        })?;
+                    let meta = RevisionOrdinalIndex::meta_with_store(&*ro, &ref_name)
+                        .await
+                        .map_err(map_index)?;
+                    if let Some(m) = meta.filter(|m| m.tip_oid == tip_oid.to_string()) {
+                        let hit = RevisionOrdinalIndex::ordinal_of_with_store(
+                            &*ro,
+                            &ref_name,
+                            &target.to_string(),
+                        )
+                        .await
+                        .map_err(map_index)?;
+                        (m, hit)
+                    } else {
+                        let chain = walk_first_parent_chain_readonly(&tip_oid)?;
+                        let max_ordinal = chain.len() as i64;
+                        let hit = chain
+                            .iter()
+                            .position(|oid| oid == &target)
+                            .map(|idx| (idx as i64) + 1);
+                        (
+                            crate::internal::revision_ordinal::OrdinalMeta {
+                                ref_name: ref_name.clone(),
+                                tip_oid: tip_oid.to_string(),
+                                replace_sig: String::new(),
+                                max_ordinal,
+                                built_at: chrono::Utc::now().to_rfc3339(),
+                            },
+                            hit,
+                        )
+                    }
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    let db = get_db_conn_instance().await;
+                    let txn = crate::internal::db::begin_write_transaction(&db)
+                        .await
+                        .map_err(map_db)?;
+                    let meta =
+                        RevisionOrdinalIndex::ensure_fresh_with_conn(&txn, &ref_name, &tip_oid)
+                            .await
+                            .map_err(map_index)?;
+                    let hit = RevisionOrdinalIndex::ordinal_of_with_conn(
+                        &txn,
+                        &ref_name,
+                        &target.to_string(),
+                    )
                     .await
                     .map_err(map_index)?;
-            txn.commit().await.map_err(map_db)?;
+                    txn.commit().await.map_err(map_db)?;
+                    (meta, hit)
+                }
+            };
             let Some(ordinal) = hit else {
                 return Err(CliError::failure(format!(
                     "{target} has no ordinal on the first-parent chain of {ref_name}"
@@ -289,26 +408,58 @@ pub async fn execute_safe(args: RevisionArgs, output: &OutputConfig) -> CliResul
             } else {
                 Vec::new()
             };
-            let db = get_db_conn_instance().await;
-            let txn = crate::internal::db::begin_write_transaction(&db)
-                .await
-                .map_err(map_db)?;
-            let mut pruned_refs = 0usize;
-            let meta = if rebuild {
-                // Prune rows for refs that no longer exist (the sweep's
-                // real trigger), then rebuild this ref deterministically.
-                pruned_refs = RevisionOrdinalIndex::prune_missing_refs_with_conn(&txn, &live)
-                    .await
-                    .map_err(map_index)?;
-                RevisionOrdinalIndex::rebuild_with_conn(&txn, &ref_name, &tip_oid)
-                    .await
-                    .map_err(map_index)?
-            } else {
-                RevisionOrdinalIndex::ensure_fresh_with_conn(&txn, &ref_name, &tip_oid)
-                    .await
-                    .map_err(map_index)?
+            let backend = crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+                CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            let (meta, pruned_refs) = match backend {
+                crate::storage::StorageBackendKind::Redb => {
+                    let store = crate::storage::runtime::open_current_git_store_read_write()
+                        .await
+                        .map_err(|e| {
+                            CliError::fatal(e.to_string())
+                                .with_stable_code(StableErrorCode::IoReadFailed)
+                        })?;
+                    let mut pruned_refs = 0usize;
+                    let meta = if rebuild {
+                        pruned_refs =
+                            RevisionOrdinalIndex::prune_missing_refs_with_store(&*store, &live)
+                                .await
+                                .map_err(map_index)?;
+                        RevisionOrdinalIndex::rebuild_with_store(&*store, &ref_name, &tip_oid)
+                            .await
+                            .map_err(map_index)?
+                    } else {
+                        RevisionOrdinalIndex::ensure_fresh_with_store(&*store, &ref_name, &tip_oid)
+                            .await
+                            .map_err(map_index)?
+                    };
+                    (meta, pruned_refs)
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    let db = get_db_conn_instance().await;
+                    let txn = crate::internal::db::begin_write_transaction(&db)
+                        .await
+                        .map_err(map_db)?;
+                    let mut pruned_refs = 0usize;
+                    let meta = if rebuild {
+                        // Prune rows for refs that no longer exist (the sweep's
+                        // real trigger), then rebuild this ref deterministically.
+                        pruned_refs =
+                            RevisionOrdinalIndex::prune_missing_refs_with_conn(&txn, &live)
+                                .await
+                                .map_err(map_index)?;
+                        RevisionOrdinalIndex::rebuild_with_conn(&txn, &ref_name, &tip_oid)
+                            .await
+                            .map_err(map_index)?
+                    } else {
+                        RevisionOrdinalIndex::ensure_fresh_with_conn(&txn, &ref_name, &tip_oid)
+                            .await
+                            .map_err(map_index)?
+                    };
+                    txn.commit().await.map_err(map_db)?;
+                    (meta, pruned_refs)
+                }
             };
-            txn.commit().await.map_err(map_db)?;
             let report = RevisionOutput::Index {
                 r#ref: ref_name.clone(),
                 tip_oid: meta.tip_oid.clone(),
@@ -339,6 +490,24 @@ pub async fn execute_safe(args: RevisionArgs, output: &OutputConfig) -> CliResul
 fn map_db(error: sea_orm::DbErr) -> CliError {
     CliError::fatal(format!("revision index storage error: {error}"))
         .with_stable_code(StableErrorCode::IoWriteFailed)
+}
+
+fn walk_first_parent_chain_readonly(
+    tip_oid: &git_internal::hash::ObjectHash,
+) -> CliResult<Vec<git_internal::hash::ObjectHash>> {
+    use crate::utils::object_ext::CommitExt;
+    let mut chain = Vec::new();
+    let mut cursor = Some(*tip_oid);
+    while let Some(oid) = cursor {
+        let commit = git_internal::internal::object::commit::Commit::load(&oid).map_err(|e| {
+            CliError::fatal(format!("failed to load commit '{oid}': {e}"))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+        chain.push(oid);
+        cursor = commit.parent_commit_ids.first().copied();
+    }
+    chain.reverse();
+    Ok(chain)
 }
 
 fn map_index(error: anyhow::Error) -> CliError {

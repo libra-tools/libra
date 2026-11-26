@@ -159,16 +159,45 @@ pub async fn create_with_target(
         },
     };
 
-    let db = get_db_conn_instance().await;
-    let exists = reference::Entity::find()
-        .filter(reference::Column::Name.eq(format!("{}{}", TAG_REF_PREFIX, name)))
-        .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
-        .one(&db)
-        .await
-        .map_err(CreateTagError::CheckExisting)?;
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|err| CreateTagError::CheckExisting(DbErr::Custom(err.to_string())))?;
 
-    if exists.is_some() && !force {
-        return Err(CreateTagError::AlreadyExists(name.to_string()));
+    let mut redb_expected: Option<crate::storage::RefTarget> = None;
+    let mut sqlite_existing: Option<reference::Model> = None;
+    let mut sqlite_db: Option<sea_orm::DatabaseConnection> = None;
+
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|err| CreateTagError::CheckExisting(DbErr::Custom(err.to_string())))?;
+            let key = crate::storage::RefKey::Tag {
+                name: format!("{TAG_REF_PREFIX}{name}"),
+            };
+            let current = store
+                .get_ref(&key)
+                .await
+                .map_err(|err| CreateTagError::CheckExisting(DbErr::Custom(err.to_string())))?;
+            if current.is_some() && !force {
+                return Err(CreateTagError::AlreadyExists(name.to_string()));
+            }
+            redb_expected = current;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let exists = reference::Entity::find()
+                .filter(reference::Column::Name.eq(format!("{}{}", TAG_REF_PREFIX, name)))
+                .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
+                .one(&db)
+                .await
+                .map_err(CreateTagError::CheckExisting)?;
+
+            if exists.is_some() && !force {
+                return Err(CreateTagError::AlreadyExists(name.to_string()));
+            }
+            sqlite_existing = exists;
+            sqlite_db = Some(db);
+        }
     }
 
     let ref_target_id: ObjectHash;
@@ -246,26 +275,56 @@ pub async fn create_with_target(
 
     // Save the reference in the database
     let ref_target = ref_target_id.to_string();
-    match exists {
-        Some(existing_ref) => {
-            let mut existing_ref: reference::ActiveModel = existing_ref.into();
-            existing_ref.commit = Set(Some(ref_target));
-            existing_ref
-                .update(&db)
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_write()
                 .await
-                .map_err(CreateTagError::PersistReference)?;
-        }
-        None => {
-            let new_ref = reference::ActiveModel {
-                name: Set(Some(format!("{}{}", TAG_REF_PREFIX, name))),
-                kind: Set(reference::ConfigKind::Tag),
-                commit: Set(Some(ref_target)),
-                ..Default::default()
+                .map_err(|err| CreateTagError::PersistReference(DbErr::Custom(err.to_string())))?;
+            let key = crate::storage::RefKey::Tag {
+                name: format!("{TAG_REF_PREFIX}{name}"),
             };
-            new_ref
-                .insert(&db)
+            let new_target = crate::storage::RefTarget::Direct(ref_target);
+            match store
+                .update_ref_cas(&key, redb_expected.as_ref(), Some(&new_target), &[])
                 .await
-                .map_err(CreateTagError::PersistReference)?;
+                .map_err(|err| CreateTagError::PersistReference(DbErr::Custom(err.to_string())))?
+            {
+                crate::storage::git_store::RefCasOutcome::Applied { .. } => {}
+                crate::storage::git_store::RefCasOutcome::CasConflict { .. } => {
+                    return Err(CreateTagError::PersistReference(DbErr::Custom(
+                        "concurrent modification detected while persisting tag reference"
+                            .to_string(),
+                    )));
+                }
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = match sqlite_db {
+                Some(db) => db,
+                None => get_db_conn_instance().await,
+            };
+            match sqlite_existing {
+                Some(existing_ref) => {
+                    let mut existing_ref: reference::ActiveModel = existing_ref.into();
+                    existing_ref.commit = Set(Some(ref_target));
+                    existing_ref
+                        .update(&db)
+                        .await
+                        .map_err(CreateTagError::PersistReference)?;
+                }
+                None => {
+                    let new_ref = reference::ActiveModel {
+                        name: Set(Some(format!("{}{}", TAG_REF_PREFIX, name))),
+                        kind: Set(reference::ConfigKind::Tag),
+                        commit: Set(Some(ref_target)),
+                        ..Default::default()
+                    };
+                    new_ref
+                        .insert(&db)
+                        .await
+                        .map_err(CreateTagError::PersistReference)?;
+                }
+            }
         }
     }
 
@@ -593,37 +652,29 @@ pub async fn find_tag_ref(name: &str) -> Result<Option<TagReference>, DbErr> {
 
 /// Finds a tag by name and returns the tag object and the final commit
 pub async fn find_tag_and_commit(name: &str) -> Result<Option<(TagObject, Commit)>, GitError> {
-    let db_conn = get_db_conn_instance().await;
-    let full_ref_name = format!("{}{}", TAG_REF_PREFIX, name);
-
-    let model = reference::Entity::find()
-        .filter(reference::Column::Name.eq(full_ref_name))
-        .filter(reference::Column::Kind.eq(reference::ConfigKind::Tag))
-        .one(&db_conn)
+    let commit_str = match find_tag_ref(name)
         .await
-        .map_err(|e| GitError::CustomError(e.to_string()))?;
+        .map_err(|e| GitError::CustomError(e.to_string()))?
+    {
+        Some(tag_ref) => tag_ref
+            .target
+            .ok_or_else(|| GitError::CustomError("Tag is missing commit field".to_string()))?,
+        None => return Ok(None),
+    };
 
-    if let Some(m) = model {
-        let commit_str = m
-            .commit
-            .as_ref()
-            .ok_or_else(|| GitError::CustomError("Tag is missing commit field".to_string()))?;
-        let target_id = crate::internal::object_format::parse_repo_oid(commit_str)
-            .map_err(|_| GitError::InvalidHashValue(commit_str.to_string()))?;
-        let ref_object = load_object_trait(&target_id).await?;
+    let target_id = crate::internal::object_format::parse_repo_oid(&commit_str)
+        .map_err(|_| GitError::InvalidHashValue(commit_str.to_string()))?;
+    let ref_object = load_object_trait(&target_id).await?;
 
-        // If the ref points to a tag object, dereference it to get the commit
-        let commit_id = if let TagObject::Tag(tag_object) = &ref_object {
-            tag_object.object_hash
-        } else {
-            target_id
-        };
-
-        let commit: Commit = load_object(&commit_id)?;
-        Ok(Some((ref_object, commit)))
+    // If the ref points to a tag object, dereference it to get the commit
+    let commit_id = if let TagObject::Tag(tag_object) = &ref_object {
+        tag_object.object_hash
     } else {
-        Ok(None)
-    }
+        target_id
+    };
+
+    let commit: Commit = load_object(&commit_id)?;
+    Ok(Some((ref_object, commit)))
 }
 
 /// Load a Git object and return it as a `TagObject`.

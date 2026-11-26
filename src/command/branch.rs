@@ -563,126 +563,237 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
         .with_stable_code(StableErrorCode::CliInvalidTarget)
     })?;
     // Preflight policy checks (friendly errors; authoritative re-check in-txn).
-    {
-        let db = crate::internal::db::get_db_conn_instance().await;
-        if crate::internal::metadata::MetadataKv::is_protected_with_conn(&db, &branch)
-            .await
-            .map_err(|e| {
-                CliError::fatal(format!("failed to read branch policy metadata: {e}"))
-                    .with_stable_code(StableErrorCode::IoReadFailed)
-            })?
-        {
-            return Err(CliError::from(BranchError::Protected(branch)));
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let meta = crate::storage::runtime::open_current_repo_metadata_store_read_only()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to read branch policy metadata: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            if crate::internal::metadata::MetadataKv::is_protected_with_store(&*meta, &branch)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to read branch policy metadata: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+            {
+                return Err(CliError::from(BranchError::Protected(branch)));
+            }
+            if crate::internal::metadata::MetadataKv::is_archived_with_store(&*meta, &branch)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to read branch policy metadata: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+            {
+                return Err(CliError::from(BranchError::Archived(branch)));
+            }
         }
-        if crate::internal::metadata::MetadataKv::is_archived_with_conn(&db, &branch)
-            .await
-            .map_err(|e| {
-                CliError::fatal(format!("failed to read branch policy metadata: {e}"))
-                    .with_stable_code(StableErrorCode::IoReadFailed)
-            })?
-        {
-            return Err(CliError::from(BranchError::Archived(branch)));
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = crate::internal::db::get_db_conn_instance().await;
+            if crate::internal::metadata::MetadataKv::is_protected_with_conn(&db, &branch)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to read branch policy metadata: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+            {
+                return Err(CliError::from(BranchError::Protected(branch)));
+            }
+            if crate::internal::metadata::MetadataKv::is_archived_with_conn(&db, &branch)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("failed to read branch policy metadata: {e}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+            {
+                return Err(CliError::from(BranchError::Archived(branch)));
+            }
         }
     }
 
     let new_commit = target_commit.to_string();
     record_branch_reset_operation_digest(&branch, &new_commit).await?;
-    // Sentinel prefixes preserve the TYPED refusal through DbErr::Custom so a
-    // race-window refusal still surfaces as LBR-POLICY-001 / the current-
-    // branch message rather than a generic storage error.
-    const SENTINEL_PROTECTED: &str = "LIBRA_POLICY_PROTECTED:";
-    const SENTINEL_ARCHIVED: &str = "LIBRA_POLICY_ARCHIVED:";
-    const SENTINEL_CURRENT: &str = "LIBRA_RESET_CURRENT:";
-    let branch_for_txn = branch.clone();
-    let target_for_txn = args.target.clone();
-    let new_for_txn = target_commit;
-    let database = crate::internal::db::get_db_conn_instance().await;
-    let transaction = crate::internal::db::begin_write_transaction(&database)
-        .await
-        .map_err(|error| CliError::fatal(format!("branch reset transaction failed: {error}")))?;
-    let result = async {
-        // Authoritative, fail-closed policy gate (the 1.5 contract).
-        let protected = crate::internal::metadata::MetadataKv::is_protected_with_conn(
-            &transaction,
-            &branch_for_txn,
-        )
-        .await
-        .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
-        if protected {
-            return Err(DbErr::Custom(format!(
-                "{SENTINEL_PROTECTED}{branch_for_txn}"
-            )));
-        }
-        let archived = crate::internal::metadata::MetadataKv::is_archived_with_conn(
-            &transaction,
-            &branch_for_txn,
-        )
-        .await
-        .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
-        if archived {
-            return Err(DbErr::Custom(format!(
-                "{SENTINEL_ARCHIVED}{branch_for_txn}"
-            )));
-        }
-        if let Head::Branch(current) = Head::current_with_conn(&transaction).await
-            && current == branch_for_txn
-        {
-            return Err(DbErr::Custom(format!("{SENTINEL_CURRENT}{branch_for_txn}")));
-        }
-        let live = Branch::find_branch_result_with_conn(&transaction, &branch_for_txn, None)
-            .await
-            .map_err(|e| DbErr::Custom(e.to_string()))?
-            .ok_or_else(|| {
-                DbErr::Custom(format!("branch '{branch_for_txn}' vanished mid-reset"))
-            })?;
-        Branch::update_branch_with_conn(
-            &transaction,
-            &branch_for_txn,
-            &new_for_txn.to_string(),
-            None,
-        )
-        .await?;
-        let context = crate::internal::reflog::ReflogContext {
-            old_oid: live.commit.to_string(),
-            new_oid: new_for_txn.to_string(),
-            action: crate::internal::reflog::ReflogAction::Reset {
-                target: target_for_txn,
-            },
-        };
-        crate::internal::reflog::Reflog::insert_single_entry(
-            &transaction,
-            &context,
-            &format!("refs/heads/{branch_for_txn}"),
-        )
-        .await
-        .map_err(|e| DbErr::Custom(format!("reflog write failed: {e}")))?;
-        Ok::<String, DbErr>(live.commit.to_string())
-    }
-    .await;
-    let old_commit = match result {
-        Ok(old_commit) => {
-            transaction
-                .commit()
+    let old_commit = match crate::storage::runtime::detect_current_repo_backend().map_err(|e| {
+        CliError::fatal(e.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let meta = crate::storage::runtime::open_current_repo_metadata_store_read_only()
                 .await
-                .map_err(|error| CliError::fatal(format!("branch reset commit failed: {error}")))?;
-            old_commit
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            let text = error.to_string();
-            if let Some(name) = text.split(SENTINEL_PROTECTED).nth(1) {
-                return Err(CliError::from(BranchError::Protected(name.to_string())));
+                .map_err(|e| CliError::fatal(format!("branch reset metadata failed: {e}")))?;
+            if crate::internal::metadata::MetadataKv::is_protected_with_store(&*meta, &branch)
+                .await
+                .map_err(|e| CliError::fatal(format!("policy metadata read failed: {e}")))?
+            {
+                return Err(CliError::from(BranchError::Protected(branch)));
             }
-            if let Some(name) = text.split(SENTINEL_ARCHIVED).nth(1) {
-                return Err(CliError::from(BranchError::Archived(name.to_string())));
+            if crate::internal::metadata::MetadataKv::is_archived_with_store(&*meta, &branch)
+                .await
+                .map_err(|e| CliError::fatal(format!("policy metadata read failed: {e}")))?
+            {
+                return Err(CliError::from(BranchError::Archived(branch)));
             }
-            if let Some(name) = text.split(SENTINEL_CURRENT).nth(1) {
-                return Err(CliError::from(BranchError::ResetCurrentBranch(
-                    name.to_string(),
-                )));
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|e| CliError::fatal(format!("branch reset store failed: {e}")))?;
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|e| CliError::fatal(format!("branch reset config failed: {e}")))?;
+            let scope = WorktreeScope::for_request();
+            if let Ok(Head::Branch(current)) =
+                Head::current_for_scope_result_with_store(&*git_store, &scope).await
+                && current == branch
+            {
+                return Err(CliError::from(BranchError::ResetCurrentBranch(branch)));
             }
-            return Err(CliError::fatal(format!("branch reset failed: {text}"))
+            let live = Branch::find_branch_result_with_store(&*git_store, &branch, None)
+                .await
+                .map_err(|e| CliError::fatal(format!("branch reset failed: {e}")))?
+                .ok_or_else(|| {
+                    CliError::fatal(format!("branch '{branch}' vanished mid-reset"))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+            let context = crate::internal::reflog::ReflogContext {
+                old_oid: live.commit.to_string(),
+                new_oid: target_commit.to_string(),
+                action: crate::internal::reflog::ReflogAction::Reset {
+                    target: args.target.clone(),
+                },
+            };
+            let reflog_write = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                &*config_store,
+                &context,
+                &format!("refs/heads/{branch}"),
+            )
+            .await;
+            let key = crate::storage::git_store::RefKey::LocalBranch {
+                name: branch.clone(),
+            };
+            let expected = crate::storage::git_store::RefTarget::Direct(live.commit.to_string());
+            let new_target =
+                crate::storage::git_store::RefTarget::Direct(target_commit.to_string());
+            let outcome = git_store
+                .update_ref_cas(&key, Some(&expected), Some(&new_target), &[reflog_write])
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!("branch reset failed: {e}"))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+            if !matches!(
+                outcome,
+                crate::storage::git_store::RefCasOutcome::Applied { .. }
+            ) {
+                return Err(CliError::fatal(format!(
+                    "branch reset failed: concurrent update on '{branch}'"
+                ))
                 .with_stable_code(StableErrorCode::IoWriteFailed));
+            }
+            live.commit.to_string()
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            // Sentinel prefixes preserve the TYPED refusal through DbErr::Custom so a
+            // race-window refusal still surfaces as LBR-POLICY-001 / the current-
+            // branch message rather than a generic storage error.
+            const SENTINEL_PROTECTED: &str = "LIBRA_POLICY_PROTECTED:";
+            const SENTINEL_ARCHIVED: &str = "LIBRA_POLICY_ARCHIVED:";
+            const SENTINEL_CURRENT: &str = "LIBRA_RESET_CURRENT:";
+            let branch_for_txn = branch.clone();
+            let target_for_txn = args.target.clone();
+            let new_for_txn = target_commit;
+            let database = crate::internal::db::get_db_conn_instance().await;
+            let transaction = crate::internal::db::begin_write_transaction(&database)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("branch reset transaction failed: {error}"))
+                })?;
+            let result = async {
+                // Authoritative, fail-closed policy gate (the 1.5 contract).
+                let protected = crate::internal::metadata::MetadataKv::is_protected_with_conn(
+                    &transaction,
+                    &branch_for_txn,
+                )
+                .await
+                .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+                if protected {
+                    return Err(DbErr::Custom(format!(
+                        "{SENTINEL_PROTECTED}{branch_for_txn}"
+                    )));
+                }
+                let archived = crate::internal::metadata::MetadataKv::is_archived_with_conn(
+                    &transaction,
+                    &branch_for_txn,
+                )
+                .await
+                .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+                if archived {
+                    return Err(DbErr::Custom(format!(
+                        "{SENTINEL_ARCHIVED}{branch_for_txn}"
+                    )));
+                }
+                if let Head::Branch(current) = Head::current_with_conn(&transaction).await
+                    && current == branch_for_txn
+                {
+                    return Err(DbErr::Custom(format!("{SENTINEL_CURRENT}{branch_for_txn}")));
+                }
+                let live =
+                    Branch::find_branch_result_with_conn(&transaction, &branch_for_txn, None)
+                        .await
+                        .map_err(|e| DbErr::Custom(e.to_string()))?
+                        .ok_or_else(|| {
+                            DbErr::Custom(format!("branch '{branch_for_txn}' vanished mid-reset"))
+                        })?;
+                Branch::update_branch_with_conn(
+                    &transaction,
+                    &branch_for_txn,
+                    &new_for_txn.to_string(),
+                    None,
+                )
+                .await?;
+                let context = crate::internal::reflog::ReflogContext {
+                    old_oid: live.commit.to_string(),
+                    new_oid: new_for_txn.to_string(),
+                    action: crate::internal::reflog::ReflogAction::Reset {
+                        target: target_for_txn,
+                    },
+                };
+                crate::internal::reflog::Reflog::insert_single_entry(
+                    &transaction,
+                    &context,
+                    &format!("refs/heads/{branch_for_txn}"),
+                )
+                .await
+                .map_err(|e| DbErr::Custom(format!("reflog write failed: {e}")))?;
+                Ok::<String, DbErr>(live.commit.to_string())
+            }
+            .await;
+            match result {
+                Ok(old_commit) => {
+                    transaction.commit().await.map_err(|error| {
+                        CliError::fatal(format!("branch reset commit failed: {error}"))
+                    })?;
+                    old_commit
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    let text = error.to_string();
+                    if let Some(name) = text.split(SENTINEL_PROTECTED).nth(1) {
+                        return Err(CliError::from(BranchError::Protected(name.to_string())));
+                    }
+                    if let Some(name) = text.split(SENTINEL_ARCHIVED).nth(1) {
+                        return Err(CliError::from(BranchError::Archived(name.to_string())));
+                    }
+                    if let Some(name) = text.split(SENTINEL_CURRENT).nth(1) {
+                        return Err(CliError::from(BranchError::ResetCurrentBranch(
+                            name.to_string(),
+                        )));
+                    }
+                    return Err(CliError::fatal(format!("branch reset failed: {text}"))
+                        .with_stable_code(StableErrorCode::IoWriteFailed));
+                }
+            }
         }
     };
 
@@ -708,27 +819,77 @@ async fn record_branch_reset_operation_digest(branch: &str, new_commit: &str) ->
     let args_digest = format!("sha256:{}", hex::encode(Sha256::digest(payload.as_bytes())));
     let scope = WorktreeScope::for_request();
     let worktree_id = scope.storage_key();
-    let database = get_db_conn_instance().await;
-    let repo_id = RepoIdentity::resolve(&database)
-        .await
-        .map_err(|error| CliError::fatal(format!("failed to read repository identity: {error}")))?;
-    if let Some(previous_operation) = store::find_recent_success_by_args_digest(
-        &database,
-        repo_id.as_str(),
-        worktree_id,
-        "branch",
-        &args_digest,
-    )
-    .await
-    .map_err(|error| CliError::fatal(format!("failed to read operation log: {error}")))?
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| CliError::fatal(format!("failed to detect repository backend: {error}")))?
     {
-        return Err(CliError::fatal(format!(
-            "duplicate operation: branch reset matches recent operation {previous_operation}"
-        )));
+        crate::storage::StorageBackendKind::Redb => {
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read repository identity: {error}"))
+                })?;
+            let repo_id = RepoIdentity::resolve_with_store(&*config_store)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read repository identity: {error}"))
+                })?;
+            let state_store = crate::storage::runtime::open_current_git_state_store_read_write()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to open operation log: {error}"))
+                })?;
+            if let Some(previous_operation) = store::find_recent_success_by_args_digest_with_store(
+                &*state_store,
+                repo_id.as_str(),
+                worktree_id,
+                "branch",
+                &args_digest,
+            )
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to read operation log: {error}")))?
+            {
+                return Err(CliError::fatal(format!(
+                    "duplicate operation: branch reset matches recent operation {previous_operation}"
+                )));
+            }
+            store::update_operation_args_digest_with_store(
+                &*state_store,
+                repo_id.as_str(),
+                &operation_id,
+                &args_digest,
+            )
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to update operation log: {error}")))?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let database = get_db_conn_instance().await;
+            let repo_id = RepoIdentity::resolve(&database).await.map_err(|error| {
+                CliError::fatal(format!("failed to read repository identity: {error}"))
+            })?;
+            if let Some(previous_operation) = store::find_recent_success_by_args_digest(
+                &database,
+                repo_id.as_str(),
+                worktree_id,
+                "branch",
+                &args_digest,
+            )
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to read operation log: {error}")))?
+            {
+                return Err(CliError::fatal(format!(
+                    "duplicate operation: branch reset matches recent operation {previous_operation}"
+                )));
+            }
+            store::update_operation_args_digest(
+                &database,
+                repo_id.as_str(),
+                &operation_id,
+                &args_digest,
+            )
+            .await
+            .map_err(|error| CliError::fatal(format!("failed to update operation log: {error}")))?;
+        }
     }
-    store::update_operation_args_digest(&database, repo_id.as_str(), &operation_id, &args_digest)
-        .await
-        .map_err(|error| CliError::fatal(format!("failed to update operation log: {error}")))?;
     Ok(())
 }
 
@@ -1470,14 +1631,11 @@ async fn write_upstream_config(
     remote: &str,
     merge_short: &str,
 ) -> Result<(), BranchError> {
-    let db = get_db_conn_instance().await;
-    let branch_config = ConfigKv::branch_config_with_conn(&db, branch)
-        .await
-        .map_err(|e| {
-            branch_config_read_error(format!("upstream config for branch '{branch}'"), e)
-        })?;
+    let branch_config = ConfigKv::branch_config(branch).await.map_err(|e| {
+        branch_config_read_error(format!("upstream config for branch '{branch}'"), e)
+    })?;
     let merge_ref = format!("refs/heads/{merge_short}");
-    // `branch_config_with_conn()` normalizes `refs/heads/<name>` to `<name>`,
+    // `branch_config()` normalizes `refs/heads/<name>` to `<name>`,
     // so the idempotency check must compare against the short branch name.
     let should_write = branch_config
         .as_ref()
@@ -1486,11 +1644,11 @@ async fn write_upstream_config(
 
     if should_write {
         let remote_key = format!("branch.{branch}.remote");
-        ConfigKv::set_with_conn(&db, &remote_key, remote, false)
+        ConfigKv::set(&remote_key, remote, false)
             .await
             .map_err(|e| branch_config_write_error(&remote_key, e))?;
         let merge_key = format!("branch.{branch}.merge");
-        ConfigKv::set_with_conn(&db, &merge_key, &merge_ref, false)
+        ConfigKv::set(&merge_key, &merge_ref, false)
             .await
             .map_err(|e| branch_config_write_error(&merge_key, e))?;
     }
@@ -1616,8 +1774,7 @@ async fn upstream_matches_configured(branch: &str, upstream: &str) -> bool {
     if remote.is_empty() || remote_branch.is_empty() {
         return false;
     }
-    let database = get_db_conn_instance().await;
-    let config = match ConfigKv::branch_config_with_conn(&database, branch).await {
+    let config = match ConfigKv::branch_config(branch).await {
         Ok(config) => config,
         Err(_) => return false,
     };
@@ -1680,12 +1837,11 @@ pub(crate) async fn set_upstream_is_idempotent(args: &BranchArgs) -> bool {
 
 async fn unset_upstream_impl(branch: &str) -> Result<(), BranchError> {
     require_existing_local_branch(branch).await?;
-    let db = get_db_conn_instance().await;
     for key in [
         format!("branch.{branch}.remote"),
         format!("branch.{branch}.merge"),
     ] {
-        ConfigKv::unset_all_with_conn(&db, &key)
+        ConfigKv::unset_all(&key)
             .await
             .map_err(|e| branch_config_write_error(&key, e))?;
     }
@@ -1809,8 +1965,31 @@ async fn load_remote_branches_with_conn<C: ConnectionTrait>(
 /// Convenience wrapper around [`load_remote_branches_with_conn`] that uses
 /// the process-wide SQLite handle.
 async fn load_remote_branches() -> Result<Vec<Branch>, BranchError> {
-    let db = get_db_conn_instance().await;
-    load_remote_branches_with_conn(&db).await
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| BranchError::StorageQueryFailed(e.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let remote_configs = ConfigKv::all_remote_configs()
+                .await
+                .map_err(|e| branch_config_read_error("remote configuration", e))?;
+            let git_store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|e| BranchError::StorageQueryFailed(e.to_string()))?;
+            let mut remote_branches = Vec::new();
+            for remote in remote_configs {
+                remote_branches.extend(
+                    Branch::list_branches_result_with_store(&*git_store, Some(&remote.name))
+                        .await
+                        .map_err(map_branch_store_error)?,
+                );
+            }
+            Ok(remote_branches)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            load_remote_branches_with_conn(&db).await
+        }
+    }
 }
 
 /// Body of `libra branch <new> [base]`.
@@ -1886,135 +2065,279 @@ async fn create_branch_impl(
 
     let mut previous_commit = None;
     if record_operation {
-        let database = crate::internal::db::get_db_conn_instance().await;
-        let transaction = crate::internal::db::begin_write_transaction(&database)
-            .await
-            .map_err(|error| BranchError::RefUpdateFailed {
-                branch: new_branch.clone(),
-                detail: error.to_string(),
-            })?;
-        let branch_for_operation = new_branch.clone();
-        let commit_for_operation = commit_id_display.clone();
-        let result = async {
-            let exists = Branch::exists_result_with_conn(&transaction, &branch_for_operation, None)
-                .await
-                .map_err(|error| BranchError::StorageQueryFailed(error.to_string()))?;
-            let existing =
-                Branch::find_branch_result_with_conn(&transaction, &branch_for_operation, None)
-                    .await
-                    .map_err(|error| BranchError::StorageQueryFailed(error.to_string()))?;
-            if exists && !force {
-                return Err(BranchError::AlreadyExists(branch_for_operation.clone()));
-            }
-            if exists {
-                // A forced create is a branch reset. Keep the same policy and
-                // checked-out-worktree boundary as `branch reset`, on the
-                // writer's transaction so a concurrent policy change cannot
-                // slip between preflight and the ref update.
-                if crate::internal::metadata::MetadataKv::is_protected_with_conn(
-                    &transaction,
-                    &branch_for_operation,
-                )
-                .await
-                .map_err(|error| {
-                    BranchError::StorageQueryFailed(format!(
-                        "failed to read protect policy for '{branch_for_operation}': {error}"
-                    ))
-                })? {
-                    return Err(BranchError::Protected(branch_for_operation.clone()));
-                }
-                if crate::internal::metadata::MetadataKv::is_archived_with_conn(
-                    &transaction,
-                    &branch_for_operation,
-                )
-                .await
-                .map_err(|error| {
-                    BranchError::StorageQueryFailed(format!(
-                        "failed to read archive policy for '{branch_for_operation}': {error}"
-                    ))
-                })? {
-                    return Err(BranchError::Archived(branch_for_operation.clone()));
-                }
-                if let Head::Branch(current) = Head::current_result_with_conn(&transaction)
-                    .await
-                    .map_err(map_branch_store_error)?
-                    && current == branch_for_operation
-                {
-                    return Err(BranchError::ResetCurrentBranch(
-                        branch_for_operation.clone(),
-                    ));
-                }
-                if let Some(other) = Head::branch_checked_out_elsewhere_result_with_conn(
-                    &transaction,
-                    &branch_for_operation,
-                )
-                .await
-                .map_err(|error| BranchError::StorageQueryFailed(format!(
-                    "failed to check other worktrees for branch '{branch_for_operation}': {error}"
-                )))?
-                {
-                    return Err(BranchError::CheckedOutElsewhere(
-                        "reset",
-                        branch_for_operation.clone(),
-                        other,
-                    ));
-                }
-            }
-            Branch::update_branch_with_conn(
-                &transaction,
-                &branch_for_operation,
-                &commit_for_operation,
-                None,
-            )
-            .await
-            .map_err(|error| BranchError::RefUpdateFailed {
-                branch: branch_for_operation.clone(),
-                detail: error.to_string(),
-            })?;
-            let zero_oid = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
-            let old_commit = exists.then(|| {
-                existing
-                    .map(|branch| branch.commit.to_string())
-                    .unwrap_or_else(|| zero_oid.clone())
-            });
-            let context = crate::internal::reflog::ReflogContext {
-                old_oid: old_commit.clone().unwrap_or(zero_oid),
-                new_oid: commit_for_operation.clone(),
-                action: crate::internal::reflog::ReflogAction::Branch {
-                    message: if old_commit.is_some() {
-                        format!("Reset to {}", base_name.as_deref().unwrap_or("HEAD"))
-                    } else {
-                        format!("Created from {}", base_name.as_deref().unwrap_or("HEAD"))
-                    },
-                },
-            };
-            crate::internal::reflog::Reflog::insert_single_entry(
-                &transaction,
-                &context,
-                &format!("refs/heads/{branch_for_operation}"),
-            )
-            .await
-            .map_err(|error| BranchError::RefUpdateFailed {
-                branch: branch_for_operation.clone(),
-                detail: format!("could not write branch reflog: {error}"),
-            })?;
-            Ok::<Option<String>, BranchError>(old_commit)
-        }
-        .await;
-        match result {
-            Ok(old_commit) => {
-                transaction
-                    .commit()
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|error| BranchError::StorageQueryFailed(error.to_string()))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                use crate::storage::git_store::{RefCasOutcome, RefKey, RefTarget};
+
+                let git_store = crate::storage::runtime::open_current_git_store_read_write()
                     .await
                     .map_err(|error| BranchError::RefUpdateFailed {
                         branch: new_branch.clone(),
                         detail: error.to_string(),
                     })?;
-                previous_commit = old_commit;
+                let config_store =
+                    crate::storage::runtime::open_current_repo_config_store_read_write()
+                        .await
+                        .map_err(|error| BranchError::RefUpdateFailed {
+                            branch: new_branch.clone(),
+                            detail: error.to_string(),
+                        })?;
+                let meta_store =
+                    crate::storage::runtime::open_current_repo_metadata_store_read_write()
+                        .await
+                        .map_err(|error| BranchError::RefUpdateFailed {
+                            branch: new_branch.clone(),
+                            detail: error.to_string(),
+                        })?;
+
+                let key = RefKey::LocalBranch {
+                    name: new_branch.clone(),
+                };
+                let existing_target = git_store
+                    .get_ref(&key)
+                    .await
+                    .map_err(|error| BranchError::StorageQueryFailed(error.to_string()))?;
+                let exists = existing_target.is_some();
+                if exists && !force {
+                    return Err(BranchError::AlreadyExists(new_branch.clone()));
+                }
+                if exists {
+                    if crate::internal::metadata::MetadataKv::is_protected_with_store(
+                        &*meta_store,
+                        &new_branch,
+                    )
+                    .await
+                    .map_err(|error| {
+                        BranchError::StorageQueryFailed(format!(
+                            "failed to read protect policy for '{new_branch}': {error}"
+                        ))
+                    })? {
+                        return Err(BranchError::Protected(new_branch.clone()));
+                    }
+                    if crate::internal::metadata::MetadataKv::is_archived_with_store(
+                        &*meta_store,
+                        &new_branch,
+                    )
+                    .await
+                    .map_err(|error| {
+                        BranchError::StorageQueryFailed(format!(
+                            "failed to read archive policy for '{new_branch}': {error}"
+                        ))
+                    })? {
+                        return Err(BranchError::Archived(new_branch.clone()));
+                    }
+                    if let Head::Branch(current) = Head::current_result_with_store(&*git_store)
+                        .await
+                        .map_err(map_branch_store_error)?
+                        && current == new_branch
+                    {
+                        return Err(BranchError::ResetCurrentBranch(new_branch.clone()));
+                    }
+                    if let Some(other) = Head::branch_checked_out_elsewhere_result_with_store(
+                        &*git_store,
+                        &new_branch,
+                    )
+                    .await
+                    .map_err(|error| {
+                        BranchError::StorageQueryFailed(format!(
+                            "failed to check other worktrees for branch '{new_branch}': {error}"
+                        ))
+                    })? {
+                        return Err(BranchError::CheckedOutElsewhere(
+                            "reset",
+                            new_branch.clone(),
+                            other,
+                        ));
+                    }
+                }
+
+                let zero_oid =
+                    ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
+                let old_commit = existing_target.as_ref().map(|target| match target {
+                    RefTarget::Direct(oid) | RefTarget::Symbolic(oid) => oid.clone(),
+                });
+                let context = crate::internal::reflog::ReflogContext {
+                    old_oid: old_commit.clone().unwrap_or(zero_oid),
+                    new_oid: commit_id_display.clone(),
+                    action: crate::internal::reflog::ReflogAction::Branch {
+                        message: if old_commit.is_some() {
+                            format!("Reset to {}", base_name.as_deref().unwrap_or("HEAD"))
+                        } else {
+                            format!("Created from {}", base_name.as_deref().unwrap_or("HEAD"))
+                        },
+                    },
+                };
+                let reflog_write = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                    &*config_store,
+                    &context,
+                    &format!("refs/heads/{new_branch}"),
+                )
+                .await;
+                let new_target = RefTarget::Direct(commit_id_display.clone());
+                match git_store
+                    .update_ref_cas(
+                        &key,
+                        existing_target.as_ref(),
+                        Some(&new_target),
+                        &[reflog_write],
+                    )
+                    .await
+                    .map_err(|error| BranchError::RefUpdateFailed {
+                        branch: new_branch.clone(),
+                        detail: error.to_string(),
+                    })? {
+                    RefCasOutcome::Applied { .. } => {
+                        previous_commit = old_commit;
+                    }
+                    RefCasOutcome::CasConflict { .. } => {
+                        return Err(BranchError::RefUpdateFailed {
+                            branch: new_branch.clone(),
+                            detail: "concurrent modification detected while updating branch"
+                                .to_string(),
+                        });
+                    }
+                }
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
+            crate::storage::StorageBackendKind::Sqlite => {
+                let database = crate::internal::db::get_db_conn_instance().await;
+                let transaction = crate::internal::db::begin_write_transaction(&database)
+                    .await
+                    .map_err(|error| BranchError::RefUpdateFailed {
+                        branch: new_branch.clone(),
+                        detail: error.to_string(),
+                    })?;
+                let branch_for_operation = new_branch.clone();
+                let commit_for_operation = commit_id_display.clone();
+                let result = async {
+                    let exists =
+                        Branch::exists_result_with_conn(&transaction, &branch_for_operation, None)
+                            .await
+                            .map_err(|error| BranchError::StorageQueryFailed(error.to_string()))?;
+                    let existing = Branch::find_branch_result_with_conn(
+                        &transaction,
+                        &branch_for_operation,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| BranchError::StorageQueryFailed(error.to_string()))?;
+                    if exists && !force {
+                        return Err(BranchError::AlreadyExists(branch_for_operation.clone()));
+                    }
+                    if exists {
+                        // A forced create is a branch reset. Keep the same policy and
+                        // checked-out-worktree boundary as `branch reset`, on the
+                        // writer's transaction so a concurrent policy change cannot
+                        // slip between preflight and the ref update.
+                        if crate::internal::metadata::MetadataKv::is_protected_with_conn(
+                            &transaction,
+                            &branch_for_operation,
+                        )
+                        .await
+                        .map_err(|error| {
+                            BranchError::StorageQueryFailed(format!(
+                                "failed to read protect policy for '{branch_for_operation}': {error}"
+                            ))
+                        })? {
+                            return Err(BranchError::Protected(branch_for_operation.clone()));
+                        }
+                        if crate::internal::metadata::MetadataKv::is_archived_with_conn(
+                            &transaction,
+                            &branch_for_operation,
+                        )
+                        .await
+                        .map_err(|error| {
+                            BranchError::StorageQueryFailed(format!(
+                                "failed to read archive policy for '{branch_for_operation}': {error}"
+                            ))
+                        })? {
+                            return Err(BranchError::Archived(branch_for_operation.clone()));
+                        }
+                        if let Head::Branch(current) =
+                            Head::current_result_with_conn(&transaction)
+                                .await
+                                .map_err(map_branch_store_error)?
+                            && current == branch_for_operation
+                        {
+                            return Err(BranchError::ResetCurrentBranch(
+                                branch_for_operation.clone(),
+                            ));
+                        }
+                        if let Some(other) = Head::branch_checked_out_elsewhere_result_with_conn(
+                            &transaction,
+                            &branch_for_operation,
+                        )
+                        .await
+                        .map_err(|error| {
+                            BranchError::StorageQueryFailed(format!(
+                                "failed to check other worktrees for branch '{branch_for_operation}': {error}"
+                            ))
+                        })? {
+                            return Err(BranchError::CheckedOutElsewhere(
+                                "reset",
+                                branch_for_operation.clone(),
+                                other,
+                            ));
+                        }
+                    }
+                    Branch::update_branch_with_conn(
+                        &transaction,
+                        &branch_for_operation,
+                        &commit_for_operation,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| BranchError::RefUpdateFailed {
+                        branch: branch_for_operation.clone(),
+                        detail: error.to_string(),
+                    })?;
+                    let zero_oid =
+                        ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
+                    let old_commit = exists.then(|| {
+                        existing
+                            .map(|branch| branch.commit.to_string())
+                            .unwrap_or_else(|| zero_oid.clone())
+                    });
+                    let context = crate::internal::reflog::ReflogContext {
+                        old_oid: old_commit.clone().unwrap_or(zero_oid),
+                        new_oid: commit_for_operation.clone(),
+                        action: crate::internal::reflog::ReflogAction::Branch {
+                            message: if old_commit.is_some() {
+                                format!("Reset to {}", base_name.as_deref().unwrap_or("HEAD"))
+                            } else {
+                                format!("Created from {}", base_name.as_deref().unwrap_or("HEAD"))
+                            },
+                        },
+                    };
+                    crate::internal::reflog::Reflog::insert_single_entry(
+                        &transaction,
+                        &context,
+                        &format!("refs/heads/{branch_for_operation}"),
+                    )
+                    .await
+                    .map_err(|error| BranchError::RefUpdateFailed {
+                        branch: branch_for_operation.clone(),
+                        detail: format!("could not write branch reflog: {error}"),
+                    })?;
+                    Ok::<Option<String>, BranchError>(old_commit)
+                }
+                .await;
+                match result {
+                    Ok(old_commit) => {
+                        transaction.commit().await.map_err(|error| {
+                            BranchError::RefUpdateFailed {
+                                branch: new_branch.clone(),
+                                detail: error.to_string(),
+                            }
+                        })?;
+                        previous_commit = old_commit;
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                }
             }
         }
     } else {
@@ -2304,15 +2627,36 @@ async fn rename_branch_impl(args: &[String]) -> Result<BranchOutput, BranchError
     // The destination has no rows (rename onto an existing branch is refused
     // above), so the defensive dest-clear inside rename_target is a no-op.
     {
-        let db = get_db_conn_instance().await;
-        crate::internal::metadata::MetadataKv::rename_target_with_conn(
-            &db,
-            crate::internal::metadata::MetadataScope::Branch,
-            &old_name,
-            &new_name,
-        )
-        .await
-        .map_err(|e| branch_config_write_error("branch metadata", e))?;
+        match crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| branch_config_write_error("branch metadata", anyhow::anyhow!(e)))?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let meta = crate::storage::runtime::open_current_repo_metadata_store_read_write()
+                    .await
+                    .map_err(|e| {
+                        branch_config_write_error("branch metadata", anyhow::anyhow!(e))
+                    })?;
+                crate::internal::metadata::MetadataKv::rename_target_with_store(
+                    &*meta,
+                    crate::internal::metadata::MetadataScope::Branch,
+                    &old_name,
+                    &new_name,
+                )
+                .await
+                .map_err(|e| branch_config_write_error("branch metadata", e))?;
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                crate::internal::metadata::MetadataKv::rename_target_with_conn(
+                    &db,
+                    crate::internal::metadata::MetadataScope::Branch,
+                    &old_name,
+                    &new_name,
+                )
+                .await
+                .map_err(|e| branch_config_write_error("branch metadata", e))?;
+            }
+        }
     }
 
     Branch::delete_branch_result(&old_name, None)
@@ -2375,15 +2719,14 @@ async fn copy_branch_impl(args: &[String], force: bool) -> Result<BranchOutput, 
     // Copy the source branch's upstream configuration, if any, to the new
     // branch (mirroring `git branch -c`). The raw stored values are copied
     // verbatim so the `refs/heads/` prefix on `branch.<old>.merge` is preserved.
-    let db = get_db_conn_instance().await;
     for suffix in ["remote", "merge"] {
         let src_key = format!("branch.{old_name}.{suffix}");
-        if let Some(entry) = ConfigKv::get_with_conn(&db, &src_key)
+        if let Some(entry) = ConfigKv::get(&src_key)
             .await
             .map_err(|e| branch_config_read_error(format!("config '{src_key}'"), e))?
         {
             let dst_key = format!("branch.{new_name}.{suffix}");
-            ConfigKv::set_with_conn(&db, &dst_key, &entry.value, false)
+            ConfigKv::set(&dst_key, &entry.value, false)
                 .await
                 .map_err(|e| branch_config_write_error(&dst_key, e))?;
         }
@@ -2392,14 +2735,34 @@ async fn copy_branch_impl(args: &[String], force: bool) -> Result<BranchOutput, 
     // Copy branch metadata (lore.md §1.5). A forced copy (-C) replaces any
     // metadata the overwritten destination carried — destructive by design,
     // matching the ref overwrite itself.
-    crate::internal::metadata::MetadataKv::copy_target_with_conn(
-        &db,
-        crate::internal::metadata::MetadataScope::Branch,
-        &old_name,
-        &new_name,
-    )
-    .await
-    .map_err(|e| branch_config_write_error("branch metadata", e))?;
+    match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|e| branch_config_write_error("branch metadata", anyhow::anyhow!(e)))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let meta = crate::storage::runtime::open_current_repo_metadata_store_read_write()
+                .await
+                .map_err(|e| branch_config_write_error("branch metadata", anyhow::anyhow!(e)))?;
+            crate::internal::metadata::MetadataKv::copy_target_with_store(
+                &*meta,
+                crate::internal::metadata::MetadataScope::Branch,
+                &old_name,
+                &new_name,
+            )
+            .await
+            .map_err(|e| branch_config_write_error("branch metadata", e))?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            crate::internal::metadata::MetadataKv::copy_target_with_conn(
+                &db,
+                crate::internal::metadata::MetadataScope::Branch,
+                &old_name,
+                &new_name,
+            )
+            .await
+            .map_err(|e| branch_config_write_error("branch metadata", e))?;
+        }
+    }
 
     Ok(BranchOutput::Copy { old_name, new_name })
 }
@@ -2506,12 +2869,29 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
     // Git `branch -a`/`-r` insert `[<remotes>/]<remote>/HEAD -> <remote>/<branch>`
     // for each cached remote HEAD symref (issues/474 CL-15 / M-BRA D1–D2).
     if matches!(list_mode, BranchListMode::Remote | BranchListMode::All) {
-        let db = get_db_conn_instance().await;
-        let remote_configs = ConfigKv::all_remote_configs_with_conn(&db)
+        let remote_configs = ConfigKv::all_remote_configs()
             .await
             .map_err(|e| branch_config_read_error("remote configuration", e))?;
+        let backend = crate::storage::runtime::detect_current_repo_backend()
+            .map_err(|e| BranchError::StorageQueryFailed(e.to_string()))?;
         for remote in remote_configs {
-            match Head::remote_current_result_with_conn(&db, &remote.name).await {
+            let remote_head = match backend {
+                crate::storage::StorageBackendKind::Redb => {
+                    let store = crate::storage::runtime::open_current_git_store_read_only()
+                        .await
+                        .map_err(|e| BranchError::StorageQueryFailed(e.to_string()))?;
+                    Head::remote_current_result_with_store(&*store, &remote.name)
+                        .await
+                        .map_err(|e| BranchError::StorageQueryFailed(e.to_string()))
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    let db = get_db_conn_instance().await;
+                    Head::remote_current_result_with_conn(&db, &remote.name)
+                        .await
+                        .map_err(|e| BranchError::StorageQueryFailed(e.to_string()))
+                }
+            };
+            match remote_head {
                 Ok(Some(Head::Branch(target))) => {
                     let target_ref = remote_tracking_refname(&remote.name, &target);
                     let Some(target_branch) = remote_branches.iter().find(|branch| {
@@ -2532,7 +2912,7 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
                     });
                 }
                 Ok(Some(Head::Detached(_)) | None) => {}
-                Err(error) => return Err(map_branch_store_error(error)),
+                Err(error) => return Err(error),
             }
         }
     }

@@ -1301,8 +1301,45 @@ impl ConfigKv {
 
     /// Pool-acquiring counterpart of [`Self::remove_remote_with_conn`].
     pub async fn remove_remote(name: &str) -> Result<()> {
-        let db = get_db_conn_instance().await;
-        Self::remove_remote_with_conn(&db, name).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::remove_remote_with_store(&*store, name).await
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::remove_remote_with_conn(&db, name).await
+            }
+        }
+    }
+
+    /// Storage-trait counterpart of [`Self::remove_remote_with_conn`].
+    pub async fn remove_remote_with_store(
+        store: &dyn crate::storage::config_store::ConfigStore,
+        name: &str,
+    ) -> Result<()> {
+        let prefix = format!("remote.{name}.");
+        let entries = Self::get_by_prefix_with_store(store, &prefix).await?;
+        let matching: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| remote_namespace_variable(&entry.key, name).is_some())
+            .collect();
+        if matching.is_empty() {
+            return Err(anyhow!("fatal: No such remote: '{name}'"));
+        }
+        let mut keys_to_unset: BTreeSet<String> = matching.into_iter().map(|e| e.key).collect();
+        let ssh_prefix = format!("vault.ssh.{name}.");
+        for entry in Self::get_by_prefix_with_store(store, &ssh_prefix).await? {
+            if ssh_remote_namespace_variable(&entry.key, name).is_some() {
+                keys_to_unset.insert(entry.key);
+            }
+        }
+        for key in keys_to_unset {
+            Self::unset_all_with_store(store, &key).await?;
+        }
+        Ok(())
     }
 
     /// Rename a remote, updating all related config entries atomically.
@@ -1466,10 +1503,109 @@ impl ConfigKv {
         Ok(())
     }
 
+    /// Storage-trait counterpart of [`Self::rename_remote_with_conn`].
+    pub async fn rename_remote_with_store(
+        store: &dyn crate::storage::config_store::ConfigStore,
+        old: &str,
+        new: &str,
+    ) -> Result<()> {
+        let old_prefix = format!("remote.{old}.");
+        let new_prefix = format!("remote.{new}.");
+        let entries: Vec<_> = Self::get_by_prefix_with_store(store, &old_prefix)
+            .await?
+            .into_iter()
+            .filter(|entry| remote_namespace_variable(&entry.key, old).is_some())
+            .collect();
+        if entries.is_empty() {
+            return Err(anyhow!("fatal: No such remote: {old}"));
+        }
+        let target_exists = Self::get_by_prefix_with_store(store, &new_prefix)
+            .await?
+            .into_iter()
+            .any(|entry| remote_namespace_variable(&entry.key, new).is_some());
+        if target_exists {
+            return Err(anyhow!("fatal: remote {new} already exists."));
+        }
+        let ssh_old_prefix = format!("vault.ssh.{old}.");
+        let ssh_new_prefix = format!("vault.ssh.{new}.");
+        let target_ssh_exists = Self::get_by_prefix_with_store(store, &ssh_new_prefix)
+            .await?
+            .into_iter()
+            .any(|entry| ssh_remote_namespace_variable(&entry.key, new).is_some());
+        if target_ssh_exists {
+            return Err(anyhow!(
+                "fatal: SSH key namespace for remote '{new}' already exists"
+            ));
+        }
+
+        let old_keys: BTreeSet<String> = entries.iter().map(|e| e.key.clone()).collect();
+        for key in &old_keys {
+            Self::unset_all_with_store(store, key).await?;
+        }
+        for entry in entries {
+            let new_key = entry.key.replacen(&old_prefix, &new_prefix, 1);
+            let new_value = if remote_namespace_variable(&entry.key, old)
+                .is_some_and(|variable| variable.eq_ignore_ascii_case("fetch"))
+            {
+                rewrite_fetch_refspec_destination(&entry.value, old, new)
+            } else {
+                entry.value
+            };
+            Self::add_with_store(store, &new_key, &new_value, entry.encrypted).await?;
+        }
+
+        for be in Self::get_by_prefix_with_store(store, "branch.").await? {
+            let is_upstream = be.key.ends_with(".remote");
+            let is_push_remote = be
+                .key
+                .strip_prefix("branch.")
+                .and_then(|k| k.rsplit_once('.'))
+                .map(|(_, var)| var.eq_ignore_ascii_case("pushRemote"))
+                .unwrap_or(false);
+            if (is_upstream || is_push_remote) && be.value == old {
+                Self::set_with_store(store, &be.key, new, be.encrypted).await?;
+            }
+        }
+        for entry in Self::get_by_prefix_with_store(store, "remote.").await? {
+            if entry
+                .key
+                .strip_prefix("remote.")
+                .is_some_and(|var| var.eq_ignore_ascii_case("pushDefault"))
+                && entry.value == old
+            {
+                Self::set_with_store(store, &entry.key, new, entry.encrypted).await?;
+            }
+        }
+        let ssh_entries: Vec<_> = Self::get_by_prefix_with_store(store, &ssh_old_prefix)
+            .await?
+            .into_iter()
+            .filter(|entry| ssh_remote_namespace_variable(&entry.key, old).is_some())
+            .collect();
+        let ssh_old_keys: BTreeSet<String> = ssh_entries.iter().map(|e| e.key.clone()).collect();
+        for key in &ssh_old_keys {
+            Self::unset_all_with_store(store, key).await?;
+        }
+        for entry in ssh_entries {
+            let new_key = entry.key.replacen(&ssh_old_prefix, &ssh_new_prefix, 1);
+            Self::add_with_store(store, &new_key, &entry.value, entry.encrypted).await?;
+        }
+        Ok(())
+    }
+
     /// Pool-acquiring counterpart of [`Self::rename_remote_with_conn`].
     pub async fn rename_remote(old: &str, new: &str) -> Result<()> {
-        let db = get_db_conn_instance().await;
-        Self::rename_remote_with_conn(&db, old, new).await
+        match crate::storage::runtime::detect_current_repo_backend().map_err(|err| anyhow!(err))? {
+            crate::storage::StorageBackendKind::Redb => {
+                let store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                    .await
+                    .map_err(|err| anyhow!(err))?;
+                Self::rename_remote_with_store(&*store, old, new).await
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let db = get_db_conn_instance().await;
+                Self::rename_remote_with_conn(&db, old, new).await
+            }
+        }
     }
 }
 

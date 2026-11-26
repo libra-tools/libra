@@ -1457,6 +1457,83 @@ impl MetadataKv {
                 .is_some_and(|entry| truthy_fail_closed(&entry.value)),
         )
     }
+
+    /// Whether the branch is recorded as protected using a [`MetadataStore`]
+    /// backend handle (fail-closed, identical to [`Self::is_protected_with_conn`]).
+    pub async fn is_protected_with_store(
+        store: &dyn crate::storage::MetadataStore,
+        branch: &str,
+    ) -> Result<bool> {
+        Ok(
+            Self::get_with_store(store, MetadataScope::Branch, branch, KEY_PROTECT)
+                .await?
+                .is_some_and(|entry| truthy_fail_closed(&entry.value)),
+        )
+    }
+
+    /// Whether the branch is recorded as archived using a [`MetadataStore`]
+    /// backend handle (fail-closed, identical to [`Self::is_archived_with_conn`]).
+    pub async fn is_archived_with_store(
+        store: &dyn crate::storage::MetadataStore,
+        branch: &str,
+    ) -> Result<bool> {
+        Ok(
+            Self::get_with_store(store, MetadataScope::Branch, branch, KEY_ARCHIVE)
+                .await?
+                .is_some_and(|entry| truthy_fail_closed(&entry.value)),
+        )
+    }
+
+    /// Move all metadata rows for `(scope, old_target)` to `(scope, new_target)`
+    /// on a [`MetadataStore`] handle (replacing any existing entries on `new_target`).
+    pub async fn rename_target_with_store(
+        store: &dyn crate::storage::MetadataStore,
+        scope: MetadataScope,
+        old_target: &str,
+        new_target: &str,
+    ) -> Result<()> {
+        if old_target == new_target {
+            return Ok(());
+        }
+        let entries = Self::list_with_store(store, scope, old_target, None).await?;
+        let _ = Self::delete_all_for_target_with_store(store, scope, new_target).await?;
+        for entry in entries {
+            let vtype = match entry.value_type.as_str() {
+                "numeric" => MetadataValueType::Numeric,
+                "binary" => MetadataValueType::Binary,
+                _ => MetadataValueType::Text,
+            };
+            let _ = Self::set_with_store(store, scope, new_target, &entry.key, &entry.value, vtype)
+                .await?;
+        }
+        let _ = Self::delete_all_for_target_with_store(store, scope, old_target).await?;
+        Ok(())
+    }
+
+    /// Copy all metadata rows from `(scope, src_target)` to `(scope, dst_target)`
+    /// on a [`MetadataStore`] handle (replacing any existing entries on `dst_target`).
+    pub async fn copy_target_with_store(
+        store: &dyn crate::storage::MetadataStore,
+        scope: MetadataScope,
+        src_target: &str,
+        dst_target: &str,
+    ) -> Result<()> {
+        if src_target == dst_target {
+            return Ok(());
+        }
+        let entries = Self::list_with_store(store, scope, src_target, None).await?;
+        let _ = Self::delete_all_for_target_with_store(store, scope, dst_target).await?;
+        for entry in entries {
+            let vtype = match entry.value_type.as_str() {
+                "numeric" => MetadataValueType::Numeric,
+                "binary" => MetadataValueType::Binary,
+                _ => MetadataValueType::Text,
+            };
+            let _ = Self::set_with_store(store, scope, dst_target, &entry.key, &entry.value, vtype)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 // ─── Revision-scope metadata (lore.md §1.10) ────────────────────────────────

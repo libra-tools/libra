@@ -213,15 +213,32 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
     // `new_oid` to `Some`; `None` only appears on the `-d` path.
     let new_value_for_txn = new_oid.clone();
 
-    let db = get_db_conn_instance().await;
-    // A compare-and-swap on a ref: it READS the current value and the branch
-    // policy before it writes, so it must take the write lock up front or a
-    // concurrent writer makes it fail instead of wait (see
-    // `db::begin_write_transaction`).
-    let outcome = crate::internal::db::write_transaction(&db, move |txn| {
-        Box::pin(async move {
-            apply_ref_update(
-                txn,
+    let outcome = match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let meta_store = crate::storage::runtime::open_current_repo_metadata_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            apply_ref_update_with_store(
+                &*git_store,
+                &*config_store,
+                &*meta_store,
                 &branch_name,
                 &full_ref,
                 new_value_for_txn.as_deref(),
@@ -229,37 +246,79 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
                 &reflog_reason,
             )
             .await
-        })
-    })
-    .await
-    .map_err(|error| {
-        // Preserve the policy refusal's dedicated stable code.
-        if let TransactionError::Transaction(UpdateRefTxError::PolicyBlocked { branch, policy }) =
-            &error
-        {
-            let policy_key = if policy == "protected" {
-                "protect"
-            } else {
-                "archive"
-            };
-            CliError::fatal(format!(
-                "branch '{branch}' is {policy}; refusing to update its ref"
-            ))
-            .with_exit_code(128)
-            .with_stable_code(StableErrorCode::PolicyRefUpdateBlocked)
-            .with_hint(format!(
-                "clear it first: 'libra metadata unset --branch {branch} {policy_key}'"
-            ))
-        } else {
-            let message = match error {
-                TransactionError::Connection(error) => error.to_string(),
-                TransactionError::Transaction(error) => error.to_string(),
-            };
-            CliError::fatal(message)
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .map_err(|error| match error {
+                UpdateRefTxError::PolicyBlocked { branch, policy } => {
+                    let policy_key = if policy == "protected" {
+                        "protect"
+                    } else {
+                        "archive"
+                    };
+                    CliError::fatal(format!(
+                        "branch '{branch}' is {policy}; refusing to update its ref"
+                    ))
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::PolicyRefUpdateBlocked)
+                    .with_hint(format!(
+                        "clear it first: 'libra metadata unset --branch {branch} {policy_key}'"
+                    ))
+                }
+                other => CliError::fatal(other.to_string())
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::RepoStateInvalid),
+            })?
         }
-    })?;
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            // A compare-and-swap on a ref: it READS the current value and the branch
+            // policy before it writes, so it must take the write lock up front or a
+            // concurrent writer makes it fail instead of wait (see
+            // `db::begin_write_transaction`).
+            crate::internal::db::write_transaction(&db, move |txn| {
+                Box::pin(async move {
+                    apply_ref_update(
+                        txn,
+                        &branch_name,
+                        &full_ref,
+                        new_value_for_txn.as_deref(),
+                        old_spec.as_ref(),
+                        &reflog_reason,
+                    )
+                    .await
+                })
+            })
+            .await
+            .map_err(|error| {
+                // Preserve the policy refusal's dedicated stable code.
+                if let TransactionError::Transaction(UpdateRefTxError::PolicyBlocked {
+                    branch,
+                    policy,
+                }) = &error
+                {
+                    let policy_key = if policy == "protected" {
+                        "protect"
+                    } else {
+                        "archive"
+                    };
+                    CliError::fatal(format!(
+                        "branch '{branch}' is {policy}; refusing to update its ref"
+                    ))
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::PolicyRefUpdateBlocked)
+                    .with_hint(format!(
+                        "clear it first: 'libra metadata unset --branch {branch} {policy_key}'"
+                    ))
+                } else {
+                    let message = match error {
+                        TransactionError::Connection(error) => error.to_string(),
+                        TransactionError::Transaction(error) => error.to_string(),
+                    };
+                    CliError::fatal(message)
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::RepoStateInvalid)
+                }
+            })?
+        }
+    };
 
     if output.is_json() {
         emit_json_data(
@@ -952,29 +1011,70 @@ async fn validate_prepared_batch(prepared: &[PreparedCommand]) -> CliResult<()> 
     if prepared.is_empty() {
         return Ok(());
     }
-    let db = get_db_conn_instance().await;
-    for command in prepared {
-        let expected = match &command.kind {
-            PreparedKind::Update { old, .. } => old.clone(),
-            PreparedKind::Create { .. } => Some(OldValue::MustNotExist),
-            PreparedKind::Delete { old } => old.clone(),
-            PreparedKind::Verify { old } => old.clone(),
-        };
-        let Some(expected) = expected else {
-            continue;
-        };
-        verify_ref_value(&db, &command.branch, &command.full_ref, Some(&expected))
-            .await
-            .map_err(|error| {
-                CliError::fatal(format!(
-                    "prepare: cannot lock ref '{}': {error}",
-                    command.full_ref
-                ))
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::RepoStateInvalid)
-            })?;
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            for command in prepared {
+                let expected = match &command.kind {
+                    PreparedKind::Update { old, .. } => old.clone(),
+                    PreparedKind::Create { .. } => Some(OldValue::MustNotExist),
+                    PreparedKind::Delete { old } => old.clone(),
+                    PreparedKind::Verify { old } => old.clone(),
+                };
+                let Some(expected) = expected else {
+                    continue;
+                };
+                verify_ref_value_with_store(
+                    &*git_store,
+                    &command.branch,
+                    &command.full_ref,
+                    Some(&expected),
+                )
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "prepare: cannot lock ref '{}': {error}",
+                        command.full_ref
+                    ))
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+                })?;
+            }
+            Ok(())
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            for command in prepared {
+                let expected = match &command.kind {
+                    PreparedKind::Update { old, .. } => old.clone(),
+                    PreparedKind::Create { .. } => Some(OldValue::MustNotExist),
+                    PreparedKind::Delete { old } => old.clone(),
+                    PreparedKind::Verify { old } => old.clone(),
+                };
+                let Some(expected) = expected else {
+                    continue;
+                };
+                verify_ref_value(&db, &command.branch, &command.full_ref, Some(&expected))
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "prepare: cannot lock ref '{}': {error}",
+                            command.full_ref
+                        ))
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::RepoStateInvalid)
+                    })?;
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Apply a resolved batch atomically and return the refs it touched.
@@ -1012,64 +1112,152 @@ async fn apply_prepared_batch(
 
     let ref_names: Vec<String> = prepared.iter().map(|c| c.full_ref.clone()).collect();
     let message = message.to_string();
-    let db = get_db_conn_instance().await;
-    crate::internal::db::write_transaction(&db, move |txn| {
-        Box::pin(async move {
+    match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
+            let meta_store = crate::storage::runtime::open_current_repo_metadata_store_read_only()
+                .await
+                .map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?;
             for command in &prepared {
-                match &command.kind {
-                    PreparedKind::Update { new, old } => {
-                        apply_ref_update(
-                            txn,
-                            &command.branch,
-                            &command.full_ref,
-                            Some(new),
-                            old.as_ref(),
-                            &message,
-                        )
-                        .await?;
-                    }
+                let res = match &command.kind {
+                    PreparedKind::Update { new, old } => apply_ref_update_with_store(
+                        &*git_store,
+                        &*config_store,
+                        &*meta_store,
+                        &command.branch,
+                        &command.full_ref,
+                        Some(new),
+                        old.as_ref(),
+                        &message,
+                    )
+                    .await
+                    .map(|_| ()),
                     PreparedKind::Create { new } => {
                         let must_not_exist = OldValue::MustNotExist;
-                        apply_ref_update(
-                            txn,
+                        apply_ref_update_with_store(
+                            &*git_store,
+                            &*config_store,
+                            &*meta_store,
                             &command.branch,
                             &command.full_ref,
                             Some(new),
                             Some(&must_not_exist),
                             &message,
                         )
-                        .await?;
+                        .await
+                        .map(|_| ())
                     }
-                    PreparedKind::Delete { old } => {
-                        apply_ref_update(
-                            txn,
+                    PreparedKind::Delete { old } => apply_ref_update_with_store(
+                        &*git_store,
+                        &*config_store,
+                        &*meta_store,
+                        &command.branch,
+                        &command.full_ref,
+                        None,
+                        old.as_ref(),
+                        &message,
+                    )
+                    .await
+                    .map(|_| ()),
+                    PreparedKind::Verify { old } => {
+                        verify_ref_value_with_store(
+                            &*git_store,
                             &command.branch,
                             &command.full_ref,
-                            None,
                             old.as_ref(),
-                            &message,
                         )
-                        .await?;
+                        .await
                     }
-                    PreparedKind::Verify { old } => {
-                        verify_ref_value(txn, &command.branch, &command.full_ref, old.as_ref())
-                            .await?;
-                    }
-                }
+                };
+                res.map_err(|error| {
+                    CliError::fatal(error.to_string())
+                        .with_exit_code(128)
+                        .with_stable_code(StableErrorCode::RepoStateInvalid)
+                })?;
             }
-            Ok::<_, UpdateRefTxError>(())
-        })
-    })
-    .await
-    .map_err(|error| {
-        let message = match error {
-            TransactionError::Connection(error) => error.to_string(),
-            TransactionError::Transaction(error) => error.to_string(),
-        };
-        CliError::fatal(message)
-            .with_exit_code(128)
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
-    })?;
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            crate::internal::db::write_transaction(&db, move |txn| {
+                Box::pin(async move {
+                    for command in &prepared {
+                        match &command.kind {
+                            PreparedKind::Update { new, old } => {
+                                apply_ref_update(
+                                    txn,
+                                    &command.branch,
+                                    &command.full_ref,
+                                    Some(new),
+                                    old.as_ref(),
+                                    &message,
+                                )
+                                .await?;
+                            }
+                            PreparedKind::Create { new } => {
+                                let must_not_exist = OldValue::MustNotExist;
+                                apply_ref_update(
+                                    txn,
+                                    &command.branch,
+                                    &command.full_ref,
+                                    Some(new),
+                                    Some(&must_not_exist),
+                                    &message,
+                                )
+                                .await?;
+                            }
+                            PreparedKind::Delete { old } => {
+                                apply_ref_update(
+                                    txn,
+                                    &command.branch,
+                                    &command.full_ref,
+                                    None,
+                                    old.as_ref(),
+                                    &message,
+                                )
+                                .await?;
+                            }
+                            PreparedKind::Verify { old } => {
+                                verify_ref_value(
+                                    txn,
+                                    &command.branch,
+                                    &command.full_ref,
+                                    old.as_ref(),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    Ok::<_, UpdateRefTxError>(())
+                })
+            })
+            .await
+            .map_err(|error| {
+                let message = match error {
+                    TransactionError::Connection(error) => error.to_string(),
+                    TransactionError::Transaction(error) => error.to_string(),
+                };
+                CliError::fatal(message)
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+            })?;
+        }
+    }
     Ok(ref_names)
 }
 
@@ -1259,6 +1447,180 @@ enum OldValue {
     MustNotExist,
     /// An exact object id the ref must currently point to.
     Exact(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_ref_update_with_store(
+    git_store: &dyn crate::storage::git_store::GitStore,
+    config_store: &dyn crate::storage::config_store::ConfigStore,
+    meta_store: &dyn crate::storage::config_store::MetadataStore,
+    branch_name: &str,
+    full_ref: &str,
+    new_value: Option<&str>,
+    old_spec: Option<&OldValue>,
+    reflog_reason: &str,
+) -> Result<UpdateRefOutcome, UpdateRefTxError> {
+    let protected =
+        crate::internal::metadata::MetadataKv::is_protected_with_store(meta_store, branch_name)
+            .await
+            .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+    if protected {
+        return Err(UpdateRefTxError::PolicyBlocked {
+            branch: branch_name.to_string(),
+            policy: "protected".to_string(),
+        });
+    }
+    let archived =
+        crate::internal::metadata::MetadataKv::is_archived_with_store(meta_store, branch_name)
+            .await
+            .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+    if archived {
+        return Err(UpdateRefTxError::PolicyBlocked {
+            branch: branch_name.to_string(),
+            policy: "archived".to_string(),
+        });
+    }
+    let current = Branch::find_branch_result_with_store(git_store, branch_name, None)
+        .await
+        .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?
+        .map(|b| b.commit.to_string());
+
+    if let Some(expected) = old_spec {
+        match (expected, &current) {
+            (OldValue::MustNotExist, Some(actual)) => {
+                return Err(UpdateRefTxError::MustNotExist {
+                    ref_name: full_ref.to_string(),
+                    actual: actual.clone(),
+                });
+            }
+            (OldValue::MustNotExist, None) => {}
+            (OldValue::Exact(want), actual) if actual.as_deref() != Some(want.as_str()) => {
+                return Err(UpdateRefTxError::CasMismatch {
+                    ref_name: full_ref.to_string(),
+                    expected: want.clone(),
+                    actual: actual.clone().unwrap_or_else(|| {
+                        ObjectHash::zero_str(git_internal::hash::get_hash_kind())
+                    }),
+                });
+            }
+            (OldValue::Exact(_), _) => {}
+        }
+    }
+
+    let key = crate::storage::git_store::RefKey::LocalBranch {
+        name: branch_name.to_string(),
+    };
+    let expected_target = current
+        .as_ref()
+        .map(|oid| crate::storage::git_store::RefTarget::Direct(oid.clone()));
+    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
+
+    if let Some(new) = new_value {
+        let old = current.clone().unwrap_or_else(|| zero.clone());
+        let context = ReflogContext {
+            old_oid: old,
+            new_oid: new.to_string(),
+            action: ReflogAction::UpdateRef {
+                message: reflog_reason.to_string(),
+            },
+        };
+        let reflog_write =
+            Reflog::build_reflog_write_with_store(config_store, &context, full_ref).await;
+        let new_target = crate::storage::git_store::RefTarget::Direct(new.to_string());
+        let outcome = git_store
+            .update_ref_cas(
+                &key,
+                expected_target.as_ref(),
+                Some(&new_target),
+                &[reflog_write],
+            )
+            .await
+            .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+        if !matches!(
+            outcome,
+            crate::storage::git_store::RefCasOutcome::Applied { .. }
+        ) {
+            return Err(UpdateRefTxError::CasMismatch {
+                ref_name: full_ref.to_string(),
+                expected: current.unwrap_or(zero.clone()),
+                actual: "concurrently modified".to_string(),
+            });
+        }
+        Ok(UpdateRefOutcome {
+            old: current,
+            new: Some(new.to_string()),
+        })
+    } else {
+        let Some(old) = current.clone() else {
+            return Ok(UpdateRefOutcome {
+                old: None,
+                new: None,
+            });
+        };
+        let context = ReflogContext {
+            old_oid: old.clone(),
+            new_oid: zero.clone(),
+            action: ReflogAction::UpdateRef {
+                message: reflog_reason.to_string(),
+            },
+        };
+        let reflog_write =
+            Reflog::build_reflog_write_with_store(config_store, &context, full_ref).await;
+        let outcome = git_store
+            .update_ref_cas(&key, expected_target.as_ref(), None, &[reflog_write])
+            .await
+            .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+        if !matches!(
+            outcome,
+            crate::storage::git_store::RefCasOutcome::Applied { .. }
+        ) {
+            return Err(UpdateRefTxError::CasMismatch {
+                ref_name: full_ref.to_string(),
+                expected: old,
+                actual: "concurrently modified".to_string(),
+            });
+        }
+        Ok(UpdateRefOutcome {
+            old: Some(old),
+            new: None,
+        })
+    }
+}
+
+async fn verify_ref_value_with_store(
+    git_store: &dyn crate::storage::git_store::GitStore,
+    branch_name: &str,
+    full_ref: &str,
+    expected: Option<&OldValue>,
+) -> Result<(), UpdateRefTxError> {
+    let current = Branch::find_branch_result_with_store(git_store, branch_name, None)
+        .await
+        .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?
+        .map(|b| b.commit.to_string());
+    let Some(expected) = expected else {
+        if current.is_none() {
+            return Err(UpdateRefTxError::DoesNotExist {
+                ref_name: full_ref.to_string(),
+            });
+        }
+        return Ok(());
+    };
+    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
+    match (expected, &current) {
+        (OldValue::MustNotExist, Some(actual)) => Err(UpdateRefTxError::MustNotExist {
+            ref_name: full_ref.to_string(),
+            actual: actual.clone(),
+        }),
+        (OldValue::MustNotExist, None) => Ok(()),
+        (OldValue::Exact(want), actual) if actual.as_deref() != Some(want.as_str()) => {
+            Err(UpdateRefTxError::CasMismatch {
+                ref_name: full_ref.to_string(),
+                expected: want.clone(),
+                actual: actual.clone().unwrap_or(zero),
+            })
+        }
+        (OldValue::Exact(_), _) => Ok(()),
+    }
 }
 
 /// Write a single `update-ref` reflog entry (never leaks the user's CAS operand).

@@ -944,6 +944,16 @@ pub trait GitStore: Send + Sync + fmt::Debug {
         limit: Option<usize>,
     ) -> StorageResult<Vec<ReflogEntry>>;
 
+    /// Atomically delete specific reflog entries (by primary `id`) belonging to
+    /// `(ref_name, worktree_id)` in a single write transaction, returning the
+    /// number of deleted rows.
+    async fn delete_reflog_entries(
+        &self,
+        ref_name: &str,
+        worktree_id: Option<&str>,
+        ids: &[i64],
+    ) -> StorageResult<usize>;
+
     /// Record a `prepared` bridge publication row before the ref update commits
     /// (`src/internal/ai/agent_bridge/publication.rs::prepare_current`).
     async fn prepare_bridge_publication(

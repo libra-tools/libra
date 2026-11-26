@@ -1962,30 +1962,64 @@ async fn collect_all_reference_tips() -> CliResult<Vec<ObjectHash>> {
 /// notes in SQLite rather than a notes commit, so this only contributes refs
 /// created by import/clone paths.
 async fn collect_notes_reference_tips() -> Vec<(String, ObjectHash)> {
-    use sea_orm::EntityTrait;
-
-    let db = crate::internal::db::get_db_conn_instance().await;
-    let rows = match crate::internal::model::reference::Entity::find()
-        .all(&db)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to list references for --all");
-            return Vec::new();
-        }
+    let Ok(backend) = crate::storage::runtime::detect_current_repo_backend() else {
+        return Vec::new();
     };
-    rows.into_iter()
-        .filter_map(|row| {
-            let name = row.name?;
-            if !name.starts_with("refs/notes/") {
-                return None;
-            }
-            let oid =
-                crate::internal::object_format::parse_repo_oid(row.commit.as_deref()?).ok()?;
-            Some((name, oid))
-        })
-        .collect()
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            // Strictly read-only handle (`ADR-RB-03`): `log` never opens writable.
+            let Ok(store) = crate::storage::runtime::open_current_git_store_read_only().await
+            else {
+                return Vec::new();
+            };
+            let Ok(refs) = store.list_refs(None).await else {
+                return Vec::new();
+            };
+            refs.into_iter()
+                .filter_map(|rec| {
+                    let name = match rec.key {
+                        crate::storage::git_store::RefKey::LocalBranch { name } => name,
+                        _ => return None,
+                    };
+                    if !name.starts_with("refs/notes/") {
+                        return None;
+                    }
+                    let crate::storage::git_store::RefTarget::Direct(oid_str) = rec.target else {
+                        return None;
+                    };
+                    let oid = crate::internal::object_format::parse_repo_oid(&oid_str).ok()?;
+                    Some((name, oid))
+                })
+                .collect()
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            use sea_orm::EntityTrait;
+
+            let db = crate::internal::db::get_db_conn_instance().await;
+            let rows = match crate::internal::model::reference::Entity::find()
+                .all(&db)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to list references for --all");
+                    return Vec::new();
+                }
+            };
+            rows.into_iter()
+                .filter_map(|row| {
+                    let name = row.name?;
+                    if !name.starts_with("refs/notes/") {
+                        return None;
+                    }
+                    let oid =
+                        crate::internal::object_format::parse_repo_oid(row.commit.as_deref()?)
+                            .ok()?;
+                    Some((name, oid))
+                })
+                .collect()
+        }
+    }
 }
 
 /// Get all reachable commits from any of the starting commits, excluding the given set.
@@ -7193,5 +7227,351 @@ mod tests {
     fn commit_diff_options_default_has_no_diff_filter() {
         let options = CommitDiffOptions::default();
         assert!(options.diff_filter.is_empty());
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, hash_kind)]
+    async fn redb_multiprocess_readonly_log_with_concurrent_commits() {
+        use std::path::PathBuf;
+
+        use git_internal::hash::{HashKind, set_hash_kind_for_test};
+
+        use crate::{
+            internal::{
+                branch::Branch,
+                config::ConfigKv,
+                head::Head,
+                reflog::{Reflog, ReflogAction, ReflogContext},
+            },
+            storage::git_store::{RefCasOutcome, RefKey, RefTarget},
+        };
+
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+
+        if let Ok(role) = std::env::var("LIBRA_REDB_TEST_WORKER") {
+            let repo_dir =
+                PathBuf::from(std::env::var("LIBRA_REDB_TEST_REPO").expect("LIBRA_REDB_TEST_REPO"));
+            let _cwd = crate::utils::test::ChangeDirGuard::new(&repo_dir);
+            assert!(
+                !repo_dir.join(".libra").join("libra.db").exists(),
+                "pure-redb worker must never see or create libra.db"
+            );
+
+            match role.as_str() {
+                "reader" => {
+                    for _ in 0..12 {
+                        // Strictly read-only handles (`ADR-RB-03`): log, reflog, revision, status-cache.
+                        let ro_store = crate::storage::runtime::open_current_git_store_read_only()
+                            .await
+                            .expect("open_current_git_store_read_only");
+                        let _notes = collect_notes_reference_tips().await;
+                        let head_commit = Head::current_commit_result_with_store(&*ro_store)
+                            .await
+                            .expect("read HEAD commit")
+                            .expect("HEAD must resolve to a commit");
+                        let walked = walk_date_priority(vec![head_commit], None, false, Some(20))
+                            .expect("walk_date_priority on concurrent redb repo");
+                        assert!(
+                            !walked.is_empty(),
+                            "log walk must observe at least root commit"
+                        );
+
+                        let reflogs = Reflog::find_all_with_store(&*ro_store, "refs/heads/main")
+                            .await
+                            .expect("read-only reflog query");
+                        assert!(
+                            !reflogs.is_empty(),
+                            "refs/heads/main reflog must stay readable during concurrent writes"
+                        );
+                        // Verify reflog linearization (newest-first: entry[i].old_oid == entry[i+1].new_oid).
+                        for pair in reflogs.windows(2) {
+                            assert_eq!(
+                                pair[0].old_oid, pair[1].new_oid,
+                                "main reflog must remain linearized under concurrent writes"
+                            );
+                        }
+                        let _ = crate::command::status::changes_to_be_committed().await;
+                        let _ = ro_store
+                            .list_revision_ordinal_metas()
+                            .await
+                            .expect("read-only revision ordinal meta list");
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }
+                "writer" => {
+                    let writer_id: usize = std::env::var("LIBRA_REDB_TEST_WRITER_ID")
+                        .expect("LIBRA_REDB_TEST_WRITER_ID")
+                        .parse()
+                        .expect("writer id usize");
+                    let branch_name = format!("writer-{writer_id}");
+                    let branch_ref = format!("refs/heads/{branch_name}");
+                    let empty_tree = ObjectHash::new(&[0x4b; 20]);
+
+                    for step in 0..6usize {
+                        let rw_store = crate::storage::runtime::open_current_git_store_read_write()
+                            .await
+                            .expect("open_current_git_store_read_write");
+                        let cfg_store =
+                            crate::storage::runtime::open_current_repo_config_store_read_write()
+                                .await
+                                .expect("open_current_repo_config_store_read_write");
+
+                        // 1) Update writer's dedicated branch ref with atomic CAS + reflog.
+                        let writer_key = RefKey::LocalBranch {
+                            name: branch_name.clone(),
+                        };
+                        let prev = rw_store.get_ref(&writer_key).await.expect("get writer ref");
+                        let prev_oid = match &prev {
+                            Some(RefTarget::Direct(oid)) => oid.clone(),
+                            _ => ObjectHash::zero_str(HashKind::Sha1).to_string(),
+                        };
+                        let parents = match &prev {
+                            Some(RefTarget::Direct(oid)) => {
+                                vec![oid.parse::<ObjectHash>().expect("parse prev oid")]
+                            }
+                            _ => Vec::new(),
+                        };
+                        let mut commit = Commit::from_tree_id(
+                            empty_tree,
+                            parents,
+                            &format!("writer {writer_id} step {step}\n"),
+                        );
+                        commit.author.timestamp = 1_795_360_100 + writer_id * 100 + step;
+                        commit.committer.timestamp = commit.author.timestamp;
+                        crate::command::save_object(&commit, &commit.id)
+                            .expect("save writer commit");
+                        let new_oid = commit.id.to_string();
+                        let ctx = ReflogContext {
+                            old_oid: prev_oid,
+                            new_oid: new_oid.clone(),
+                            action: ReflogAction::Commit {
+                                message: format!("writer {writer_id} step {step}"),
+                            },
+                        };
+                        let reflog_write =
+                            Reflog::build_reflog_write_with_store(&*cfg_store, &ctx, &branch_ref)
+                                .await;
+                        let outcome = rw_store
+                            .update_ref_cas(
+                                &writer_key,
+                                prev.as_ref(),
+                                Some(&RefTarget::Direct(new_oid)),
+                                &[reflog_write],
+                            )
+                            .await
+                            .expect("update_ref_cas on writer branch");
+                        assert!(matches!(outcome, RefCasOutcome::Applied { .. }));
+
+                        // 2) Contend on shared `refs/heads/main` with CAS retry loop.
+                        let main_key = RefKey::LocalBranch {
+                            name: "main".to_string(),
+                        };
+                        for _attempt in 0..32 {
+                            let cur_main = rw_store
+                                .get_ref(&main_key)
+                                .await
+                                .expect("get main ref")
+                                .expect("main branch exists");
+                            let RefTarget::Direct(cur_oid_str) = &cur_main else {
+                                panic!("main must be a direct ref");
+                            };
+                            let parent_oid = cur_oid_str
+                                .parse::<ObjectHash>()
+                                .expect("parse main parent");
+                            let mut main_commit = Commit::from_tree_id(
+                                empty_tree,
+                                vec![parent_oid],
+                                &format!("main commit from writer {writer_id} step {step}\n"),
+                            );
+                            main_commit.author.timestamp = 1_795_360_500 + writer_id * 100 + step;
+                            main_commit.committer.timestamp = main_commit.author.timestamp;
+                            crate::command::save_object(&main_commit, &main_commit.id)
+                                .expect("save main commit");
+                            let next_oid = main_commit.id.to_string();
+                            let main_ctx = ReflogContext {
+                                old_oid: cur_oid_str.clone(),
+                                new_oid: next_oid.clone(),
+                                action: ReflogAction::Commit {
+                                    message: format!("main writer {writer_id} step {step}"),
+                                },
+                            };
+                            let main_reflog = Reflog::build_reflog_write_with_store(
+                                &*cfg_store,
+                                &main_ctx,
+                                "refs/heads/main",
+                            )
+                            .await;
+                            match rw_store
+                                .update_ref_cas(
+                                    &main_key,
+                                    Some(&cur_main),
+                                    Some(&RefTarget::Direct(next_oid)),
+                                    &[main_reflog],
+                                )
+                                .await
+                                .expect("CAS update main")
+                            {
+                                RefCasOutcome::Applied { .. } => break,
+                                RefCasOutcome::CasConflict { .. } => continue,
+                            }
+                        }
+                    }
+                }
+                other => panic!("unexpected LIBRA_REDB_TEST_WORKER role: {other}"),
+            }
+            return;
+        }
+
+        // Parent coordinator process: initialize a fresh pure-redb repo with a root commit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_dir = dir.path().join(".libra");
+        std::fs::create_dir_all(storage_dir.join("objects")).expect("create objects dir");
+        std::fs::create_dir_all(storage_dir.join("objects/pack")).expect("create pack dir");
+        crate::storage::runtime::init_redb_repository_storage(&storage_dir)
+            .await
+            .expect("init_redb_repository_storage");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(dir.path());
+
+        let cfg_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+            .await
+            .expect("open repo config store");
+        ConfigKv::set_with_store(&*cfg_store, "user.name", "Redb Tester", false)
+            .await
+            .expect("set user.name");
+        ConfigKv::set_with_store(&*cfg_store, "user.email", "redb@example.com", false)
+            .await
+            .expect("set user.email");
+
+        let rw_store = crate::storage::runtime::open_current_git_store_read_write()
+            .await
+            .expect("open git store");
+        let empty_tree = ObjectHash::new(&[0x4b; 20]);
+        let mut root_commit = Commit::from_tree_id(empty_tree, Vec::new(), "root commit\n");
+        root_commit.author.timestamp = 1_795_360_000;
+        root_commit.committer.timestamp = 1_795_360_000;
+        crate::command::save_object(&root_commit, &root_commit.id).expect("save root commit");
+        let root_oid = root_commit.id.to_string();
+        let zero_oid = ObjectHash::zero_str(HashKind::Sha1).to_string();
+
+        rw_store
+            .update_ref_cas(
+                &RefKey::LocalHead { worktree_id: None },
+                None,
+                Some(&RefTarget::Symbolic("main".to_string())),
+                &[],
+            )
+            .await
+            .expect("init HEAD");
+        let init_ctx = ReflogContext {
+            old_oid: zero_oid,
+            new_oid: root_oid.clone(),
+            action: ReflogAction::Commit {
+                message: "root commit".to_string(),
+            },
+        };
+        let init_reflog =
+            Reflog::build_reflog_write_with_store(&*cfg_store, &init_ctx, "refs/heads/main").await;
+        rw_store
+            .update_ref_cas(
+                &RefKey::LocalBranch {
+                    name: "main".to_string(),
+                },
+                None,
+                Some(&RefTarget::Direct(root_oid)),
+                &[init_reflog],
+            )
+            .await
+            .expect("init main branch");
+        drop(rw_store);
+        drop(cfg_store);
+
+        assert!(
+            !storage_dir.join("libra.db").exists(),
+            "pure-redb repo must not have libra.db before multiprocess test"
+        );
+
+        // Spawn 8 concurrent reader processes + 2 concurrent writer processes.
+        let test_exe = std::env::current_exe().expect("current_exe");
+        let mut children = Vec::with_capacity(10);
+        for reader_idx in 0..8usize {
+            let child = std::process::Command::new(&test_exe)
+                .arg("--exact")
+                .arg("command::log::tests::redb_multiprocess_readonly_log_with_concurrent_commits")
+                .arg("--nocapture")
+                .env("LIBRA_REDB_TEST_WORKER", "reader")
+                .env("LIBRA_REDB_TEST_REPO", dir.path())
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawn reader {reader_idx}: {e}"));
+            children.push((format!("reader-{reader_idx}"), child));
+        }
+        for writer_idx in 0..2usize {
+            let child = std::process::Command::new(&test_exe)
+                .arg("--exact")
+                .arg("command::log::tests::redb_multiprocess_readonly_log_with_concurrent_commits")
+                .arg("--nocapture")
+                .env("LIBRA_REDB_TEST_WORKER", "writer")
+                .env("LIBRA_REDB_TEST_WRITER_ID", writer_idx.to_string())
+                .env("LIBRA_REDB_TEST_REPO", dir.path())
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawn writer {writer_idx}: {e}"));
+            children.push((format!("writer-{writer_idx}"), child));
+        }
+
+        for (label, mut child) in children {
+            let status = child.wait().unwrap_or_else(|e| panic!("wait {label}: {e}"));
+            assert!(
+                status.success(),
+                "child process {label} failed with status {status}"
+            );
+        }
+
+        // Verify post-concurrency invariants via strictly read-only handle.
+        assert!(
+            !storage_dir.join("libra.db").exists(),
+            "multiprocess redb operations must never create libra.db"
+        );
+        let ro_store = crate::storage::runtime::open_current_git_store_read_only()
+            .await
+            .expect("open final ro store");
+        let main_reflogs = Reflog::find_all_with_store(&*ro_store, "refs/heads/main")
+            .await
+            .expect("final main reflog");
+        // 1 initial commit + 2 writers * 6 commits = 13 linearized entries.
+        assert_eq!(
+            main_reflogs.len(),
+            13,
+            "all 12 concurrent commits must land on main"
+        );
+        for pair in main_reflogs.windows(2) {
+            assert_eq!(
+                pair[0].old_oid, pair[1].new_oid,
+                "final main reflog must be strictly linearized"
+            );
+        }
+        let main_tip = Branch::find_branch_result_with_store(&*ro_store, "main", None)
+            .await
+            .expect("find main")
+            .expect("main branch exists");
+        let walked = walk_date_priority(vec![main_tip.commit], None, false, None)
+            .expect("walk full main history");
+        assert_eq!(
+            walked.len(),
+            13,
+            "all 13 commits must be reachable from main"
+        );
+        for writer_idx in 0..2usize {
+            let w_branch = Branch::find_branch_result_with_store(
+                &*ro_store,
+                &format!("writer-{writer_idx}"),
+                None,
+            )
+            .await
+            .expect("find writer branch")
+            .expect("writer branch exists");
+            let w_walked = walk_date_priority(vec![w_branch.commit], None, false, None)
+                .expect("walk writer history");
+            assert_eq!(w_walked.len(), 6, "writer-{writer_idx} must have 6 commits");
+        }
     }
 }

@@ -2175,15 +2175,42 @@ async fn perform_reset(
     target_ref_str: &str, // e.g, "HEAD~2"
 ) -> Result<ResetStats, ResetError> {
     // avoids holding the transaction open while doing read-only preparations.
-    let db = get_db_conn_instance().await;
-    let old_oid = Head::current_commit_result_with_conn(&db)
-        .await
-        .map_err(map_reset_head_commit_error)?
-        .ok_or(ResetError::HeadUnborn)?;
-    let current_head_state = if old_oid != target_commit_id {
-        Some(Head::current_with_conn(&db).await)
-    } else {
-        None
+    let (old_oid, current_head_state) = match crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| ResetError::HeadUpdate(error.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| ResetError::HeadUpdate(error.to_string()))?;
+            let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+            let old_oid = Head::current_commit_for_scope_result_with_store(&*store, &scope)
+                .await
+                .map_err(map_reset_head_commit_error)?
+                .ok_or(ResetError::HeadUnborn)?;
+            let current_head_state = if old_oid != target_commit_id {
+                Some(
+                    Head::current_for_scope_result_with_store(&*store, &scope)
+                        .await
+                        .map_err(|error| ResetError::HeadUpdate(error.to_string()))?,
+                )
+            } else {
+                None
+            };
+            (old_oid, current_head_state)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let old_oid = Head::current_commit_result_with_conn(&db)
+                .await
+                .map_err(map_reset_head_commit_error)?
+                .ok_or(ResetError::HeadUnborn)?;
+            let current_head_state = if old_oid != target_commit_id {
+                Some(Head::current_with_conn(&db).await)
+            } else {
+                None
+            };
+            (old_oid, current_head_state)
+        }
     };
     if matches!(mode, ResetMode::Merge | ResetMode::Keep) {
         return perform_guarded_reset(
@@ -2308,38 +2335,117 @@ async fn update_reset_reference(
         action,
     };
 
-    with_reflog(
-        context,
-        move |txn| {
-            Box::pin(async move {
-                match &current_head_state {
-                    Head::Branch(branch_name) => {
-                        Branch::update_branch_with_conn(
-                            txn,
-                            branch_name,
-                            &target_commit_id.to_string(),
-                            None,
+    let backend = crate::storage::runtime::detect_current_repo_backend()
+        .map_err(|error| ResetError::HeadUpdate(error.to_string()))?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| ResetError::HeadUpdate(error.to_string()))?;
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_only()
+                .await
+                .map_err(|error| ResetError::HeadUpdate(error.to_string()))?;
+            let head_reflog = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                &*config_store,
+                &context,
+                crate::internal::reflog::HEAD,
+            )
+            .await;
+            match &current_head_state {
+                Head::Branch(branch_name) => {
+                    let branch_reflog =
+                        crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                            &*config_store,
+                            &context,
+                            &format!("refs/heads/{branch_name}"),
                         )
-                        .await?;
-                    }
-                    Head::Detached(_) => {
-                        let new_head = Head::Detached(target_commit_id);
-                        // Propagated, not logged-and-dropped: a HEAD write
-                        // that fails while the surrounding work commits
-                        // leaves the repository pointing at the wrong commit
-                        // and reports success.
-                        Head::update_result_with_conn(txn, new_head, None)
-                            .await
-                            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+                        .await;
+                    let key = crate::storage::git_store::RefKey::LocalBranch {
+                        name: branch_name.clone(),
+                    };
+                    let existing = git_store
+                        .get_ref(&key)
+                        .await
+                        .map_err(|error| ResetError::HeadUpdate(error.to_string()))?;
+                    let new_target =
+                        crate::storage::git_store::RefTarget::Direct(target_commit_id.to_string());
+                    let outcome = git_store
+                        .update_ref_cas(
+                            &key,
+                            existing.as_ref(),
+                            Some(&new_target),
+                            &[head_reflog, branch_reflog],
+                        )
+                        .await
+                        .map_err(|error| ResetError::HeadUpdate(error.to_string()))?;
+                    if !matches!(
+                        outcome,
+                        crate::storage::git_store::RefCasOutcome::Applied { .. }
+                    ) {
+                        return Err(ResetError::HeadUpdate(format!(
+                            "concurrent ref update while resetting branch '{branch_name}'"
+                        )));
                     }
                 }
-                Ok(())
-            })
-        },
-        true,
-    )
-    .await
-    .map_err(|e| ResetError::HeadUpdate(e.to_string()))
+                Head::Detached(_) => {
+                    let key = crate::storage::git_store::RefKey::LocalHead {
+                        worktree_id: crate::utils::util::current_worktree_id(),
+                    };
+                    let existing = git_store
+                        .get_ref(&key)
+                        .await
+                        .map_err(|error| ResetError::HeadUpdate(error.to_string()))?;
+                    let new_target =
+                        crate::storage::git_store::RefTarget::Direct(target_commit_id.to_string());
+                    let outcome = git_store
+                        .update_ref_cas(&key, existing.as_ref(), Some(&new_target), &[head_reflog])
+                        .await
+                        .map_err(|error| ResetError::HeadUpdate(error.to_string()))?;
+                    if !matches!(
+                        outcome,
+                        crate::storage::git_store::RefCasOutcome::Applied { .. }
+                    ) {
+                        return Err(ResetError::HeadUpdate(
+                            "concurrent ref update while resetting detached HEAD".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        crate::storage::StorageBackendKind::Sqlite => with_reflog(
+            context,
+            move |txn| {
+                Box::pin(async move {
+                    match &current_head_state {
+                        Head::Branch(branch_name) => {
+                            Branch::update_branch_with_conn(
+                                txn,
+                                branch_name,
+                                &target_commit_id.to_string(),
+                                None,
+                            )
+                            .await?;
+                        }
+                        Head::Detached(_) => {
+                            let new_head = Head::Detached(target_commit_id);
+                            // Propagated, not logged-and-dropped: a HEAD write
+                            // that fails while the surrounding work commits
+                            // leaves the repository pointing at the wrong commit
+                            // and reports success.
+                            Head::update_result_with_conn(txn, new_head, None)
+                                .await
+                                .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+                        }
+                    }
+                    Ok(())
+                })
+            },
+            true,
+        )
+        .await
+        .map_err(|e| ResetError::HeadUpdate(e.to_string())),
+    }
 }
 
 fn merge_reset_failure(error: ResetError, rollback: Result<(), ResetError>) -> ResetError {

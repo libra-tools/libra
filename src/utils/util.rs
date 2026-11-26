@@ -2342,15 +2342,12 @@ async fn resolve_remote_head_atom_typed(
     remote: &str,
     display_name: &str,
 ) -> Result<Option<ResolvedAtom>, CommitBaseError> {
-    let db = get_db_conn_instance().await;
-    let head = Head::remote_current_result_with_conn(&db, remote)
-        .await
-        .map_err(|error| {
-            CommitBaseError::from_branch_store_error(
-                format!("failed to resolve remote HEAD for '{display_name}' on remote '{remote}'"),
-                error,
-            )
-        })?;
+    let head = Head::remote_current_result(remote).await.map_err(|error| {
+        CommitBaseError::from_branch_store_error(
+            format!("failed to resolve remote HEAD for '{display_name}' on remote '{remote}'"),
+            error,
+        )
+    })?;
     let (object_id, reflog_ref) = match head {
         Some(Head::Branch(branch_name)) => {
             let full_ref = format!("refs/remotes/{remote}/{branch_name}");
@@ -2800,12 +2797,36 @@ async fn resolve_reflog_selector_typed(
     index: usize,
     display_name: &str,
 ) -> Result<ObjectHash, CommitBaseError> {
-    let db = get_db_conn_instance().await;
-    let entries = Reflog::find_all(&db, ref_name).await.map_err(|error| {
+    let entries = match crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
         CommitBaseError::ReadFailure(format!(
-            "failed to read reflog '{ref_name}' while resolving '{display_name}': {error}"
+            "failed to detect repository backend while resolving '{display_name}': {error}"
         ))
-    })?;
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_current_git_store_read_only()
+                .await
+                .map_err(|error| {
+                    CommitBaseError::ReadFailure(format!(
+                        "failed to open reflog store while resolving '{display_name}': {error}"
+                    ))
+                })?;
+            Reflog::find_all_with_store(&*store, ref_name)
+                .await
+                .map_err(|error| {
+                    CommitBaseError::ReadFailure(format!(
+                        "failed to read reflog '{ref_name}' while resolving '{display_name}': {error}"
+                    ))
+                })?
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            Reflog::find_all(&db, ref_name).await.map_err(|error| {
+                CommitBaseError::ReadFailure(format!(
+                    "failed to read reflog '{ref_name}' while resolving '{display_name}': {error}"
+                ))
+            })?
+        }
+    };
     let entry = entries.get(index).ok_or_else(|| {
         CommitBaseError::InvalidReference(format!(
             "reflog entry '{ref_name}@{{{index}}}' does not exist"

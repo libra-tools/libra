@@ -900,7 +900,20 @@ fn clone_should_reject_shallow(
     reject_shallow && is_shallow && depth.is_none()
 }
 
-const REPO_MARKERS: &[&str] = &["description", "libra.db", "info/exclude", "objects"];
+const REPO_MARKERS: &[&str] = &[
+    "description",
+    "libra.db",
+    "storage-format.json",
+    "redb",
+    "info/exclude",
+    "objects",
+];
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn has_repo_markers(dir: &Path) -> bool {
+    REPO_MARKERS.iter().any(|marker| dir.join(marker).exists())
+}
 
 // ---------------------------------------------------------------------------
 // CloneOutput — structured result of a successful clone
@@ -3067,151 +3080,367 @@ pub(crate) async fn setup_repository(
     advertised_head: bool,
     detached_source: bool,
 ) -> Result<SetupResult, CloneError> {
-    let db = get_db_conn_instance().await;
-    let remote_head = Head::remote_current_with_conn(&db, &remote_config.name).await;
-
-    let branch_to_checkout = match specified_branch {
-        Some(branch_name) => Some(branch_name),
-        None if advertised_head => match remote_head {
-            Some(Head::Branch(name)) => Some(name),
-            _ => default_tracked_branch(&db, &remote_config.name).await?,
-        },
-        None => default_tracked_branch(&db, &remote_config.name).await?,
-    };
-
-    if let Some(branch_name) = branch_to_checkout {
-        let remote_tracking_ref = format!("refs/remotes/{}/{}", remote_config.name, branch_name);
-        let origin_branch = Branch::find_branch_result_with_conn(
-            &db,
-            &remote_tracking_ref,
-            Some(&remote_config.name),
-        )
-        .await
-        .map_err(|source| CloneError::LocalBranchState { source })?
-        .ok_or_else(|| CloneError::RemoteBranchNotFound {
-            branch: branch_name.clone(),
-            remote: remote_config.name.clone(),
-        })?;
-
-        let action = ReflogAction::Clone {
-            from: remote_config.url.clone(),
-        };
-        let context = ReflogContext {
-            old_oid: ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
-            new_oid: origin_branch.commit.to_string(),
-            action,
-        };
-
-        // Clone the branch name before moving it into the closure.
-        let branch_name_for_result = branch_name.clone();
-        with_reflog(
-            context,
-            move |txn: &DatabaseTransaction| {
-                Box::pin(async move {
-                    Branch::update_branch_with_conn(
-                        txn,
-                        &branch_name,
-                        &origin_branch.commit.to_string(),
-                        None,
-                    )
-                    .await?;
-                    Head::update_result_with_conn(txn, Head::Branch(branch_name.to_owned()), None)
-                        .await
-                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
-
-                    let merge_ref = format!("refs/heads/{}", branch_name);
-                    let _ = ConfigKv::set_with_conn(
-                        txn,
-                        &format!("branch.{}.merge", branch_name),
-                        &merge_ref,
-                        false,
-                    )
-                    .await;
-                    let _ = ConfigKv::set_with_conn(
-                        txn,
-                        &format!("branch.{}.remote", branch_name),
-                        &remote_config.name,
-                        false,
-                    )
-                    .await;
-                    let _ = ConfigKv::set_with_conn(
-                        txn,
-                        &format!("remote.{}.url", remote_config.name),
-                        &remote_config.url,
-                        false,
-                    )
-                    .await;
-                    // Every non-mirror, non-revision clone records a fetch
-                    // refspec: single-branch narrows it to the checked-out
-                    // branch, a plain clone records the standard wildcard
-                    // (#876 — without it, appending a refspec later would make
-                    // `fetch --prune` trim fields it never owned).
-                    let spec = if single_branch && !detached_source {
-                        Some(format!(
-                            "+refs/heads/{branch_name}:refs/remotes/{}/{branch_name}",
-                            remote_config.name
-                        ))
-                    } else if !single_branch && !detached_source {
-                        Some(format!(
-                            "+refs/heads/*:refs/remotes/{}/*",
-                            remote_config.name
-                        ))
-                    } else {
-                        None
-                    };
-                    if let Some(spec) = spec {
-                        let _ = ConfigKv::add_with_conn(
-                            txn,
-                            &format!("remote.{}.fetch", remote_config.name),
-                            &spec,
-                            false,
-                        )
-                        .await;
-                    }
-                    Ok(())
-                })
-            },
-            true,
-        )
-        .await
-        .map_err(|error| CloneError::SetupFailed {
-            message: error.to_string(),
-        })?;
-
-        if checkout_worktree {
-            command::restore::execute_checked_typed(RestoreArgs {
-                overlay: false,
-                no_overlay: false,
-                ours: false,
-                theirs: false,
-                ignore_unmerged: false,
-                merge: false,
-                conflict: None,
-                worktree: true,
-                staged: true,
-                source: None,
-                pathspec: vec![util::working_dir_string()],
-                pathspec_from_file: None,
-                pathspec_file_nul: false,
-                no_progress: false,
-            })
-            .await
-            .map_err(|source| CloneError::CheckoutFailed { source })?;
+    let backend = crate::storage::runtime::detect_current_repo_backend().map_err(|error| {
+        CloneError::SetupFailed {
+            message: format!("failed to detect repository backend: {error}"),
         }
+    })?;
+    match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let git_store = crate::storage::runtime::open_current_git_store_read_write()
+                .await
+                .map_err(|error| CloneError::SetupFailed {
+                    message: format!("failed to open repository git store: {error}"),
+                })?;
+            let config_store = crate::storage::runtime::open_current_repo_config_store_read_write()
+                .await
+                .map_err(|error| CloneError::SetupFailed {
+                    message: format!("failed to open repository config store: {error}"),
+                })?;
+            let remote_head =
+                Head::remote_current_result_with_store(&*git_store, &remote_config.name)
+                    .await
+                    .ok()
+                    .flatten();
+            let branch_to_checkout = match specified_branch {
+                Some(branch_name) => Some(branch_name),
+                None if advertised_head => match remote_head {
+                    Some(Head::Branch(name)) => Some(name),
+                    _ => {
+                        default_tracked_branch_with_store(&*git_store, &remote_config.name).await?
+                    }
+                },
+                None => default_tracked_branch_with_store(&*git_store, &remote_config.name).await?,
+            };
+            if let Some(branch_name) = branch_to_checkout {
+                let remote_tracking_ref =
+                    format!("refs/remotes/{}/{}", remote_config.name, branch_name);
+                let origin_branch = Branch::find_branch_result_with_store(
+                    &*git_store,
+                    &remote_tracking_ref,
+                    Some(&remote_config.name),
+                )
+                .await
+                .map_err(|source| CloneError::LocalBranchState { source })?
+                .ok_or_else(|| CloneError::RemoteBranchNotFound {
+                    branch: branch_name.clone(),
+                    remote: remote_config.name.clone(),
+                })?;
 
-        Ok(SetupResult {
-            branch_name: Some(branch_name_for_result),
-        })
-    } else {
-        let _ = ConfigKv::set(
-            &format!("remote.{}.url", remote_config.name),
-            &remote_config.url,
-            false,
-        )
-        .await;
+                let action = ReflogAction::Clone {
+                    from: remote_config.url.clone(),
+                };
+                let context = ReflogContext {
+                    old_oid: ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
+                    new_oid: origin_branch.commit.to_string(),
+                    action,
+                };
+                let branch_reflog = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                    &*config_store,
+                    &context,
+                    &format!("refs/heads/{branch_name}"),
+                )
+                .await;
+                let head_reflog = crate::internal::reflog::Reflog::build_reflog_write_with_store(
+                    &*config_store,
+                    &context,
+                    crate::internal::reflog::HEAD,
+                )
+                .await;
+                let branch_key = crate::storage::git_store::RefKey::LocalBranch {
+                    name: branch_name.clone(),
+                };
+                let existing_branch = git_store.get_ref(&branch_key).await.map_err(|error| {
+                    CloneError::SetupFailed {
+                        message: error.to_string(),
+                    }
+                })?;
+                let _ = git_store
+                    .update_ref_cas(
+                        &branch_key,
+                        existing_branch.as_ref(),
+                        Some(&crate::storage::git_store::RefTarget::Direct(
+                            origin_branch.commit.to_string(),
+                        )),
+                        &[branch_reflog],
+                    )
+                    .await
+                    .map_err(|error| CloneError::SetupFailed {
+                        message: error.to_string(),
+                    })?;
+                let head_key = crate::storage::git_store::RefKey::LocalHead {
+                    worktree_id: crate::utils::util::current_worktree_id(),
+                };
+                let existing_head = git_store.get_ref(&head_key).await.map_err(|error| {
+                    CloneError::SetupFailed {
+                        message: error.to_string(),
+                    }
+                })?;
+                let _ = git_store
+                    .update_ref_cas(
+                        &head_key,
+                        existing_head.as_ref(),
+                        Some(&crate::storage::git_store::RefTarget::Symbolic(
+                            branch_name.clone(),
+                        )),
+                        &[head_reflog],
+                    )
+                    .await
+                    .map_err(|error| CloneError::SetupFailed {
+                        message: error.to_string(),
+                    })?;
 
-        Ok(SetupResult { branch_name: None })
+                let merge_ref = format!("refs/heads/{}", branch_name);
+                let _ = ConfigKv::set_with_store(
+                    &*config_store,
+                    &format!("branch.{}.merge", branch_name),
+                    &merge_ref,
+                    false,
+                )
+                .await;
+                let _ = ConfigKv::set_with_store(
+                    &*config_store,
+                    &format!("branch.{}.remote", branch_name),
+                    &remote_config.name,
+                    false,
+                )
+                .await;
+                let _ = ConfigKv::set_with_store(
+                    &*config_store,
+                    &format!("remote.{}.url", remote_config.name),
+                    &remote_config.url,
+                    false,
+                )
+                .await;
+                let spec = if single_branch && !detached_source {
+                    Some(format!(
+                        "+refs/heads/{branch_name}:refs/remotes/{}/{branch_name}",
+                        remote_config.name
+                    ))
+                } else if !single_branch && !detached_source {
+                    Some(format!(
+                        "+refs/heads/*:refs/remotes/{}/*",
+                        remote_config.name
+                    ))
+                } else {
+                    None
+                };
+                if let Some(spec) = spec {
+                    let _ = ConfigKv::add_with_store(
+                        &*config_store,
+                        &format!("remote.{}.fetch", remote_config.name),
+                        &spec,
+                        false,
+                    )
+                    .await;
+                }
+                drop(git_store);
+                drop(config_store);
+
+                if checkout_worktree {
+                    command::restore::execute_checked_typed(RestoreArgs {
+                        overlay: false,
+                        no_overlay: false,
+                        ours: false,
+                        theirs: false,
+                        ignore_unmerged: false,
+                        merge: false,
+                        conflict: None,
+                        worktree: true,
+                        staged: true,
+                        source: None,
+                        pathspec: vec![util::working_dir_string()],
+                        pathspec_from_file: None,
+                        pathspec_file_nul: false,
+                        no_progress: false,
+                    })
+                    .await
+                    .map_err(|source| CloneError::CheckoutFailed { source })?;
+                }
+                Ok(SetupResult {
+                    branch_name: Some(branch_name),
+                })
+            } else {
+                let _ = ConfigKv::set_with_store(
+                    &*config_store,
+                    &format!("remote.{}.url", remote_config.name),
+                    &remote_config.url,
+                    false,
+                )
+                .await;
+                Ok(SetupResult { branch_name: None })
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db = get_db_conn_instance().await;
+            let remote_head = Head::remote_current_with_conn(&db, &remote_config.name).await;
+
+            let branch_to_checkout = match specified_branch {
+                Some(branch_name) => Some(branch_name),
+                None if advertised_head => match remote_head {
+                    Some(Head::Branch(name)) => Some(name),
+                    _ => default_tracked_branch(&db, &remote_config.name).await?,
+                },
+                None => default_tracked_branch(&db, &remote_config.name).await?,
+            };
+
+            if let Some(branch_name) = branch_to_checkout {
+                let remote_tracking_ref =
+                    format!("refs/remotes/{}/{}", remote_config.name, branch_name);
+                let origin_branch = Branch::find_branch_result_with_conn(
+                    &db,
+                    &remote_tracking_ref,
+                    Some(&remote_config.name),
+                )
+                .await
+                .map_err(|source| CloneError::LocalBranchState { source })?
+                .ok_or_else(|| CloneError::RemoteBranchNotFound {
+                    branch: branch_name.clone(),
+                    remote: remote_config.name.clone(),
+                })?;
+
+                let action = ReflogAction::Clone {
+                    from: remote_config.url.clone(),
+                };
+                let context = ReflogContext {
+                    old_oid: ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
+                    new_oid: origin_branch.commit.to_string(),
+                    action,
+                };
+
+                // Clone the branch name before moving it into the closure.
+                let branch_name_for_result = branch_name.clone();
+                with_reflog(
+                    context,
+                    move |txn: &DatabaseTransaction| {
+                        Box::pin(async move {
+                            Branch::update_branch_with_conn(
+                                txn,
+                                &branch_name,
+                                &origin_branch.commit.to_string(),
+                                None,
+                            )
+                            .await?;
+                            Head::update_result_with_conn(
+                                txn,
+                                Head::Branch(branch_name.to_owned()),
+                                None,
+                            )
+                            .await
+                            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+
+                            let merge_ref = format!("refs/heads/{}", branch_name);
+                            let _ = ConfigKv::set_with_conn(
+                                txn,
+                                &format!("branch.{}.merge", branch_name),
+                                &merge_ref,
+                                false,
+                            )
+                            .await;
+                            let _ = ConfigKv::set_with_conn(
+                                txn,
+                                &format!("branch.{}.remote", branch_name),
+                                &remote_config.name,
+                                false,
+                            )
+                            .await;
+                            let _ = ConfigKv::set_with_conn(
+                                txn,
+                                &format!("remote.{}.url", remote_config.name),
+                                &remote_config.url,
+                                false,
+                            )
+                            .await;
+                            // Every non-mirror, non-revision clone records a fetch
+                            // refspec: single-branch narrows it to the checked-out
+                            // branch, a plain clone records the standard wildcard
+                            // (#876 — without it, appending a refspec later would make
+                            // `fetch --prune` trim fields it never owned).
+                            let spec = if single_branch && !detached_source {
+                                Some(format!(
+                                    "+refs/heads/{branch_name}:refs/remotes/{}/{branch_name}",
+                                    remote_config.name
+                                ))
+                            } else if !single_branch && !detached_source {
+                                Some(format!(
+                                    "+refs/heads/*:refs/remotes/{}/*",
+                                    remote_config.name
+                                ))
+                            } else {
+                                None
+                            };
+                            if let Some(spec) = spec {
+                                let _ = ConfigKv::add_with_conn(
+                                    txn,
+                                    &format!("remote.{}.fetch", remote_config.name),
+                                    &spec,
+                                    false,
+                                )
+                                .await;
+                            }
+                            Ok(())
+                        })
+                    },
+                    true,
+                )
+                .await
+                .map_err(|error| CloneError::SetupFailed {
+                    message: error.to_string(),
+                })?;
+
+                if checkout_worktree {
+                    command::restore::execute_checked_typed(RestoreArgs {
+                        overlay: false,
+                        no_overlay: false,
+                        ours: false,
+                        theirs: false,
+                        ignore_unmerged: false,
+                        merge: false,
+                        conflict: None,
+                        worktree: true,
+                        staged: true,
+                        source: None,
+                        pathspec: vec![util::working_dir_string()],
+                        pathspec_from_file: None,
+                        pathspec_file_nul: false,
+                        no_progress: false,
+                    })
+                    .await
+                    .map_err(|source| CloneError::CheckoutFailed { source })?;
+                }
+
+                Ok(SetupResult {
+                    branch_name: Some(branch_name_for_result),
+                })
+            } else {
+                let _ = ConfigKv::set(
+                    &format!("remote.{}.url", remote_config.name),
+                    &remote_config.url,
+                    false,
+                )
+                .await;
+
+                Ok(SetupResult { branch_name: None })
+            }
+        }
     }
+}
+
+async fn default_tracked_branch_with_store(
+    store: &dyn crate::storage::git_store::GitStore,
+    remote: &str,
+) -> Result<Option<String>, CloneError> {
+    for name in ["main", "master"] {
+        let tracking = format!("refs/remotes/{remote}/{name}");
+        if Branch::find_branch_result_with_store(store, &tracking, Some(remote))
+            .await
+            .map_err(|source| CloneError::LocalBranchState { source })?
+            .is_some()
+        {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// When the remote advertised no HEAD, check out `main`/`master` only if that
