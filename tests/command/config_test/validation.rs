@@ -467,3 +467,20 @@ fn test_cf_27_predicates() {
         assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_28_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for flag in ["--get", "--get-all"] {
+        let out = run_libra_command(&["config", flag, "nosuchkey"], repo.path());
+        assert_eq!(out.status.code(), Some(1), "{flag}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("key does not contain a section"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+    }
+}

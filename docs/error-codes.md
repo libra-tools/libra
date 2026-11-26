@@ -721,3 +721,5 @@ config unrecognized type exit-code exception.
 get prints the last value matching the pattern.
 
 invalid key pattern exits 6.
+
+key without a section exits 1.

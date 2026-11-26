@@ -352,3 +352,5 @@ type=expiry-date prints a unix timestamp.
 config --file writes through a lock and rename.
 
 invalid key pattern exits 6.
+
+key without a section exits 1.
