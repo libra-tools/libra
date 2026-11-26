@@ -1185,6 +1185,9 @@ pub enum ConfigCommand {
         /// Only return values matching this pattern (`git config get --value`)
         #[clap(long = "value", value_name = "PATTERN")]
         value_pattern: Option<String>,
+        /// Canonicalize the returned value to this type (`--type=bool-or-str`)
+        #[clap(long = "type", value_name = "TYPE")]
+        value_type: Option<String>,
         /// Treat the value pattern as a literal byte string (`--fixed-value`)
         #[clap(long = "fixed-value")]
         fixed_value: bool,
@@ -2315,6 +2318,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 reveal,
                 regexp,
                 value_pattern,
+                value_type: get_type,
                 fixed_value,
                 show_origin,
                 show_scope,
@@ -2338,7 +2342,10 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                     show_scope: *show_scope,
                     default: default.clone(),
                     null: args.null,
-                    value_type,
+                    value_type: match get_type.as_deref() {
+                        Some(name) => Some(parse_value_type_name(name)?),
+                        None => value_type,
+                    },
                     name_only: args.name_only,
                 }
             }

@@ -342,3 +342,7 @@ get prints the last value matching the pattern.
 edit imports a changed temp file in one transaction.
 
 config set subcommand matches the legacy write.
+
+fatal: unrecognized --type argument.
+
+bool-or-str and bool-or-int preserve and canonicalize.

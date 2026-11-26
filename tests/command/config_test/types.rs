@@ -757,3 +757,56 @@ fn test_cf_70_predicates() {
         assert_eq!(shortcut.stdout, typed.stdout, "--bool-or-int parity");
     }
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_bool_or_str_and_bool_or_int_matrix() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "combo.k", "maybe"], repo.path()),
+        "set maybe",
+    );
+    let raw = run_libra_command(&["config", "--local", "--get", "combo.k"], repo.path());
+    assert_eq!(String::from_utf8_lossy(&raw.stdout).trim(), "maybe");
+    let typed = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--type=bool-or-str",
+            "--get",
+            "combo.k",
+        ],
+        repo.path(),
+    );
+    assert_eq!(String::from_utf8_lossy(&typed.stdout).trim(), "maybe");
+    let sub = run_libra_command(
+        &["config", "get", "--local", "--type=bool-or-str", "combo.k"],
+        repo.path(),
+    );
+    assert_eq!(sub.stdout, typed.stdout);
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "combo.k", "yes"], repo.path()),
+        "set yes",
+    );
+    let yes = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--type=bool-or-str",
+            "--get",
+            "combo.k",
+        ],
+        repo.path(),
+    );
+    assert_eq!(String::from_utf8_lossy(&yes.stdout).trim(), "true");
+    let int = run_libra_command(
+        &["config", "--local", "--bool-or-int", "--get", "combo.k"],
+        repo.path(),
+    );
+    assert_eq!(String::from_utf8_lossy(&int.stdout).trim(), "true");
+}
