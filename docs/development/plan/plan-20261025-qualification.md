@@ -957,7 +957,7 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `in-progress` / 空（已推送 main `6177646`；family child 无独立发布，所以不是 done。session `71cf457d-5724-48c9-b2e4-68c4ac1a8bc4` 已准入 `client_storage.rs`；实现审查 `d6849287-9d4e-46c7-8148-a41e8e5e412d` VERDICT PASS）
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：两个 lib 门复跑 1/1 + 1/1；本卡不 bump、不打 tag，D 组按 family child 继承。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** `ensure_existing_object_index` 在存储读取失败时不再说载荷已经不存在。`search_result` 在 `~` / `^` 导览里过滤提交类型时，类型读取失败返回 `Err`；对象缺失和类型不符仍丢弃该哈希。`storage.search` 仍返回 `Vec`。
 
@@ -967,13 +967,13 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Acceptance criteria:**
 
-- [ ] AC-1: `ensure_existing_object_index` 的存储读取失败不是 `NotFound`，正文不含 “no longer present”。`Ok(false)` 仍是这句缺失文案。
-- [ ] AC-2: `search_result` 的 `~` / `^` 类型读取失败返回 `Err`，不是空列表。`ObjectNotFound` 仍得到空列表。
+- [x] AC-1: 存储读取失败不是 `NotFound`、正文不含 no longer present；`Ok(false)` 仍保留缺失文案（`ensure_existing_object_index_read_error_is_not_missing`）。
+- [x] AC-2: `search_result` 的 `~`/`^` 类型读取失败返回 `Err`，不是空列表；`ObjectNotFound` 仍得到空列表（`search_result_type_read_error_is_not_empty`）。
 
 **Verification:**
 
-- [ ] VER-1: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(ensure_existing_object_index_read_error_is_not_missing)' --no-fail-fast --retries 0`
-- [ ] VER-2: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(search_result_type_read_error_is_not_empty)' --no-fail-fast --retries 0`
+- [x] VER-1: 同上命令（1/1 passed，2026-11-25 复跑）。
+- [x] VER-2: 同上命令（1/1 passed，2026-11-25 复跑）。
 
 **Full-suite trigger:** `N/A`（本卡不改 `sql/**`、`src/cli.rs`、稳定错误码或版本面）。
 
