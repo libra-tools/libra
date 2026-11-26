@@ -3289,7 +3289,7 @@ ER-01 至 ER-14 按模板原文对本计划全部任务生效（见 [`plan-templ
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / 空
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读子进程执行器 8 个具名门全部复跑通过（超时 SIGKILL/槽位回收、hash kind、schema 不自迁移、不修对象索引、跳过升级检查）；同卡文档门与网站源文件检查已勾选，版本 patch +1。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；T-1 全量未运行，线上页面/远端 D 未重验。
 
 **Description:** 自 MC-19 拆出。新增读执行器 `mcp_server/exec.rs`：每次读工具调用由服务进程派生一个隐藏的读子进程 `libra agent mcp --read-worker`（`#[arg(hide = true)]`，不出现在 help；只从 stdin 读取一个由服务端构造的内部请求、向 stdout 写一个结果；在 `src/cli.rs` 中先于常规预检被分派到**只读预检**：只做仓库发现并以只读方式读取 `core.objectformat` 设置 hash kind（SHA-1/SHA-256 仓库都正确），不执行数据库迁移（schema 不是当前版本即以 `LBR-AGENT-037` 失败）、不修复对象索引、不启动自动升级检查或任何启动维护；以发起进程的工作目录启动，只读访问仓库），容量 4 的信号量限制同时存在的读子进程数。读 deadline 到期时服务立即回复 `LBR-AGENT-036`，并在 Unix 上向读子进程的进程组发送 `SIGKILL`、在 Windows 上 `TerminateProcess`，**回收（wait）完成后才归还槽位**（≤ 1 s）。因此任何读路径（status、diff 含 rename 检测、checkpoint、workspace、trace）的阻塞计算、I/O 与内存都随子进程一起被强制终止，超时的读工作不会继续占用槽位或资源。另注册仅在 `cfg(debug_assertions)` 且 `LIBRA_TEST=1` 时存在的 `libra_test_block`（在读子进程内阻塞并写 PID 文件）与 `libra_test_hash_kind`（在读子进程内返回当前 hash kind），以及 debug-only 读 deadline 覆盖 `LIBRA_MCP_TEST_READ_DEADLINE_MS`。唯一行为轴：「读工具子进程执行器」。
 
