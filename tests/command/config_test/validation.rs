@@ -435,3 +435,21 @@ fn test_cf_58_predicates() {
     assert!(String::from_utf8_lossy(&list.stderr).contains("LBR-IO-001"));
     let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_107_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let before = run_libra_command(&["config", "--local", "--list"], repo.path());
+    for args in [
+        vec!["config", "--unset", "nosuchkey"],
+        vec!["config", "nosuchkey", "value"],
+        vec!["config", "set", "nosuchkey", "v"],
+        vec!["config", "unset", "nosuchkey"],
+    ] {
+        let _ = run_libra_command(&args, repo.path());
+        let after = run_libra_command(&["config", "--local", "--list"], repo.path());
+        assert_eq!(before.stdout, after.stdout, "zero write: {args:?}");
+    }
+}
