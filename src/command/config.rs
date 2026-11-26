@@ -3881,6 +3881,16 @@ fn serve_config_file(
         }
         return write_config_file(path, &mutation, args, output);
     }
+    if path != "-" && !Path::new(path).exists() {
+        if matches!(cmd, ResolvedCommand::List { .. }) {
+            return Err(CliError::fatal(format!(
+                "unable to read config file '{}': No such file or directory",
+                path
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed));
+        }
+        return Err(CliError::silent_exit(1));
+    }
     let show_origin = args.show_origin;
     let show_scope = args.show_scope;
     let entries = if path == "-" {

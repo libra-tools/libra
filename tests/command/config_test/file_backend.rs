@@ -281,3 +281,22 @@ fn test_cf_91_predicates() {
         );
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_82_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let get = run_libra_command(
+        &["config", "--file", "missing.cfg", "--get", "a.b"],
+        repo.path(),
+    );
+    assert_eq!(get.status.code(), Some(1), "missing file get");
+    let list = run_libra_command(&["config", "--file", "missing.cfg", "--list"], repo.path());
+    assert_eq!(list.status.code(), Some(128), "missing file list");
+    assert!(
+        String::from_utf8_lossy(&list.stderr).contains("unable to read config file"),
+        "stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+}

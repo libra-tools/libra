@@ -2133,3 +2133,5 @@ invalid colors fail and do not store.
 absolute expiry dates match git timestamps.
 
 upstream expiry get and list pass.
+
+config file read exit-code exception.

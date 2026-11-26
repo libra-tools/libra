@@ -709,3 +709,5 @@ RG-03 opaque reasoning export: `LBR-AGENT-013` refuses missing/blank authorizati
 pattern unset with no match exits 5.
 
 invalid get pattern exits 6.
+
+config file read exit-code exception.
