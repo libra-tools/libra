@@ -12,4 +12,6 @@ pub enum MemoryError {
     Change(#[from] crate::internal::change::ChangeStoreError),
     #[error("database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+    #[error("storage backend error: {0}")]
+    Storage(#[from] crate::storage::StorageBackendError),
 }

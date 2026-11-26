@@ -177,6 +177,42 @@ pub(crate) struct PendingHeader {
 }
 
 impl PendingHeader {
+    /// Return the repository-private envelope MAC stored in this header.
+    #[allow(dead_code)]
+    pub(crate) fn mac(&self) -> &str {
+        &self.mac
+    }
+
+    /// Construct a validated [`PendingHeader`] for store-backed persistence
+    /// (`MetadataStore`) after authenticating the envelope bytes.
+    #[allow(dead_code)]
+    pub(crate) fn new_for_store(
+        binding: PendingBinding,
+        mac: String,
+        envelope_bytes: usize,
+    ) -> Result<Self> {
+        binding.validate()?;
+        ensure!(
+            envelope_bytes > 0 && envelope_bytes <= MAX_ENVELOPE_BYTES,
+            "capture recovery envelope exceeds its safe capacity; run `libra agent doctor`"
+        );
+        let chunks = envelope_bytes.div_ceil(CHUNK_BYTES);
+        ensure!(
+            chunks <= MAX_CHUNKS,
+            "capture recovery envelope chunk count exceeds its safe limit; run `libra agent doctor`"
+        );
+        let header = Self {
+            version: VERSION,
+            binding,
+            mac,
+            envelope_bytes,
+            chunks,
+            manual_attempted: false,
+        };
+        let encoded = serde_json::to_string(&header)?;
+        Self::decode(&encoded)
+    }
+
     pub(crate) fn decode(text: &str) -> Result<Self> {
         ensure!(
             text.len() <= MAX_HEADER_BYTES,
@@ -2192,14 +2228,36 @@ async fn metadata_presence<C: ConnectionTrait>(
             }
             // Recovery headers stay in the repository database. A capture
             // transaction cannot see them, and the two files are not attached.
-            let repo = crate::internal::db::open_paired_repository(conn)
+            let storage = crate::internal::db::connection_storage_root(conn)
                 .await
                 .context(context)?;
-            Ok(repo
-                .query_one_raw(statement(repo.get_database_backend(), values))
-                .await
-                .context(context)?
-                .is_some())
+            match crate::storage::runtime::detect_repo_backend(&storage).context(context)? {
+                crate::storage::StorageBackendKind::Redb => {
+                    let meta =
+                        crate::storage::runtime::open_repo_metadata_store_read_only(&storage)
+                            .await
+                            .context(context)?;
+                    let rows = meta
+                        .list_metadata_scope(MetadataScope::AgentCapturePending.as_str())
+                        .await
+                        .context(context)?;
+                    let qrows = meta
+                        .list_metadata_scope(MetadataScope::AgentCaptureQuarantine.as_str())
+                        .await
+                        .context(context)?;
+                    Ok(!rows.is_empty() || !qrows.is_empty())
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    let repo = crate::internal::db::open_paired_repository(conn)
+                        .await
+                        .context(context)?;
+                    Ok(repo
+                        .query_one_raw(statement(repo.get_database_backend(), values))
+                        .await
+                        .context(context)?
+                        .is_some())
+                }
+            }
         }
     }
 }
@@ -2276,17 +2334,31 @@ pub(crate) async fn retains_unpublished_artifact_for_checkpoint<C: ConnectionTra
         .context(context)?
         .is_some()
     } else {
-        let repo = crate::internal::db::open_paired_repository(conn)
+        let storage_root = crate::internal::db::connection_storage_root(conn)
             .await
             .context(context)?;
-        repo.query_one_raw(Statement::from_sql_and_values(
-            repo.get_database_backend(),
-            header_sql,
-            header_values,
-        ))
-        .await
-        .context(context)?
-        .is_some()
+        match crate::storage::runtime::detect_repo_backend(&storage_root).context(context)? {
+            crate::storage::StorageBackendKind::Redb => {
+                let meta =
+                    crate::storage::runtime::open_repo_metadata_store_read_only(&storage_root)
+                        .await
+                        .context(context)?;
+                has_header_for_checkpoint_with_store(meta.as_ref(), repo_id, checkpoint).await?
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let repo = crate::internal::db::open_paired_repository(conn)
+                    .await
+                    .context(context)?;
+                repo.query_one_raw(Statement::from_sql_and_values(
+                    repo.get_database_backend(),
+                    header_sql,
+                    header_values,
+                ))
+                .await
+                .context(context)?
+                .is_some()
+            }
+        }
     };
     if !header_present {
         return Ok(false);
@@ -2305,18 +2377,34 @@ pub(crate) async fn retains_unpublished_artifact_for_checkpoint<C: ConnectionTra
         let storage_root = crate::internal::db::connection_storage_root(conn)
             .await
             .context(context)?;
-        match super::store::open_readonly(&storage_root, super::store::COMMAND_BUSY_TIMEOUT).await {
-            Ok(capture) => capture
-                .query_one_raw(Statement::from_sql_and_values(
-                    capture.get_database_backend(),
-                    published_sql,
-                    [checkpoint.into()],
-                ))
-                .await
-                .context(context)?
-                .is_some(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error).context(context),
+        match crate::storage::runtime::detect_repo_backend(&storage_root).context(context)? {
+            crate::storage::StorageBackendKind::Redb => {
+                let capture = crate::storage::runtime::open_capture_store_read_only(&storage_root)
+                    .await
+                    .context(context)?;
+                capture
+                    .get_checkpoint(checkpoint)
+                    .await
+                    .context(context)?
+                    .is_some()
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                match super::store::open_readonly(&storage_root, super::store::COMMAND_BUSY_TIMEOUT)
+                    .await
+                {
+                    Ok(capture) => capture
+                        .query_one_raw(Statement::from_sql_and_values(
+                            capture.get_database_backend(),
+                            published_sql,
+                            [checkpoint.into()],
+                        ))
+                        .await
+                        .context(context)?
+                        .is_some(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error).context(context),
+                }
+            }
         }
     };
     Ok(!published)
@@ -2391,26 +2479,50 @@ pub(crate) async fn quarantine_checkpoint_if_present(
         // Recovery headers stay in the repository database. Do not query
         // `metadata_kv` on this catalog transaction: a missing table aborts it.
         // The repository write commits on its own; the two files are not attached.
-        let repo = crate::internal::db::open_paired_repository(txn)
+        let storage = crate::internal::db::connection_storage_root(txn)
             .await
             .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
-        let repo_txn = crate::internal::db::begin_write_transaction(&repo)
-            .await
-            .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
-        let moved = Box::pin(quarantine_checkpoint_if_present(
-            &repo_txn, repo_id, checkpoint,
-        ))
-        .await;
-        return match moved {
-            Ok(true) => {
-                repo_txn.commit().await.context(
-                    "cannot retain exhausted capture artifact; run `libra agent doctor`",
-                )?;
-                Ok(true)
+        return match crate::storage::runtime::detect_repo_backend(&storage)
+            .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let meta = crate::storage::runtime::open_repo_metadata_store_read_write(&storage)
+                    .await
+                    .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
+                let config = crate::storage::runtime::open_repo_config_store_read_only(&storage)
+                    .await
+                    .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
+                quarantine_checkpoint_if_present_with_store(
+                    meta.as_ref(),
+                    config.as_ref(),
+                    repo_id,
+                    checkpoint,
+                )
+                .await
             }
-            other => {
-                let _ = repo_txn.rollback().await;
-                other
+            crate::storage::StorageBackendKind::Sqlite => {
+                let repo = crate::internal::db::open_paired_repository(txn)
+                    .await
+                    .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
+                let repo_txn = crate::internal::db::begin_write_transaction(&repo)
+                    .await
+                    .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
+                let moved = Box::pin(quarantine_checkpoint_if_present(
+                    &repo_txn, repo_id, checkpoint,
+                ))
+                .await;
+                match moved {
+                    Ok(true) => {
+                        repo_txn.commit().await.context(
+                            "cannot retain exhausted capture artifact; run `libra agent doctor`",
+                        )?;
+                        Ok(true)
+                    }
+                    other => {
+                        let _ = repo_txn.rollback().await;
+                        other
+                    }
+                }
             }
         };
     }
@@ -2584,28 +2696,67 @@ pub(crate) async fn erase_session_artifacts(
         [session_id.into()],
     );
     // The session row is in the capture catalog when the databases are split.
-    let row = if crate::internal::db::connection_has_table(txn, "agent_session")
-        .await
-        .context("cannot inspect erased session incarnation; run `libra agent doctor`")?
-    {
-        txn.query_one_raw(session_statement).await
-    } else {
-        let storage = crate::internal::db::connection_storage_root(txn)
+    let metadata: Option<String> =
+        if crate::internal::db::connection_has_table(txn, "agent_session")
             .await
-            .context("cannot locate the capture catalog for erasure; run `libra agent doctor`")?;
-        let catalog = super::store::open_readonly(&storage, super::store::COMMAND_BUSY_TIMEOUT)
-            .await
-            .context("cannot open the capture catalog for erasure; run `libra agent doctor`")?;
-        catalog.query_one_raw(session_statement).await
-    }
-    .context("cannot read erased session incarnation; run `libra agent doctor`")?;
-    let Some(row) = row else {
-        ensure!(!known_association, ownership_remedy);
-        return Ok(legacy.has_unassigned());
-    };
-    let metadata: Option<String> = row
-        .try_get_by("bounded_value")
-        .context("cannot decode erased session incarnation; run `libra agent doctor`")?;
+            .context("cannot inspect erased session incarnation; run `libra agent doctor`")?
+        {
+            let row = txn
+                .query_one_raw(session_statement)
+                .await
+                .context("cannot read erased session incarnation; run `libra agent doctor`")?;
+            let Some(row) = row else {
+                ensure!(!known_association, ownership_remedy);
+                return Ok(legacy.has_unassigned());
+            };
+            row.try_get_by("bounded_value")
+                .context("cannot decode erased session incarnation; run `libra agent doctor`")?
+        } else {
+            let storage = crate::internal::db::connection_storage_root(txn)
+                .await
+                .context(
+                    "cannot locate the capture catalog for erasure; run `libra agent doctor`",
+                )?;
+            match crate::storage::runtime::detect_repo_backend(&storage).context(
+                "cannot locate the capture catalog for erasure; run `libra agent doctor`",
+            )? {
+                crate::storage::StorageBackendKind::Redb => {
+                    let capture = crate::storage::runtime::open_capture_store_read_only(&storage)
+                        .await
+                        .context(
+                            "cannot open the capture catalog for erasure; run `libra agent doctor`",
+                        )?;
+                    let Some(session) = capture.get_session(session_id).await.context(
+                        "cannot read erased session incarnation; run `libra agent doctor`",
+                    )?
+                    else {
+                        ensure!(!known_association, ownership_remedy);
+                        return Ok(legacy.has_unassigned());
+                    };
+                    (session.metadata_json.len() <= 1_048_576).then_some(session.metadata_json)
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    let catalog = super::store::open_readonly(
+                        &storage,
+                        super::store::COMMAND_BUSY_TIMEOUT,
+                    )
+                    .await
+                    .context(
+                        "cannot open the capture catalog for erasure; run `libra agent doctor`",
+                    )?;
+                    let row = catalog.query_one_raw(session_statement).await.context(
+                        "cannot read erased session incarnation; run `libra agent doctor`",
+                    )?;
+                    let Some(row) = row else {
+                        ensure!(!known_association, ownership_remedy);
+                        return Ok(legacy.has_unassigned());
+                    };
+                    row.try_get_by("bounded_value").context(
+                        "cannot decode erased session incarnation; run `libra agent doctor`",
+                    )?
+                }
+            }
+        };
     use crate::internal::ai::observed_agents::coverage::CanonValue;
     let Some(CanonValue::Object(metadata)) = metadata.as_deref().and_then(|text| {
         crate::internal::ai::observed_agents::parse_canon_value(text.as_bytes()).ok()
@@ -2689,6 +2840,479 @@ async fn alias_registered(txn: &DatabaseTransaction, repo_id: &str, alias: &str)
         .await
         .context("cannot inspect capture deletion ownership; run `libra agent doctor`")?
         .is_some())
+}
+
+async fn validate_queue_repo_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    repo_id: &str,
+) -> Result<()> {
+    let canonical = crate::internal::workspace::RepoIdentity::resolve_with_store(config)
+        .await
+        .context(
+            "cannot validate capture recovery repository identity; run `libra agent doctor`",
+        )?;
+    ensure!(
+        canonical.as_str() == repo_id,
+        "capture recovery repository identity mismatch; run `libra agent doctor`"
+    );
+    for scope in [
+        MetadataScope::AgentCapturePending,
+        MetadataScope::AgentCaptureQuarantine,
+        MetadataScope::AgentCapturePendingChunk,
+        MetadataScope::AgentCaptureSessionAlias,
+    ] {
+        let rows = meta
+            .list_metadata_scope(scope.as_str())
+            .await
+            .context("cannot inspect capture recovery scope; run `libra agent doctor`")?;
+        ensure!(
+            rows.iter().all(|row| row.target == repo_id),
+            "capture recovery contains foreign repository rows; run `libra agent doctor`"
+        );
+    }
+    Ok(())
+}
+
+/// Store-backed counterpart to [`has_pending_hint`] using [`crate::storage::MetadataStore`]
+/// and [`crate::storage::ConfigStore`] without opening SQLite.
+#[allow(dead_code)]
+pub(crate) async fn has_pending_hint_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    scope: &CaptureScope,
+) -> Result<bool> {
+    validate_queue_repo_with_store(meta, config, &scope.repo_id).await?;
+    let pending = MetadataKv::list_with_store(
+        meta,
+        MetadataScope::AgentCapturePending,
+        &scope.repo_id,
+        None,
+    )
+    .await
+    .context("cannot inspect capture recovery queue; run `libra agent doctor`")?;
+    let quarantined = MetadataKv::list_with_store(
+        meta,
+        MetadataScope::AgentCaptureQuarantine,
+        &scope.repo_id,
+        None,
+    )
+    .await
+    .context("cannot inspect capture recovery quarantine; run `libra agent doctor`")?;
+    let quarantined_keys: std::collections::HashSet<&str> =
+        quarantined.iter().map(|e| e.key.as_str()).collect();
+    for entry in pending {
+        if quarantined_keys.contains(entry.key.as_str())
+            || entry.value_type != "text"
+            || entry.value.len() > MAX_HEADER_BYTES
+        {
+            continue;
+        }
+        if let Ok(header) = PendingHeader::decode(&entry.value)
+            && !header.manual_attempted
+            && header.binding.scope == *scope
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Store-backed counterpart to [`header_for_checkpoint`].
+#[allow(dead_code)]
+pub(crate) async fn header_for_checkpoint_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    repo_id: &str,
+    checkpoint: &str,
+) -> Result<Option<(PendingHeader, MetadataScope)>> {
+    ensure!(
+        uuid::Uuid::parse_str(checkpoint).is_ok_and(|id| id.to_string() == checkpoint),
+        "invalid capture artifact identity; run `libra agent doctor`"
+    );
+    let p = MetadataKv::get_with_store(
+        meta,
+        MetadataScope::AgentCapturePending,
+        repo_id,
+        checkpoint,
+    )
+    .await?;
+    let q = MetadataKv::get_with_store(
+        meta,
+        MetadataScope::AgentCaptureQuarantine,
+        repo_id,
+        checkpoint,
+    )
+    .await?;
+    match (p, q) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("conflicting capture recovery headers; run `libra agent doctor`")
+        }
+        (Some(entry), None) => {
+            ensure!(entry.value_type == "text" && entry.value.len() <= MAX_HEADER_BYTES);
+            Ok(Some((
+                PendingHeader::decode(&entry.value)?,
+                MetadataScope::AgentCapturePending,
+            )))
+        }
+        (None, Some(entry)) => {
+            ensure!(entry.value_type == "text" && entry.value.len() <= MAX_HEADER_BYTES);
+            Ok(Some((
+                PendingHeader::decode(&entry.value)?,
+                MetadataScope::AgentCaptureQuarantine,
+            )))
+        }
+    }
+}
+
+/// Store-backed counterpart to [`has_header_for_checkpoint`].
+#[allow(dead_code)]
+pub(crate) async fn has_header_for_checkpoint_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    repo_id: &str,
+    checkpoint: &str,
+) -> Result<bool> {
+    ensure!(
+        uuid::Uuid::parse_str(checkpoint).is_ok_and(|id| id.to_string() == checkpoint),
+        "invalid capture artifact cleanup identity; run `libra agent doctor`"
+    );
+    let p = MetadataKv::get_with_store(
+        meta,
+        MetadataScope::AgentCapturePending,
+        repo_id,
+        checkpoint,
+    )
+    .await?;
+    if p.is_some() {
+        return Ok(true);
+    }
+    let q = MetadataKv::get_with_store(
+        meta,
+        MetadataScope::AgentCaptureQuarantine,
+        repo_id,
+        checkpoint,
+    )
+    .await?;
+    Ok(q.is_some())
+}
+
+/// Store-backed counterpart to [`retains_unpublished_artifact_for_checkpoint`].
+#[allow(dead_code)]
+pub(crate) async fn retains_unpublished_artifact_for_checkpoint_with_capture(
+    meta: &dyn crate::storage::MetadataStore,
+    capture: &dyn crate::storage::CaptureStore,
+    repo_id: &str,
+    checkpoint: &str,
+) -> Result<bool> {
+    if !has_header_for_checkpoint_with_store(meta, repo_id, checkpoint).await? {
+        return Ok(false);
+    }
+    let published = capture
+        .get_checkpoint(checkpoint)
+        .await
+        .context("cannot inspect retained capture recovery evidence; run `libra agent doctor`")?
+        .is_some();
+    Ok(!published)
+}
+
+/// Store-backed counterpart to [`pending_candidates_for_scope`].
+#[allow(dead_code)]
+pub(crate) async fn pending_candidates_for_scope_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    scope: &CaptureScope,
+) -> Result<PendingCandidateBatch> {
+    validate_queue_repo_with_store(meta, config, &scope.repo_id).await?;
+    let pending = MetadataKv::list_with_store(
+        meta,
+        MetadataScope::AgentCapturePending,
+        &scope.repo_id,
+        None,
+    )
+    .await?;
+    let quarantined = MetadataKv::list_with_store(
+        meta,
+        MetadataScope::AgentCaptureQuarantine,
+        &scope.repo_id,
+        None,
+    )
+    .await?;
+    ensure!(
+        pending.len().saturating_add(quarantined.len()) <= MAX_ARTIFACTS,
+        "capture recovery capacity exceeds its safe limit; run `libra agent doctor`"
+    );
+    let quarantined_keys: std::collections::HashSet<&str> =
+        quarantined.iter().map(|e| e.key.as_str()).collect();
+    let mut conflicting_namespaces = false;
+    let mut headers = Vec::new();
+    let mut quarantined_count = 0usize;
+    for entry in pending {
+        if quarantined_keys.contains(entry.key.as_str()) {
+            conflicting_namespaces = true;
+            continue;
+        }
+        if entry.value_type == "text"
+            && entry.value.len() <= MAX_HEADER_BYTES
+            && let Ok(header) = PendingHeader::decode(&entry.value)
+            && header.binding.checkpoint_id == entry.key
+        {
+            if header.binding.scope == *scope && !header.manual_attempted {
+                headers.push(header);
+            }
+        } else {
+            MetadataKv::set_with_store(
+                meta,
+                MetadataScope::AgentCaptureQuarantine,
+                &scope.repo_id,
+                &entry.key,
+                &entry.value,
+                MetadataValueType::Text,
+            )
+            .await?;
+            MetadataKv::unset_with_store(
+                meta,
+                MetadataScope::AgentCapturePending,
+                &scope.repo_id,
+                &entry.key,
+            )
+            .await?;
+            quarantined_count = quarantined_count.saturating_add(1);
+        }
+    }
+    let window_full = headers.len() >= MAX_ARTIFACTS;
+    Ok(PendingCandidateBatch {
+        headers,
+        quarantined: quarantined_count,
+        conflicting_namespaces,
+        window_full,
+    })
+}
+
+/// Store-backed counterpart to [`quarantine_checkpoint_if_present`].
+#[allow(dead_code)]
+pub(crate) async fn quarantine_checkpoint_if_present_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    repo_id: &str,
+    checkpoint: &str,
+) -> Result<bool> {
+    if !has_header_for_checkpoint_with_store(meta, repo_id, checkpoint).await? {
+        return Ok(false);
+    }
+    validate_queue_repo_with_store(meta, config, repo_id).await?;
+    let existing_q = MetadataKv::get_with_store(
+        meta,
+        MetadataScope::AgentCaptureQuarantine,
+        repo_id,
+        checkpoint,
+    )
+    .await?;
+    if existing_q.is_none()
+        && let Some(entry) = MetadataKv::get_with_store(
+            meta,
+            MetadataScope::AgentCapturePending,
+            repo_id,
+            checkpoint,
+        )
+        .await?
+    {
+        MetadataKv::set_with_store(
+            meta,
+            MetadataScope::AgentCaptureQuarantine,
+            repo_id,
+            checkpoint,
+            &entry.value,
+            MetadataValueType::Text,
+        )
+        .await?;
+        MetadataKv::unset_with_store(
+            meta,
+            MetadataScope::AgentCapturePending,
+            repo_id,
+            checkpoint,
+        )
+        .await?;
+    }
+    Ok(true)
+}
+
+/// Store-backed counterpart to [`remove_artifact`].
+#[allow(dead_code)]
+pub(crate) async fn remove_artifact_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    repo_id: &str,
+    checkpoint: &str,
+    owned_aliases: &[String],
+) -> Result<bool> {
+    ensure!(
+        uuid::Uuid::parse_str(checkpoint).is_ok_and(|id| id.to_string() == checkpoint),
+        "invalid capture artifact cleanup identity; run `libra agent doctor`"
+    );
+    let mut aliases = std::collections::HashSet::new();
+    let mut retained = false;
+    for scope in [
+        MetadataScope::AgentCapturePending,
+        MetadataScope::AgentCaptureQuarantine,
+    ] {
+        if let Some(entry) = MetadataKv::get_with_store(meta, scope, repo_id, checkpoint).await? {
+            let alias = (entry.value.len() <= MAX_HEADER_BYTES)
+                .then(|| pending_identity::header_alias_attribution(&entry.value, checkpoint))
+                .flatten();
+            match alias {
+                Some(alias) if owned_aliases.contains(&alias) => {
+                    MetadataKv::unset_with_store(meta, scope, repo_id, checkpoint).await?;
+                    aliases.insert(alias);
+                }
+                _ => retained = true,
+            }
+        }
+    }
+    let prefix = format!("{checkpoint}/");
+    let chunks = MetadataKv::list_with_store(
+        meta,
+        MetadataScope::AgentCapturePendingChunk,
+        repo_id,
+        Some(&prefix),
+    )
+    .await?;
+    if !retained && !aliases.is_empty() {
+        for chunk in chunks {
+            MetadataKv::unset_with_store(
+                meta,
+                MetadataScope::AgentCapturePendingChunk,
+                repo_id,
+                &chunk.key,
+            )
+            .await?;
+        }
+    } else if aliases.is_empty() {
+        retained |= !chunks.is_empty();
+    }
+    for alias in aliases {
+        pending_identity::remove_alias_if_unreferenced_with_store(meta, config, repo_id, &alias)
+            .await?;
+    }
+    Ok(retained)
+}
+
+/// Store-backed counterpart to [`gc_parent_roots`].
+#[allow(dead_code)]
+pub(crate) async fn gc_parent_roots_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+) -> Result<Vec<String>> {
+    let mut entries = meta
+        .list_metadata_scope(MetadataScope::AgentCapturePending.as_str())
+        .await
+        .context("list pending capture headers from store")?;
+    entries.extend(
+        meta.list_metadata_scope(MetadataScope::AgentCaptureQuarantine.as_str())
+            .await
+            .context("list quarantined capture headers from store")?,
+    );
+    ensure!(
+        entries.len() <= MAX_ARTIFACTS,
+        "capture recovery capacity exceeds its safe limit; destructive maintenance stopped"
+    );
+    let mut roots = Vec::new();
+    for entry in entries {
+        ensure!(
+            entry.value_type == "text" && entry.value.len() <= MAX_HEADER_BYTES,
+            "invalid capture recovery header; destructive maintenance stopped"
+        );
+        if let Some(parent) = PendingHeader::decode(&entry.value)?.binding.parent_commit {
+            roots.push(parent);
+        }
+    }
+    Ok(roots)
+}
+
+/// Persist a pending artifact header and base64-encoded chunks into
+/// [`crate::storage::MetadataStore`] without opening SQLite.
+#[allow(dead_code)]
+pub(crate) async fn persist_header_and_chunks_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    header: &PendingHeader,
+    envelope_bytes: &[u8],
+) -> Result<()> {
+    header.binding.validate()?;
+    ensure!(
+        envelope_bytes.len() == header.envelope_bytes
+            && envelope_bytes.len().div_ceil(CHUNK_BYTES) == header.chunks
+            && header.chunks <= MAX_CHUNKS,
+        "capture recovery envelope metadata mismatch; run `libra agent doctor`"
+    );
+    let encoded_header = serde_json::to_string(header)?;
+    ensure!(
+        encoded_header.len() <= MAX_HEADER_BYTES,
+        "capture recovery header exceeds its capacity; retry through the provider"
+    );
+    for (index, chunk) in envelope_bytes.chunks(CHUNK_BYTES).enumerate() {
+        MetadataKv::set_with_store(
+            meta,
+            MetadataScope::AgentCapturePendingChunk,
+            &header.binding.scope.repo_id,
+            &chunk_key(&header.binding.checkpoint_id, index),
+            &STANDARD.encode(chunk),
+            MetadataValueType::Binary,
+        )
+        .await?;
+    }
+    MetadataKv::set_with_store(
+        meta,
+        MetadataScope::AgentCapturePending,
+        &header.binding.scope.repo_id,
+        &header.binding.checkpoint_id,
+        &encoded_header,
+        MetadataValueType::Text,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Store-backed counterpart to [`load_chunks`] using [`crate::storage::MetadataStore`].
+#[allow(dead_code)]
+pub(crate) async fn load_chunks_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    header: &PendingHeader,
+) -> Result<Vec<u8>> {
+    let prefix = format!("{}:", header.binding.checkpoint_id);
+    let mut entries = MetadataKv::list_with_store(
+        meta,
+        MetadataScope::AgentCapturePendingChunk,
+        &header.binding.scope.repo_id,
+        Some(&prefix),
+    )
+    .await?;
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    ensure!(
+        entries.len() == header.chunks,
+        "capture recovery chunks are missing or excessive; run `libra agent doctor`"
+    );
+    let mut bytes = Vec::with_capacity(header.envelope_bytes);
+    for (index, entry) in entries.iter().enumerate() {
+        ensure!(
+            entry.key == chunk_key(&header.binding.checkpoint_id, index)
+                && entry.value_type == "binary",
+            "capture recovery chunk ordering is invalid; run `libra agent doctor`"
+        );
+        let chunk = decode_part(&entry.value, CHUNK_BYTES)?;
+        let expected = if index + 1 == header.chunks {
+            header.envelope_bytes - index * CHUNK_BYTES
+        } else {
+            CHUNK_BYTES
+        };
+        ensure!(
+            chunk.len() == expected,
+            "capture recovery chunk length is invalid; run `libra agent doctor`"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    ensure!(
+        bytes.len() == header.envelope_bytes,
+        "capture recovery envelope length is invalid; run `libra agent doctor`"
+    );
+    Ok(bytes)
 }
 
 #[cfg(test)]

@@ -26,6 +26,9 @@ use super::capture_scope::{
     CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
     authorize_final_capture_commit,
 };
+use crate::storage::capture_store::{
+    AgentExportJobRecord, CaptureExportJobState, CaptureScopeState, CaptureStore,
+};
 
 /// Lease length is exactly deadline_ms + 15_000 (ADR-OG-04), reserving
 /// parse/redact/claim margin after the default export wall-clock budget.
@@ -960,6 +963,265 @@ pub async fn scavenge_expired(conn: &DatabaseConnection, now_ms: i64) -> Result<
         .await
         .context("scavenge expired export jobs")?;
     Ok(result.rows_affected())
+}
+
+/// Deterministic `job_id` for `(agent_kind, provider_session_id)` used by
+/// [`CaptureStore`]-backed export-job operations (`RB-22`).
+#[must_use]
+pub fn export_job_id_for_session(agent_kind: &str, provider_session_id: &str) -> String {
+    let mut name = String::with_capacity(18 + agent_kind.len() + provider_session_id.len());
+    name.push_str("libra:export_job:");
+    name.push_str(agent_kind);
+    name.push(':');
+    name.push_str(provider_session_id);
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
+}
+
+/// Fetch one `agent_export_job` record by `job_id` via [`CaptureStore`] (`RB-22`).
+pub async fn get_export_job_with_capture(
+    capture: &dyn CaptureStore,
+    job_id: &str,
+) -> Result<Option<AgentExportJobRecord>> {
+    capture
+        .get_export_job(job_id)
+        .await
+        .context("read agent_export_job from capture store")
+}
+
+/// Fetch one `agent_export_job` record for `(agent_kind, provider_session_id)`
+/// via [`CaptureStore`] (`RB-22`).
+pub async fn get_export_job_for_session_with_capture(
+    capture: &dyn CaptureStore,
+    agent_kind: &str,
+    provider_session_id: &str,
+) -> Result<Option<AgentExportJobRecord>> {
+    let job_id = export_job_id_for_session(agent_kind, provider_session_id);
+    get_export_job_with_capture(capture, &job_id).await
+}
+
+async fn export_session_is_tombstoned_with_capture(
+    capture: &dyn CaptureStore,
+    agent_kind: &str,
+    provider_session_id: &str,
+) -> Result<bool> {
+    let tombstones = capture
+        .list_import_tombstones()
+        .await
+        .context("check export tombstone barrier in capture store")?;
+    Ok(tombstones
+        .iter()
+        .any(|t| t.agent_kind == agent_kind && t.provider_session_id == provider_session_id))
+}
+
+/// Record one `session.idle` and try to become the runner via [`CaptureStore`] (`RB-22`).
+pub async fn observe_idle_with_capture(
+    capture: &dyn CaptureStore,
+    agent_kind: &str,
+    provider_session_id: &str,
+    scope: &CaptureScope,
+    owner: &str,
+    now_ms: i64,
+) -> Result<IdleOutcome> {
+    scope
+        .assert_provider_session_compatible_with_capture(capture, provider_session_id)
+        .await?;
+    if export_session_is_tombstoned_with_capture(capture, agent_kind, provider_session_id).await? {
+        bail!("erased agent session cannot create or advance an export job");
+    }
+
+    let job_id = export_job_id_for_session(agent_kind, provider_session_id);
+    let mut record = match capture
+        .get_export_job(&job_id)
+        .await
+        .context("read export-job workspace ownership from capture store")?
+    {
+        Some(mut existing) => {
+            if !scope.matches_scope_fields(
+                existing.scope_state,
+                existing.repo_id.as_deref(),
+                existing.worktree_id.as_deref(),
+                existing.workspace_id.as_deref(),
+                existing.workspace_fence,
+            ) {
+                bail!(
+                    "OpenCode export job belongs to a legacy or different workspace scope; refusing to \
+                     advance it — inspect it with `libra worktree doctor` before retrying"
+                );
+            }
+            existing.observed_generation = existing.observed_generation.saturating_add(1);
+            existing.updated_at = now_ms;
+            existing.ttl_expires_at = now_or(now_ms, EXPORT_JOB_TTL_MS);
+            existing
+        }
+        None => AgentExportJobRecord {
+            job_id: job_id.clone(),
+            agent_kind: agent_kind.to_string(),
+            provider_session_id: provider_session_id.to_string(),
+            owner: None,
+            lease_expires_at: None,
+            fence_token: None,
+            observed_generation: 1,
+            processed_generation: 0,
+            state: CaptureExportJobState::Idle,
+            last_error_code: None,
+            created_at: now_ms,
+            updated_at: now_ms,
+            ttl_expires_at: now_or(now_ms, EXPORT_JOB_TTL_MS),
+            repo_id: Some(scope.repo_id.clone()),
+            worktree_id: Some(scope.worktree_id.clone()),
+            workspace_id: scope.workspace_id.clone(),
+            workspace_fence: scope.workspace_fence,
+            scope_state: CaptureScopeState::Scoped,
+        },
+    };
+
+    let lease_available = record.owner.is_none()
+        || record
+            .lease_expires_at
+            .is_none_or(|expires_at| expires_at <= now_ms);
+    let outcome = if lease_available && record.processed_generation < record.observed_generation {
+        let next_fence = record.fence_token.unwrap_or(0).saturating_add(1);
+        record.owner = Some(owner.to_string());
+        record.lease_expires_at = Some(now_or(now_ms, EXPORT_LEASE_MS));
+        record.fence_token = Some(next_fence);
+        record.state = CaptureExportJobState::Inflight;
+        record.updated_at = now_ms;
+        IdleOutcome::Runner {
+            job_id: record.job_id.clone(),
+            fence_token: next_fence,
+            target_generation: record.observed_generation,
+        }
+    } else {
+        IdleOutcome::RecordedOnly
+    };
+
+    capture
+        .upsert_export_job(&record)
+        .await
+        .context("persist agent_export_job observation in capture store")?;
+    Ok(outcome)
+}
+
+/// Advance `processed_generation` to `target` under `(owner, fence_token)` via
+/// [`CaptureStore`] (`RB-22`).
+pub async fn advance_processed_with_capture(
+    capture: &dyn CaptureStore,
+    job: &ExportJobTarget<'_>,
+    owner: &str,
+    fence_token: i64,
+    target: i64,
+    now_ms: i64,
+) -> Result<AdvanceOutcome> {
+    if export_session_is_tombstoned_with_capture(capture, job.agent_kind, job.provider_session_id)
+        .await?
+    {
+        return Ok(AdvanceOutcome::FencedOut);
+    }
+    let Some(mut record) =
+        get_export_job_for_session_with_capture(capture, job.agent_kind, job.provider_session_id)
+            .await?
+    else {
+        return Ok(AdvanceOutcome::FencedOut);
+    };
+    if !job.scope.matches_scope_fields(
+        record.scope_state,
+        record.repo_id.as_deref(),
+        record.worktree_id.as_deref(),
+        record.workspace_id.as_deref(),
+        record.workspace_fence,
+    ) || record.owner.as_deref() != Some(owner)
+        || record.fence_token != Some(fence_token)
+        || record.processed_generation >= target
+    {
+        return Ok(AdvanceOutcome::FencedOut);
+    }
+    record.processed_generation = target;
+    record.updated_at = now_ms;
+    capture
+        .upsert_export_job(&record)
+        .await
+        .context("advance processed_generation in capture store")?;
+    Ok(
+        if record.observed_generation > record.processed_generation {
+            AdvanceOutcome::MoreWork {
+                target_generation: record.observed_generation,
+            }
+        } else {
+            AdvanceOutcome::Clean
+        },
+    )
+}
+
+/// Release an export-job lease under `(owner, fence_token)` via [`CaptureStore`] (`RB-22`).
+pub async fn release_with_capture(
+    capture: &dyn CaptureStore,
+    job: &ExportJobTarget<'_>,
+    owner: &str,
+    fence_token: i64,
+    state: &str,
+    last_error_code: Option<&str>,
+    now_ms: i64,
+) -> Result<bool> {
+    let parsed_state = match state {
+        "idle" => CaptureExportJobState::Idle,
+        "dirty" => CaptureExportJobState::Dirty,
+        "failed" => CaptureExportJobState::Failed,
+        other => bail!("unsupported export job release state '{other}'"),
+    };
+    if export_session_is_tombstoned_with_capture(capture, job.agent_kind, job.provider_session_id)
+        .await?
+    {
+        return Ok(false);
+    }
+    let Some(mut record) =
+        get_export_job_for_session_with_capture(capture, job.agent_kind, job.provider_session_id)
+            .await?
+    else {
+        return Ok(false);
+    };
+    if !job.scope.matches_scope_fields(
+        record.scope_state,
+        record.repo_id.as_deref(),
+        record.worktree_id.as_deref(),
+        record.workspace_id.as_deref(),
+        record.workspace_fence,
+    ) || record.owner.as_deref() != Some(owner)
+        || record.fence_token != Some(fence_token)
+    {
+        return Ok(false);
+    }
+    record.owner = None;
+    record.lease_expires_at = None;
+    record.state = parsed_state;
+    record.last_error_code = last_error_code.map(str::to_string);
+    record.updated_at = now_ms;
+    capture
+        .upsert_export_job(&record)
+        .await
+        .context("release export lease in capture store")?;
+    Ok(true)
+}
+
+/// Advance `processed_generation` and release the lease via [`CaptureStore`] (`RB-22`).
+pub async fn advance_and_release_with_capture(
+    capture: &dyn CaptureStore,
+    job: &ExportJobTarget<'_>,
+    owner: &str,
+    fence_token: i64,
+    target: i64,
+    now_ms: i64,
+) -> Result<AdvanceOutcome> {
+    let outcome =
+        advance_processed_with_capture(capture, job, owner, fence_token, target, now_ms).await?;
+    let state = match outcome {
+        AdvanceOutcome::Clean => Some("idle"),
+        AdvanceOutcome::MoreWork { .. } => Some("dirty"),
+        AdvanceOutcome::FencedOut => None,
+    };
+    if let Some(state) = state {
+        let _ = release_with_capture(capture, job, owner, fence_token, state, None, now_ms).await?;
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]

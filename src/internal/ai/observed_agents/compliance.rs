@@ -66,6 +66,16 @@ async fn read_setting(key: &str) -> Result<Option<String>> {
         .map(|entry| entry.value))
 }
 
+async fn read_setting_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    key: &str,
+) -> Result<Option<String>> {
+    Ok(ConfigKv::get_with_store(store, key)
+        .await
+        .with_context(|| format!("read config '{key}' from store"))?
+        .map(|entry| entry.value))
+}
+
 /// Narrow a validated positive day-count to `u32`, rejecting values that would
 /// silently wrap on an `as u32` cast (a huge config must fail loudly rather
 /// than becoming a tiny — and dangerously destructive — retention window).
@@ -84,10 +94,34 @@ pub async fn retention_transcript_days() -> Result<u32> {
     u32_days(v, RETENTION_TRANSCRIPT_DAYS_KEY)
 }
 
+/// Backend-agnostic counterpart of [`retention_transcript_days`] over [`crate::storage::ConfigStore`].
+pub async fn retention_transcript_days_with_store(
+    store: &dyn crate::storage::ConfigStore,
+) -> Result<u32> {
+    let v = positive_u64_setting(
+        read_setting_with_store(store, RETENTION_TRANSCRIPT_DAYS_KEY).await?,
+        RETENTION_TRANSCRIPT_DAYS_KEY,
+        DEFAULT_RETENTION_TRANSCRIPT_DAYS as u64,
+    )?;
+    u32_days(v, RETENTION_TRANSCRIPT_DAYS_KEY)
+}
+
 /// Resolve `agent.retention.stderr_days` (default 30, must be > 0).
 pub async fn retention_stderr_days() -> Result<u32> {
     let v = positive_u64_setting(
         read_setting(RETENTION_STDERR_DAYS_KEY).await?,
+        RETENTION_STDERR_DAYS_KEY,
+        DEFAULT_RETENTION_STDERR_DAYS as u64,
+    )?;
+    u32_days(v, RETENTION_STDERR_DAYS_KEY)
+}
+
+/// Backend-agnostic counterpart of [`retention_stderr_days`] over [`crate::storage::ConfigStore`].
+pub async fn retention_stderr_days_with_store(
+    store: &dyn crate::storage::ConfigStore,
+) -> Result<u32> {
+    let v = positive_u64_setting(
+        read_setting_with_store(store, RETENTION_STDERR_DAYS_KEY).await?,
         RETENTION_STDERR_DAYS_KEY,
         DEFAULT_RETENTION_STDERR_DAYS as u64,
     )?;
@@ -104,9 +138,28 @@ pub async fn retention_findings_days() -> Result<u32> {
     u32_days(v, RETENTION_FINDINGS_DAYS_KEY)
 }
 
+/// Backend-agnostic counterpart of [`retention_findings_days`] over [`crate::storage::ConfigStore`].
+pub async fn retention_findings_days_with_store(
+    store: &dyn crate::storage::ConfigStore,
+) -> Result<u32> {
+    let v = positive_u64_setting(
+        read_setting_with_store(store, RETENTION_FINDINGS_DAYS_KEY).await?,
+        RETENTION_FINDINGS_DAYS_KEY,
+        DEFAULT_RETENTION_FINDINGS_DAYS as u64,
+    )?;
+    u32_days(v, RETENTION_FINDINGS_DAYS_KEY)
+}
+
 /// Resolve `agent.max_transcript_read_bytes` (default 256 MiB, must be > 0).
 pub async fn max_transcript_read_bytes() -> Result<u64> {
     Ok(max_transcript_read_bytes_setting().await?.0)
+}
+
+/// Backend-agnostic counterpart of [`max_transcript_read_bytes`] over [`crate::storage::ConfigStore`].
+pub async fn max_transcript_read_bytes_with_store(
+    store: &dyn crate::storage::ConfigStore,
+) -> Result<u64> {
+    Ok(max_transcript_read_bytes_setting_with_store(store).await?.0)
 }
 
 /// Resolve the transcript-read setting and report whether the value was
@@ -115,6 +168,20 @@ pub async fn max_transcript_read_bytes() -> Result<u64> {
 /// compliance default.
 pub async fn max_transcript_read_bytes_setting() -> Result<(u64, bool)> {
     let raw = read_setting(MAX_TRANSCRIPT_READ_BYTES_KEY).await?;
+    let explicitly_configured = raw.is_some();
+    let value = positive_u64_setting(
+        raw,
+        MAX_TRANSCRIPT_READ_BYTES_KEY,
+        DEFAULT_MAX_TRANSCRIPT_READ_BYTES,
+    )?;
+    Ok((value, explicitly_configured))
+}
+
+/// Backend-agnostic counterpart of [`max_transcript_read_bytes_setting`] over [`crate::storage::ConfigStore`].
+pub async fn max_transcript_read_bytes_setting_with_store(
+    store: &dyn crate::storage::ConfigStore,
+) -> Result<(u64, bool)> {
+    let raw = read_setting_with_store(store, MAX_TRANSCRIPT_READ_BYTES_KEY).await?;
     let explicitly_configured = raw.is_some();
     let value = positive_u64_setting(
         raw,
@@ -226,6 +293,30 @@ pub async fn write_audit_record<C: ConnectionTrait>(conn: &C, record: &AuditReco
     ))
     .await
     .context("append agent_audit_log record")?;
+    Ok(())
+}
+
+/// Backend-agnostic counterpart of [`write_audit_record`] over [`crate::storage::CaptureStore`].
+pub async fn write_audit_record_with_store(
+    store: &dyn crate::storage::CaptureStore,
+    record: &AuditRecord,
+) -> Result<()> {
+    let stored = crate::storage::AgentAuditLogRecord {
+        audit_id: record.audit_id.clone(),
+        timestamp: record.timestamp.clone(),
+        user_id: record.user_id.clone(),
+        user_name: record.user_name.clone(),
+        action: record.action.clone(),
+        checkpoint_id: record.checkpoint_id.clone(),
+        scope: record.scope.as_str().to_string(),
+        export_path: record.export_path.clone(),
+        justification: record.justification.clone(),
+        granted: record.granted,
+    };
+    store
+        .append_audit_log(&stored)
+        .await
+        .map_err(|err| anyhow::anyhow!("append agent_audit_log record: {err}"))?;
     Ok(())
 }
 

@@ -38,6 +38,64 @@ pub async fn resolve_task_run<C: ConnectionTrait>(
     }))
 }
 
+/// Load one `(task_id, run_id)` pair from `ai_index_task_run` via
+/// [`crate::storage::GitStateStore`].
+pub async fn resolve_task_run_with_store(
+    store: &dyn crate::storage::GitStateStore,
+    task_id: &str,
+    run_id: &str,
+) -> crate::storage::StorageResult<Option<ResolvedTaskRun>> {
+    let rows = store.list_ai_index_task_runs(task_id).await?;
+    Ok(rows
+        .into_iter()
+        .find(|row| row.run_id == run_id)
+        .map(|row| ResolvedTaskRun {
+            task_id: row.task_id,
+            run_id: row.run_id,
+            is_latest: row.is_latest,
+            created_at: row.created_at,
+            base_commit_ref: row.base_commit_ref,
+        }))
+}
+
+/// List every projected run for `task_id` from `ai_index_task_run` via
+/// [`crate::storage::GitStateStore`].
+pub async fn list_task_runs_with_store(
+    store: &dyn crate::storage::GitStateStore,
+    task_id: &str,
+) -> crate::storage::StorageResult<Vec<ResolvedTaskRun>> {
+    let rows = store.list_ai_index_task_runs(task_id).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ResolvedTaskRun {
+            task_id: row.task_id,
+            run_id: row.run_id,
+            is_latest: row.is_latest,
+            created_at: row.created_at,
+            base_commit_ref: row.base_commit_ref,
+        })
+        .collect())
+}
+
+/// Load the latest projected run (`is_latest == true`) for `task_id` via
+/// [`crate::storage::GitStateStore`].
+pub async fn resolve_latest_task_run_with_store(
+    store: &dyn crate::storage::GitStateStore,
+    task_id: &str,
+) -> crate::storage::StorageResult<Option<ResolvedTaskRun>> {
+    let rows = store.list_ai_index_task_runs(task_id).await?;
+    Ok(rows
+        .into_iter()
+        .find(|row| row.is_latest)
+        .map(|row| ResolvedTaskRun {
+            task_id: row.task_id,
+            run_id: row.run_id,
+            is_latest: row.is_latest,
+            created_at: row.created_at,
+            base_commit_ref: row.base_commit_ref,
+        }))
+}
+
 impl ResolvedTaskRun {
     /// Parse `base_commit_ref` under an explicit repository kind (B3-10).
     ///

@@ -8353,7 +8353,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/internal/ai/capture/` 下 12 个非禁改生产文件（`catalog.rs`、`checkpoint.rs`、`key.rs`、`live.rs`、`live_checkpoint.rs`、`live_pipeline.rs`、`pending.rs`、`pending_identity.rs`、`pending_payload.rs`、`recovery.rs`、`snapshot.rs`、`summary.rs`）按双签名保签模式接入 `CaptureStore`、`GitStore` 与 `cross_store` 意图协调器：原样保留 `live_checkpoint.rs:147` 等接收 `DatabaseConnection` 的签名，并行新增 `*_with_capture(&dyn CaptureStore)` 路径，且**严禁触碰 `store.rs` 与 `detach.rs`**（与 `RB-17`..`RB-20` 写集完全不相交，可并行实现）。
 
@@ -8368,16 +8368,16 @@
 | `live_checkpoint.rs:147` 显式接收 `&sea_orm::DatabaseConnection`；`pending_identity.rs:242` 跨 `libra.db` 与 `capture.db` 发布 | `src/internal/ai/capture/live_checkpoint.rs:147`；`src/internal/ai/capture/pending_identity.rs:242` |
 
 **Acceptance criteria:**
-- [ ] 上列 12 文件在 `Redb` 仓库上全部经 `CaptureStore`/`GitStore` 完成会话、检查点、pending 与摘要读写，不打开 `capture.db` 或 `libra.db`。
-- [ ] `live_checkpoint.rs:147` 等既有 `DatabaseConnection` 签名原样保留，SQLite 路径行为不变。
-- [ ] 跨库检查点发布经 `cross_store` 持久化意图发件箱按 `GitStore → CaptureStore` 顺序提交（严禁跳代掩盖缺口）。
-- [ ] `src/internal/ai/capture/store.rs` 与 `src/internal/ai/capture/detach.rs` 零改动。
-- [ ] 既有 SQLite `agent_local_capture_smoke_test` 零回归。
+- [x] 上列 12 文件在 `Redb` 仓库上全部经 `CaptureStore`/`GitStore` 完成会话、检查点、pending 与摘要读写，不打开 `capture.db` 或 `libra.db`。
+- [x] `live_checkpoint.rs:147` 等既有 `DatabaseConnection` 签名原样保留，SQLite 路径行为不变。
+- [x] 跨库检查点发布经 `cross_store` 持久化意图发件箱按 `GitStore → CaptureStore` 顺序提交（严禁跳代掩盖缺口）。
+- [x] `src/internal/ai/capture/store.rs` 与 `src/internal/ai/capture/detach.rs` 零改动。
+- [x] 既有 SQLite `agent_local_capture_smoke_test` 零回归。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::capture::live_checkpoint::tests::redb_capture_catalog_checkpoint_and_cross_store_intent)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::capture::live_checkpoint::tests::redb_capture_catalog_checkpoint_and_cross_store_intent)'`（new，覆盖 AC1、AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test agent_local_capture_smoke_test`（覆盖 AC5；AC4 由 `RB-30` 禁改 diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::capture::live_checkpoint::tests::redb_capture_catalog_checkpoint_and_cross_store_intent)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::capture::live_checkpoint::tests::redb_capture_catalog_checkpoint_and_cross_store_intent)'`（new，覆盖 AC1、AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test agent_local_capture_smoke_test`（覆盖 AC5；AC4 由 `RB-30` 禁改 diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8411,7 +8411,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/internal/ai/` 下 9 个非第三方生产文件（`agent_import.rs`、`capture_scope.rs`、`checkpoint_reader.rs`、`commit_recovery.rs`、`coverage_gate.rs`、`export_job.rs`、`history.rs`、`subagent_content.rs`、`traces.rs`）按双签名保签模式接入 `CaptureStore`/`GitStore`，保持第三方读取器 `provider_index_io.rs` 原样不变。
 
@@ -8425,16 +8425,16 @@
 | 上列 9 个文件读写 `agent_import_*`、`agent_coverage_*`、`agent_export_job`、`agent_subagent_*` 与 `traces` 关联目录 | 2026-11-21 AST 扫描 `src/internal/ai/*.rs` |
 
 **Acceptance criteria:**
-- [ ] `agent_import` 与 `export_job` 在 `Redb` 仓库上读写导入身份、墓碑与导出任务，保持墓碑拒绝重导语义。
-- [ ] `capture_scope`、`coverage_gate` 与 `subagent_content` 在 `Redb` 仓库上完成声明、冲突与修订查询。
-- [ ] `checkpoint_reader`、`commit_recovery`、`history` 与 `traces` 在 `Redb` 仓库上经只读快照查询历史与检查点。
-- [ ] `src/internal/ai/provider_index_io.rs` 零改动。
-- [ ] 既有 SQLite `agent_capture_migration_test` 路径零回归。
+- [x] `agent_import` 与 `export_job` 在 `Redb` 仓库上读写导入身份、墓碑与导出任务，保持墓碑拒绝重导语义。
+- [x] `capture_scope`、`coverage_gate` 与 `subagent_content` 在 `Redb` 仓库上完成声明、冲突与修订查询。
+- [x] `checkpoint_reader`、`commit_recovery`、`history` 与 `traces` 在 `Redb` 仓库上经只读快照查询历史与检查点。
+- [x] `src/internal/ai/provider_index_io.rs` 零改动。
+- [x] 既有 SQLite `agent_capture_migration_test` 路径零回归。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::agent_import::tests::redb_ai_import_coverage_history_and_export_services)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::agent_import::tests::redb_ai_import_coverage_history_and_export_services)'`（new，覆盖 AC1、AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test agent_capture_migration_test`（覆盖 AC5；AC4 由 `RB-30` diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::agent_import::tests::redb_ai_import_coverage_history_and_export_services)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::agent_import::tests::redb_ai_import_coverage_history_and_export_services)'`（new，覆盖 AC1、AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test agent_capture_migration_test`（覆盖 AC5；AC4 由 `RB-30` diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8468,7 +8468,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/internal/ai/memory/{derive_commit,error,projection,reader}.rs`（4 文件）、`src/internal/ai/automation/{history,runtime}.rs`（2 文件）、`src/internal/ai/permission/{approved,runtime_cache}.rs`（2 文件）与 `src/internal/ai/projection/{rebuild,resolver}.rs`（2 文件）共 4 目录、10 文件接入 `crate::storage`。
 
@@ -8482,17 +8482,17 @@
 | `automation/runtime.rs:101` 与 `permission/runtime_cache.rs:89` 直接拼接 `util::DATABASE`；`memory/{projection,reader}.rs` 操作 5 张 `memory_*` 表 | `src/internal/ai/automation/runtime.rs:101`；`src/internal/ai/permission/runtime_cache.rs:89`；`src/internal/ai/memory/projection.rs` |
 
 **Acceptance criteria:**
-- [ ] `memory/{derive_commit,error,projection,reader}.rs` 在 `Redb` 仓库上完成 5 张 `memory_*` 表的派生、重建与路径搜索。
-- [ ] `automation/{history,runtime}.rs` 在 `Redb` 仓库上读写 `automation_log`（不打开 `libra.db`）。
-- [ ] `permission/{approved,runtime_cache}.rs` 在 `Redb` 仓库上读写 `approved_permission` 缓存与审批记录。
-- [ ] `projection/{rebuild,resolver}.rs` 在 `Redb` 仓库上重建并解析 AI 投影表（`ai_*`）。
-- [ ] SQLite 路径既有记忆/权限单元测试零回归。
-- [ ] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
+- [x] `memory/{derive_commit,error,projection,reader}.rs` 在 `Redb` 仓库上完成 5 张 `memory_*` 表的派生、重建与路径搜索。
+- [x] `automation/{history,runtime}.rs` 在 `Redb` 仓库上读写 `automation_log`（不打开 `libra.db`）。
+- [x] `permission/{approved,runtime_cache}.rs` 在 `Redb` 仓库上读写 `approved_permission` 缓存与审批记录。
+- [x] `projection/{rebuild,resolver}.rs` 在 `Redb` 仓库上重建并解析 AI 投影表（`ai_*`）。
+- [x] SQLite 路径既有记忆/权限单元测试零回归。
+- [x] 禁改文件（`db.rs`、`capture/{store,detach}.rs`、`shared_perm.rs`）零改动。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::memory::projection::tests::redb_memory_automation_permission_and_projection_stores)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::memory::projection::tests::redb_memory_automation_permission_and_projection_stores)'`（new，覆盖 AC1、AC2、AC3、AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^internal::ai::(memory|permission)::/)'`（覆盖 AC5；AC6 由 `RB-30` 禁改 diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::memory::projection::tests::redb_memory_automation_permission_and_projection_stores)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::memory::projection::tests::redb_memory_automation_permission_and_projection_stores)'`（new，覆盖 AC1、AC2、AC3、AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^internal::ai::(memory|permission)::/)'`（覆盖 AC5；AC6 由 `RB-30` 禁改 diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 
@@ -8526,7 +8526,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `completed` / `passed`
 
 **Description:** 在隔离集成工作区将 `src/internal/ai/hooks/intent.rs`（1 文件）、`src/internal/ai/mcp_server/{exec,stdio}.rs`（2 文件）、`src/internal/ai/observed_agents/{compliance,hermes_export,trust}.rs`（3 文件）与 `src/internal/ai/observed_agents/native_origin/{attest,registry,verify}.rs`（3 文件）共 4 目录、9 文件接入 `crate::storage`，保持第三方外部 SQLite 解析器 `codex_index.rs` 与 `builtin/hermes.rs` 原样不变。
 
@@ -8540,16 +8540,16 @@
 | `hooks/intent.rs:62`、`mcp_server/{exec:698,stdio:20}`、`native_origin/registry.rs:19` 与 `hermes_export.rs:238` 直接打开 `libra.db`/`capture.db` | `src/internal/ai/hooks/intent.rs:62`；`src/internal/ai/mcp_server/exec.rs:698`；`src/internal/ai/mcp_server/stdio.rs:20`；`src/internal/ai/observed_agents/hermes_export.rs:238`；`src/internal/ai/observed_agents/native_origin/registry.rs:19` |
 
 **Acceptance criteria:**
-- [ ] `hooks/intent.rs` 在 `Redb` 仓库上通过 `ConfigStore`/`GitStore` 读取意图配置，不打开 `libra.db`。
-- [ ] `mcp_server/{exec,stdio}.rs` 在 `Redb` 仓库上通过 `crate::storage` 处理工具请求与状态持久化。
-- [ ] `observed_agents/{compliance,hermes_export,trust}.rs` 与 `native_origin/{attest,registry,verify}.rs` 在 `Redb` 仓库上完成合规导出、信任登记与原生来源校验。
-- [ ] 第三方只读解析器 `codex_index.rs` 与 `builtin/hermes.rs` 零改动。
-- [ ] SQLite 路径既有 `codex_capture_local_test` 零回归。
+- [x] `hooks/intent.rs` 在 `Redb` 仓库上通过 `ConfigStore`/`GitStore` 读取意图配置，不打开 `libra.db`。
+- [x] `mcp_server/{exec,stdio}.rs` 在 `Redb` 仓库上通过 `crate::storage` 处理工具请求与状态持久化。
+- [x] `observed_agents/{compliance,hermes_export,trust}.rs` 与 `native_origin/{attest,registry,verify}.rs` 在 `Redb` 仓库上完成合规导出、信任登记与原生来源校验。
+- [x] 第三方只读解析器 `codex_index.rs` 与 `builtin/hermes.rs` 零改动。
+- [x] SQLite 路径既有 `codex_capture_local_test` 零回归。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::mcp_server::exec::tests::redb_hooks_mcp_observed_and_native_origin_stores)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::mcp_server::exec::tests::redb_hooks_mcp_observed_and_native_origin_stores)'`（new，覆盖 AC1、AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test codex_capture_local_test`（覆盖 AC5；AC4 由 `RB-30` diff 门终审）
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::mcp_server::exec::tests::redb_hooks_mcp_observed_and_native_origin_stores)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=internal::ai::mcp_server::exec::tests::redb_hooks_mcp_observed_and_native_origin_stores)'`（new，覆盖 AC1、AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --test codex_capture_local_test`（覆盖 AC5；AC4 由 `RB-30` diff 门终审）
 
 **Full-suite trigger:** `N/A`（`family child of REL-RB-01`）
 

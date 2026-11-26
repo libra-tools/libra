@@ -31,8 +31,102 @@ pub(crate) enum SummaryErrorKind {
     Catalog,
 }
 
+enum SummaryMetadataSource {
+    Snapshot(CheckpointMetadataRead),
+    Store {
+        checkpoint_id: String,
+        storage: std::path::PathBuf,
+        tree_oid: git_internal::hash::ObjectHash,
+        metadata_oid: git_internal::hash::ObjectHash,
+    },
+}
+
+impl SummaryMetadataSource {
+    fn checkpoint_id(&self) -> &str {
+        match self {
+            Self::Snapshot(checkpoint) => checkpoint.checkpoint_id(),
+            Self::Store { checkpoint_id, .. } => checkpoint_id.as_str(),
+        }
+    }
+
+    fn read(
+        self,
+        budget: &CheckpointReadBudget,
+    ) -> Result<Vec<u8>, crate::internal::ai::checkpoint_reader::CheckpointReaderError> {
+        match self {
+            Self::Snapshot(checkpoint) => checkpoint.read(budget),
+            Self::Store {
+                checkpoint_id,
+                storage,
+                tree_oid,
+                metadata_oid,
+            } => read_store_metadata_blob(&storage, &checkpoint_id, tree_oid, metadata_oid, budget),
+        }
+    }
+}
+
+fn read_store_metadata_blob(
+    storage: &Path,
+    checkpoint_id: &str,
+    tree_oid: git_internal::hash::ObjectHash,
+    metadata_oid: git_internal::hash::ObjectHash,
+    budget: &CheckpointReadBudget,
+) -> Result<Vec<u8>, crate::internal::ai::checkpoint_reader::CheckpointReaderError> {
+    use git_internal::internal::object::{
+        ObjectTrait,
+        tree::{Tree, TreeItemMode},
+    };
+
+    use crate::internal::ai::checkpoint_reader::CheckpointReaderError;
+
+    budget.check()?;
+    if checkpoint_id.len() < 3 || !checkpoint_id.is_ascii() {
+        return Err(CheckpointReaderError::RoleProof);
+    }
+    let client =
+        crate::utils::client_storage::ClientStorage::init_local_existing(storage.join("objects"));
+    let read_tree = |oid: git_internal::hash::ObjectHash| -> Result<Tree, CheckpointReaderError> {
+        let raw = client
+            .get(&oid)
+            .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
+        Tree::from_bytes(&raw, oid).map_err(|_| CheckpointReaderError::ObjectIntegrity)
+    };
+    let descend = |tree: &Tree, name: &str| -> Result<Tree, CheckpointReaderError> {
+        let item = tree
+            .tree_items
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or(CheckpointReaderError::UnknownLayout)?;
+        if item.mode != TreeItemMode::Tree {
+            return Err(CheckpointReaderError::UnknownLayout);
+        }
+        read_tree(item.id)
+    };
+    let root = read_tree(tree_oid)?;
+    let wrapped = descend(&root, "checkpoint")?;
+    let prefix = descend(&wrapped, &checkpoint_id[..2])?;
+    let inner = descend(&prefix, &checkpoint_id[2..])?;
+    let metadata_entry = inner
+        .tree_items
+        .iter()
+        .find(|entry| entry.name == "metadata.json")
+        .ok_or(CheckpointReaderError::RoleProof)?;
+    if metadata_entry.mode != TreeItemMode::Blob || metadata_entry.id != metadata_oid {
+        return Err(CheckpointReaderError::RoleProof);
+    }
+    budget.check()?;
+    let bytes = client
+        .get(&metadata_oid)
+        .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(CheckpointReaderError::Budget);
+    }
+    budget.check()?;
+    Ok(bytes)
+}
+
 pub(crate) struct SessionSummaryRead {
-    checkpoint: Option<CheckpointMetadataRead>,
+    checkpoint: Option<SummaryMetadataSource>,
     pending: bool,
     budget: CheckpointReadBudget,
     session_id: String,
@@ -93,6 +187,84 @@ impl SessionSummaryRead {
         let pending = CaptureCatalogStore::session_summary_is_pending(txn, session_id).await?;
         let checkpoint =
             latest_session_metadata_in_snapshot(txn, storage, session_id, &budget).await?;
+        Ok(Self {
+            checkpoint: checkpoint.map(SummaryMetadataSource::Snapshot),
+            pending,
+            budget,
+            session_id: session_id.to_owned(),
+            agent_kind: agent_kind.to_owned(),
+        })
+    }
+
+    /// Store-backed counterpart to [`Self::prepare`] using [`crate::storage::CaptureStore`]
+    /// and [`crate::storage::ConfigStore`] without opening SQLite.
+    #[allow(dead_code)]
+    pub(crate) async fn prepare_with_capture(
+        capture: &dyn crate::storage::CaptureStore,
+        config: &dyn crate::storage::ConfigStore,
+        storage: &Path,
+        session_id: &str,
+    ) -> anyhow::Result<Self> {
+        let budget =
+            CheckpointReadBudget::new(Instant::now() + Duration::from_secs(1), Arc::new(|| false));
+        Self::prepare_for_with_capture(capture, config, storage, session_id, "codex", budget).await
+    }
+
+    /// Store-backed counterpart to [`Self::prepare_for`] using
+    /// [`crate::storage::CaptureStore`] and [`crate::storage::ConfigStore`].
+    #[allow(dead_code)]
+    pub(crate) async fn prepare_for_with_capture(
+        capture: &dyn crate::storage::CaptureStore,
+        config: &dyn crate::storage::ConfigStore,
+        storage: &Path,
+        session_id: &str,
+        agent_kind: &str,
+        budget: CheckpointReadBudget,
+    ) -> anyhow::Result<Self> {
+        budget.check()?;
+        let pending =
+            CaptureCatalogStore::session_summary_is_pending_with_capture(capture, session_id)
+                .await?;
+        let mut checkpoints = capture
+            .list_checkpoints_by_session(session_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("list session checkpoints from capture store: {err}"))?;
+        checkpoints.retain(|cp| cp.scope == crate::storage::CaptureCheckpointScope::Committed);
+        checkpoints.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.checkpoint_id.cmp(&a.checkpoint_id))
+        });
+        let latest = checkpoints.into_iter().next();
+        let checkpoint = match latest {
+            Some(cp) => {
+                let format_entry =
+                    crate::internal::config::ConfigKv::get_with_store(config, "core.objectformat")
+                        .await?;
+                if format_entry.as_ref().is_some_and(|e| e.encrypted) {
+                    anyhow::bail!("encrypted core.objectformat is unsupported for summary read");
+                }
+                let kind = match format_entry {
+                    Some(entry) => {
+                        crate::internal::object_format::parse_config_value(&entry.value)?
+                    }
+                    None => git_internal::hash::HashKind::Sha1,
+                };
+                let tree_oid =
+                    crate::internal::object_format::parse_hex_for_kind(kind, &cp.tree_oid)?;
+                let metadata_oid = crate::internal::object_format::parse_hex_for_kind(
+                    kind,
+                    &cp.metadata_blob_oid,
+                )?;
+                Some(SummaryMetadataSource::Store {
+                    checkpoint_id: cp.checkpoint_id,
+                    storage: storage.to_path_buf(),
+                    tree_oid,
+                    metadata_oid,
+                })
+            }
+            None => None,
+        };
         Ok(Self {
             checkpoint,
             pending,

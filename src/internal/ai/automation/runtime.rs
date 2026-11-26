@@ -3,18 +3,15 @@ use std::path::Path;
 use sea_orm::DatabaseConnection;
 
 use crate::{
-    internal::{
-        ai::{
-            automation::{
-                config::AutomationConfig,
-                events::{AutomationError, AutomationRunResult, AutomationRuntimeEvent},
-                executor::AutomationExecutor,
-                history::AutomationHistory,
-                scheduler::AutomationScheduler,
-            },
-            hooks::{HookEvent, LifecycleEventKind},
+    internal::ai::{
+        automation::{
+            config::AutomationConfig,
+            events::{AutomationError, AutomationRunResult, AutomationRuntimeEvent},
+            executor::AutomationExecutor,
+            history::AutomationHistory,
+            scheduler::AutomationScheduler,
         },
-        db,
+        hooks::{HookEvent, LifecycleEventKind},
     },
     utils::util,
 };
@@ -98,10 +95,71 @@ pub async fn dispatch_repo_hook_lifecycle_event_to_history(
         return Ok(Vec::new());
     }
 
-    let conn = db::get_db_conn_instance_for_path(&storage_path.join(util::DATABASE))
+    match crate::storage::runtime::detect_repo_backend(storage_path)
+        .map_err(|error| AutomationError::Database(error.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let store = crate::storage::runtime::open_git_state_store_read_write(storage_path)
+                    .await
+                    .map_err(|error| AutomationError::Database(error.to_string()))?;
+                dispatch_hook_event_with_config_to_history_with_store(
+                    working_dir,
+                    store.as_ref(),
+                    config,
+                    hook_event,
+                )
+                .await
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (working_dir, config, hook_event);
+                Err(AutomationError::Database(
+                    "this Libra binary was compiled without `storage-redb`".to_string(),
+                ))
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = crate::internal::db::get_db_conn_instance_for_path(
+                    &storage_path.join(util::DATABASE),
+                )
+                .await
+                .map_err(|error| AutomationError::Database(error.to_string()))?;
+                dispatch_hook_event_with_config_to_history(working_dir, &conn, config, hook_event)
+                    .await
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (working_dir, config, hook_event);
+                Err(AutomationError::Database(
+                    "this Libra binary was compiled without `storage-sqlite`".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// Dispatch a normalized hook lifecycle event through automation rules and
+/// persist every matched rule result via [`crate::storage::GitStateStore`].
+pub async fn dispatch_hook_lifecycle_event_to_history_with_store(
+    working_dir: &Path,
+    store: &dyn crate::storage::GitStateStore,
+    event_kind: LifecycleEventKind,
+) -> Result<Vec<AutomationRunResult>, AutomationError> {
+    let Some(hook_event) = automation_hook_event(event_kind) else {
+        return Ok(Vec::new());
+    };
+    if unknown_scope_dispatch_disabled(working_dir) {
+        return Ok(Vec::new());
+    }
+
+    let config = AutomationConfig::load_from_working_dir(working_dir)?;
+    config.validate()?;
+    dispatch_hook_event_with_config_to_history_with_store(working_dir, store, config, hook_event)
         .await
-        .map_err(|error| AutomationError::Database(error.to_string()))?;
-    dispatch_hook_event_with_config_to_history(working_dir, &conn, config, hook_event).await
 }
 
 /// Best-effort VCS event bridge for top-level Libra VCS commands.
@@ -177,10 +235,65 @@ pub async fn dispatch_repo_vcs_event_to_history(
         return Ok(Vec::new());
     }
 
-    let conn = db::get_db_conn_instance_for_path(&storage_path.join(util::DATABASE))
-        .await
-        .map_err(|error| AutomationError::Database(error.to_string()))?;
-    dispatch_vcs_event_with_config_to_history(working_dir, &conn, config, event).await
+    match crate::storage::runtime::detect_repo_backend(storage_path)
+        .map_err(|error| AutomationError::Database(error.to_string()))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let store = crate::storage::runtime::open_git_state_store_read_write(storage_path)
+                    .await
+                    .map_err(|error| AutomationError::Database(error.to_string()))?;
+                dispatch_vcs_event_with_config_to_history_with_store(
+                    working_dir,
+                    store.as_ref(),
+                    config,
+                    event,
+                )
+                .await
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (working_dir, config, event);
+                Err(AutomationError::Database(
+                    "this Libra binary was compiled without `storage-redb`".to_string(),
+                ))
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = crate::internal::db::get_db_conn_instance_for_path(
+                    &storage_path.join(util::DATABASE),
+                )
+                .await
+                .map_err(|error| AutomationError::Database(error.to_string()))?;
+                dispatch_vcs_event_with_config_to_history(working_dir, &conn, config, event).await
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = (working_dir, config, event);
+                Err(AutomationError::Database(
+                    "this Libra binary was compiled without `storage-sqlite`".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// Dispatch a VCS event through automation rules and persist every matched rule
+/// result via [`crate::storage::GitStateStore`].
+pub async fn dispatch_vcs_event_to_history_with_store(
+    working_dir: &Path,
+    store: &dyn crate::storage::GitStateStore,
+    event: &str,
+) -> Result<Vec<AutomationRunResult>, AutomationError> {
+    if unknown_scope_dispatch_disabled(working_dir) {
+        return Ok(Vec::new());
+    }
+    let config = AutomationConfig::load_from_working_dir(working_dir)?;
+    config.validate()?;
+    dispatch_vcs_event_with_config_to_history_with_store(working_dir, store, config, event).await
 }
 
 async fn dispatch_hook_event_with_config_to_history(
@@ -204,6 +317,27 @@ async fn dispatch_hook_event_with_config_to_history(
     Ok(results)
 }
 
+async fn dispatch_hook_event_with_config_to_history_with_store(
+    working_dir: &Path,
+    store: &dyn crate::storage::GitStateStore,
+    config: AutomationConfig,
+    hook_event: HookEvent,
+) -> Result<Vec<AutomationRunResult>, AutomationError> {
+    if !has_matching_hook_rule(&config, hook_event) {
+        return Ok(Vec::new());
+    }
+
+    let scheduler = AutomationScheduler::new(config);
+    let executor = AutomationExecutor::live(working_dir);
+    let results = scheduler
+        .run_event(AutomationRuntimeEvent::hook(hook_event), &executor)
+        .await?;
+    for result in &results {
+        AutomationHistory::append_with_store(store, result).await?;
+    }
+    Ok(results)
+}
+
 async fn dispatch_vcs_event_with_config_to_history(
     working_dir: &Path,
     conn: &DatabaseConnection,
@@ -221,6 +355,27 @@ async fn dispatch_vcs_event_with_config_to_history(
         .await?;
     for result in &results {
         AutomationHistory::append(conn, result).await?;
+    }
+    Ok(results)
+}
+
+async fn dispatch_vcs_event_with_config_to_history_with_store(
+    working_dir: &Path,
+    store: &dyn crate::storage::GitStateStore,
+    config: AutomationConfig,
+    event: &str,
+) -> Result<Vec<AutomationRunResult>, AutomationError> {
+    if !has_matching_vcs_rule(&config, event) {
+        return Ok(Vec::new());
+    }
+
+    let scheduler = AutomationScheduler::new(config);
+    let executor = AutomationExecutor::live(working_dir);
+    let results = scheduler
+        .run_event(AutomationRuntimeEvent::vcs(event), &executor)
+        .await?;
+    for result in &results {
+        AutomationHistory::append_with_store(store, result).await?;
     }
     Ok(results)
 }

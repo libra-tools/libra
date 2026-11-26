@@ -19,6 +19,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
     signature,
 };
+#[cfg(feature = "storage-sqlite")]
 use sea_orm::ConnectionTrait;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -716,15 +717,12 @@ fn verify_challenge(bytes: &[u8], challenge: &str, local: &LocalBinding) -> Resu
     })
 }
 
-pub(super) async fn prepare<C: ConnectionTrait>(
-    conn: &C,
+async fn prepare_from_trust(
+    exporter_trust: TrustRecord,
+    dirs: Vec<PathBuf>,
     worktree: &Path,
     manifest: &Path,
 ) -> Result<PreparedRegistration> {
-    let exporter_trust = trust::read_trust_with_conn(conn, trust::OPENCODE_EXPORTER_SLUG)
-        .await?
-        .ok_or(NativeOriginError::PriorTrust)?;
-    let dirs = trust::read_trusted_dirs_with_conn(conn).await?;
     if !trust::path_within_trusted_dirs(&exporter_trust.path, &dirs) {
         return Err(NativeOriginError::PriorTrust.into());
     }
@@ -771,6 +769,32 @@ pub(super) async fn prepare<C: ConnectionTrait>(
         record,
         observer_executable_sha256: local.observer_executable_sha256,
     })
+}
+
+#[cfg(feature = "storage-sqlite")]
+pub(super) async fn prepare<C: ConnectionTrait>(
+    conn: &C,
+    worktree: &Path,
+    manifest: &Path,
+) -> Result<PreparedRegistration> {
+    let exporter_trust = trust::read_trust_with_conn(conn, trust::OPENCODE_EXPORTER_SLUG)
+        .await?
+        .ok_or(NativeOriginError::PriorTrust)?;
+    let dirs = trust::read_trusted_dirs_with_conn(conn).await?;
+    prepare_from_trust(exporter_trust, dirs, worktree, manifest).await
+}
+
+/// Backend-agnostic counterpart of [`prepare`] using [`crate::storage::ConfigStore`].
+pub(super) async fn prepare_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    worktree: &Path,
+    manifest: &Path,
+) -> Result<PreparedRegistration> {
+    let exporter_trust = trust::read_trust_with_store(store, trust::OPENCODE_EXPORTER_SLUG)
+        .await?
+        .ok_or(NativeOriginError::PriorTrust)?;
+    let dirs = trust::read_trusted_dirs_with_store(store).await?;
+    prepare_from_trust(exporter_trust, dirs, worktree, manifest).await
 }
 
 #[cfg(test)]

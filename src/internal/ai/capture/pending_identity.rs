@@ -324,6 +324,90 @@ impl PreparedPendingAlias {
         }
         Ok(())
     }
+
+    /// Store-backed counterpart to [`Self::publish_for_artifact`] using
+    /// [`crate::storage::CaptureStore`], [`crate::storage::ConfigStore`], and
+    /// [`crate::storage::MetadataStore`] without opening SQLite.
+    #[allow(dead_code)]
+    pub(crate) async fn publish_for_artifact_with_capture(
+        &self,
+        capture: &dyn crate::storage::CaptureStore,
+        config: &dyn crate::storage::ConfigStore,
+        meta: &dyn crate::storage::MetadataStore,
+        checkpoint_id: &str,
+    ) -> Result<()> {
+        ensure!(
+            Uuid::parse_str(checkpoint_id).is_ok_and(|id| id.to_string() == checkpoint_id),
+            REMEDY
+        );
+        let current = super::catalog::resolve_pending_session_context_with_capture(
+            capture,
+            config,
+            self.context.scope(),
+            self.context.session_id(),
+        )
+        .await
+        .map_err(|error| preserve_transient_association_error(error.into()))?;
+        ensure!(current == self.context, REMEDY);
+        let existing = retained_alias_with_store(meta, config, &current).await?;
+        if let Some(existing) = &existing {
+            if existing.alias() != self.alias() {
+                return Err(PendingAliasConflict.into());
+            }
+            ensure!(*existing == self.record, REMEDY);
+        }
+        let pending_entry = MetadataKv::get_with_store(
+            meta,
+            MetadataScope::AgentCapturePending,
+            &current.scope().repo_id,
+            checkpoint_id,
+        )
+        .await
+        .map_err(preserve_transient_association_error)?;
+        let quarantine_entry = MetadataKv::get_with_store(
+            meta,
+            MetadataScope::AgentCaptureQuarantine,
+            &current.scope().repo_id,
+            checkpoint_id,
+        )
+        .await
+        .map_err(preserve_transient_association_error)?;
+        let entry = match (pending_entry, quarantine_entry) {
+            (Some(entry), None) | (None, Some(entry)) => entry,
+            _ => anyhow::bail!(REMEDY),
+        };
+        ensure!(entry.value.len() <= MAX_ALIAS_BYTES, REMEDY);
+        let header = super::pending::PendingHeader::decode(&entry.value)
+            .map_err(|_| anyhow::anyhow!(REMEDY))?;
+        ensure!(
+            header.binding.session_id == self.alias()
+                && header.binding.checkpoint_id == checkpoint_id
+                && header.binding.scope == *current.scope(),
+            REMEDY
+        );
+        if existing.is_none() {
+            let aliases = MetadataKv::list_with_store(
+                meta,
+                MetadataScope::AgentCaptureSessionAlias,
+                &current.scope().repo_id,
+                None,
+            )
+            .await
+            .map_err(preserve_transient_association_error)?;
+            ensure!(aliases.len() < MAX_ALIASES, REMEDY);
+            MetadataKv::set_with_store(
+                meta,
+                MetadataScope::AgentCaptureSessionAlias,
+                &current.scope().repo_id,
+                self.alias(),
+                &self.record.encode()?,
+                crate::internal::metadata::MetadataValueType::Text,
+            )
+            .await
+            .map_err(preserve_transient_association_error)?;
+        }
+        Ok(())
+    }
 }
 
 impl PendingSessionAlias {
@@ -403,6 +487,99 @@ impl PendingSessionAlias {
             record,
             context: context.clone(),
         })
+    }
+
+    /// Store-backed counterpart to [`Self::prepare`] using [`crate::storage::ConfigStore`]
+    /// and [`crate::storage::GitStateStore`].
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_with_store(
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        context: &PendingSessionContext,
+        existing: Option<Self>,
+        storage: &Path,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<PreparedPendingAlias> {
+        let body = existing.as_ref().map_or_else(
+            || AliasBody {
+                version: VERSION,
+                alias: Uuid::new_v4().to_string(),
+                session_id: context.session_id().to_owned(),
+                repo_id: context.scope().repo_id.clone(),
+                worktree_id: context.scope().worktree_id.clone(),
+                workspace_id: context.scope().workspace_id.clone(),
+                capture_incarnation: context.incarnation().map(str::to_owned),
+            },
+            |record| record.body.clone(),
+        );
+        body.validate()?;
+        ensure!(body.matches(context), REMEDY);
+        let bytes = serde_json::to_vec(&body).map_err(|_| anyhow::anyhow!(REMEDY))?;
+        let mac = super::key::authenticate_pending_alias_in_scope_with_store(
+            config,
+            git_state,
+            context.scope(),
+            storage,
+            root,
+            &bytes,
+            existing.as_ref().map(|record| record.mac.as_str()),
+            deadline,
+        )
+        .await
+        .map_err(preserve_transient_association_error)?;
+        let record = Self { body, mac };
+        record.encode()?;
+        Ok(PreparedPendingAlias {
+            record,
+            context: context.clone(),
+        })
+    }
+
+    /// Store-backed counterpart to [`Self::resolve`] using [`crate::storage::CaptureStore`],
+    /// [`crate::storage::ConfigStore`], and [`crate::storage::GitStateStore`].
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn resolve_with_capture(
+        &self,
+        capture: &dyn crate::storage::CaptureStore,
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        scope: &CaptureScope,
+        storage: &Path,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<PendingSessionContext> {
+        ensure!(
+            self.body.repo_id == scope.repo_id
+                && self.body.worktree_id == scope.worktree_id
+                && self.body.workspace_id == scope.workspace_id,
+            REMEDY
+        );
+        let bytes = serde_json::to_vec(&self.body).map_err(|_| anyhow::anyhow!(REMEDY))?;
+        super::key::authenticate_pending_alias_in_scope_with_store(
+            config,
+            git_state,
+            scope,
+            storage,
+            root,
+            &bytes,
+            Some(&self.mac),
+            deadline,
+        )
+        .await
+        .map_err(preserve_transient_association_error)?;
+        let context = super::catalog::resolve_pending_session_context_with_capture(
+            capture,
+            config,
+            scope,
+            &self.body.session_id,
+        )
+        .await
+        .map_err(|error| preserve_transient_association_error(error.into()))?;
+        ensure!(self.body.matches(&context), REMEDY);
+        Ok(context)
     }
 
     /// Authenticate before selecting the sensitive catalog PK. A current
@@ -996,6 +1173,247 @@ pub(crate) async fn remove_alias_if_unreferenced(
     MetadataKv::unset_with_conn(txn, MetadataScope::AgentCaptureSessionAlias, repo_id, alias)
         .await
         .map_err(|_| anyhow::anyhow!(REMEDY))?;
+    Ok(true)
+}
+
+async fn assert_private_repo_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    repo_id: &str,
+) -> Result<()> {
+    let canonical = RepoIdentity::resolve_with_store(config)
+        .await
+        .map_err(|error| anyhow::Error::new(error).context(REMEDY))?;
+    ensure!(canonical.as_str() == repo_id, REMEDY);
+    for scope in [
+        MetadataScope::AgentCapturePending,
+        MetadataScope::AgentCaptureQuarantine,
+        MetadataScope::AgentCapturePendingChunk,
+        MetadataScope::AgentCaptureSessionAlias,
+    ] {
+        let rows = meta
+            .list_metadata_scope(scope.as_str())
+            .await
+            .map_err(|err| anyhow::anyhow!("inspect capture metadata scope: {err}"))?;
+        if rows.iter().any(|row| row.target != repo_id) {
+            anyhow::bail!(REMEDY);
+        }
+    }
+    Ok(())
+}
+
+/// Store-backed counterpart to [`lookup`] using [`crate::storage::MetadataStore`]
+/// and [`crate::storage::ConfigStore`].
+#[allow(dead_code)]
+pub(crate) async fn lookup_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    repo_id: &str,
+    alias: &str,
+) -> Result<Option<PendingSessionAlias>> {
+    ensure!(canonical_alias(alias), REMEDY);
+    assert_private_repo_with_store(meta, config, repo_id)
+        .await
+        .map_err(preserve_transient_association_error)?;
+    let Some(entry) = MetadataKv::get_with_store(
+        meta,
+        MetadataScope::AgentCaptureSessionAlias,
+        repo_id,
+        alias,
+    )
+    .await
+    .map_err(preserve_transient_association_error)?
+    else {
+        return Ok(None);
+    };
+    ensure!(
+        entry.value_type == "text" && entry.value.len() <= MAX_ALIAS_BYTES,
+        REMEDY
+    );
+    Ok(Some(PendingSessionAlias::decode(
+        &entry.value,
+        repo_id,
+        alias,
+    )?))
+}
+
+/// Store-backed counterpart to [`retained_alias`].
+#[allow(dead_code)]
+pub(crate) async fn retained_alias_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    context: &PendingSessionContext,
+) -> Result<Option<PendingSessionAlias>> {
+    assert_private_repo_with_store(meta, config, &context.scope().repo_id)
+        .await
+        .map_err(preserve_transient_association_error)?;
+    let rows = MetadataKv::list_with_store(
+        meta,
+        MetadataScope::AgentCaptureSessionAlias,
+        &context.scope().repo_id,
+        None,
+    )
+    .await
+    .map_err(preserve_transient_association_error)?;
+    ensure!(rows.len() <= MAX_ALIASES, REMEDY);
+    let mut found = None;
+    for row in rows {
+        ensure!(
+            row.key.len() <= 36 && row.value_type == "text" && row.value.len() <= MAX_ALIAS_BYTES,
+            REMEDY
+        );
+        let record = PendingSessionAlias::decode(&row.value, &context.scope().repo_id, &row.key)?;
+        if record.matches_context(context) {
+            ensure!(found.is_none(), REMEDY);
+            found = Some(record);
+        }
+    }
+    Ok(found)
+}
+
+/// Store-backed counterpart to [`aliases_for_erasure`].
+#[allow(dead_code)]
+pub(crate) async fn aliases_for_erasure_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    scope: &CaptureScope,
+    session_id: &str,
+    incarnation: Option<&str>,
+) -> Result<ErasureAliases> {
+    let repo = RepoIdentity::resolve_with_store(config)
+        .await
+        .map_err(|_| anyhow::anyhow!(REMEDY))?;
+    ensure!(repo.as_str() == scope.repo_id, REMEDY);
+    let rows = MetadataKv::list_with_store(
+        meta,
+        MetadataScope::AgentCaptureSessionAlias,
+        &scope.repo_id,
+        None,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(REMEDY))?;
+    let mut result = ErasureAliases {
+        aliases: Vec::new(),
+        unassigned: rows.len() > MAX_ALIASES,
+        repo_id: scope.repo_id.clone(),
+        session_id: session_id.to_owned(),
+        incarnation: incarnation.map(str::to_owned),
+        other_incarnation: false,
+    };
+    for row in rows.into_iter().take(MAX_ALIASES + 1) {
+        let record = if row.key.len() <= 36
+            && row.value_type == "text"
+            && row.value.len() <= MAX_ALIAS_BYTES
+        {
+            PendingSessionAlias::decode(&row.value, &scope.repo_id, &row.key).ok()
+        } else {
+            None
+        };
+        if let Some(record) = record {
+            let body = &record.body;
+            if body.session_id == session_id {
+                if body.capture_incarnation.as_deref() == incarnation {
+                    result.aliases.push(body.alias.clone());
+                } else {
+                    result.other_incarnation = true;
+                }
+            }
+        } else {
+            result.unassigned = true;
+        }
+    }
+    Ok(result)
+}
+
+/// Store-backed counterpart to [`erase_attributed_aliases`].
+#[allow(dead_code)]
+pub(crate) async fn erase_attributed_aliases_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    owned: &ErasureAliases,
+) -> Result<()> {
+    let repo = RepoIdentity::resolve_with_store(config)
+        .await
+        .map_err(|_| anyhow::anyhow!(REMEDY))?;
+    ensure!(repo.as_str() == owned.repo_id, REMEDY);
+    for alias in &owned.aliases {
+        let Some(entry) = MetadataKv::get_with_store(
+            meta,
+            MetadataScope::AgentCaptureSessionAlias,
+            &owned.repo_id,
+            alias,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!(REMEDY))?
+        else {
+            continue;
+        };
+        ensure!(
+            entry.value_type == "text" && entry.value.len() <= MAX_ALIAS_BYTES,
+            REMEDY
+        );
+        let record = PendingSessionAlias::decode(&entry.value, &owned.repo_id, alias)?;
+        ensure!(
+            record.body.session_id == owned.session_id
+                && record.body.capture_incarnation == owned.incarnation,
+            REMEDY
+        );
+        MetadataKv::unset_with_store(
+            meta,
+            MetadataScope::AgentCaptureSessionAlias,
+            &owned.repo_id,
+            alias,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!(REMEDY))?;
+    }
+    Ok(())
+}
+
+/// Store-backed counterpart to [`remove_alias_if_unreferenced`].
+#[allow(dead_code)]
+pub(crate) async fn remove_alias_if_unreferenced_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    config: &dyn crate::storage::ConfigStore,
+    repo_id: &str,
+    alias: &str,
+) -> Result<bool> {
+    ensure!(canonical_alias(alias), REMEDY);
+    let repo = RepoIdentity::resolve_with_store(config)
+        .await
+        .map_err(|_| anyhow::anyhow!(REMEDY))?;
+    ensure!(repo.as_str() == repo_id, REMEDY);
+    let mut rows =
+        MetadataKv::list_with_store(meta, MetadataScope::AgentCapturePending, repo_id, None)
+            .await
+            .map_err(|_| anyhow::anyhow!(REMEDY))?;
+    rows.extend(
+        MetadataKv::list_with_store(meta, MetadataScope::AgentCaptureQuarantine, repo_id, None)
+            .await
+            .map_err(|_| anyhow::anyhow!(REMEDY))?,
+    );
+    if rows.len() > MAX_ALIASES {
+        return Ok(false);
+    }
+    for row in rows {
+        let Some(attribution) = (row.key.len() <= 36 && row.value.len() <= MAX_ALIAS_BYTES)
+            .then(|| header_alias_attribution(&row.value, &row.key))
+            .flatten()
+        else {
+            return Ok(false);
+        };
+        if attribution == alias {
+            return Ok(false);
+        }
+    }
+    MetadataKv::unset_with_store(
+        meta,
+        MetadataScope::AgentCaptureSessionAlias,
+        repo_id,
+        alias,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(REMEDY))?;
     Ok(true)
 }
 

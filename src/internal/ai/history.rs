@@ -84,6 +84,11 @@ use crate::{
         },
         model::reference::{self, ConfigKind},
     },
+    storage::{
+        backend::StorageBackendKind,
+        capture_store::{AgentSessionCommitRecord, CaptureHashKind, CaptureStore},
+        git_store::{GitStore, RefKey, RefTarget},
+    },
     utils::{
         object::{
             git_object_hash, read_git_object, read_git_object_bounded_validated, write_git_object,
@@ -1967,13 +1972,20 @@ impl HistoryManager {
         match (has_catalog, has_repository) {
             (true, true) => Ok(None),
             (true, false) => Ok(Some(self.db_conn.as_ref().clone())),
-            (false, _) => crate::internal::ai::capture::store::open_existing_writer(
-                &self.repo_path,
-                crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
-            )
-            .await
-            .map(Some)
-            .context("open the capture database for traces history"),
+            (false, _) => match crate::storage::runtime::detect_repo_backend(&self.repo_path)
+                .context("detect storage backend for traces history")?
+            {
+                StorageBackendKind::Redb => Ok(None),
+                StorageBackendKind::Sqlite => {
+                    crate::internal::ai::capture::store::open_existing_writer(
+                        &self.repo_path,
+                        crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+                    )
+                    .await
+                    .map(Some)
+                    .context("open the capture database for traces history")
+                }
+            },
         }
     }
 
@@ -4155,27 +4167,47 @@ impl HistoryManager {
                 .context("verify rejected checkpoint cleanup candidate")?
                 .is_some());
         }
-        let capture = match crate::internal::ai::capture::store::open_readonly(
-            &self.repo_path,
-            crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
-        )
-        .await
+        match crate::storage::runtime::detect_repo_backend(&self.repo_path)
+            .context("detect storage backend for rejected object cleanup")?
         {
-            Ok(capture) => capture,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(error).context("open the capture database for rejected object cleanup");
+            StorageBackendKind::Redb => {
+                let capture =
+                    crate::storage::runtime::open_capture_store_read_only(&self.repo_path)
+                        .await
+                        .context("open capture store for rejected object cleanup")?;
+                return Ok(capture
+                    .get_checkpoint(checkpoint_id)
+                    .await
+                    .context("verify rejected checkpoint cleanup candidate in capture store")?
+                    .is_some());
             }
-        };
-        Ok(capture
-            .query_one_raw(Statement::from_sql_and_values(
-                capture.get_database_backend(),
-                sql,
-                values,
-            ))
-            .await
-            .context("verify rejected checkpoint cleanup candidate in the capture database")?
-            .is_some())
+            StorageBackendKind::Sqlite => {
+                let capture = match crate::internal::ai::capture::store::open_readonly(
+                    &self.repo_path,
+                    crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(capture) => capture,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => {
+                        return Err(error)
+                            .context("open the capture database for rejected object cleanup");
+                    }
+                };
+                Ok(capture
+                    .query_one_raw(Statement::from_sql_and_values(
+                        capture.get_database_backend(),
+                        sql,
+                        values,
+                    ))
+                    .await
+                    .context(
+                        "verify rejected checkpoint cleanup candidate in the capture database",
+                    )?
+                    .is_some())
+            }
+        }
     }
 
     async fn rejected_cleanup_db_snapshot<C: ConnectionTrait>(
@@ -7095,6 +7127,204 @@ pub async fn persist_ai_session(
 /// Canonical intent-ref name. KEEP capture paths must not import [`AI_REF`].
 pub fn ai_ref_name() -> &'static str {
     AI_REF
+}
+
+fn load_tree_from_repo_path(repo_path: &Path, tree_id: &ObjectHash) -> Result<Vec<TreeItem>> {
+    let data = read_git_object(repo_path, tree_id)?;
+    let tree = Tree::from_bytes(&data, *tree_id)?;
+    Ok(tree.tree_items)
+}
+
+fn load_commit_tree_from_repo_path(
+    repo_path: &Path,
+    commit_id: &ObjectHash,
+) -> Result<Vec<TreeItem>> {
+    let data = read_git_object(repo_path, commit_id)?;
+    let content = String::from_utf8_lossy(&data);
+    for line in content.lines() {
+        if let Some(hash_str) = line.strip_prefix("tree ") {
+            let tree_hash = crate::internal::ai::util::parse_repo_object_id(hash_str)
+                .map_err(|e| anyhow!("Invalid tree hash in commit: {}", e))?;
+            return load_tree_from_repo_path(repo_path, &tree_hash);
+        }
+    }
+    Err(anyhow!("Commit has no tree"))
+}
+
+/// Resolve the current head commit of an AI history branch via a read-only
+/// [`GitStore`] handle (`RB-22`).
+pub async fn resolve_history_head_with_git_store(
+    git_store: &dyn GitStore,
+    ref_name: &str,
+) -> Result<Option<ObjectHash>> {
+    let target = git_store
+        .get_ref(&RefKey::LocalBranch {
+            name: ref_name.to_string(),
+        })
+        .await
+        .context("Failed to query history head from git store")?;
+    match target {
+        Some(RefTarget::Direct(commit_hash)) => {
+            crate::internal::ai::util::parse_repo_object_id(&commit_hash)
+                .map(Some)
+                .map_err(|e| anyhow!("Invalid commit hash in git store: {}", e))
+        }
+        Some(RefTarget::Symbolic(_)) | None => Ok(None),
+    }
+}
+
+/// Look up an AI object blob hash by `(object_type, object_id)` via a read-only
+/// [`GitStore`] handle (`RB-22`).
+pub async fn get_object_hash_with_git_store(
+    repo_path: &Path,
+    git_store: &dyn GitStore,
+    ref_name: &str,
+    object_type: &str,
+    object_id: &str,
+) -> Result<Option<ObjectHash>> {
+    let Some(parent_id) = resolve_history_head_with_git_store(git_store, ref_name).await? else {
+        return Ok(None);
+    };
+    let root_items = load_commit_tree_from_repo_path(repo_path, &parent_id)?;
+    if let Some(type_entry) = root_items.iter().find(|item| item.name == object_type) {
+        let type_items = load_tree_from_repo_path(repo_path, &type_entry.id)?;
+        if let Some(item) = type_items.iter().find(|item| item.name == object_id) {
+            return Ok(Some(item.id));
+        }
+    }
+    Ok(None)
+}
+
+/// Find all `(blob_hash, object_type)` entries matching `object_id` via a
+/// read-only [`GitStore`] handle (`RB-22`).
+pub async fn find_object_hashes_with_git_store(
+    repo_path: &Path,
+    git_store: &dyn GitStore,
+    ref_name: &str,
+    object_id: &str,
+) -> Result<Vec<(ObjectHash, String)>> {
+    let Some(parent_id) = resolve_history_head_with_git_store(git_store, ref_name).await? else {
+        return Ok(Vec::new());
+    };
+    let root_items = load_commit_tree_from_repo_path(repo_path, &parent_id)?;
+    let mut matches = Vec::new();
+    for type_entry in root_items {
+        let type_items = load_tree_from_repo_path(repo_path, &type_entry.id)?;
+        if let Some(item) = type_items.iter().find(|item| item.name == object_id) {
+            matches.push((item.id, type_entry.name));
+        }
+    }
+    Ok(matches)
+}
+
+/// Find the first `(blob_hash, object_type)` matching `object_id` via a
+/// read-only [`GitStore`] handle (`RB-22`).
+pub async fn find_object_hash_with_git_store(
+    repo_path: &Path,
+    git_store: &dyn GitStore,
+    ref_name: &str,
+    object_id: &str,
+) -> Result<Option<(ObjectHash, String)>> {
+    Ok(
+        find_object_hashes_with_git_store(repo_path, git_store, ref_name, object_id)
+            .await?
+            .into_iter()
+            .next(),
+    )
+}
+
+/// List all `(object_id, blob_hash)` entries under `object_type` via a
+/// read-only [`GitStore`] handle (`RB-22`).
+pub async fn list_objects_with_git_store(
+    repo_path: &Path,
+    git_store: &dyn GitStore,
+    ref_name: &str,
+    object_type: &str,
+) -> Result<Vec<(String, ObjectHash)>> {
+    let Some(parent_id) = resolve_history_head_with_git_store(git_store, ref_name).await? else {
+        return Ok(Vec::new());
+    };
+    let root_items = load_commit_tree_from_repo_path(repo_path, &parent_id)?;
+    if let Some(type_entry) = root_items.iter().find(|item| item.name == object_type) {
+        let type_items = load_tree_from_repo_path(repo_path, &type_entry.id)?;
+        return Ok(type_items
+            .into_iter()
+            .map(|item| (item.name, item.id))
+            .collect());
+    }
+    Ok(Vec::new())
+}
+
+/// List sorted top-level object types at the current history head via a
+/// read-only [`GitStore`] handle (`RB-22`).
+pub async fn list_object_types_with_git_store(
+    repo_path: &Path,
+    git_store: &dyn GitStore,
+    ref_name: &str,
+) -> Result<Vec<String>> {
+    let Some(parent_id) = resolve_history_head_with_git_store(git_store, ref_name).await? else {
+        return Ok(Vec::new());
+    };
+    let mut root_items = load_commit_tree_from_repo_path(repo_path, &parent_id)?;
+    root_items.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(root_items.into_iter().map(|item| item.name).collect())
+}
+
+fn capture_hash_kind_for_oid(commit_oid: ObjectHash) -> CaptureHashKind {
+    match commit_oid.kind() {
+        git_internal::hash::HashKind::Sha1 => CaptureHashKind::Sha1,
+        git_internal::hash::HashKind::Sha256 => CaptureHashKind::Sha256,
+        git_internal::hash::HashKind::Blake3 => CaptureHashKind::Blake3,
+    }
+}
+
+/// Read the local session links for `commit_oid` via a read-only [`CaptureStore`]
+/// handle, enforcing the same 64-session cap as [`agent_sessions_for_commit`] (`RB-22`).
+pub async fn agent_sessions_for_commit_with_capture(
+    capture: &dyn CaptureStore,
+    commit_oid: ObjectHash,
+) -> Result<Vec<String>> {
+    let hash_kind = capture_hash_kind_for_oid(commit_oid);
+    let oid = commit_oid.to_string();
+    let sessions = capture
+        .list_sessions_by_started_desc()
+        .await
+        .with_context(|| format!("list sessions while reading commit links for {oid}"))?;
+    let mut matched = Vec::new();
+    for session in sessions {
+        let commits = capture
+            .list_session_commits(&session.session_id)
+            .await
+            .with_context(|| format!("read agent session links for commit {oid}"))?;
+        if commits
+            .iter()
+            .any(|row| row.hash_kind == hash_kind && row.commit_oid == oid)
+        {
+            matched.push(session.session_id);
+        }
+    }
+    matched.sort();
+    matched.dedup();
+    if matched.len() > 64 {
+        bail!("commit {oid} has more than 64 agent session links");
+    }
+    Ok(matched)
+}
+
+/// Record a session-to-commit link via [`CaptureStore`] (`RB-22`).
+pub async fn link_agent_session_to_commit_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    commit_oid: ObjectHash,
+) -> Result<()> {
+    capture
+        .put_session_commit(&AgentSessionCommitRecord {
+            session_id: session_id.to_string(),
+            hash_kind: capture_hash_kind_for_oid(commit_oid),
+            commit_oid: commit_oid.to_string(),
+        })
+        .await
+        .with_context(|| format!("link agent session '{session_id}' to commit {commit_oid}"))
 }
 
 pub use crate::internal::ai::traces::{

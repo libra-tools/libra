@@ -73,6 +73,8 @@ pub enum ApprovedStoreError {
     #[error(transparent)]
     Db(#[from] DbErr),
     #[error(transparent)]
+    Storage(#[from] crate::storage::StorageBackendError),
+    #[error(transparent)]
     Workspace(#[from] WorkspaceError),
     #[error("{0}")]
     Conflict(String),
@@ -594,6 +596,279 @@ impl ApprovedRulesetStore {
         }
         txn.commit().await?;
         Ok(result.rows_affected())
+    }
+
+    // -------------------------------------------------------------------------
+    // Backend-agnostic `ConfigStore` + `GitStateStore` methods (RB-23).
+    // -------------------------------------------------------------------------
+
+    /// Resolve `libra.repoid`, minting it once when absent, via
+    /// [`crate::storage::ConfigStore`].
+    pub async fn ensure_repo_identity_with_store(
+        config_store: &dyn crate::storage::ConfigStore,
+    ) -> Result<RepoIdentity, ApprovedStoreError> {
+        RepoIdentity::resolve_or_init_with_store(config_store)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Load every persisted approval for the canonical `libra.repoid` using
+    /// backend-agnostic stores.
+    pub async fn load_with_store(
+        config_store: &dyn crate::storage::ConfigStore,
+        state_store: &dyn crate::storage::GitStateStore,
+    ) -> Result<ApprovedRuleset, ApprovedStoreError> {
+        let identity = Self::ensure_repo_identity_with_store(config_store).await?;
+        Self::load_for_project_id_with_store(state_store, identity.as_str()).await
+    }
+
+    /// Load every persisted approval for an explicit `project_id` via
+    /// [`crate::storage::GitStateStore`].
+    pub async fn load_for_project_id_with_store(
+        state_store: &dyn crate::storage::GitStateStore,
+        project_id: &str,
+    ) -> Result<ApprovedRuleset, ApprovedStoreError> {
+        let rows = state_store.list_approved_permissions(project_id).await?;
+        let rules = rows
+            .into_iter()
+            .map(|row| PermissionRule::new(row.permission, row.pattern, PermissionAction::Allow))
+            .collect();
+        Ok(ApprovedRuleset {
+            project_id: project_id.to_string(),
+            rules,
+        })
+    }
+
+    /// Load Always rows including W4-07 provenance for the canonical identity
+    /// via backend-agnostic stores.
+    pub async fn list_with_provenance_with_store(
+        config_store: &dyn crate::storage::ConfigStore,
+        state_store: &dyn crate::storage::GitStateStore,
+    ) -> Result<Vec<ApprovedPermissionRecord>, ApprovedStoreError> {
+        let identity = Self::ensure_repo_identity_with_store(config_store).await?;
+        Self::list_with_provenance_for_project_id_with_store(state_store, identity.as_str()).await
+    }
+
+    /// Load Always rows including provenance for an explicit `project_id` via
+    /// [`crate::storage::GitStateStore`].
+    pub async fn list_with_provenance_for_project_id_with_store(
+        state_store: &dyn crate::storage::GitStateStore,
+        project_id: &str,
+    ) -> Result<Vec<ApprovedPermissionRecord>, ApprovedStoreError> {
+        let rows = state_store.list_approved_permissions(project_id).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ApprovedPermissionRecord {
+                permission: row.permission,
+                pattern: row.pattern,
+                provenance: ApprovalProvenance {
+                    source_worktree_id: row.source_worktree_id,
+                    source_session_id: row.source_session_id,
+                    source_workspace_id: row.source_workspace_id,
+                },
+            })
+            .collect())
+    }
+
+    /// Persist one `(permission, pattern)` approval under the canonical
+    /// repository identity via backend-agnostic stores. Returns `1` for a fresh
+    /// insert or `0` if the triple already existed (`INSERT OR IGNORE` parity).
+    pub async fn append_with_store(
+        config_store: &dyn crate::storage::ConfigStore,
+        state_store: &dyn crate::storage::GitStateStore,
+        permission: &str,
+        pattern: &str,
+        provenance: &ApprovalProvenance,
+    ) -> Result<u64, ApprovedStoreError> {
+        let identity = Self::ensure_repo_identity_with_store(config_store).await?;
+        Self::append_for_project_id_with_store(
+            state_store,
+            identity.as_str(),
+            permission,
+            pattern,
+            provenance,
+        )
+        .await
+    }
+
+    /// Persist one `(permission, pattern)` approval under an explicit
+    /// `project_id` via [`crate::storage::GitStateStore`]. Returns `1` for a
+    /// fresh insert or `0` if already present.
+    pub async fn append_for_project_id_with_store(
+        state_store: &dyn crate::storage::GitStateStore,
+        project_id: &str,
+        permission: &str,
+        pattern: &str,
+        provenance: &ApprovalProvenance,
+    ) -> Result<u64, ApprovedStoreError> {
+        let existing = state_store.list_approved_permissions(project_id).await?;
+        if existing
+            .iter()
+            .any(|row| row.permission == permission && row.pattern == pattern)
+        {
+            return Ok(0);
+        }
+        let record = crate::storage::ApprovedPermissionRecord {
+            project_id: project_id.to_string(),
+            permission: permission.to_string(),
+            pattern: pattern.to_string(),
+            created_at: Utc::now().timestamp_micros(),
+            source_worktree_id: provenance.source_worktree_id.clone(),
+            source_session_id: provenance.source_session_id.clone(),
+            source_workspace_id: provenance.source_workspace_id.clone(),
+        };
+        state_store.upsert_approved_permission(&record).await?;
+        Ok(1)
+    }
+
+    /// Remove a single `(permission, pattern)` approval for the canonical
+    /// repository identity via backend-agnostic stores.
+    pub async fn remove_with_store(
+        config_store: &dyn crate::storage::ConfigStore,
+        state_store: &dyn crate::storage::GitStateStore,
+        permission: &str,
+        pattern: &str,
+    ) -> Result<u64, ApprovedStoreError> {
+        let identity = Self::ensure_repo_identity_with_store(config_store).await?;
+        Self::remove_for_project_id_with_store(state_store, identity.as_str(), permission, pattern)
+            .await
+    }
+
+    /// Remove a single `(permission, pattern)` approval under an explicit
+    /// `project_id` via [`crate::storage::GitStateStore`].
+    pub async fn remove_for_project_id_with_store(
+        state_store: &dyn crate::storage::GitStateStore,
+        project_id: &str,
+        permission: &str,
+        pattern: &str,
+    ) -> Result<u64, ApprovedStoreError> {
+        let removed = state_store
+            .delete_approved_permission(project_id, permission, pattern)
+            .await?;
+        Ok(u64::from(removed))
+    }
+
+    /// Wipe every persisted approval for the canonical repository identity via
+    /// backend-agnostic stores.
+    pub async fn clear_with_store(
+        config_store: &dyn crate::storage::ConfigStore,
+        state_store: &dyn crate::storage::GitStateStore,
+    ) -> Result<u64, ApprovedStoreError> {
+        let identity = Self::ensure_repo_identity_with_store(config_store).await?;
+        Self::clear_for_project_id_with_store(state_store, identity.as_str()).await
+    }
+
+    /// Wipe every persisted approval for an explicit `project_id` via
+    /// [`crate::storage::GitStateStore`].
+    pub async fn clear_for_project_id_with_store(
+        state_store: &dyn crate::storage::GitStateStore,
+        project_id: &str,
+    ) -> Result<u64, ApprovedStoreError> {
+        let rows = state_store.list_approved_permissions(project_id).await?;
+        let mut removed = 0u64;
+        for row in rows {
+            if state_store
+                .delete_approved_permission(project_id, &row.permission, &row.pattern)
+                .await?
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Delete every approval under `legacy_project_id` via backend-agnostic
+    /// stores, failing closed if it equals the canonical `libra.repoid` or has
+    /// no rows.
+    pub async fn clear_legacy_project_id_with_store(
+        config_store: &dyn crate::storage::ConfigStore,
+        state_store: &dyn crate::storage::GitStateStore,
+        legacy_project_id: &str,
+    ) -> Result<u64, ApprovedStoreError> {
+        let identity = RepoIdentity::resolve_with_store(config_store).await?;
+        if legacy_project_id == identity.as_str() {
+            return Err(ApprovedStoreError::Conflict(format!(
+                "project_id '{legacy_project_id}' is the canonical repository identity; refuse \
+                 to clear current-repository approvals via the legacy recovery path"
+            )));
+        }
+        let rows = state_store
+            .list_approved_permissions(legacy_project_id)
+            .await?;
+        if rows.is_empty() {
+            return Err(ApprovedStoreError::NotFound(format!(
+                "no approved_permission rows use project_id '{legacy_project_id}'"
+            )));
+        }
+        let mut removed = 0u64;
+        for row in rows {
+            if state_store
+                .delete_approved_permission(legacy_project_id, &row.permission, &row.pattern)
+                .await?
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Re-home every approval under `legacy_project_id` onto the current
+    /// `libra.repoid` via backend-agnostic stores. Fails closed on key conflict
+    /// before mutating any row.
+    pub async fn adopt_legacy_project_id_with_store(
+        config_store: &dyn crate::storage::ConfigStore,
+        state_store: &dyn crate::storage::GitStateStore,
+        legacy_project_id: &str,
+    ) -> Result<u64, ApprovedStoreError> {
+        let identity = RepoIdentity::resolve_with_store(config_store).await?;
+        if legacy_project_id == identity.as_str() {
+            return Err(ApprovedStoreError::Conflict(format!(
+                "project_id '{legacy_project_id}' is already the canonical repository identity; \
+                 nothing to adopt"
+            )));
+        }
+        let legacy_rows = state_store
+            .list_approved_permissions(legacy_project_id)
+            .await?;
+        if legacy_rows.is_empty() {
+            return Err(ApprovedStoreError::NotFound(format!(
+                "no approved_permission rows use legacy project_id '{legacy_project_id}'"
+            )));
+        }
+        let canonical_rows = state_store
+            .list_approved_permissions(identity.as_str())
+            .await?;
+        for row in &legacy_rows {
+            if canonical_rows
+                .iter()
+                .any(|c| c.permission == row.permission && c.pattern == row.pattern)
+            {
+                return Err(ApprovedStoreError::Conflict(format!(
+                    "cannot adopt legacy project_id '{legacy_project_id}' onto '{}': one or more \
+                     (permission, pattern) pairs already exist under the canonical identity — clear \
+                     the conflict (or the legacy bucket) before retrying",
+                    identity.as_str()
+                )));
+            }
+        }
+        let mut adopted = 0u64;
+        for row in legacy_rows {
+            let migrated = crate::storage::ApprovedPermissionRecord {
+                project_id: identity.as_str().to_string(),
+                permission: row.permission.clone(),
+                pattern: row.pattern.clone(),
+                created_at: row.created_at,
+                source_worktree_id: row.source_worktree_id,
+                source_session_id: row.source_session_id,
+                source_workspace_id: row.source_workspace_id,
+            };
+            state_store.upsert_approved_permission(&migrated).await?;
+            let _ = state_store
+                .delete_approved_permission(legacy_project_id, &row.permission, &row.pattern)
+                .await?;
+            adopted += 1;
+        }
+        Ok(adopted)
     }
 }
 

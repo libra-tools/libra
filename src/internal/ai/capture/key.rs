@@ -234,6 +234,181 @@ impl PrivateArtifactMacDomain {
     }
 }
 
+/// Store-backed counterpart to [`CaptureScope::assert_capture_key_storage_binding_until`]
+/// using [`crate::storage::ConfigStore`] and [`crate::storage::GitStateStore`]
+/// without opening SQLite.
+pub(crate) async fn assert_capture_key_storage_binding_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    scope: &CaptureScope,
+    storage_path: &Path,
+    authorized_root: &Path,
+    deadline: Instant,
+) -> Result<std::path::PathBuf> {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        ensure_capture_source_commitment_deadline(deadline)?;
+        let identity = crate::internal::workspace::RepoIdentity::resolve_with_store(config)
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(error).context("cannot resolve capture repository identity")
+            })?;
+        if identity.as_str() != scope.repo_id {
+            bail!("capture commitment root does not belong to the authorized scope");
+        }
+        let gitdir = crate::utils::util::try_get_worktree_gitdir(Some(
+            authorized_root.to_path_buf(),
+        ))
+        .with_context(|| {
+            format!(
+                "cannot resolve capture worktree metadata for '{}'",
+                authorized_root.display()
+            )
+        })?;
+        let worktree_id = crate::utils::util::worktree_id_for_gitdir(&gitdir).unwrap_or_default();
+        if worktree_id != scope.worktree_id {
+            bail!("capture commitment root does not belong to the authorized scope");
+        }
+        if let Some(workspace_id) = scope.workspace_id.as_deref() {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let rec = git_state
+                .get_workspace_record(workspace_id)
+                .await
+                .map_err(|err| anyhow::anyhow!("verify capture workspace lease fence: {err}"))?;
+            let is_live = rec.as_ref().is_some_and(|r| {
+                r.repo_id == scope.repo_id
+                    && Some(r.lease_fence) == scope.workspace_fence
+                    && matches!(
+                        r.state,
+                        crate::storage::WorkspaceRecordState::Provisioning
+                            | crate::storage::WorkspaceRecordState::Active
+                            | crate::storage::WorkspaceRecordState::Releasing
+                    )
+                    && r.lease_owner.is_some()
+                    && r.lease_expires_at.is_some_and(|exp| exp > now_ms)
+            });
+            if !is_live {
+                return Err(
+                    crate::internal::ai::capture_scope::CaptureFinalCommitAuthorizationError::WorkspaceFenceRejected
+                        .into(),
+                );
+            }
+        }
+        ensure_capture_source_commitment_deadline(deadline)?;
+        let authorized_storage =
+            crate::utils::util::try_get_storage_path(Some(authorized_root.to_path_buf()))
+                .context("resolve storage for authorized capture root")?
+                .canonicalize()
+                .context("canonicalize storage for authorized capture root")?;
+        let storage_path = storage_path
+            .canonicalize()
+            .context("canonicalize capture commitment storage")?;
+        if authorized_storage != storage_path {
+            bail!("capture commitment storage does not belong to the authorized repository root");
+        }
+        ensure_capture_source_commitment_deadline(deadline)?;
+        Ok(storage_path)
+    })
+    .await
+    .map_err(|_| {
+        anyhow!(
+            crate::internal::ai::capture_scope::CaptureFinalCommitAuthorizationError::DeadlineElapsed
+        )
+    })?
+}
+
+/// Store-backed counterpart to [`authenticate_reasoning_identity_in_scope_until`].
+#[allow(dead_code)]
+pub(crate) async fn authenticate_reasoning_identity_in_scope_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    scope: &CaptureScope,
+    storage_path: &Path,
+    authorized_root: &Path,
+    request: ReasoningIdentityAuthentication<'_>,
+    deadline: Instant,
+) -> Result<String> {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        ensure_capture_source_commitment_deadline(deadline)?;
+        let storage_path = assert_capture_key_storage_binding_with_store(
+            config,
+            git_state,
+            scope,
+            storage_path,
+            authorized_root,
+            deadline,
+        )
+        .await?;
+        authenticate_private_artifact_existing_key(
+            &storage_path,
+            request.body,
+            request.expected_mac,
+            deadline,
+            request.purpose.private_domain(),
+        )
+        .context("cannot authenticate private reasoning identity; run libra agent doctor")
+    })
+    .await
+    .map_err(|_| {
+        anyhow!(
+            crate::internal::ai::capture_scope::CaptureFinalCommitAuthorizationError::DeadlineElapsed
+        )
+    })?
+}
+
+/// Store-backed counterpart to [`authenticate_pending_alias_in_scope_until`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn authenticate_pending_alias_in_scope_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    scope: &CaptureScope,
+    storage_path: &Path,
+    authorized_root: &Path,
+    body: &[u8],
+    expected_mac: Option<&str>,
+    deadline: Instant,
+) -> Result<String> {
+    let storage_path = assert_capture_key_storage_binding_with_store(
+        config,
+        git_state,
+        scope,
+        storage_path,
+        authorized_root,
+        deadline,
+    )
+    .await?;
+    authenticate_private_artifact_existing_key(
+        &storage_path,
+        body,
+        expected_mac,
+        deadline,
+        PrivateArtifactMacDomain::SessionAlias,
+    )
+}
+
+/// Store-backed counterpart to [`authenticate_pending_envelope_in_scope_until`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn authenticate_pending_envelope_in_scope_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    scope: &CaptureScope,
+    storage_path: &Path,
+    authorized_root: &Path,
+    envelope: &[u8],
+    expected_mac: Option<&str>,
+    deadline: Instant,
+) -> Result<String> {
+    let storage_path = assert_capture_key_storage_binding_with_store(
+        config,
+        git_state,
+        scope,
+        storage_path,
+        authorized_root,
+        deadline,
+    )
+    .await?;
+    authenticate_pending_envelope_existing_key(&storage_path, envelope, expected_mac, deadline)
+}
+
 /// Derive or verify a local reasoning commitment with an existing key only.
 /// The body is a bounded metadata descriptor or closed private record, never
 /// a raw field preimage. Scope acquisition and key verification share the
@@ -568,6 +743,133 @@ pub(crate) async fn authenticate_pending_versioned_reasoning_members_in_scope_un
         verify_pending_versioned_reasoning_members(original_envelope, candidate, &decoded)?;
     // The bounded parse/canonical comparisons can be expensive near the
     // envelope cap. Never issue a fresh integrity capability after expiry.
+    ensure_capture_source_commitment_deadline(deadline)?;
+    Ok(PendingIntegrityToken::from_authenticated_members(
+        preflight.envelope_sha256,
+        preflight.payload_sha256,
+        preflight.source_sha256,
+        preflight.associations_sha256,
+        preflight.coverage_sha256,
+    ))
+}
+
+/// Store-backed counterpart to [`authenticate_pending_reasoning_members_in_scope_until`].
+#[allow(dead_code)]
+pub(crate) async fn authenticate_pending_reasoning_members_in_scope_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    request: PendingReasoningAuthentication<'_>,
+) -> Result<PendingIntegrityToken> {
+    let PendingReasoningAuthentication {
+        scope,
+        storage_path,
+        authorized_root,
+        original_envelope,
+        original_mac,
+        members,
+        deadline,
+    } = request;
+    anyhow::ensure!(
+        original_envelope.first() == Some(&b'{'),
+        "capture recovery membership authentication failed; run libra agent doctor"
+    );
+    let storage_path = assert_capture_key_storage_binding_with_store(
+        config,
+        git_state,
+        scope,
+        storage_path,
+        authorized_root,
+        deadline,
+    )
+    .await?;
+    let preflight = authenticate_pending_reasoning_members_existing_key(
+        &storage_path,
+        original_envelope,
+        original_mac,
+        members,
+        deadline,
+    )?;
+    Ok(PendingIntegrityToken::from_authenticated_members(
+        preflight.envelope_sha256,
+        preflight.payload_sha256,
+        preflight.source_sha256,
+        preflight.associations_sha256,
+        preflight.coverage_sha256,
+    ))
+}
+
+/// Store-backed counterpart to [`authenticate_pending_reasoning_original_in_scope_until`].
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn authenticate_pending_reasoning_original_in_scope_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    scope: &CaptureScope,
+    storage_path: &Path,
+    authorized_root: &Path,
+    original_envelope: &[u8],
+    original_mac: &str,
+    deadline: Instant,
+) -> Result<PendingIntegrityToken> {
+    let decoded: PendingEnvelopeMembers<'_> = serde_json::from_slice(original_envelope)
+        .context("capture recovery original membership is invalid; run libra agent doctor")?;
+    authenticate_pending_reasoning_members_in_scope_with_store(
+        config,
+        git_state,
+        PendingReasoningAuthentication {
+            scope,
+            storage_path,
+            authorized_root,
+            original_envelope,
+            original_mac,
+            members: PendingReasoningMembers {
+                binding: decoded.binding.get().as_bytes(),
+                payload: decoded.payload.get().as_bytes(),
+                coverage: decoded.coverage.get().as_bytes(),
+            },
+            deadline,
+        },
+    )
+    .await
+}
+
+/// Store-backed counterpart to [`authenticate_pending_versioned_reasoning_members_in_scope_until`].
+#[allow(dead_code)]
+pub(crate) async fn authenticate_pending_versioned_reasoning_members_in_scope_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    request: PendingVersionedReasoningAuthentication<'_>,
+) -> Result<PendingIntegrityToken> {
+    const REMEDY: &str =
+        "capture recovery membership authentication failed; run libra agent doctor";
+    let PendingVersionedReasoningAuthentication {
+        scope,
+        storage_path,
+        authorized_root,
+        original_envelope,
+        original_mac,
+        expected_binding,
+        candidate,
+        deadline,
+    } = request;
+    anyhow::ensure!(
+        original_envelope.first() == Some(&b'{')
+            && original_envelope.len() <= PENDING_ENVELOPE_MAX_BYTES,
+        REMEDY
+    );
+    let authenticated = AuthenticatedPendingEnvelope::verify_with_store(
+        config,
+        git_state,
+        storage_path,
+        authorized_root,
+        scope,
+        original_envelope,
+        original_mac,
+        deadline,
+    )
+    .await?;
+    let decoded = decode_authenticated_versioned_envelope(&authenticated, expected_binding)?;
+    let preflight =
+        verify_pending_versioned_reasoning_members(original_envelope, candidate, &decoded)?;
     ensure_capture_source_commitment_deadline(deadline)?;
     Ok(PendingIntegrityToken::from_authenticated_members(
         preflight.envelope_sha256,
@@ -960,6 +1262,56 @@ impl ExistingCaptureSourceVerifier {
             crate::internal::ai::capture_scope::CaptureFinalCommitAuthorizationError::DeadlineElapsed))?
     }
 
+    /// Store-backed counterpart to [`Self::acquire`].
+    #[allow(dead_code)]
+    pub(crate) async fn acquire_with_store(
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        scope: &CaptureScope,
+        storage_path: &Path,
+        authorized_root: &Path,
+        deadline: Instant,
+    ) -> Result<Self> {
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            ensure_capture_source_commitment_deadline(deadline)?;
+            let storage_path = assert_capture_key_storage_binding_with_store(
+                config,
+                git_state,
+                scope,
+                storage_path,
+                authorized_root,
+                deadline,
+            )
+            .await?;
+            #[cfg(any(unix, windows))]
+            {
+                let private = CaptureDedupPrivateDir::open_path_read_only(
+                    &storage_path.join(CAPTURE_DEDUP_SECRET_DIR),
+                    "key directory",
+                )?;
+                let secret = private.read_secret()?.context(
+                    "repository-private capture key is missing; run libra agent doctor before retrying attribution",
+                )?;
+                ensure_capture_source_commitment_deadline(deadline)?;
+                Ok(Self {
+                    key: hmac::Key::new(hmac::HMAC_SHA256, &secret),
+                    deadline,
+                })
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = storage_path;
+                Err(CaptureDedupUnsupportedPlatform.into())
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                crate::internal::ai::capture_scope::CaptureFinalCommitAuthorizationError::DeadlineElapsed
+            )
+        })?
+    }
+
     pub(crate) fn derive(
         &self,
         domain: CaptureSourceCommitmentDomain,
@@ -1060,6 +1412,85 @@ pub(crate) async fn derive_snapshot_content_commitment_in_scope_until<
 ) -> Result<String> {
     derive_capture_source_commitment_in_scope_until(
         conn,
+        scope,
+        storage_path,
+        authorized_root,
+        CaptureSourceCommitmentDomain::SnapshotContentV2,
+        preimage,
+        deadline,
+    )
+    .await
+}
+
+/// Store-backed counterpart to [`derive_capture_source_commitment_in_scope_until`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn derive_capture_source_commitment_in_scope_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    scope: &CaptureScope,
+    storage_path: &Path,
+    authorized_root: &Path,
+    domain: CaptureSourceCommitmentDomain,
+    preimage: &[u8; 32],
+    deadline: Instant,
+) -> Result<String> {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        ensure_capture_source_commitment_deadline(deadline)?;
+        let storage_path = assert_capture_key_storage_binding_with_store(
+            config,
+            git_state,
+            scope,
+            storage_path,
+            authorized_root,
+            deadline,
+        )
+        .await?;
+        let mutation_deadline_millis = capture_source_commitment_deadline_millis(deadline)?;
+        ensure_capture_dedup_mutation_deadline(Some(mutation_deadline_millis))?;
+        let secret = load_capture_dedup_secret_with_mutation_deadline(
+            &storage_path,
+            Some(mutation_deadline_millis),
+        )?;
+        ensure_capture_dedup_mutation_deadline(Some(mutation_deadline_millis))?;
+        #[cfg(any(unix, windows))]
+        {
+            let key = hmac::Key::new(hmac::HMAC_SHA256, &secret);
+            let mut context = hmac::Context::with_key(&key);
+            context.update(domain.tag());
+            context.update(preimage);
+            Ok(format!(
+                "{}{}",
+                domain.prefix(),
+                hex::encode(context.sign().as_ref())
+            ))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (secret, domain, preimage);
+            Err(CaptureDedupUnsupportedPlatform.into())
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow!(
+            crate::internal::ai::capture_scope::CaptureFinalCommitAuthorizationError::DeadlineElapsed
+        )
+    })?
+}
+
+/// Store-backed counterpart to [`derive_snapshot_content_commitment_in_scope_until`].
+pub(crate) async fn derive_snapshot_content_commitment_in_scope_with_store(
+    config: &dyn crate::storage::ConfigStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    scope: &CaptureScope,
+    storage_path: &Path,
+    authorized_root: &Path,
+    preimage: &[u8; 32],
+    deadline: Instant,
+) -> Result<String> {
+    derive_capture_source_commitment_in_scope_with_store(
+        config,
+        git_state,
         scope,
         storage_path,
         authorized_root,

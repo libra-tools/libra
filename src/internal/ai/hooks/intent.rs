@@ -7,10 +7,22 @@
 //! stays callable by library users and never parses raw hook data. The shared
 //! hook runtime (`hooks::runtime`) dispatches here only after ingress succeeds.
 
-use std::{path::Path, sync::Arc};
+use std::path::Path;
+#[cfg(any(feature = "storage-sqlite", test))]
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+#[cfg(feature = "storage-redb")]
+use git_internal::{
+    hash::ObjectHash,
+    internal::object::{
+        ObjectTrait,
+        commit::Commit,
+        signature::{Signature, SignatureType},
+        tree::{Tree, TreeItem, TreeItemMode},
+    },
+};
 use serde_json::{Value, json};
 
 use super::{
@@ -20,24 +32,51 @@ use super::{
     },
     provider::HookProvider,
 };
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::{ai::capture::live::set_hash_kind_from_connection, db};
+#[cfg(feature = "storage-redb")]
+use crate::storage::{GitStore, RefCasOutcome, RefKey, RefTarget};
+#[cfg(feature = "storage-redb")]
+use crate::utils::object::read_git_object;
+#[cfg(feature = "storage-sqlite")]
+use crate::utils::util;
 use crate::{
-    internal::{
-        ai::{
-            automation::dispatch_repo_hook_lifecycle_event_to_history,
-            capture::{
-                ingress::CaptureIngressCommand,
-                live::{
-                    build_ai_session_id, narrow_envelope_from_capture_context, redact_session_id,
-                    set_hash_kind_from_connection,
-                },
-            },
-            history,
-            session::{SessionState, SessionStore},
+    internal::ai::{
+        automation::dispatch_repo_hook_lifecycle_event_to_history,
+        capture::{
+            ingress::CaptureIngressCommand,
+            live::{build_ai_session_id, narrow_envelope_from_capture_context, redact_session_id},
         },
-        db,
+        history,
+        session::{SessionState, SessionStore},
     },
-    utils::{client_storage::ClientStorage, error::emit_warning, object::write_git_object, util},
+    utils::{client_storage::ClientStorage, error::emit_warning, object::write_git_object},
 };
+
+enum IntentRepoBackend {
+    #[cfg(feature = "storage-redb")]
+    Redb,
+    #[cfg(feature = "storage-sqlite")]
+    Sqlite(sea_orm::DatabaseConnection),
+}
+
+/// Read `core.objectformat` from a backend-agnostic [`crate::storage::ConfigStore`]
+/// and configure the active Git hash algorithm (defaults to `sha1` when absent).
+#[cfg(feature = "storage-redb")]
+pub(crate) async fn set_hash_kind_from_config_store(
+    store: &dyn crate::storage::ConfigStore,
+) -> Result<git_internal::hash::HashKind> {
+    let raw = store
+        .get("core.objectformat")
+        .await
+        .map_err(|err| anyhow!("failed to read core.objectformat from config store: {err}"))?
+        .map(|entry| entry.value)
+        .unwrap_or_else(|| "sha1".to_string());
+    let hash_kind = crate::internal::object_format::parse_config_value(&raw)
+        .map_err(|err| anyhow!("unsupported object format '{raw}': {err}"))?;
+    git_internal::hash::set_hash_kind(hash_kind);
+    Ok(hash_kind)
+}
 
 /// Persist a command already canonicalized at the hook boundary to the legacy
 /// AI intent session store. This function must never parse or validate raw hook
@@ -59,12 +98,53 @@ pub(super) async fn process_ai_intent_ingress(
 
     let process_cwd = runtime_scope.worktree_root;
     let storage_path = runtime_scope.storage_path;
-    let config_conn = db::open_cached_repository(&storage_path.join(util::DATABASE))
-        .await
-        .map_err(|err| anyhow!("failed to open libra database for hook configuration: {err}"))?;
-    set_hash_kind_from_connection(&config_conn)
-        .await
-        .context("failed to configure hash kind from repo config")?;
+    let repo_backend = match crate::storage::runtime::detect_repo_backend(&storage_path)
+        .map_err(|err| anyhow!("failed to detect repository storage backend: {err}"))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let config_store =
+                    crate::storage::runtime::open_repo_config_store_read_only(&storage_path)
+                        .await
+                        .map_err(|err| {
+                            anyhow!(
+                                "failed to open redb config store for hook configuration: {err}"
+                            )
+                        })?;
+                set_hash_kind_from_config_store(config_store.as_ref())
+                    .await
+                    .context("failed to configure hash kind from repo config")?;
+                IntentRepoBackend::Redb
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                return Err(anyhow!(
+                    "this Libra binary was compiled without `storage-redb`"
+                ));
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let config_conn = db::open_cached_repository(&storage_path.join(util::DATABASE))
+                    .await
+                    .map_err(|err| {
+                        anyhow!("failed to open libra database for hook configuration: {err}")
+                    })?;
+                set_hash_kind_from_connection(&config_conn)
+                    .await
+                    .context("failed to configure hash kind from repo config")?;
+                IntentRepoBackend::Sqlite(config_conn)
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                return Err(anyhow!(
+                    "this Libra binary was compiled without `storage-sqlite`"
+                ));
+            }
+        }
+    };
 
     let process_cwd_str = process_cwd.to_string_lossy().to_string();
     // CEX-EntireIO §11.2: agent capture sessions live under `sessions/agent/`
@@ -207,7 +287,30 @@ pub(super) async fn process_ai_intent_ingress(
     }
 
     if event.kind == LifecycleEventKind::SessionEnd {
-        match persist_session_history(&storage_path, &session, provider, &config_conn).await {
+        let persist_result = match &repo_backend {
+            #[cfg(feature = "storage-redb")]
+            IntentRepoBackend::Redb => {
+                match crate::storage::runtime::open_git_store_read_write(&storage_path).await {
+                    Ok(git_store) => {
+                        persist_session_history_with_store(
+                            &storage_path,
+                            &session,
+                            provider,
+                            git_store.as_ref(),
+                        )
+                        .await
+                    }
+                    Err(err) => Err(anyhow!(
+                        "failed to open redb git store for session history: {err}"
+                    )),
+                }
+            }
+            #[cfg(feature = "storage-sqlite")]
+            IntentRepoBackend::Sqlite(config_conn) => {
+                persist_session_history(&storage_path, &session, provider, config_conn).await
+            }
+        };
+        match persist_result {
             Ok(outcome) => {
                 session
                     .metadata
@@ -617,6 +720,7 @@ fn session_persisted(session: &SessionState) -> bool {
 /// Boundary conditions: any I/O error short-circuits; the caller retains only
 /// a fixed safe reason in session metadata and surfaces an actionable retry
 /// message without rendering filesystem paths or untrusted input.
+#[cfg(any(feature = "storage-sqlite", test))]
 async fn persist_session_history(
     storage_path: &Path,
     session: &SessionState,
@@ -653,6 +757,186 @@ async fn persist_session_history(
         object_hash: object_hash.to_string(),
         already_exists,
     })
+}
+
+/// Backend-agnostic counterpart of [`persist_session_history`] using [`GitStore`].
+#[cfg(feature = "storage-redb")]
+async fn persist_session_history_with_store(
+    storage_path: &Path,
+    session: &SessionState,
+    provider: &dyn HookProvider,
+    git_store: &dyn GitStore,
+) -> Result<PersistOutcome> {
+    const HISTORY_HEAD_CONFLICT_MAX_RETRIES: usize = 32;
+
+    let objects_dir = storage_path.join("objects");
+    std::fs::create_dir_all(&objects_dir)?;
+
+    let _storage = ClientStorage::open_init_storage(objects_dir).map_err(|error| {
+        anyhow!(
+            "failed to read storage configuration for {}",
+            error.variable()
+        )
+    })?;
+    let payload = build_ai_session_payload(session, provider);
+    let blob_data = serde_json::to_vec(&normalize_json_value(payload))
+        .context("failed to serialize ai_session payload")?;
+    let blob_hash = write_git_object(storage_path, "blob", &blob_data)?;
+
+    let ref_key = RefKey::LocalBranch {
+        name: history::ai_ref_name().to_string(),
+    };
+
+    for attempt in 0..=HISTORY_HEAD_CONFLICT_MAX_RETRIES {
+        let current_target = git_store
+            .get_ref(&ref_key)
+            .await
+            .map_err(|err| anyhow!("failed to read AI history ref from git store: {err}"))?;
+        let parent_commit_id = match &current_target {
+            Some(RefTarget::Direct(oid)) => Some(
+                crate::internal::ai::util::parse_repo_object_id(oid)
+                    .map_err(|err| anyhow!("invalid AI history commit hash: {err}"))?,
+            ),
+            Some(RefTarget::Symbolic(_)) => {
+                return Err(anyhow!(
+                    "AI history ref '{}' unexpectedly holds a symbolic target",
+                    history::ai_ref_name()
+                ));
+            }
+            None => None,
+        };
+
+        let mut root_items = match parent_commit_id {
+            Some(parent_id) => load_intent_commit_tree(storage_path, &parent_id)?,
+            None => Vec::new(),
+        };
+
+        let type_tree_entry = root_items
+            .iter()
+            .find(|item| item.name == AI_SESSION_TYPE)
+            .cloned();
+        let mut type_items = match type_tree_entry {
+            Some(entry) => load_intent_tree(storage_path, &entry.id)?,
+            None => Vec::new(),
+        };
+
+        if let Some(existing) = type_items.iter().find(|item| item.name == session.id) {
+            return Ok(PersistOutcome {
+                object_hash: existing.id.to_string(),
+                already_exists: true,
+            });
+        }
+
+        type_items.push(TreeItem::new(
+            TreeItemMode::Blob,
+            blob_hash,
+            session.id.clone(),
+        ));
+        type_items.sort_by(|a, b| a.name.cmp(&b.name));
+        let type_tree_hash = write_intent_tree(storage_path, &type_items)?;
+
+        root_items.retain(|item| item.name != AI_SESSION_TYPE);
+        root_items.push(TreeItem::new(
+            TreeItemMode::Tree,
+            type_tree_hash,
+            AI_SESSION_TYPE.to_string(),
+        ));
+        root_items.sort_by(|a, b| a.name.cmp(&b.name));
+        let root_tree_hash = write_intent_tree(storage_path, &root_items)?;
+
+        let author = Signature::new(
+            SignatureType::Author,
+            "Libra".to_string(),
+            "history@libra".to_string(),
+        );
+        let committer = Signature::new(
+            SignatureType::Committer,
+            "Libra".to_string(),
+            "history@libra".to_string(),
+        );
+        let message = format!("Update {AI_SESSION_TYPE}/{}", session.id);
+        let parents = parent_commit_id.into_iter().collect::<Vec<_>>();
+        let commit = Commit::new(author, committer, root_tree_hash, parents, &message);
+        let commit_data = commit
+            .to_data()
+            .context("failed to serialize AI history commit")?;
+        let commit_hash = write_git_object(storage_path, "commit", &commit_data)
+            .context("failed to write AI history commit")?;
+        let new_target = RefTarget::Direct(commit_hash.to_string());
+
+        match git_store
+            .update_ref_cas(&ref_key, current_target.as_ref(), Some(&new_target), &[])
+            .await
+            .map_err(|err| anyhow!("failed to CAS update AI history ref in git store: {err}"))?
+        {
+            RefCasOutcome::Applied { .. } => {
+                return Ok(PersistOutcome {
+                    object_hash: blob_hash.to_string(),
+                    already_exists: false,
+                });
+            }
+            RefCasOutcome::CasConflict { .. } if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES => {
+                continue;
+            }
+            RefCasOutcome::CasConflict { .. } => {
+                return Err(anyhow!(
+                    "history head changed repeatedly while appending {AI_SESSION_TYPE}/{}",
+                    session.id
+                ));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "history head changed repeatedly while appending {AI_SESSION_TYPE}/{}",
+        session.id
+    ))
+}
+
+#[cfg(feature = "storage-redb")]
+fn load_intent_commit_tree(storage_path: &Path, commit_id: &ObjectHash) -> Result<Vec<TreeItem>> {
+    let data = read_git_object(storage_path, commit_id)?;
+    let content = String::from_utf8_lossy(&data);
+    for line in content.lines() {
+        if let Some(hash_str) = line.strip_prefix("tree ") {
+            let tree_hash = crate::internal::ai::util::parse_repo_object_id(hash_str)
+                .map_err(|err| anyhow!("invalid tree hash in commit: {err}"))?;
+            return load_intent_tree(storage_path, &tree_hash);
+        }
+    }
+    Err(anyhow!("commit has no tree"))
+}
+
+#[cfg(feature = "storage-redb")]
+fn load_intent_tree(storage_path: &Path, tree_id: &ObjectHash) -> Result<Vec<TreeItem>> {
+    let data = read_git_object(storage_path, tree_id)?;
+    let tree = Tree::from_bytes(&data, *tree_id)?;
+    Ok(tree.tree_items)
+}
+
+#[cfg(feature = "storage-redb")]
+fn write_intent_tree(storage_path: &Path, tree_items: &[TreeItem]) -> Result<ObjectHash> {
+    let mut data = Vec::new();
+    for item in tree_items {
+        let mode_str = match item.mode {
+            TreeItemMode::Tree => "40000",
+            TreeItemMode::Blob => "100644",
+            TreeItemMode::BlobExecutable => "100755",
+            TreeItemMode::Link => "120000",
+            TreeItemMode::Commit => "160000",
+        };
+        data.extend_from_slice(mode_str.as_bytes());
+        data.push(b' ');
+        data.extend_from_slice(item.name.as_bytes());
+        data.push(0);
+        let hash_bytes = hex::decode(item.id.to_string())
+            .map_err(|err| anyhow!("invalid tree item hash hex: {err}"))?;
+        if hash_bytes.len() != 20 && hash_bytes.len() != 32 {
+            return Err(anyhow!("invalid object hash length: {}", hash_bytes.len()));
+        }
+        data.extend_from_slice(&hash_bytes);
+    }
+    write_git_object(storage_path, "tree", &data).context("failed to write AI history tree")
 }
 
 /// Construct the canonical JSON payload persisted as an `ai_session` blob.
@@ -1043,5 +1327,65 @@ mod storage_config_upcast_intent_tests {
             !text.contains("failed to read storage configuration"),
             "local must not be a confirmed storage failure: {text}"
         );
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn redb_intent_config_and_history_store_roundtrip() {
+        let prev_hash_kind = git_internal::hash::get_hash_kind();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = temp.path().join(".libra");
+        std::fs::create_dir_all(storage.join("objects")).expect("mkdir objects");
+        let _gen = crate::storage::runtime::init_redb_repository_storage(&storage)
+            .await
+            .expect("init redb repo");
+
+        let cfg_rw = crate::storage::runtime::open_repo_config_store_read_write(&storage)
+            .await
+            .expect("open redb config rw");
+        cfg_rw
+            .set("core.objectformat", "sha256", false)
+            .await
+            .expect("set objectformat=sha256");
+
+        let cfg_ro = crate::storage::runtime::open_repo_config_store_read_only(&storage)
+            .await
+            .expect("open redb config ro");
+        let kind = super::set_hash_kind_from_config_store(cfg_ro.as_ref())
+            .await
+            .expect("set hash kind from redb config store");
+        assert_eq!(kind, git_internal::hash::HashKind::Sha256);
+
+        let git_rw = crate::storage::runtime::open_git_store_read_write(&storage)
+            .await
+            .expect("open redb git store rw");
+        let mut session = SessionState::new(temp.path().to_str().expect("utf8"));
+        session.id = "storage-config-stub__rb24-sess".to_string();
+        let first = super::persist_session_history_with_store(
+            &storage,
+            &session,
+            &StorageConfigStub,
+            git_rw.as_ref(),
+        )
+        .await
+        .expect("persist session history via redb git store");
+        assert!(!first.already_exists);
+        assert_eq!(first.object_hash.len(), 64);
+
+        let second = super::persist_session_history_with_store(
+            &storage,
+            &session,
+            &StorageConfigStub,
+            git_rw.as_ref(),
+        )
+        .await
+        .expect("idempotent second persist via redb git store");
+        assert!(second.already_exists);
+        assert_eq!(second.object_hash, first.object_hash);
+        assert!(!storage.join("libra.db").exists());
+        assert!(!storage.join("private").join("capture.db").exists());
+
+        git_internal::hash::set_hash_kind(prev_hash_kind);
     }
 }

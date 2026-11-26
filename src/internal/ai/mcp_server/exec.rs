@@ -657,67 +657,118 @@ async fn read_worker_request() -> Result<(String, Value), String> {
     Ok((name, arguments))
 }
 
-/// Open the repository database with bounded retries for transient failures.
-///
-/// SQLite lock errors and SQLx native-thread creation failures are distinct:
-/// `Io(EAGAIN)` can mean there is no address space left for a SQLite thread.
-/// The private CLI runtime is bounded to leave room for that thread. This
-/// existing retry loop neither identifies the cause nor relaxes worker limits.
-async fn open_read_worker_database(
-    db_path_text: &str,
-    db_path: &Path,
-) -> Result<sea_orm::DatabaseConnection, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match crate::internal::db::open_connection_without_schema_management(
-            db_path_text,
-            Duration::from_millis(200),
-        )
-        .await
-        {
-            Ok(conn) => return Ok(conn),
-            Err(error) => {
-                let message = error.to_string();
-                let locked = message.contains("WouldBlock")
-                    || message.contains("database is locked")
-                    || message.contains("Resource temporarily unavailable");
-                if locked && Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    continue;
-                }
-                return Err(format!(
-                    "read worker could not open the repository database at {}: {message}",
-                    db_path.display()
-                ));
-            }
-        }
-    }
-}
-
-async fn prepare_read_only_repository(storage: &Path) -> Result<(), String> {
-    let db_path = storage.join(crate::utils::util::DATABASE);
-    let db_path_text = db_path.to_str().ok_or_else(|| {
-        format!(
-            "read worker could not open the repository database at {}: path is not UTF-8",
-            db_path.display()
-        )
-    })?;
-    let conn = open_read_worker_database(db_path_text, &db_path).await?;
-    let current = crate::internal::db::migration::current_builtin_schema_version_readonly(&conn)
+/// Verify repository schema version and configure the active Git hash algorithm
+/// from a backend-agnostic [`crate::storage::ConfigStore`] without mutating state.
+pub async fn prepare_read_only_repository_with_store(
+    store: &dyn crate::storage::ConfigStore,
+) -> Result<git_internal::hash::HashKind, String> {
+    let receipts = store
+        .list_schema_receipts()
         .await
         .map_err(|_| "read worker could not read the repository schema version".to_string())?;
+    let current = receipts.iter().map(|receipt| receipt.version).max();
     let latest = crate::internal::db::migration::latest_builtin_schema_version()
         .map_err(|_| "read worker could not determine its schema version".to_string())?;
     if current.is_none() || current != latest {
         return Err("repository schema is not the version this binary reads".to_string());
     }
-    let object_format = read_object_format(&conn).await?;
+    let object_format = store
+        .get("core.objectformat")
+        .await
+        .map_err(|_| "read worker could not read core.objectformat".to_string())?
+        .map(|entry| entry.value)
+        .unwrap_or_else(|| "sha1".to_string());
     let hash_kind = crate::internal::object_format::parse_config_value(&object_format)
         .map_err(|_| format!("unsupported object format: '{object_format}'"))?;
     git_internal::hash::set_hash_kind(hash_kind);
-    Ok(())
+    Ok(hash_kind)
 }
 
+pub(crate) async fn prepare_read_only_repository(storage: &Path) -> Result<(), String> {
+    match crate::storage::runtime::detect_repo_backend(storage).map_err(|error| {
+        format!("read worker could not detect repository storage backend: {error}")
+    })? {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let store = crate::storage::runtime::open_repo_config_store_read_only(storage)
+                    .await
+                    .map_err(|error| {
+                        format!("read worker could not open the redb repository store: {error}")
+                    })?;
+                prepare_read_only_repository_with_store(store.as_ref()).await?;
+                Ok(())
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                Err("this Libra binary was compiled without `storage-redb`".to_string())
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let db_path = storage.join(crate::utils::util::DATABASE);
+                let db_path_text = db_path.to_str().ok_or_else(|| {
+                    format!(
+                        "read worker could not open the repository database at {}: path is not UTF-8",
+                        db_path.display()
+                    )
+                })?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let conn = loop {
+                    match crate::internal::db::open_connection_without_schema_management(
+                        db_path_text,
+                        Duration::from_millis(200),
+                    )
+                    .await
+                    {
+                        Ok(conn) => break conn,
+                        Err(error) => {
+                            let message = error.to_string();
+                            let locked = message.contains("WouldBlock")
+                                || message.contains("database is locked")
+                                || message.contains("Resource temporarily unavailable");
+                            if locked && Instant::now() < deadline {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                continue;
+                            }
+                            return Err(format!(
+                                "read worker could not open the repository database at {}: {message}",
+                                db_path.display()
+                            ));
+                        }
+                    }
+                };
+                let current =
+                    crate::internal::db::migration::current_builtin_schema_version_readonly(&conn)
+                        .await
+                        .map_err(|_| {
+                            "read worker could not read the repository schema version".to_string()
+                        })?;
+                let latest = crate::internal::db::migration::latest_builtin_schema_version()
+                    .map_err(|_| {
+                        "read worker could not determine its schema version".to_string()
+                    })?;
+                if current.is_none() || current != latest {
+                    return Err(
+                        "repository schema is not the version this binary reads".to_string()
+                    );
+                }
+                let object_format = read_object_format(&conn).await?;
+                let hash_kind = crate::internal::object_format::parse_config_value(&object_format)
+                    .map_err(|_| format!("unsupported object format: '{object_format}'"))?;
+                git_internal::hash::set_hash_kind(hash_kind);
+                Ok(())
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                Err("this Libra binary was compiled without `storage-sqlite`".to_string())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "storage-sqlite")]
 async fn read_object_format(conn: &sea_orm::DatabaseConnection) -> Result<String, String> {
     use sea_orm::{ConnectionTrait, Statement};
     let row = conn
@@ -755,4 +806,655 @@ fn write_worker_error(code: &str, message: &str, retryable: bool) -> CliResult<(
     .map_err(|error| CliError::fatal(format!("read worker could not encode its error: {error}")))?;
     println!("{line}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "storage-redb")]
+    use super::*;
+
+    #[cfg(feature = "storage-redb")]
+    struct CwdGuard(std::path::PathBuf);
+
+    #[cfg(feature = "storage-redb")]
+    impl CwdGuard {
+        fn enter(path: &Path) -> Self {
+            let prev = std::env::current_dir().expect("capture current_dir");
+            std::env::set_current_dir(path).expect("enter test repo cwd");
+            Self(prev)
+        }
+    }
+
+    #[cfg(feature = "storage-redb")]
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[cfg(feature = "storage-redb")]
+    struct HashKindGuard(git_internal::hash::HashKind);
+
+    #[cfg(feature = "storage-redb")]
+    impl HashKindGuard {
+        fn capture() -> Self {
+            Self(git_internal::hash::get_hash_kind())
+        }
+    }
+
+    #[cfg(feature = "storage-redb")]
+    impl Drop for HashKindGuard {
+        fn drop(&mut self) {
+            git_internal::hash::set_hash_kind(self.0);
+        }
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_hooks_mcp_observed_and_native_origin_stores() {
+        use std::{fs, time::Instant};
+
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use git_internal::hash::{HashKind, get_hash_kind};
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        use sha2::{Digest, Sha256};
+
+        use crate::{
+            internal::{
+                ai::{
+                    history,
+                    hooks::load_hook_config,
+                    mcp_server::stdio::{
+                        repository_id_for_storage, repository_id_with_store, serve,
+                    },
+                    observed_agents::{
+                        compliance::{
+                            AuditRecord, AuditScope, MAX_TRANSCRIPT_READ_BYTES_KEY,
+                            RETENTION_FINDINGS_DAYS_KEY, RETENTION_STDERR_DAYS_KEY,
+                            RETENTION_TRANSCRIPT_DAYS_KEY, max_transcript_read_bytes,
+                            max_transcript_read_bytes_setting_with_store,
+                            retention_findings_days_with_store, retention_stderr_days_with_store,
+                            retention_transcript_days, retention_transcript_days_with_store,
+                            write_audit_record_with_store,
+                        },
+                        hermes_export::{
+                            HermesBridgeStatus, HermesExporterTrust, HermesLiveError,
+                            HermesLiveRequest, HermesLiveSource,
+                            acquire_hermes_export_lease_with_store, export_for_live_capture,
+                            read_hermes_live_source_with_stores,
+                            release_hermes_export_lease_with_store,
+                            resolve_capture_scope_with_stores,
+                        },
+                        native_origin::{
+                            approved_build, codec,
+                            registry::{
+                                self, IssuerRecord, IssuerState, NativeOriginError, REGISTRY_KEY,
+                                Registry,
+                            },
+                            verify::{self, OriginalField, SourceCoordinates, VerificationError},
+                        },
+                        trust::{
+                            self, HERMES_EXPORTER_SLUG, OPENCODE_EXPORTER_SLUG, TRUSTED_DIRS_KEY,
+                            TrustRecord,
+                        },
+                    },
+                },
+                config::ConfigKv,
+            },
+            storage::{
+                RedbRepairContext, RefCasOutcome, RefKey, RefTarget, StorageBackendKind,
+                runtime::{
+                    detect_repo_backend, init_redb_repository_storage,
+                    open_capture_store_read_write, open_git_state_store_read_only,
+                    open_git_store_read_write, open_repo_config_store_read_only,
+                    open_repo_config_store_read_write,
+                },
+            },
+        };
+
+        let _hash_guard = HashKindGuard::capture();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let repo_root = temp.path().join("repo");
+        let storage = repo_root.join(".libra");
+        fs::create_dir_all(storage.join("objects")).expect("create .libra/objects");
+
+        let _gen = init_redb_repository_storage(&storage)
+            .await
+            .expect("init pure redb repo");
+        assert_eq!(
+            detect_repo_backend(&storage).expect("detect backend"),
+            StorageBackendKind::Redb
+        );
+
+        let repo_id = "rb24-redb-repo-id-0001";
+        {
+            let cfg_rw = open_repo_config_store_read_write(&storage)
+                .await
+                .expect("open redb config rw");
+            cfg_rw
+                .set("libra.repoid", repo_id, false)
+                .await
+                .expect("seed libra.repoid");
+            cfg_rw
+                .set("core.objectformat", "sha256", false)
+                .await
+                .expect("seed core.objectformat=sha256");
+        }
+
+        let _cwd_guard = CwdGuard::enter(&repo_root);
+
+        // -----------------------------------------------------------------
+        // AC1: hooks/intent configuration & AI history store on pure Redb
+        // -----------------------------------------------------------------
+        let _hook_cfg = load_hook_config(&repo_root).expect("load hook config on redb repo");
+        {
+            let git_store = open_git_store_read_write(&storage)
+                .await
+                .expect("open redb git store rw");
+            let ai_ref = RefKey::LocalBranch {
+                name: history::ai_ref_name().to_string(),
+            };
+            let synthetic_commit = "a".repeat(64);
+            let cas = git_store
+                .update_ref_cas(
+                    &ai_ref,
+                    None,
+                    Some(&RefTarget::Direct(synthetic_commit.clone())),
+                    &[],
+                )
+                .await
+                .expect("cas create ai history ref");
+            assert!(matches!(cas, RefCasOutcome::Applied { .. }));
+            assert_eq!(
+                git_store.get_ref(&ai_ref).await.expect("read ai ref"),
+                Some(RefTarget::Direct(synthetic_commit))
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // AC2: mcp_server exec & stdio storage probe and JSON-RPC roundtrip
+        // -----------------------------------------------------------------
+        prepare_read_only_repository(&storage)
+            .await
+            .expect("prepare_read_only_repository on redb (sha256)");
+        assert_eq!(get_hash_kind(), HashKind::Sha256);
+
+        {
+            let cfg_rw = open_repo_config_store_read_write(&storage)
+                .await
+                .expect("open redb config rw");
+            cfg_rw
+                .set("core.objectformat", "sha1", false)
+                .await
+                .expect("switch core.objectformat=sha1");
+            let cfg_ro = open_repo_config_store_read_only(&storage)
+                .await
+                .expect("open redb config ro");
+            let kind = prepare_read_only_repository_with_store(cfg_ro.as_ref())
+                .await
+                .expect("prepare_read_only_repository_with_store on redb (sha1)");
+            assert_eq!(kind, HashKind::Sha1);
+            assert_eq!(get_hash_kind(), HashKind::Sha1);
+            assert_eq!(repository_id_with_store(cfg_ro.as_ref()).await, repo_id);
+        }
+        assert_eq!(repository_id_for_storage(&storage).await, repo_id);
+
+        // Verify stdio::serve JSON-RPC initialize + tools/list on pure Redb.
+        let rpc_input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"rb24","version":"1.0"}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+            "\n"
+        );
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(rpc_input.as_bytes().to_vec()));
+        let mut rpc_out = Vec::new();
+        serve(reader, &mut rpc_out)
+            .await
+            .expect("mcp stdio serve on redb");
+        let rpc_text = String::from_utf8(rpc_out).expect("utf8 rpc output");
+        let responses: Vec<Value> = rpc_text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid jsonrpc line"))
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], json!(1));
+        assert_eq!(responses[0]["result"]["serverInfo"]["name"], json!("libra"));
+        assert_eq!(responses[1]["id"], json!(2));
+        assert!(responses[1]["result"]["tools"].is_array());
+
+        // -----------------------------------------------------------------
+        // AC3a: observed_agents::compliance (ConfigStore + CaptureStore)
+        // -----------------------------------------------------------------
+        let cfg_rw = open_repo_config_store_read_write(&storage)
+            .await
+            .expect("open redb config rw");
+        let state_ro = open_git_state_store_read_only(&storage)
+            .await
+            .expect("open redb git state ro");
+        let capture_rw = open_capture_store_read_write(&storage, RedbRepairContext::WriteCommand)
+            .await
+            .expect("open redb capture rw");
+
+        cfg_rw
+            .set(RETENTION_TRANSCRIPT_DAYS_KEY, "45", false)
+            .await
+            .expect("set transcript retention");
+        cfg_rw
+            .set(RETENTION_STDERR_DAYS_KEY, "14", false)
+            .await
+            .expect("set stderr retention");
+        cfg_rw
+            .set(RETENTION_FINDINGS_DAYS_KEY, "60", false)
+            .await
+            .expect("set findings retention");
+        cfg_rw
+            .set(MAX_TRANSCRIPT_READ_BYTES_KEY, "1048576", false)
+            .await
+            .expect("set max_transcript_read_bytes");
+
+        assert_eq!(
+            retention_transcript_days_with_store(cfg_rw.as_ref())
+                .await
+                .expect("transcript days with store"),
+            45
+        );
+        assert_eq!(
+            retention_transcript_days()
+                .await
+                .expect("transcript days current repo"),
+            45
+        );
+        assert_eq!(
+            retention_stderr_days_with_store(cfg_rw.as_ref())
+                .await
+                .expect("stderr days with store"),
+            14
+        );
+        assert_eq!(
+            retention_findings_days_with_store(cfg_rw.as_ref())
+                .await
+                .expect("findings days with store"),
+            60
+        );
+        assert_eq!(
+            max_transcript_read_bytes_setting_with_store(cfg_rw.as_ref())
+                .await
+                .expect("max transcript read bytes with store"),
+            (1_048_576, true)
+        );
+        assert_eq!(
+            max_transcript_read_bytes()
+                .await
+                .expect("max transcript read bytes current repo"),
+            1_048_576
+        );
+
+        let audit = AuditRecord::new(
+            "audit-rb24-1".to_string(),
+            "2026-11-26T00:00:00Z".to_string(),
+            (Some("u1".to_string()), Some("tester".to_string())),
+            "raw_export",
+            "chk-rb24-1",
+            AuditScope::Transcript,
+            Some("/tmp/export.jsonl".to_string()),
+            Some("rb24 verification".to_string()),
+            true,
+        );
+        write_audit_record_with_store(capture_rw.as_ref(), &audit)
+            .await
+            .expect("write audit record to redb capture store");
+        let fetched_audit = capture_rw
+            .get_audit_log("audit-rb24-1")
+            .await
+            .expect("get audit log")
+            .expect("audit row must exist");
+        assert_eq!(fetched_audit.checkpoint_id, "chk-rb24-1");
+        assert_eq!(fetched_audit.scope, "transcript");
+        assert!(fetched_audit.granted);
+
+        // -----------------------------------------------------------------
+        // AC3b: observed_agents::trust & observed_agents::hermes_export
+        // -----------------------------------------------------------------
+        let trusted_bin_dir = temp.path().join("trusted-bin");
+        fs::create_dir_all(&trusted_bin_dir).expect("create trusted bin dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&trusted_bin_dir, fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 trusted dir");
+        }
+        let hermes_bin = trusted_bin_dir.join("hermes");
+        fs::write(&hermes_bin, b"#!/bin/sh\nexit 0\n").expect("write dummy hermes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hermes_bin, fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 hermes");
+        }
+
+        let canonical_dir = trust::add_trusted_dir(&trusted_bin_dir)
+            .await
+            .expect("add trusted dir on redb");
+        let dirs = trust::read_trusted_dirs_with_store(cfg_rw.as_ref())
+            .await
+            .expect("read trusted dirs with store");
+        assert!(dirs.contains(&canonical_dir));
+
+        let hermes_record = trust::record_trust(HERMES_EXPORTER_SLUG, &hermes_bin)
+            .await
+            .expect("record hermes trust on redb");
+        assert_eq!(
+            trust::read_trust_with_store(cfg_rw.as_ref(), HERMES_EXPORTER_SLUG)
+                .await
+                .expect("read hermes trust with store"),
+            Some(hermes_record.clone())
+        );
+        trust::revalidate_trust(HERMES_EXPORTER_SLUG, &hermes_record)
+            .await
+            .expect("revalidate hermes trust on redb");
+
+        let status_current = HermesBridgeStatus::current()
+            .await
+            .expect("HermesBridgeStatus::current");
+        let status_store = HermesBridgeStatus::from_store(cfg_rw.as_ref())
+            .await
+            .expect("HermesBridgeStatus::from_store");
+        assert_eq!(status_current, status_store);
+        assert!(status_store.trusted);
+        assert!(status_store.source_qualified);
+        assert!(!status_store.native_claimed);
+
+        let loaded_trust = HermesExporterTrust::load_with_store(cfg_rw.as_ref())
+            .await
+            .expect("load hermes trust with store")
+            .expect("hermes trust must be present");
+        assert_eq!(loaded_trust.path(), hermes_record.path.as_path());
+
+        let scope =
+            resolve_capture_scope_with_stores(cfg_rw.as_ref(), state_ro.as_ref(), &repo_root)
+                .await
+                .expect("resolve capture scope on redb");
+        assert_eq!(scope.repo_id, repo_id);
+        assert!(scope.worktree_id.is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let lease1 = acquire_hermes_export_lease_with_store(
+            capture_rw.as_ref(),
+            &scope,
+            "hermes-rb24-sess",
+            deadline,
+        )
+        .await
+        .expect("acquire hermes lease")
+        .expect("first caller must acquire lease");
+        assert_eq!(lease1.session_id(), "hermes-rb24-sess");
+
+        // Second concurrent acquire while lease is live must return None (RecordedOnly).
+        let second = acquire_hermes_export_lease_with_store(
+            capture_rw.as_ref(),
+            &scope,
+            "hermes-rb24-sess",
+            deadline,
+        )
+        .await
+        .expect("contended acquire");
+        assert!(second.is_none());
+
+        // Missing lease fails closed with NoLease.
+        let no_lease_req = HermesLiveRequest {
+            session_id: "hermes-rb24-sess".to_string(),
+            profile: "default".to_string(),
+            cwd: repo_root.clone(),
+            source: HermesLiveSource::Export,
+        };
+        let no_lease_err = read_hermes_live_source_with_stores(
+            cfg_rw.as_ref(),
+            capture_rw.as_ref(),
+            &scope,
+            None,
+            Some(&loaded_trust),
+            &no_lease_req,
+            deadline,
+        )
+        .await
+        .expect_err("missing lease must fail");
+        assert_eq!(no_lease_err, HermesLiveError::NoLease);
+
+        release_hermes_export_lease_with_store(capture_rw.as_ref(), &scope, lease1)
+            .await
+            .expect("release hermes lease");
+        let lease2 = acquire_hermes_export_lease_with_store(
+            capture_rw.as_ref(),
+            &scope,
+            "hermes-rb24-sess",
+            deadline,
+        )
+        .await
+        .expect("reacquire after release")
+        .expect("released lease must be re-acquirable");
+        release_hermes_export_lease_with_store(capture_rw.as_ref(), &scope, lease2)
+            .await
+            .expect("release reacquired hermes lease");
+
+        // Mutate binary -> revalidate_trust must detect drift and revoke in Redb.
+        fs::write(&hermes_bin, b"#!/bin/sh\nexit 1\n").expect("mutate hermes binary");
+        assert!(
+            trust::revalidate_trust(HERMES_EXPORTER_SLUG, &hermes_record)
+                .await
+                .is_err()
+        );
+        assert!(
+            trust::read_trust_with_store(cfg_rw.as_ref(), HERMES_EXPORTER_SLUG)
+                .await
+                .expect("read revoked hermes trust")
+                .is_none()
+        );
+        // Without trust, export_for_live_capture dispatches to Redb and returns Unavailable.
+        let unavail = export_for_live_capture("hermes-rb24-sess", &repo_root, deadline)
+            .await
+            .expect_err("untrusted hermes must be unavailable");
+        assert_eq!(unavail, HermesLiveError::Unavailable);
+
+        // -----------------------------------------------------------------
+        // AC3c: native_origin::{attest,registry,verify} on pure Redb
+        // -----------------------------------------------------------------
+        assert!(
+            registry::read_with_store(cfg_rw.as_ref())
+                .await
+                .expect("empty native_origin registry")
+                .is_none()
+        );
+
+        // register() on Redb dispatches through detect_repo_backend -> register_with_store ->
+        // attest::prepare_with_store and returns PriorTrust when OpenCode trust is absent.
+        let missing_manifest = temp.path().join("installation.json");
+        let prior_err = registry::register(&missing_manifest, 0)
+            .await
+            .expect_err("register without prior opencode trust must fail");
+        assert_eq!(
+            prior_err.downcast_ref::<NativeOriginError>(),
+            Some(&NativeOriginError::PriorTrust)
+        );
+
+        // Seed a valid synthetic approved-build Registry + OpenCode trust into Redb ConfigStore.
+        const BINARY_SHA: &str = "547c36eb928da163ef61d019bad669860d519f2da0b67737c9a3920e831c9196";
+        const BUILD_ID: &str = "bac21cc4027896b8d1836133c347d20f";
+        let seed: Vec<u8> = (0u8..32u8).collect();
+        let kp = Ed25519KeyPair::from_seed_unchecked(&seed).expect("test ed25519 key");
+        let public_key_hex = hex::encode(kp.public_key().as_ref());
+        let issuer_hex = hex::encode(Sha256::digest(kp.public_key().as_ref()));
+        let build =
+            approved_build::lookup(codec::PRODUCER_VERSION, BUILD_ID, BINARY_SHA).expect("build");
+        let cmd_path = "/Applications/Libra.app/Contents/MacOS/libra";
+        let rendered = build.render_observer(cmd_path).expect("render observer");
+        let policy = build
+            .installation_policy(cmd_path, rendered.as_bytes())
+            .expect("policy");
+        let policy_digest = hex::encode(Sha256::digest(
+            codec::policy_bytes(&policy).expect("policy bytes"),
+        ));
+        let synthetic_producer = "/synthetic/rb24-producer/opencode";
+        let issuer_record = IssuerRecord {
+            issuer: issuer_hex.clone(),
+            public_key: public_key_hex,
+            key_generation: 1,
+            build_identity: BUILD_ID.to_string(),
+            producer_version: codec::PRODUCER_VERSION.to_string(),
+            producer_binary_digest: BINARY_SHA.to_string(),
+            producer_path: synthetic_producer.to_string(),
+            policy_descriptor: policy.clone(),
+            policy_digest: policy_digest.clone(),
+            state: IssuerState::Active,
+        };
+        let reg = Registry {
+            version: 1,
+            epoch: 1,
+            issuers: vec![issuer_record.clone()],
+        };
+        let opencode_trust = TrustRecord {
+            path: synthetic_producer.into(),
+            sha256: BINARY_SHA.to_string(),
+            device: 7,
+            inode: 8,
+            mtime: 9,
+        };
+        ConfigKv::set_with_store(
+            cfg_rw.as_ref(),
+            REGISTRY_KEY,
+            &serde_json::to_string(&reg).expect("encode registry"),
+            false,
+        )
+        .await
+        .expect("seed native_origin registry");
+        ConfigKv::set_with_store(
+            cfg_rw.as_ref(),
+            &format!("agent.trust.{OPENCODE_EXPORTER_SLUG}"),
+            &serde_json::to_string(&opencode_trust).expect("encode opencode trust"),
+            false,
+        )
+        .await
+        .expect("seed opencode trust");
+        ConfigKv::set_with_store(
+            cfg_rw.as_ref(),
+            TRUSTED_DIRS_KEY,
+            r#"["/synthetic/rb24-producer"]"#,
+            false,
+        )
+        .await
+        .expect("seed trusted dirs for synthetic producer");
+
+        let read_reg = registry::read_with_store(cfg_rw.as_ref())
+            .await
+            .expect("read registry with store")
+            .expect("registry must exist");
+        assert_eq!(read_reg, reg);
+
+        let prov = trust::Provenance {
+            canonical_path: synthetic_producer.into(),
+            sha256: BINARY_SHA.to_string(),
+            device: 7,
+            inode: 8,
+            mtime: 9,
+        };
+        let active = registry::active_issuer_with_store(cfg_rw.as_ref(), &issuer_hex, &prov)
+            .await
+            .expect("active_issuer_with_store")
+            .expect("active issuer must match");
+        assert_eq!(active, issuer_record);
+
+        // Epoch mismatch on register() via Redb dispatch returns NativeOriginError::Epoch.
+        let epoch_err = registry::register(&missing_manifest, 99)
+            .await
+            .expect_err("register with stale epoch must fail");
+        assert_eq!(
+            epoch_err.downcast_ref::<NativeOriginError>(),
+            Some(&NativeOriginError::Epoch)
+        );
+
+        // verify_with_store reads registry & trust from Redb ConfigStore before measuring runtime.
+        let sample_val = "rb24 synthetic signature value";
+        let mut receipt = codec::Receipt {
+            version: 1,
+            issuer: issuer_hex.clone(),
+            key_generation: 1,
+            build_identity: BUILD_ID.to_string(),
+            producer_version: codec::PRODUCER_VERSION.to_string(),
+            policy_digest,
+            protocol: codec::Protocol::OpenaiResponses,
+            route: "/v1/responses".to_string(),
+            endpoint_digest: policy.endpoint_digests[0].clone(),
+            source_session: "sess_rb24".to_string(),
+            source_message: "msg_rb24".to_string(),
+            source_part: "npart_0102030405060708090a0b0c0d0e0f10".to_string(),
+            stream: "10".repeat(16),
+            fragment: "frag_rb24".to_string(),
+            fields: vec![codec::FieldDigest {
+                name: codec::FieldName::Signature,
+                length: u32::try_from(sample_val.len()).expect("u32 field length"),
+                sha256: hex::encode(Sha256::digest(sample_val.as_bytes())),
+            }],
+            signature: STANDARD.encode([0u8; 64]),
+        };
+        receipt.signature = STANDARD.encode(
+            kp.sign(&codec::signing_bytes(&receipt).expect("signing bytes"))
+                .as_ref(),
+        );
+        let raw_receipt = serde_json::to_vec(&receipt).expect("encode receipt");
+        let verify_err = verify::verify_with_store(
+            cfg_rw.as_ref(),
+            &repo_root,
+            &raw_receipt,
+            &SourceCoordinates {
+                session: &receipt.source_session,
+                message: &receipt.source_message,
+                part: &receipt.source_part,
+            },
+            &[OriginalField {
+                name: codec::FieldName::Signature,
+                value: sample_val,
+            }],
+        )
+        .await
+        .err()
+        .expect("synthetic producer path does not exist on disk");
+        assert_eq!(
+            verify_err.downcast_ref::<VerificationError>(),
+            Some(&VerificationError::Runtime)
+        );
+
+        // revoke() dispatches to Redb -> removes opencode trust, marks issuer Revoked, bumps epoch.
+        let rev = registry::revoke()
+            .await
+            .expect("native_origin::registry::revoke on redb");
+        assert!(rev.removed);
+        assert_eq!(rev.native_revoked, 1);
+        assert_eq!(rev.native_epoch, Some(2));
+        let after_rev = registry::read_with_store(cfg_rw.as_ref())
+            .await
+            .expect("read revoked registry")
+            .expect("tombstone must be preserved");
+        assert_eq!(after_rev.epoch, 2);
+        assert_eq!(after_rev.issuers[0].state, IssuerState::Revoked);
+        assert!(
+            trust::read_trust_with_store(cfg_rw.as_ref(), OPENCODE_EXPORTER_SLUG)
+                .await
+                .expect("read opencode trust after revoke")
+                .is_none()
+        );
+
+        // -----------------------------------------------------------------
+        // Final invariant: NO SQLite files created anywhere under .libra/
+        // -----------------------------------------------------------------
+        assert!(
+            !storage.join("libra.db").exists(),
+            "pure-redb test must never create .libra/libra.db"
+        );
+        assert!(
+            !storage.join("private").join("capture.db").exists(),
+            "pure-redb test must never create .libra/private/capture.db"
+        );
+    }
 }

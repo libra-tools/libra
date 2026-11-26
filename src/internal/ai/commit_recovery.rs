@@ -22,6 +22,14 @@ use crate::{
         ai::{capture_scope::CaptureScope, commit_journal},
         object_format::parse_repo_oid,
     },
+    storage::{
+        capture_store::{
+            AgentSessionCommitRecord, CaptureCheckpointScope, CaptureHashKind, CaptureSessionState,
+            CaptureStore,
+        },
+        git_state_store::GitStateStore,
+        git_store::{GitStore, RefKey, RefTarget},
+    },
     utils::storage::{Storage, local::LocalStorage, tiered::verify_fetched_object},
 };
 
@@ -101,6 +109,14 @@ fn oid_kind(oid: ObjectHash) -> &'static str {
         git_internal::hash::HashKind::Sha1 => "sha1",
         git_internal::hash::HashKind::Sha256 => "sha256",
         git_internal::hash::HashKind::Blake3 => "blake3",
+    }
+}
+
+fn capture_hash_kind(oid: ObjectHash) -> CaptureHashKind {
+    match oid.kind() {
+        git_internal::hash::HashKind::Sha1 => CaptureHashKind::Sha1,
+        git_internal::hash::HashKind::Sha256 => CaptureHashKind::Sha256,
+        git_internal::hash::HashKind::Blake3 => CaptureHashKind::Blake3,
     }
 }
 
@@ -487,6 +503,408 @@ pub async fn reclaim_reconciled<R: ConnectionTrait, C: ConnectionTrait>(
         for session_id in &record.session_ids {
             if !session_owned_and_not_erased(catalog, session_id, scope).await?
                 || !link_exists(catalog, session_id, commit.id).await?
+            {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
+            reconciled.push(record);
+        }
+    }
+    commit_journal::compact_reconciled(storage_root, &reconciled)
+        .context("reclaim verified agent commit journal recovery records")
+}
+
+async fn current_head_with_git_store(
+    git_store: &dyn GitStore,
+    scope: &CaptureScope,
+) -> Result<(Option<ObjectHash>, bool)> {
+    let worktree_id = (!scope.worktree_id.is_empty()).then(|| scope.worktree_id.clone());
+    let head_target = git_store
+        .get_ref(&RefKey::LocalHead { worktree_id })
+        .await
+        .context("read current-worktree commit-link HEAD from git store")?;
+    let Some(target) = head_target else {
+        return Ok((None, false));
+    };
+    let resolved = match target {
+        RefTarget::Direct(oid) => Some(oid),
+        RefTarget::Symbolic(branch_name) => match git_store
+            .get_ref(&RefKey::LocalBranch { name: branch_name })
+            .await
+            .context("resolve symbolic HEAD branch from git store")?
+        {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
+        },
+    };
+    match resolved {
+        Some(value) => match parse_repo_oid(&value) {
+            Ok(oid) => Ok((Some(oid), false)),
+            Err(_) => Ok((None, true)),
+        },
+        None => Ok((None, true)),
+    }
+}
+
+/// Resolve only this worktree's local HEAD via a read-only [`GitStore`] handle,
+/// then read bounded commit objects without opening SQLite (`RB-22`).
+pub async fn prepare_page_with_git_store(
+    git_store: &dyn GitStore,
+    storage_root: &Path,
+    scope: &CaptureScope,
+    page: u16,
+) -> Result<PreparedPage> {
+    if page == 0 || page > MAX_PAGE {
+        bail!("commit-link page must be between 1 and 100");
+    }
+    let (head, mut incomplete) = current_head_with_git_store(git_store, scope).await?;
+    let mut queue = VecDeque::new();
+    if let Some(oid) = head {
+        queue.push_back(oid);
+    }
+    let storage = LocalStorage::open_no_create_with_alternates(storage_root.join("objects"));
+    let mut visited = HashSet::new();
+    let mut commits_seen = 0usize;
+    let mut selected = BTreeMap::new();
+    let first = (usize::from(page) - 1) * COMMITS_PER_PAGE;
+    let end = first + COMMITS_PER_PAGE;
+    while let Some(oid) = queue.pop_front() {
+        if !visited.insert(oid) {
+            continue;
+        }
+        if visited.len() > MAX_VISITED_OBJECTS {
+            incomplete = true;
+            break;
+        }
+        let fetched = storage.get_with_limit(&oid, MAX_COMMIT_BYTES).await;
+        let Ok((payload, object_type)) = fetched else {
+            incomplete = true;
+            continue;
+        };
+        if verify_fetched_object(&oid, object_type, &payload).is_err() {
+            incomplete = true;
+            continue;
+        }
+        match object_type {
+            ObjectType::Commit => {
+                let Ok(commit) = Commit::from_bytes(&payload, oid) else {
+                    incomplete = true;
+                    continue;
+                };
+                queue.extend(commit.parent_commit_ids.iter().copied());
+                if commits_seen >= first && commits_seen < end {
+                    selected.insert(oid.to_string(), commit);
+                }
+                commits_seen += 1;
+                if commits_seen >= end {
+                    break;
+                }
+            }
+            ObjectType::Tag => match Tag::from_bytes(&payload, oid) {
+                Ok(tag) => queue.push_back(tag.object_hash),
+                Err(_) => incomplete = true,
+            },
+            _ => incomplete = true,
+        }
+    }
+    let has_more = queue.iter().any(|oid| !visited.contains(oid));
+    let mut trailer_candidates = Vec::new();
+    let mut trailer_limit_reached = false;
+    'commits: for (oid, commit) in &selected {
+        let message = parse_commit_msg(&commit.message).0;
+        let mut per_commit = 0;
+        for trailer in crate::internal::log::trailer::parse_trailers(message) {
+            if !trailer.key_matches("Libra-Agent-Session") || !valid_session_id(&trailer.value) {
+                continue;
+            }
+            if per_commit >= MAX_TRAILERS_PER_COMMIT
+                || trailer_candidates.len() >= MAX_CANDIDATES_PER_PAGE
+            {
+                trailer_limit_reached = true;
+                break 'commits;
+            }
+            trailer_candidates.push((oid.clone(), trailer.value, commit.id));
+            per_commit += 1;
+        }
+    }
+    Ok(PreparedPage {
+        head,
+        reachable: selected,
+        has_more,
+        incomplete,
+        trailer_candidates,
+        trailer_limit_reached,
+    })
+}
+
+async fn session_eligible_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    scope: &CaptureScope,
+) -> Result<bool> {
+    let Some(session) = capture
+        .get_session(session_id)
+        .await
+        .context("recheck commit-link recovery session scope in capture store")?
+    else {
+        return Ok(false);
+    };
+    if !scope.matches_scope_fields(
+        session.scope_state,
+        session.repo_id.as_deref(),
+        session.worktree_id.as_deref(),
+        session.workspace_id.as_deref(),
+        session.workspace_fence,
+    ) || !matches!(
+        session.state,
+        CaptureSessionState::Active | CaptureSessionState::Condensed | CaptureSessionState::Stopped
+    ) {
+        return Ok(false);
+    }
+    let tombstones = capture
+        .list_import_tombstones()
+        .await
+        .context("check import tombstones for commit recovery")?;
+    if tombstones.iter().any(|t| t.erased_session_id == session_id) {
+        return Ok(false);
+    }
+    let checkpoints = capture
+        .list_checkpoints_by_session(session_id)
+        .await
+        .context("check committed checkpoints for commit recovery")?;
+    Ok(checkpoints
+        .iter()
+        .any(|cp| cp.scope == CaptureCheckpointScope::Committed))
+}
+
+async fn session_owned_and_not_erased_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    scope: &CaptureScope,
+) -> Result<bool> {
+    let Some(session) = capture
+        .get_session(session_id)
+        .await
+        .context("recheck completed agent commit journal session ownership in capture store")?
+    else {
+        return Ok(false);
+    };
+    if !scope.matches_scope_fields(
+        session.scope_state,
+        session.repo_id.as_deref(),
+        session.worktree_id.as_deref(),
+        session.workspace_id.as_deref(),
+        session.workspace_fence,
+    ) {
+        return Ok(false);
+    }
+    let tombstones = capture
+        .list_import_tombstones()
+        .await
+        .context("check import tombstones for journal reclaim")?;
+    Ok(!tombstones.iter().any(|t| t.erased_session_id == session_id))
+}
+
+async fn link_exists_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    oid: ObjectHash,
+) -> Result<bool> {
+    let kind = capture_hash_kind(oid);
+    let oid_str = oid.to_string();
+    let commits = capture
+        .list_session_commits(session_id)
+        .await
+        .context("read existing agent commit links from capture store")?;
+    Ok(commits
+        .iter()
+        .any(|row| row.hash_kind == kind && row.commit_oid == oid_str))
+}
+
+async fn link_count_with_capture(capture: &dyn CaptureStore, oid: ObjectHash) -> Result<usize> {
+    let kind = capture_hash_kind(oid);
+    let oid_str = oid.to_string();
+    let sessions = capture
+        .list_sessions_by_started_desc()
+        .await
+        .context("list sessions to count commit links in capture store")?;
+    let mut count = 0usize;
+    for session in sessions {
+        let commits = capture
+            .list_session_commits(&session.session_id)
+            .await
+            .context("read session commits for commit-link count")?;
+        if commits
+            .iter()
+            .any(|row| row.hash_kind == kind && row.commit_oid == oid_str)
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Inspect (and optionally repair) a prepared commit page using backend-neutral
+/// [`GitStore`], [`GitStateStore`], and [`CaptureStore`] handles (`RB-22`).
+#[allow(clippy::too_many_arguments)]
+pub async fn inspect_prepared_with_stores(
+    git_store: &dyn GitStore,
+    state_store: &dyn GitStateStore,
+    capture_store: &dyn CaptureStore,
+    storage_root: &Path,
+    scope: &CaptureScope,
+    page: u16,
+    repair: bool,
+    prepared: &PreparedPage,
+) -> Result<CommitRecoveryReport> {
+    if repair && current_head_with_git_store(git_store, scope).await?.0 != prepared.head {
+        bail!("current HEAD changed during commit-link inspection; retry doctor --repair");
+    }
+    let mut report = CommitRecoveryReport::new(page);
+    let (records, bad_tail) = match commit_journal::read(storage_root) {
+        Ok(result) => result,
+        Err(_) => {
+            report.journal_unavailable = true;
+            report.journal_unavailable_reason = commit_journal::read_issue(storage_root);
+            (Vec::new(), false)
+        }
+    };
+    report.journal_records = records.len();
+    report.journal_bad_tail = bad_tail;
+    let reachable = &prepared.reachable;
+    let has_more = prepared.has_more;
+    let incomplete = prepared.incomplete;
+    report.reachable_commits_scanned = reachable.len();
+    report.history_incomplete =
+        incomplete || prepared.trailer_limit_reached || (has_more && page == MAX_PAGE);
+    report.next_commit_page = (has_more && page < MAX_PAGE).then_some(page + 1);
+    let mut candidates: BTreeMap<(String, String), ObjectHash> = BTreeMap::new();
+    for record in &records {
+        if &record.scope != scope {
+            report.foreign_scope_intents += 1;
+            continue;
+        }
+        let Some(commit) = reachable.get(&record.commit_oid) else {
+            report.unmatched_scope_intents += 1;
+            continue;
+        };
+        if record.hash_kind != oid_kind(commit.id) {
+            report.unmatched_scope_intents += 1;
+            continue;
+        }
+        for session_id in &record.session_ids {
+            if candidates.len() >= MAX_CANDIDATES_PER_PAGE {
+                report.more_missing_links = true;
+                report.history_incomplete = true;
+                break;
+            }
+            candidates.insert((record.commit_oid.clone(), session_id.clone()), commit.id);
+        }
+    }
+    for (oid, session_id, commit_id) in &prepared.trailer_candidates {
+        if candidates.len() >= MAX_CANDIDATES_PER_PAGE {
+            report.more_missing_links = true;
+            report.history_incomplete = true;
+            break;
+        }
+        report.trailer_candidates += 1;
+        candidates.insert((oid.clone(), session_id.clone()), *commit_id);
+    }
+    report.candidate_links = candidates.len();
+    report.evidence_state = if report.journal_unavailable {
+        "unavailable"
+    } else if report.journal_records > 0 || report.trailer_candidates > 0 {
+        "available"
+    } else {
+        "no_evidence"
+    };
+    if repair {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if scope
+            .assert_workspace_fence_live_with_state(state_store, now_ms)
+            .await
+            .is_err()
+        {
+            report.permission_blocked = true;
+            return Ok(report);
+        }
+    }
+    report.repair_applied = repair;
+    for ((_, session_id), oid) in candidates {
+        if link_exists_with_capture(capture_store, &session_id, oid).await? {
+            continue;
+        }
+        if !session_eligible_with_capture(capture_store, &session_id, scope).await? {
+            report.rejected_links += 1;
+            continue;
+        }
+        report.missing_links += 1;
+        if !repair {
+            continue;
+        }
+        if report.repaired_links >= MAX_LINKS_PER_REPAIR {
+            report.more_missing_links = true;
+            break;
+        }
+        if link_count_with_capture(capture_store, oid).await? >= 64 {
+            report.rejected_links += 1;
+            continue;
+        }
+        capture_store
+            .put_session_commit(&AgentSessionCommitRecord {
+                session_id,
+                hash_kind: capture_hash_kind(oid),
+                commit_oid: oid.to_string(),
+            })
+            .await
+            .context("repair authorized agent commit link in capture store")?;
+        report.repaired_links += 1;
+    }
+    if repair && bad_tail && !report.journal_unavailable {
+        commit_journal::repair_torn_tail(storage_root)
+            .context("repair torn agent commit journal tail")?;
+    }
+    Ok(report)
+}
+
+/// Reclaim journal records whose links are durably committed in [`CaptureStore`] (`RB-22`).
+pub async fn reclaim_reconciled_with_stores(
+    git_store: &dyn GitStore,
+    state_store: &dyn GitStateStore,
+    capture_store: &dyn CaptureStore,
+    storage_root: &Path,
+    scope: &CaptureScope,
+    prepared: &PreparedPage,
+) -> Result<usize> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    scope
+        .assert_workspace_fence_live_with_state(state_store, now_ms)
+        .await?;
+    if current_head_with_git_store(git_store, scope).await?.0 != prepared.head {
+        bail!("current HEAD changed before agent commit journal cleanup; retry doctor --repair");
+    }
+    let (records, bad_tail) = commit_journal::read(storage_root)?;
+    if bad_tail {
+        bail!("repair the torn agent commit journal tail before reclaiming recovered links");
+    }
+    let reachable = &prepared.reachable;
+    let mut reconciled = Vec::new();
+    for record in records {
+        if &record.scope != scope {
+            continue;
+        }
+        let Some(commit) = reachable.get(&record.commit_oid) else {
+            continue;
+        };
+        if record.hash_kind != oid_kind(commit.id) {
+            continue;
+        }
+        let mut complete = true;
+        for session_id in &record.session_ids {
+            if !session_owned_and_not_erased_with_capture(capture_store, session_id, scope).await?
+                || !link_exists_with_capture(capture_store, session_id, commit.id).await?
             {
                 complete = false;
                 break;

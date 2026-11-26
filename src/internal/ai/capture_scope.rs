@@ -17,6 +17,15 @@ use thiserror::Error;
 
 use crate::{
     internal::workspace::{RepoIdentity, WorkspaceStore},
+    storage::{
+        backend::StorageBackendKind,
+        capture_store::{
+            AgentWorkspaceScopeAuditRecord, CaptureScopeState, CaptureStore,
+            WORKSPACE_SCOPE_AUDIT_ACTION,
+        },
+        config_store::ConfigStore,
+        git_state_store::{GitStateStore, WorkspaceRecordKind},
+    },
     utils::util,
 };
 
@@ -236,17 +245,41 @@ impl CaptureScope {
             if on_repository {
                 self.assert_scope_and_lease(conn, authorized_root).await?;
             } else {
-                let database = storage_path.join(util::DATABASE);
-                let database = database
-                    .to_str()
-                    .context("the repository database path is not valid UTF-8")?;
-                let busy = deadline.saturating_duration_since(Instant::now());
-                let repository =
-                    crate::internal::db::open_repository_with_busy_timeout(database, busy)
-                        .await
-                        .context("open the repository database for the capture commitment")?;
-                self.assert_scope_and_lease(&repository, authorized_root)
-                    .await?;
+                match crate::storage::runtime::detect_repo_backend(storage_path)
+                    .context("detect storage backend for capture commitment")?
+                {
+                    StorageBackendKind::Redb => {
+                        let config =
+                            crate::storage::runtime::open_repo_config_store_read_only(storage_path)
+                                .await
+                                .context("open repository config store for capture commitment")?;
+                        let state =
+                            crate::storage::runtime::open_git_state_store_read_only(storage_path)
+                                .await
+                                .context("open repository state store for capture commitment")?;
+                        self.assert_scope_and_lease_with_stores(
+                            config.as_ref(),
+                            state.as_ref(),
+                            authorized_root,
+                        )
+                        .await?;
+                    }
+                    StorageBackendKind::Sqlite => {
+                        let database = storage_path.join(util::DATABASE);
+                        let database = database
+                            .to_str()
+                            .context("the repository database path is not valid UTF-8")?;
+                        let busy = deadline.saturating_duration_since(Instant::now());
+                        let repository =
+                            crate::internal::db::open_repository_with_busy_timeout(database, busy)
+                                .await
+                                .context(
+                                    "open the repository database for the capture commitment",
+                                )?;
+                        self.assert_scope_and_lease(&repository, authorized_root)
+                            .await?;
+                    }
+                }
             }
             check_deadline()?;
             let authorized_storage =
@@ -579,6 +612,234 @@ impl CaptureScope {
              AND {table}.workspace_fence IS ?"
         )
     }
+
+    /// Compare in-memory scope fields stored on a [`CaptureStore`] record against
+    /// this canonical [`CaptureScope`].
+    #[must_use]
+    pub fn matches_scope_fields(
+        &self,
+        scope_state: CaptureScopeState,
+        repo_id: Option<&str>,
+        worktree_id: Option<&str>,
+        workspace_id: Option<&str>,
+        workspace_fence: Option<i64>,
+    ) -> bool {
+        scope_state == CaptureScopeState::Scoped
+            && repo_id == Some(self.repo_id.as_str())
+            && worktree_id == Some(self.worktree_id.as_str())
+            && workspace_id == self.workspace_id.as_deref()
+            && workspace_fence == self.workspace_fence
+    }
+
+    /// Resolve the scope from one already-selected repository root using
+    /// backend-neutral [`ConfigStore`] and [`GitStateStore`] handles (`RB-22`).
+    pub async fn resolve_with_stores(
+        config: &dyn ConfigStore,
+        state: &dyn GitStateStore,
+        repo_root: &Path,
+    ) -> Result<Self> {
+        let repo_id = config
+            .get("libra.repoid")
+            .await
+            .context("cannot resolve capture repository identity")?
+            .map(|entry| entry.value)
+            .filter(|value| !value.is_empty())
+            .context("cannot resolve capture repository identity: libra.repoid is missing")?;
+        let gitdir =
+            util::try_get_worktree_gitdir(Some(repo_root.to_path_buf())).with_context(|| {
+                format!(
+                    "cannot resolve capture worktree metadata for '{}'",
+                    repo_root.display()
+                )
+            })?;
+        let worktree_id = util::worktree_id_for_gitdir(&gitdir).unwrap_or_default();
+        let records = state
+            .list_workspace_records(&repo_id, None)
+            .await
+            .context("cannot resolve capture workspace records")?;
+        let record = if worktree_id.is_empty() {
+            let canonical = repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| repo_root.to_path_buf());
+            let canonical_str = canonical.to_string_lossy();
+            records.into_iter().find(|rec| {
+                rec.state.holds_identity()
+                    && (rec.path == canonical_str.as_ref()
+                        || Path::new(&rec.path)
+                            .canonicalize()
+                            .ok()
+                            .is_some_and(|p| p == canonical))
+            })
+        } else {
+            records.into_iter().find(|rec| {
+                rec.state.holds_identity()
+                    && rec.kind == WorkspaceRecordKind::Linked
+                    && rec.worktree_id.as_deref() == Some(worktree_id.as_str())
+            })
+        };
+        Ok(Self {
+            repo_id,
+            worktree_id,
+            workspace_id: record.as_ref().map(|rec| rec.workspace_id.clone()),
+            workspace_fence: record.as_ref().map(|rec| rec.lease_fence),
+        })
+    }
+
+    /// Resolve the main-worktree scope directly from a [`ConfigStore`] handle (`RB-22`).
+    pub async fn main_for_config_store(config: &dyn ConfigStore) -> Result<Self> {
+        let repo_id = config
+            .get("libra.repoid")
+            .await
+            .context("cannot resolve capture repository identity")?
+            .map(|entry| entry.value)
+            .filter(|value| !value.is_empty())
+            .context("cannot resolve capture repository identity: libra.repoid is missing")?;
+        Ok(Self {
+            repo_id,
+            worktree_id: String::new(),
+            workspace_id: None,
+            workspace_fence: None,
+        })
+    }
+
+    /// Verify that any existing session claim for `provider_session_id` in
+    /// [`CaptureStore`] belongs to exactly this [`CaptureScope`] (`RB-22`).
+    pub async fn assert_provider_session_compatible_with_capture(
+        &self,
+        capture: &dyn CaptureStore,
+        provider_session_id: &str,
+    ) -> Result<()> {
+        let sessions = capture
+            .list_sessions_by_started_desc()
+            .await
+            .context("read captured provider-session ownership from capture store")?;
+        for session in sessions {
+            if session.provider_session_id != provider_session_id {
+                continue;
+            }
+            if !self.matches_scope_fields(
+                session.scope_state,
+                session.repo_id.as_deref(),
+                session.worktree_id.as_deref(),
+                session.workspace_id.as_deref(),
+                session.workspace_fence,
+            ) {
+                if session.scope_state != CaptureScopeState::Scoped {
+                    bail!(
+                        "provider session has legacy unscoped capture state; \
+                         inspect it with `libra worktree doctor` and explicitly adopt it before retrying"
+                    );
+                }
+                bail!(
+                    "provider session is already claimed by another \
+                     repository/worktree/workspace scope; refusing to overwrite it — inspect \
+                     with `libra worktree doctor`; only legacy unscoped claims may be explicitly adopted"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify the optional workspace lease against [`GitStateStore`] (`RB-22`).
+    pub async fn assert_workspace_fence_live_with_state(
+        &self,
+        state: &dyn GitStateStore,
+        now_ms: i64,
+    ) -> Result<()> {
+        let Some(workspace_id) = self.workspace_id.as_deref() else {
+            return Ok(());
+        };
+        let record = state
+            .get_workspace_record(workspace_id)
+            .await
+            .context("verify capture workspace lease fence")?;
+        let live = record.is_some_and(|rec| {
+            rec.repo_id == self.repo_id
+                && Some(rec.lease_fence) == self.workspace_fence
+                && rec.state.holds_identity()
+                && rec.lease_owner.is_some()
+                && rec.lease_expires_at.is_some_and(|exp| exp > now_ms)
+        });
+        if !live {
+            return Err(CaptureFinalCommitAuthorizationError::WorkspaceFenceRejected.into());
+        }
+        Ok(())
+    }
+
+    async fn assert_scope_and_lease_with_stores(
+        &self,
+        config: &dyn ConfigStore,
+        state: &dyn GitStateStore,
+        authorized_root: &Path,
+    ) -> Result<()> {
+        let resolved_scope = Self::resolve_with_stores(config, state, authorized_root)
+            .await
+            .context("resolve capture commitment scope")?;
+        if &resolved_scope != self {
+            bail!("capture commitment root does not belong to the authorized scope");
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock precedes Unix epoch while verifying capture lease")?
+            .as_millis();
+        let now_ms = i64::try_from(now_ms).context("system clock exceeds i64 milliseconds")?;
+        self.assert_workspace_fence_live_with_state(state, now_ms)
+            .await
+            .context("verify capture commitment workspace lease")
+    }
+}
+
+/// Append a workspace-scope adoption audit entry to `agent_workspace_scope_audit`
+/// via [`CaptureStore`] (`RB-22`).
+pub async fn record_workspace_scope_audit_with_capture(
+    capture: &dyn CaptureStore,
+    agent_kind: &str,
+    provider_session_id: &str,
+    scope: &CaptureScope,
+    actor: Option<&str>,
+    created_at: i64,
+) -> Result<AgentWorkspaceScopeAuditRecord> {
+    let record = AgentWorkspaceScopeAuditRecord {
+        audit_id: uuid::Uuid::new_v4().to_string(),
+        action: WORKSPACE_SCOPE_AUDIT_ACTION.to_string(),
+        agent_kind: agent_kind.to_string(),
+        provider_session_id: provider_session_id.to_string(),
+        repo_id: scope.repo_id.clone(),
+        worktree_id: scope.worktree_id.clone(),
+        workspace_id: scope.workspace_id.clone(),
+        workspace_fence: scope.workspace_fence,
+        actor: actor.map(str::to_string),
+        created_at,
+    };
+    capture
+        .append_workspace_scope_audit(&record)
+        .await
+        .context("append agent_workspace_scope_audit record")?;
+    Ok(record)
+}
+
+/// Fetch a single workspace-scope audit entry by `audit_id` via [`CaptureStore`] (`RB-22`).
+pub async fn get_workspace_scope_audit_with_capture(
+    capture: &dyn CaptureStore,
+    audit_id: &str,
+) -> Result<Option<AgentWorkspaceScopeAuditRecord>> {
+    capture
+        .get_workspace_scope_audit(audit_id)
+        .await
+        .context("get agent_workspace_scope_audit record")
+}
+
+/// List workspace-scope audit entries for `(agent_kind, provider_session_id)`
+/// via [`CaptureStore`] (`RB-22`).
+pub async fn list_workspace_scope_audits_with_capture(
+    capture: &dyn CaptureStore,
+    agent_kind: &str,
+    provider_session_id: &str,
+) -> Result<Vec<AgentWorkspaceScopeAuditRecord>> {
+    capture
+        .list_workspace_scope_audits(agent_kind, provider_session_id)
+        .await
+        .context("list agent_workspace_scope_audit records")
 }
 
 /// Final database authorization for both scoped and legacy/non-capture paths.

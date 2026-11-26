@@ -51,6 +51,64 @@ impl AutomationHistory {
 
         rows.into_iter().map(decode_row).collect()
     }
+
+    pub async fn append_with_store(
+        store: &dyn crate::storage::GitStateStore,
+        result: &AutomationRunResult,
+    ) -> Result<(), AutomationError> {
+        let record = crate::storage::AutomationLogRecord {
+            id: result.id.clone(),
+            rule_id: result.rule_id.clone(),
+            trigger_kind: result.trigger_kind.clone(),
+            action_kind: result.action_kind.clone(),
+            status: result.status.as_str().to_string(),
+            message: result.message.clone(),
+            started_at: result.started_at.to_rfc3339(),
+            finished_at: result.finished_at.to_rfc3339(),
+            details_json: result.details.to_string(),
+        };
+        store
+            .append_automation_log(&record)
+            .await
+            .map_err(|error| AutomationError::Database(error.to_string()))
+    }
+
+    pub async fn list_recent_with_store(
+        store: &dyn crate::storage::GitStateStore,
+        limit: u64,
+    ) -> Result<Vec<AutomationRunResult>, AutomationError> {
+        let cap = usize::try_from(limit).unwrap_or(usize::MAX);
+        let rows = store
+            .list_automation_logs(None, Some(cap))
+            .await
+            .map_err(|error| AutomationError::Database(error.to_string()))?;
+        rows.into_iter().map(decode_record).collect()
+    }
+}
+
+fn decode_record(
+    record: crate::storage::AutomationLogRecord,
+) -> Result<AutomationRunResult, AutomationError> {
+    let started_at = chrono::DateTime::parse_from_rfc3339(&record.started_at)
+        .map_err(|error| AutomationError::Database(format!("invalid started_at: {error}")))?
+        .with_timezone(&chrono::Utc);
+    let finished_at = chrono::DateTime::parse_from_rfc3339(&record.finished_at)
+        .map_err(|error| AutomationError::Database(format!("invalid finished_at: {error}")))?
+        .with_timezone(&chrono::Utc);
+    let details = serde_json::from_str(&record.details_json)
+        .map_err(|error| AutomationError::Database(format!("invalid details_json: {error}")))?;
+
+    Ok(AutomationRunResult {
+        id: record.id,
+        rule_id: record.rule_id,
+        trigger_kind: record.trigger_kind,
+        action_kind: record.action_kind,
+        status: AutomationRunStatus::parse(&record.status)?,
+        message: record.message,
+        details,
+        started_at,
+        finished_at,
+    })
 }
 
 fn decode_row(row: sea_orm::QueryResult) -> Result<AutomationRunResult, AutomationError> {

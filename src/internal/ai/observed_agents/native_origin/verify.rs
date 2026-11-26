@@ -104,6 +104,45 @@ pub(crate) async fn verify_with_conn(
     verify_bound(receipt, &record, &measured, source, fields)
 }
 
+/// Backend-agnostic counterpart of [`verify_with_conn`] using [`crate::storage::ConfigStore`].
+pub(crate) async fn verify_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    worktree: &Path,
+    raw_receipt: &[u8],
+    source: &SourceCoordinates<'_>,
+    fields: &[OriginalField<'_>],
+) -> Result<VerifiedProducerReceipt> {
+    let receipt = codec::decode_receipt(raw_receipt)?;
+    let current = registry::read_with_store(store)
+        .await?
+        .ok_or(VerificationError::Authority)?;
+    if !current.issuers.iter().any(|record| {
+        record.issuer == receipt.issuer && record.state == registry::IssuerState::Active
+    }) {
+        return Err(VerificationError::Authority.into());
+    }
+    let trusted = trust::read_trust_with_store(store, trust::OPENCODE_EXPORTER_SLUG)
+        .await?
+        .ok_or(VerificationError::Authority)?;
+    let producer = trusted.path.clone();
+    let repo = worktree.to_owned();
+    let measured = tokio::task::spawn_blocking(move || measure_runtime(&producer, &repo))
+        .await
+        .context(
+            "measure native-origin runtime; keep capture partial if measurement cannot finish",
+        )??;
+    let record = registry::active_issuer_with_store(store, &receipt.issuer, &measured.producer)
+        .await?
+        .ok_or(VerificationError::Authority)?;
+    let dirs = trust::read_trusted_dirs_with_store(store).await?;
+    let dir = dirs
+        .iter()
+        .find(|dir| measured.producer.canonical_path.starts_with(dir))
+        .ok_or(VerificationError::Authority)?;
+    trust::ensure_dir_not_world_writable(dir).map_err(|_| VerificationError::Authority)?;
+    verify_bound(receipt, &record, &measured, source, fields)
+}
+
 struct MeasuredRuntime {
     producer: trust::Provenance,
     observer_command: String,

@@ -277,6 +277,152 @@ pub async fn derive_commit_episodes(
     Ok(episodes)
 }
 
+/// Derive commit Episodes from a backend-agnostic [`crate::storage::GitStateStore`]
+/// (supports both Redb and SQLite without opening `libra.db`).
+#[allow(dead_code)]
+pub async fn derive_commit_episodes_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    repo_id: &str,
+    horizon: usize,
+) -> Result<Vec<Episode>, MemoryError> {
+    use std::collections::{BTreeMap, HashMap};
+
+    use crate::storage::{ChangeRevisionRecord, OperationRecord};
+
+    let clamped = horizon.clamp(1, 200);
+    let identities = state_store
+        .list_change_identities_by_prefix(repo_id, "")
+        .await?;
+    let mut all_revisions: Vec<ChangeRevisionRecord> = Vec::new();
+    for identity in identities {
+        let mut revs = state_store
+            .list_change_revisions(&identity.change_id)
+            .await?;
+        all_revisions.append(&mut revs);
+    }
+    all_revisions.sort_by(|a, b| {
+        b.revision_ordinal
+            .cmp(&a.revision_ordinal)
+            .then_with(|| b.commit_oid.cmp(&a.commit_oid))
+    });
+    all_revisions.truncate(clamped);
+
+    let mut by_change: BTreeMap<String, Vec<ChangeRevisionRecord>> = BTreeMap::new();
+    for revision in all_revisions {
+        by_change
+            .entry(revision.change_id.clone())
+            .or_default()
+            .push(revision);
+    }
+
+    let ops_by_id: HashMap<String, OperationRecord> = state_store
+        .list_operations(repo_id)
+        .await?
+        .into_iter()
+        .map(|(op, _)| (op.op_id.clone(), op))
+        .collect();
+
+    let mut episodes = Vec::new();
+    for (change_id, mut revisions) in by_change {
+        revisions.sort_by(|a, b| {
+            b.revision_ordinal
+                .cmp(&a.revision_ordinal)
+                .then_with(|| a.commit_oid.cmp(&b.commit_oid))
+        });
+        let Some(current) = revisions.first().cloned() else {
+            continue;
+        };
+
+        let current_op = ops_by_id.get(&current.created_op_id);
+        let current_status = current_op
+            .map(|op| {
+                if op.command_name.as_deref()
+                    == Some(crate::internal::change::import::IMPORT_COMMAND)
+                {
+                    "unknown".to_string()
+                } else {
+                    op.status.clone()
+                }
+            })
+            .unwrap_or_else(|| "success".to_string());
+
+        let mut history_statuses: Vec<String> = Vec::new();
+        for revision in &revisions {
+            if revision.change_id == current.change_id
+                && revision.created_op_id == current.created_op_id
+            {
+                continue;
+            }
+            if let Some(op) = ops_by_id.get(&revision.created_op_id) {
+                history_statuses.push(op.status.clone());
+            }
+        }
+
+        let links = state_store
+            .list_ai_operation_links_by_change(repo_id, &change_id)
+            .await?;
+        let linked_ops: Vec<&OperationRecord> = links
+            .iter()
+            .filter_map(|link| ops_by_id.get(&link.operation_id))
+            .collect();
+
+        let started_at = linked_ops
+            .iter()
+            .map(|op| op.start_ts)
+            .min()
+            .or_else(|| current_op.map(|op| op.start_ts))
+            .unwrap_or(0);
+        let ended_at = linked_ops
+            .iter()
+            .filter_map(|op| op.end_ts)
+            .max()
+            .or_else(|| current_op.and_then(|op| op.end_ts))
+            .unwrap_or(started_at);
+        let actor = current_op
+            .and_then(|op| op.actor.clone())
+            .or_else(|| linked_ops.iter().find_map(|op| op.actor.clone()));
+
+        let (title, body, anchor) =
+            load_commit_fields(&current.commit_oid).map_err(MemoryError::Git)?;
+
+        let outcome = change_outcome(&current_status, &history_statuses);
+
+        let evidence = revisions
+            .iter()
+            .map(|revision| EvidenceEdge {
+                kind: "commit".to_string(),
+                ref_id: revision.commit_oid.clone(),
+                link_confidence: "identity".to_string(),
+                resolution_status: "resolved".to_string(),
+            })
+            .collect();
+
+        let mut episode = Episode {
+            episode_id: Episode::compute_episode_id(repo_id, SourceKind::Commit, &change_id),
+            repo_id: repo_id.to_string(),
+            source_kind: SourceKind::Commit,
+            source_key: change_id.clone(),
+            outcome,
+            actor,
+            started_at,
+            ended_at,
+            anchor_commit: anchor,
+            change_id: Some(change_id),
+            title,
+            body,
+            content_digest: String::new(),
+            producer: "derived-v1",
+            rules_version: 1,
+            evidence,
+            paths: Vec::new(),
+        };
+        episode.content_digest = super::episode::content_digest(&episode);
+        episodes.push(episode);
+    }
+
+    Ok(episodes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::strip_commit_signing_headers;

@@ -474,6 +474,89 @@ impl VersionedPendingPayloadProjection {
             .map_err(Into::into)
     }
 
+    /// Store-backed counterpart to [`Self::rehydrate_authenticated_deferred`].
+    #[allow(dead_code)]
+    pub(crate) async fn rehydrate_authenticated_deferred_with_store(
+        material: VersionedPendingRehydrateMaterial<'_>,
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        identity: &PreparedPendingAlias,
+        deadline: Instant,
+    ) -> Result<CheckpointRedactedPayload> {
+        let (projection, authentication, integrity) = material.into_parts();
+        projection.validate()?;
+        check_budget(deadline)?;
+        ensure!(
+            projection.reasoning_source.is_some()
+                && projection.redacted.alias == identity.alias()
+                && authentication.scope() == identity.context().scope()
+                && integrity.matches_associations(
+                    &serde_json::to_vec(&projection.identity_commit_associations)
+                        .map_err(|_| failure())?
+                ),
+            REMEDY
+        );
+        #[derive(Deserialize)]
+        struct RawOuter<'a> {
+            version: u8,
+            #[serde(borrow)]
+            payload: &'a RawValue,
+        }
+        #[derive(Deserialize)]
+        struct RawProjection<'a> {
+            #[serde(borrow)]
+            redacted: &'a RawValue,
+        }
+        let outer: RawOuter<'_> =
+            serde_json::from_slice(authentication.bytes()).map_err(|_| failure())?;
+        ensure!(outer.version == 2, REMEDY);
+        let raw: RawProjection<'_> =
+            serde_json::from_str(outer.payload.get()).map_err(|_| failure())?;
+        struct OriginalMemberWriter<'a> {
+            original: &'a [u8],
+            offset: usize,
+        }
+        impl Write for OriginalMemberWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let end = self.offset.checked_add(bytes.len()).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "capture member length overflow")
+                })?;
+                if self.original.get(self.offset..end) != Some(bytes) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "capture member differs",
+                    ));
+                }
+                self.offset = end;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut exact = OriginalMemberWriter {
+            original: raw.redacted.get().as_bytes(),
+            offset: 0,
+        };
+        serde_json::to_writer(&mut exact, &projection.redacted).map_err(|_| failure())?;
+        ensure!(exact.offset == exact.original.len(), REMEDY);
+        let payload = projection
+            .redacted
+            .rehydrate_authenticated_components_with_store(
+                config, git_state, storage, root, identity, deadline,
+            )
+            .await?;
+        let requirement = VersionedPendingPayloadRequirement::from_authenticated_payload(
+            authentication,
+            &payload,
+        )?;
+        payload
+            .with_versioned_pending_requirement(requirement)
+            .map_err(Into::into)
+    }
+
     #[allow(dead_code)] // COV2-08 consumes the original bytes on every replay attempt.
     pub(crate) fn into_deferred_reasoning(
         material: VersionedPendingReplayMaterial,
@@ -992,6 +1075,177 @@ impl PendingPayloadProjection {
         Ok(projected)
     }
 
+    /// Store-backed counterpart to [`Self::seal`].
+    #[allow(dead_code)]
+    pub(crate) async fn seal_with_store(
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        payload: &CheckpointRedactedPayload,
+        identity: &PreparedPendingAlias,
+        deadline: Instant,
+    ) -> Result<Self> {
+        payload.authorize_ordinary_pending_payload()?;
+        Self::seal_base_with_store(
+            config, git_state, storage, root, payload, identity, deadline,
+        )
+        .await
+    }
+
+    /// Store-backed counterpart to [`Self::seal_bound_reasoning`].
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn seal_bound_reasoning_with_store(
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        payload: &CheckpointRedactedPayload,
+        identity: &PreparedPendingAlias,
+        prepared: PreparedPendingNativeSeal<'_>,
+        deadline: Instant,
+    ) -> Result<Self> {
+        Self::seal_base_with_store(
+            config, git_state, storage, root, payload, identity, deadline,
+        )
+        .await?
+        .with_bound_reasoning(prepared.batch, &prepared.binding, prepared.associations)
+    }
+
+    /// Store-backed counterpart to [`Self::seal_bound_versioned_reasoning`].
+    #[allow(dead_code)]
+    pub(crate) async fn seal_bound_versioned_reasoning_with_store(
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        identity: &PreparedPendingAlias,
+        material: VersionedPendingSealMaterial<'_>,
+        deadline: Instant,
+    ) -> Result<VersionedPendingPayloadProjection> {
+        let (payload, prepared, companion) = material.into_parts();
+        let claims = companion.versioned();
+        let count = claims.claims().count();
+        ensure!(
+            count > 0
+                && count <= crate::internal::ai::traces::REASONING_ARTIFACT_MAX_ENTRIES
+                && prepared.associations.len() == count,
+            REMEDY
+        );
+        let mut associations = Vec::with_capacity(count);
+        for ((version, claim), (key, turn)) in claims.claims().zip(prepared.associations) {
+            let expected = companion
+                .reasoning()
+                .turn(version, &claim.logical_turn_key)
+                .ok_or_else(failure)?;
+            ensure!(
+                key == claim.logical_turn_key
+                    && turn.slot() == expected.slot()
+                    && turn.descriptor_mac() == expected.descriptor_mac()
+                    && turn.kind() == expected.kind(),
+                REMEDY
+            );
+            associations.push(VersionedPendingIdentityAssociation::from_prepared_turn(
+                version, &key, &turn,
+            ));
+        }
+        let source = seal_pending(prepared.batch, &prepared.binding).map_err(|_| failure())?;
+        let redacted = Self::seal_base_with_store(
+            config, git_state, storage, root, payload, identity, deadline,
+        )
+        .await?;
+        VersionedPendingPayloadProjection::new_codec(redacted, Some(source), associations)
+    }
+
+    async fn seal_base_with_store(
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        payload: &CheckpointRedactedPayload,
+        identity: &PreparedPendingAlias,
+        deadline: Instant,
+    ) -> Result<Self> {
+        ensure!(
+            payload.is_exact_complete_snapshot() && payload.transcript().len() <= MAX_TRANSCRIPT,
+            REMEDY
+        );
+        check_budget(deadline)?;
+        let original = [
+            payload.metadata_json().bytes(),
+            payload.lifecycle_events_jsonl().bytes(),
+            payload.redaction_report_json().bytes(),
+        ];
+        ensure!(sidecar_size(original)? <= MAX_SIDECARS, REMEDY);
+        let mut metadata = json(payload.metadata_json().bytes(), MAX_SIDECARS)?;
+        let fields = metadata.as_object_mut().ok_or_else(failure)?;
+        remove_controls(
+            fields,
+            &["session_id", "provider_session_id", "working_dir"],
+        )?;
+        let metadata = normalize_json_value(metadata);
+        let lifecycle_bytes = payload.lifecycle_events_jsonl().bytes();
+        ensure!(
+            !lifecycle_bytes.is_empty() && lifecycle_bytes.ends_with(b"\n"),
+            REMEDY
+        );
+        let mut lifecycle = Vec::new();
+        for line in lifecycle_bytes[..lifecycle_bytes.len() - 1].split(|byte| *byte == b'\n') {
+            ensure!(!line.is_empty() && lifecycle.len() < MAX_EVENTS, REMEDY);
+            let mut value = json(line, MAX_SIDECARS)?;
+            remove_controls(
+                value.as_object_mut().ok_or_else(failure)?,
+                &["session_id", "provider_session_id"],
+            )?;
+            let value = normalize_json_value(value);
+            lifecycle.push(value);
+        }
+        validate_report(&json(
+            payload.redaction_report_json().bytes(),
+            MAX_SIDECARS,
+        )?)?;
+        let mut projected = Self {
+            version: VERSION,
+            alias: identity.alias().to_owned(),
+            snapshot: payload.snapshot().clone(),
+            transcript: STANDARD.encode(payload.transcript().bytes()),
+            metadata,
+            lifecycle,
+            redaction_report: STANDARD.encode(payload.redaction_report_json().bytes()),
+            metadata_mac: String::new(),
+            lifecycle_mac: String::new(),
+            reasoning_source: None,
+            identity_commit_associations: None,
+        };
+        projected.validate_data()?;
+        let (metadata, lifecycle) = projected.rebuild(identity)?;
+        ensure!(
+            metadata.bytes() == original[0] && lifecycle.bytes() == original[1],
+            REMEDY
+        );
+        for (kind, bytes, target) in [
+            ("metadata", metadata.bytes(), &mut projected.metadata_mac),
+            ("lifecycle", lifecycle.bytes(), &mut projected.lifecycle_mac),
+        ] {
+            *target = super::key::authenticate_pending_envelope_in_scope_with_store(
+                config,
+                git_state,
+                identity.context().scope(),
+                storage,
+                root,
+                &sidecar_commitment_body(kind, bytes),
+                None,
+                deadline,
+            )
+            .await
+            .map_err(|error| untrusted_unless_retryable(error, deadline))?;
+        }
+        projected.validate()?;
+        check_budget(deadline)?;
+        Ok(projected)
+    }
+
     /// Closed v2 codec entry. A deserialized DTO cannot call this constructor.
     fn with_bound_reasoning(
         self,
@@ -1141,6 +1395,129 @@ impl PendingPayloadProjection {
                 )
                 .await
                 .map_err(|error| untrusted_unless_retryable(error, deadline))?;
+        }
+        let transcript = decoded(&self.transcript, MAX_TRANSCRIPT)?;
+        let report = decoded(&self.redaction_report, MAX_SIDECARS)?;
+        ensure!(
+            sidecar_size([metadata.bytes(), lifecycle.bytes(), &report])? <= MAX_SIDECARS,
+            REMEDY
+        );
+        let payload = CheckpointRedactedPayload::from_redacted_capture(
+            RedactedBytes::new_unchecked(transcript),
+            Some(self.snapshot.clone()),
+            metadata,
+            lifecycle,
+            RedactedBytes::new_unchecked(report),
+        )
+        .map_err(|_| failure())?;
+        ensure!(payload.is_exact_complete_snapshot(), REMEDY);
+        check_budget(deadline)?;
+        Ok(payload)
+    }
+
+    /// Store-backed counterpart to [`Self::rehydrate`].
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rehydrate_with_store(
+        &self,
+        authentication: &AuthenticatedPendingEnvelope<'_>,
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        identity: &PreparedPendingAlias,
+        deadline: Instant,
+    ) -> Result<CheckpointRedactedPayload> {
+        ensure!(self.version != REASONING_VERSION, PENDING_V2_REMEDY);
+        self.rehydrate_ordinary_components_with_store(
+            authentication,
+            config,
+            git_state,
+            storage,
+            root,
+            identity,
+            deadline,
+        )
+        .await
+    }
+
+    /// Store-backed counterpart to [`Self::rehydrate_v2_deferred`].
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rehydrate_v2_deferred_with_store(
+        &self,
+        authentication: &AuthenticatedPendingEnvelope<'_>,
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        identity: &PreparedPendingAlias,
+        deadline: Instant,
+    ) -> Result<CheckpointRedactedPayload> {
+        ensure!(self.version == REASONING_VERSION, REMEDY);
+        self.rehydrate_ordinary_components_with_store(
+            authentication,
+            config,
+            git_state,
+            storage,
+            root,
+            identity,
+            deadline,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rehydrate_ordinary_components_with_store(
+        &self,
+        authentication: &AuthenticatedPendingEnvelope<'_>,
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        identity: &PreparedPendingAlias,
+        deadline: Instant,
+    ) -> Result<CheckpointRedactedPayload> {
+        self.validate()?;
+        check_budget(deadline)?;
+        ensure!(
+            self.alias == identity.alias() && authentication.scope() == identity.context().scope(),
+            REMEDY
+        );
+        verify_payload_membership(authentication.bytes(), self)?;
+        self.rehydrate_authenticated_components_with_store(
+            config, git_state, storage, root, identity, deadline,
+        )
+        .await
+    }
+
+    async fn rehydrate_authenticated_components_with_store(
+        &self,
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        identity: &PreparedPendingAlias,
+        deadline: Instant,
+    ) -> Result<CheckpointRedactedPayload> {
+        check_budget(deadline)?;
+        let (metadata, lifecycle) = self.rebuild(identity)?;
+        for (kind, bytes, mac) in [
+            ("metadata", metadata.bytes(), &self.metadata_mac),
+            ("lifecycle", lifecycle.bytes(), &self.lifecycle_mac),
+        ] {
+            super::key::authenticate_pending_envelope_in_scope_with_store(
+                config,
+                git_state,
+                identity.context().scope(),
+                storage,
+                root,
+                &sidecar_commitment_body(kind, bytes),
+                Some(mac),
+                deadline,
+            )
+            .await
+            .map_err(|error| untrusted_unless_retryable(error, deadline))?;
         }
         let transcript = decoded(&self.transcript, MAX_TRANSCRIPT)?;
         let report = decoded(&self.redaction_report, MAX_SIDECARS)?;

@@ -12,12 +12,7 @@ use chrono::Utc;
 use tokio::sync::Mutex;
 
 use super::{ApprovedRuleset, ApprovedRulesetStore, ApprovedStoreError};
-use crate::{
-    internal::{
-        ai::sandbox::ApprovalStore, db::get_db_conn_instance_for_path, worktree_scope::RequestScope,
-    },
-    utils::util,
-};
+use crate::internal::{ai::sandbox::ApprovalStore, worktree_scope::RequestScope};
 
 /// Fail-closed errors while resolving the runtime approval cache.
 #[derive(Debug, thiserror::Error)]
@@ -86,16 +81,96 @@ pub async fn resolve_approval_runtime_cache(
             });
         }
     };
-    let db_path = request.storage.join(util::DATABASE);
-    let conn = get_db_conn_instance_for_path(&db_path)
-        .await
-        .map_err(|error| {
+    let ruleset = match crate::storage::runtime::detect_repo_backend(&request.storage).map_err(
+        |error| {
             ApprovalRuntimeCacheError::Database(format!(
-                "cannot open repository database `{}` to load Always approvals: {error}",
-                db_path.display()
+                "cannot detect storage backend for `{}` to load Always approvals: {error}",
+                request.storage.display()
             ))
-        })?;
-    let ruleset = ApprovedRulesetStore::load(&conn).await?;
+        },
+    )? {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let ro_config =
+                    crate::storage::runtime::open_repo_config_store_read_only(&request.storage)
+                        .await
+                        .map_err(|error| {
+                            ApprovalRuntimeCacheError::Database(format!(
+                                "cannot open repository config store `{}` to load Always approvals: {error}",
+                                request.storage.display()
+                            ))
+                        })?;
+                let identity = match crate::internal::workspace::RepoIdentity::resolve_with_store(
+                    ro_config.as_ref(),
+                )
+                .await
+                {
+                    Ok(identity) => identity,
+                    Err(crate::internal::workspace::WorkspaceError::Corrupt(message))
+                        if message.contains("repository identity (libra.repoid) is missing") =>
+                    {
+                        drop(ro_config);
+                        let rw_config = crate::storage::runtime::open_repo_config_store_read_write(
+                            &request.storage,
+                        )
+                        .await
+                        .map_err(|error| {
+                            ApprovalRuntimeCacheError::Database(format!(
+                                "cannot open repository config store `{}` to initialize repository identity: {error}",
+                                request.storage.display()
+                            ))
+                        })?;
+                        ApprovedRulesetStore::ensure_repo_identity_with_store(rw_config.as_ref())
+                            .await?
+                    }
+                    Err(error) => return Err(ApprovedStoreError::Workspace(error).into()),
+                };
+                let state_store = crate::storage::runtime::open_git_state_store_read_only(
+                    &request.storage,
+                )
+                .await
+                .map_err(|error| {
+                    ApprovalRuntimeCacheError::Database(format!(
+                        "cannot open repository state store `{}` to load Always approvals: {error}",
+                        request.storage.display()
+                    ))
+                })?;
+                ApprovedRulesetStore::load_for_project_id_with_store(
+                    state_store.as_ref(),
+                    identity.as_str(),
+                )
+                .await?
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                return Err(ApprovalRuntimeCacheError::Database(
+                    "this Libra binary was compiled without `storage-redb`".to_string(),
+                ));
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let db_path = request.storage.join(crate::utils::util::DATABASE);
+                let conn = crate::internal::db::get_db_conn_instance_for_path(&db_path)
+                    .await
+                    .map_err(|error| {
+                        ApprovalRuntimeCacheError::Database(format!(
+                            "cannot open repository database `{}` to load Always approvals: {error}",
+                            db_path.display()
+                        ))
+                    })?;
+                ApprovedRulesetStore::load(&conn).await?
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                return Err(ApprovalRuntimeCacheError::Database(
+                    "this Libra binary was compiled without `storage-sqlite`".to_string(),
+                ));
+            }
+        }
+    };
     let scope_key = approval_cache_scope_key(&ruleset.project_id)?;
     Ok(ApprovalRuntimeCache {
         repo_id: ruleset.project_id.clone(),

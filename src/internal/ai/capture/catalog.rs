@@ -3030,16 +3030,39 @@ pub(crate) async fn resolve_pending_session_context(
         let storage = crate::internal::db::connection_storage_root(txn)
             .await
             .map_err(|_| CaptureCatalogError::Database)?;
-        let catalog = super::store::open_readonly(&storage, super::store::COMMAND_BUSY_TIMEOUT)
-            .await
-            .map_err(|_| CaptureCatalogError::Database)?;
-        let read = catalog
-            .begin()
-            .await
-            .map_err(|_| CaptureCatalogError::Database)?;
-        let result = Box::pin(resolve_pending_session_context(&read, scope, session_id)).await;
-        let _ = read.rollback().await;
-        return result;
+        return match crate::storage::runtime::detect_repo_backend(&storage)
+            .map_err(|_| CaptureCatalogError::Database)?
+        {
+            crate::storage::StorageBackendKind::Redb => {
+                let capture = crate::storage::runtime::open_capture_store_read_only(&storage)
+                    .await
+                    .map_err(|_| CaptureCatalogError::Database)?;
+                let config = crate::storage::runtime::open_repo_config_store_read_only(&storage)
+                    .await
+                    .map_err(|_| CaptureCatalogError::Database)?;
+                resolve_pending_session_context_with_capture(
+                    capture.as_ref(),
+                    config.as_ref(),
+                    scope,
+                    session_id,
+                )
+                .await
+            }
+            crate::storage::StorageBackendKind::Sqlite => {
+                let catalog =
+                    super::store::open_readonly(&storage, super::store::COMMAND_BUSY_TIMEOUT)
+                        .await
+                        .map_err(|_| CaptureCatalogError::Database)?;
+                let read = catalog
+                    .begin()
+                    .await
+                    .map_err(|_| CaptureCatalogError::Database)?;
+                let result =
+                    Box::pin(resolve_pending_session_context(&read, scope, session_id)).await;
+                let _ = read.rollback().await;
+                result
+            }
+        };
     }
     let repo = crate::internal::workspace::RepoIdentity::resolve(txn)
         .await
@@ -3113,6 +3136,89 @@ pub(crate) async fn resolve_pending_session_context(
         scope: scope.clone(),
         incarnation,
         revision,
+    })
+}
+
+/// Store-backed counterpart to [`resolve_pending_session_context`] using
+/// [`crate::storage::CaptureStore`] and [`crate::storage::ConfigStore`]
+/// without opening SQLite.
+pub(crate) async fn resolve_pending_session_context_with_capture(
+    capture: &dyn crate::storage::CaptureStore,
+    config: &dyn crate::storage::ConfigStore,
+    scope: &CaptureScope,
+    session_id: &str,
+) -> Result<PendingSessionContext, CaptureCatalogError> {
+    validate_catalog_text(session_id, MAX_SESSION_ID_BYTES)?;
+    let repo = crate::internal::workspace::RepoIdentity::resolve_with_store(config)
+        .await
+        .map_err(|_| CaptureCatalogError::Database)?;
+    if repo.as_str() != scope.repo_id {
+        return Err(CaptureCatalogError::ScopeRejected);
+    }
+    let row = capture
+        .get_session(session_id)
+        .await
+        .map_err(|err| classify_database_message(&err.to_string()))?
+        .ok_or(CaptureCatalogError::InvalidRequest)?;
+    if row.scope_state != crate::storage::CaptureScopeState::Scoped
+        || row.repo_id.as_deref() != Some(scope.repo_id.as_str())
+        || row.worktree_id.as_deref() != Some(scope.worktree_id.as_str())
+        || row.workspace_id != scope.workspace_id
+        || row.workspace_fence != scope.workspace_fence
+    {
+        return Err(CaptureCatalogError::ScopeRejected);
+    }
+    let agent_kind = row.agent_kind.as_str().to_owned();
+    if agent_kind.len() > 96
+        || row.provider_session_id.len() > 1024
+        || row.working_dir.len() > 4096
+        || row.metadata_json.len() > 1048576
+    {
+        return Err(CaptureCatalogError::InvalidRequest);
+    }
+    let session = CaptureCatalogSession::new(
+        session_id,
+        agent_kind,
+        row.provider_session_id.clone(),
+        row.working_dir.clone(),
+    )?;
+    let tombstones = capture
+        .list_import_tombstones()
+        .await
+        .map_err(|err| classify_database_message(&err.to_string()))?;
+    if tombstones.iter().any(|t| {
+        t.erased_session_id == session.session_id
+            || (t.agent_kind == session.agent_kind
+                && t.provider_session_id == session.provider_session_id)
+    }) {
+        return Err(CaptureCatalogError::Tombstoned);
+    }
+    use crate::internal::ai::observed_agents::coverage::CanonValue;
+    let metadata = parse_canon_value(row.metadata_json.as_bytes())
+        .map_err(|_| CaptureCatalogError::MalformedReceiptLedger)?;
+    let CanonValue::Object(object) = metadata else {
+        return Err(CaptureCatalogError::MalformedReceiptLedger);
+    };
+    let incarnation = match object.get("capture_incarnation") {
+        None | Some(CanonValue::Null) => None,
+        Some(CanonValue::Str(value))
+            if value.len() == 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            Some(value.clone())
+        }
+        _ => return Err(CaptureCatalogError::MalformedReceiptLedger),
+    };
+    if row.sync_revision <= 0 {
+        return Err(CaptureCatalogError::InvalidRequest);
+    }
+    Ok(PendingSessionContext {
+        session,
+        scope: scope.clone(),
+        incarnation,
+        revision: row.sync_revision,
     })
 }
 
@@ -3466,6 +3572,67 @@ impl CaptureCatalogStore {
             .try_get_by("importing")
             .map_err(|_| CaptureCatalogError::Database)?;
         receipt_metadata_is_pending(&metadata, importing != 0)
+    }
+
+    /// Store-backed counterpart to [`Self::session_summary_is_pending`] using
+    /// [`crate::storage::CaptureStore`] without opening SQLite.
+    #[allow(dead_code)]
+    pub(crate) async fn session_summary_is_pending_with_capture(
+        capture: &dyn crate::storage::CaptureStore,
+        session_id: &str,
+    ) -> Result<bool, CaptureCatalogError> {
+        let session = capture
+            .get_session(session_id)
+            .await
+            .map_err(|err| classify_database_message(&err.to_string()))?
+            .ok_or(CaptureCatalogError::InvalidRequest)?;
+        if session.metadata_json.len() > CAPTURE_DIAGNOSTIC_METADATA_CAP_BYTES {
+            return Err(CaptureCatalogError::MalformedReceiptLedger);
+        }
+        let metadata = if session.metadata_json.is_empty() {
+            "{}"
+        } else {
+            session.metadata_json.as_str()
+        };
+        receipt_metadata_is_pending(metadata, false)
+    }
+
+    /// Upsert a session record directly into [`crate::storage::CaptureStore`].
+    #[allow(dead_code)]
+    pub(crate) async fn upsert_session_with_capture(
+        capture: &dyn crate::storage::CaptureStore,
+        record: &crate::storage::AgentSessionRecord,
+    ) -> Result<(), CaptureCatalogError> {
+        capture.upsert_session(record).await.map_err(|err| {
+            if crate::storage::is_capture_tombstone_error(&err) {
+                CaptureCatalogError::Tombstoned
+            } else {
+                classify_database_message(&err.to_string())
+            }
+        })
+    }
+
+    /// Fetch a session record directly from [`crate::storage::CaptureStore`].
+    #[allow(dead_code)]
+    pub(crate) async fn get_session_with_capture(
+        capture: &dyn crate::storage::CaptureStore,
+        session_id: &str,
+    ) -> Result<Option<crate::storage::AgentSessionRecord>, CaptureCatalogError> {
+        capture
+            .get_session(session_id)
+            .await
+            .map_err(|err| classify_database_message(&err.to_string()))
+    }
+
+    /// List sessions ordered by `started_at DESC` from [`crate::storage::CaptureStore`].
+    #[allow(dead_code)]
+    pub(crate) async fn list_sessions_with_capture(
+        capture: &dyn crate::storage::CaptureStore,
+    ) -> Result<Vec<crate::storage::AgentSessionRecord>, CaptureCatalogError> {
+        capture
+            .list_sessions_by_started_desc()
+            .await
+            .map_err(|err| classify_database_message(&err.to_string()))
     }
 
     /// Re-elect the exact persisted terminal attempt for one authenticated
@@ -6677,6 +6844,480 @@ impl CaptureCatalogPort for CaptureCatalogStore {
     }
 }
 
+/// [`CaptureCatalogPort`] implementation backed directly by
+/// [`crate::storage::CaptureStore`] (Redb or SQLite trait object) without
+/// opening SQLite connections directly.
+#[derive(Clone)]
+pub(crate) struct CaptureStoreCatalogPort {
+    capture: Arc<dyn crate::storage::CaptureStore>,
+    execution_deadline: Option<CaptureCommitDeadline>,
+}
+
+impl CaptureStoreCatalogPort {
+    pub(crate) fn new(capture: Arc<dyn crate::storage::CaptureStore>) -> Self {
+        Self {
+            capture,
+            execution_deadline: None,
+        }
+    }
+
+    pub(crate) fn new_until(
+        capture: Arc<dyn crate::storage::CaptureStore>,
+        deadline: CaptureCommitDeadline,
+    ) -> Self {
+        Self {
+            capture,
+            execution_deadline: Some(deadline),
+        }
+    }
+
+    fn session_matches_scope(
+        row: &crate::storage::AgentSessionRecord,
+        scope: &CaptureScope,
+    ) -> bool {
+        row.scope_state == crate::storage::CaptureScopeState::Scoped
+            && row.repo_id.as_deref() == Some(scope.repo_id.as_str())
+            && row.worktree_id.as_deref() == Some(scope.worktree_id.as_str())
+            && row.workspace_id == scope.workspace_id
+            && row.workspace_fence == scope.workspace_fence
+    }
+
+    fn phase_to_store_state(phase: CapturePhase) -> crate::storage::CaptureSessionState {
+        match phase {
+            CapturePhase::Pending => crate::storage::CaptureSessionState::Pending,
+            CapturePhase::Active => crate::storage::CaptureSessionState::Active,
+            CapturePhase::Condensed => crate::storage::CaptureSessionState::Condensed,
+            CapturePhase::Stopped => crate::storage::CaptureSessionState::Stopped,
+            CapturePhase::Quarantined => crate::storage::CaptureSessionState::Quarantined,
+        }
+    }
+
+    fn store_state_to_phase(state: crate::storage::CaptureSessionState) -> CapturePhase {
+        match state {
+            crate::storage::CaptureSessionState::Pending => CapturePhase::Pending,
+            crate::storage::CaptureSessionState::Active => CapturePhase::Active,
+            crate::storage::CaptureSessionState::Condensed => CapturePhase::Condensed,
+            crate::storage::CaptureSessionState::Stopped => CapturePhase::Stopped,
+            crate::storage::CaptureSessionState::Quarantined => CapturePhase::Quarantined,
+        }
+    }
+
+    fn row_durable_state(row: &crate::storage::AgentSessionRecord) -> DurableCaptureState {
+        DurableCaptureState {
+            phase: Self::store_state_to_phase(row.state),
+            stopped_at: row.stopped_at,
+            sync_revision: row.sync_revision,
+        }
+    }
+
+    async fn check_tombstone(
+        &self,
+        session: &CaptureCatalogSession,
+    ) -> Result<(), CaptureCatalogError> {
+        let tombstones = self
+            .capture
+            .list_import_tombstones()
+            .await
+            .map_err(|err| classify_database_message(&err.to_string()))?;
+        if tombstones.iter().any(|t| {
+            t.erased_session_id == session.session_id
+                || (t.agent_kind == session.agent_kind
+                    && t.provider_session_id == session.provider_session_id)
+        }) {
+            return Err(CaptureCatalogError::Tombstoned);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CaptureCatalogPort for CaptureStoreCatalogPort {
+    async fn apply(
+        &self,
+        request: &CaptureCatalogApplyRequest,
+    ) -> Result<CaptureCatalogApplyResult, CaptureCatalogError> {
+        request.session.validate()?;
+        request.mutation.validate()?;
+        ensure_catalog_deadline(self.execution_deadline)?;
+        self.check_tombstone(&request.session).await?;
+
+        let all_sessions = self
+            .capture
+            .list_sessions_by_started_desc()
+            .await
+            .map_err(|err| classify_database_message(&err.to_string()))?;
+        if !request.action.owner_claim_exempt()
+            && let Some(owner) = all_sessions.iter().find(|s| {
+                s.provider_session_id == request.session.provider_session_id
+                    && Self::session_matches_scope(s, &request.scope)
+            })
+            && owner.agent_kind.as_str() != request.session.agent_kind
+        {
+            return Ok(CaptureCatalogApplyResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::SessionIdentity,
+            });
+        }
+
+        let existing = all_sessions.into_iter().find(|s| {
+            s.agent_kind.as_str() == request.session.agent_kind
+                && s.provider_session_id == request.session.provider_session_id
+        });
+        if let Some(existing) = &existing {
+            if !Self::session_matches_scope(existing, &request.scope) {
+                return Err(CaptureCatalogError::ScopeRejected);
+            }
+            if existing.session_id != request.session.session_id
+                || existing.working_dir != request.session.working_dir
+            {
+                return Ok(CaptureCatalogApplyResult::ConflictUnchanged {
+                    conflict: CaptureCatalogConflict::SessionIdentity,
+                });
+            }
+        }
+
+        let metadata_raw = existing
+            .as_ref()
+            .map(|s| s.metadata_json.as_str())
+            .unwrap_or("{}");
+        let (mut metadata, mut ledger) = decode_receipt_metadata(metadata_raw)?;
+        if request.metadata.concurrent_active {
+            metadata.insert(
+                "concurrent_active".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        let redaction_report = match &request.metadata.redaction_report {
+            Some(report) => report.json()?,
+            None => existing
+                .as_ref()
+                .map(|s| s.redaction_report.clone())
+                .unwrap_or_else(|| "{}".to_string()),
+        };
+
+        let current = existing.as_ref().map(Self::row_durable_state);
+        let receipt_key = request
+            .action
+            .receipt_storage_key(request.mutation.is_terminal());
+        if let Some(receipt_key) = receipt_key.as_deref()
+            && let Some(receipt) = ledger.find(receipt_key).cloned()
+        {
+            if !receipt.matches(&request.action, &request.mutation) {
+                return Ok(CaptureCatalogApplyResult::ConflictUnchanged {
+                    conflict: CaptureCatalogConflict::ActionMismatch,
+                });
+            }
+            return Ok(match receipt.status {
+                StoredReceiptStatus::Pending => {
+                    let finalizer = receipt.finalizer.as_ref();
+                    let unbound = finalizer.is_some_and(StoredFinalizeReceipt::is_unbound_snapshot);
+                    CaptureCatalogApplyResult::ResumePending {
+                        state: current.ok_or(CaptureCatalogError::MalformedReceiptLedger)?,
+                        checkpoint: receipt.intent.checkpoint.to_checkpoint_write(),
+                        terminal_finalizer_needs_binding: receipt.is_deferred_terminal()
+                            && (finalizer.is_none() || unbound),
+                        terminal_marker_generation: finalizer
+                            .filter(|f| !f.is_unbound_snapshot())
+                            .map(|f| f.marker_generation.clone()),
+                        adopted_action: None,
+                    }
+                }
+                StoredReceiptStatus::Complete => CaptureCatalogApplyResult::AlreadyApplied,
+            });
+        }
+
+        if current != request.mutation.expected {
+            return Ok(CaptureCatalogApplyResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::ExpectedState,
+            });
+        }
+
+        let defer_terminal = request.mutation.is_terminal();
+        let next_state = if defer_terminal {
+            match current {
+                Some(state) => DurableCaptureState {
+                    phase: state.phase,
+                    stopped_at: state.stopped_at,
+                    sync_revision: state
+                        .sync_revision
+                        .checked_add(1)
+                        .ok_or(CaptureCatalogError::InvalidRequest)?,
+                },
+                None => DurableCaptureState {
+                    phase: CapturePhase::Pending,
+                    stopped_at: None,
+                    sync_revision: 1,
+                },
+            }
+        } else {
+            let stopped_at = match request.mutation.stopped_at {
+                StoppedAtMutation::Preserve => current.and_then(|s| s.stopped_at),
+                StoppedAtMutation::Set(_) => return Err(CaptureCatalogError::InvalidRequest),
+            };
+            let sync_revision = match current {
+                Some(state) => state
+                    .sync_revision
+                    .checked_add(1)
+                    .ok_or(CaptureCatalogError::InvalidRequest)?,
+                None => 1,
+            };
+            DurableCaptureState {
+                phase: request.mutation.next_phase,
+                stopped_at,
+                sync_revision,
+            }
+        };
+
+        let receipt = if let Some(receipt_key) = receipt_key.as_deref() {
+            let status = if request.mutation.checkpoint == CheckpointWrite::None {
+                StoredReceiptStatus::Complete
+            } else {
+                StoredReceiptStatus::Pending
+            };
+            let mut entry = StoredReceipt::new(
+                receipt_key,
+                &request.action,
+                &request.mutation,
+                status,
+                next_state.sync_revision,
+            );
+            arm_required_child_gate(&mut entry, request.requires_child_checkpoints)?;
+            ledger.insert(entry)?;
+            match status {
+                StoredReceiptStatus::Pending => CaptureReceiptDisposition::Pending,
+                StoredReceiptStatus::Complete => CaptureReceiptDisposition::Complete,
+            }
+        } else {
+            CaptureReceiptDisposition::NotTracked
+        };
+
+        let metadata_json = encode_receipt_metadata(metadata, &ledger)?;
+        let agent_kind = crate::storage::CaptureAgentKind::parse(&request.session.agent_kind)
+            .map_err(|_| CaptureCatalogError::InvalidRequest)?;
+        let started_at = existing
+            .as_ref()
+            .map(|s| s.started_at)
+            .unwrap_or(request.mutation.observed_at);
+        let record = crate::storage::AgentSessionRecord {
+            session_id: request.session.session_id.clone(),
+            agent_kind,
+            provider_session_id: request.session.provider_session_id.clone(),
+            thread_id: existing.as_ref().and_then(|s| s.thread_id.clone()),
+            state: Self::phase_to_store_state(next_state.phase),
+            working_dir: request.session.working_dir.clone(),
+            worktree_id: Some(request.scope.worktree_id.clone()),
+            parent_commit: existing.as_ref().and_then(|s| s.parent_commit.clone()),
+            parent_session_id: existing.as_ref().and_then(|s| s.parent_session_id.clone()),
+            metadata_json,
+            redaction_report,
+            started_at,
+            last_event_at: request.mutation.observed_at,
+            stopped_at: next_state.stopped_at,
+            schema_version: existing.as_ref().map(|s| s.schema_version).unwrap_or(1),
+            sync_revision: next_state.sync_revision,
+            repo_id: Some(request.scope.repo_id.clone()),
+            workspace_id: request.scope.workspace_id.clone(),
+            workspace_fence: request.scope.workspace_fence,
+            scope_state: crate::storage::CaptureScopeState::Scoped,
+        };
+        ensure_catalog_deadline(self.execution_deadline)?;
+        CaptureCatalogStore::upsert_session_with_capture(self.capture.as_ref(), &record).await?;
+        Ok(CaptureCatalogApplyResult::Applied {
+            state: next_state,
+            checkpoint: request.mutation.checkpoint,
+            receipt,
+        })
+    }
+
+    async fn complete(
+        &self,
+        request: &CaptureCatalogCompleteRequest,
+    ) -> Result<CaptureCatalogCompleteResult, CaptureCatalogError> {
+        request.session.validate()?;
+        ensure_catalog_deadline(self.execution_deadline)?;
+        self.check_tombstone(&request.session).await?;
+        let Some(mut existing) = self
+            .capture
+            .get_session(&request.session.session_id)
+            .await
+            .map_err(|err| classify_database_message(&err.to_string()))?
+        else {
+            return Ok(CaptureCatalogCompleteResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::MissingReceipt,
+            });
+        };
+        if !Self::session_matches_scope(&existing, &request.scope) {
+            return Err(CaptureCatalogError::ScopeRejected);
+        }
+        let (metadata, mut ledger) = decode_receipt_metadata(&existing.metadata_json)?;
+        let receipt_key = request.action.completion_receipt_storage_key();
+        let Some(receipt) = ledger.find_mut(&receipt_key) else {
+            return Ok(CaptureCatalogCompleteResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::MissingReceipt,
+            });
+        };
+        if !receipt.matches_action(&request.action) {
+            return Ok(CaptureCatalogCompleteResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::ActionMismatch,
+            });
+        }
+        if receipt.status == StoredReceiptStatus::Complete {
+            return Ok(CaptureCatalogCompleteResult::AlreadyComplete);
+        }
+        let deferred_terminal = receipt.is_deferred_terminal();
+        if deferred_terminal && let CaptureCatalogCompletion::Ordinary = &request.completion {
+            return Ok(CaptureCatalogCompleteResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::FinalizerFence,
+            });
+        }
+        receipt.status = StoredReceiptStatus::Complete;
+        if deferred_terminal {
+            existing.state = crate::storage::CaptureSessionState::Stopped;
+            if existing.stopped_at.is_none() {
+                existing.stopped_at = Some(existing.last_event_at);
+            }
+        }
+        existing.metadata_json = encode_receipt_metadata(metadata, &ledger)?;
+        ensure_catalog_deadline(self.execution_deadline)?;
+        CaptureCatalogStore::upsert_session_with_capture(self.capture.as_ref(), &existing).await?;
+        Ok(CaptureCatalogCompleteResult::Completed)
+    }
+
+    async fn finalize(
+        &self,
+        request: &CaptureCatalogFinalizeRequest,
+    ) -> Result<CaptureCatalogFinalizeResult, CaptureCatalogError> {
+        request.session.validate()?;
+        ensure_catalog_deadline(self.execution_deadline)?;
+        let Some(existing) = self
+            .capture
+            .get_session(&request.session.session_id)
+            .await
+            .map_err(|err| classify_database_message(&err.to_string()))?
+        else {
+            return Ok(CaptureCatalogFinalizeResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::MissingReceipt,
+            });
+        };
+        if !Self::session_matches_scope(&existing, &request.scope) {
+            return Err(CaptureCatalogError::ScopeRejected);
+        }
+        let (_, ledger) = decode_receipt_metadata(&existing.metadata_json)?;
+        let receipt_key = request.action.completion_receipt_storage_key();
+        let Some(stored) = ledger.find(&receipt_key) else {
+            return Ok(CaptureCatalogFinalizeResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::MissingReceipt,
+            });
+        };
+        if stored.status == StoredReceiptStatus::Complete {
+            return Ok(CaptureCatalogFinalizeResult::AlreadyComplete);
+        }
+        Ok(CaptureCatalogFinalizeResult::ConflictUnchanged {
+            conflict: CaptureCatalogConflict::ConditionalWrite,
+        })
+    }
+
+    async fn prove_durable_replay(
+        &self,
+        request: &CaptureCatalogCompleteRequest,
+    ) -> Result<CaptureCatalogFinalizeResult, CaptureCatalogError> {
+        request.session.validate()?;
+        ensure_catalog_deadline(self.execution_deadline)?;
+        let Some(existing) = self
+            .capture
+            .get_session(&request.session.session_id)
+            .await
+            .map_err(|err| classify_database_message(&err.to_string()))?
+        else {
+            return Ok(CaptureCatalogFinalizeResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::MissingReceipt,
+            });
+        };
+        if !Self::session_matches_scope(&existing, &request.scope) {
+            return Err(CaptureCatalogError::ScopeRejected);
+        }
+        let (_, ledger) = decode_receipt_metadata(&existing.metadata_json)?;
+        let receipt_key = request.action.completion_receipt_storage_key();
+        let Some(stored) = ledger.find(&receipt_key) else {
+            return Ok(CaptureCatalogFinalizeResult::ConflictUnchanged {
+                conflict: CaptureCatalogConflict::MissingReceipt,
+            });
+        };
+        if stored.status == StoredReceiptStatus::Complete {
+            return Ok(CaptureCatalogFinalizeResult::AlreadyComplete);
+        }
+        Ok(CaptureCatalogFinalizeResult::ConflictUnchanged {
+            conflict: CaptureCatalogConflict::FinalizerFence,
+        })
+    }
+
+    async fn update_diagnostic(
+        &self,
+        request: &CaptureCatalogApplyRequest,
+        diagnostic: CaptureCatalogDiagnostic,
+    ) -> Result<bool, CaptureCatalogError> {
+        request.session.validate()?;
+        ensure_catalog_deadline(self.execution_deadline)?;
+        self.check_tombstone(&request.session).await?;
+        let Some(mut existing) = self
+            .capture
+            .get_session(&request.session.session_id)
+            .await
+            .map_err(|err| classify_database_message(&err.to_string()))?
+        else {
+            return Ok(false);
+        };
+        if !Self::session_matches_scope(&existing, &request.scope) {
+            return Err(CaptureCatalogError::ScopeRejected);
+        }
+        let (mut metadata, ledger) = decode_receipt_metadata(&existing.metadata_json)?;
+        match diagnostic {
+            CaptureCatalogDiagnostic::RecordRetryableCheckpointFailure { stage, failed_at } => {
+                metadata.insert(
+                    "capture_status".to_string(),
+                    serde_json::Value::String("retryable".to_string()),
+                );
+                metadata.insert(
+                    "capture_error_code".to_string(),
+                    serde_json::Value::String("checkpoint_write_failed".to_string()),
+                );
+                metadata.insert(
+                    "capture_error_stage".to_string(),
+                    serde_json::Value::String(stage.metadata_stage().to_string()),
+                );
+                metadata.insert(
+                    "capture_attempt_id".to_string(),
+                    serde_json::Value::String(stage.attempt_id().to_string()),
+                );
+                metadata.insert(
+                    "capture_failed_at".to_string(),
+                    serde_json::Value::from(failed_at),
+                );
+            }
+            CaptureCatalogDiagnostic::ClearRetryableCheckpointFailure => {
+                if metadata
+                    .get("capture_status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("retryable")
+                {
+                    return Ok(true);
+                }
+                for key in [
+                    "capture_status",
+                    "capture_error_code",
+                    "capture_error_stage",
+                    "capture_attempt_id",
+                    "capture_failed_at",
+                ] {
+                    metadata.remove(key);
+                }
+            }
+        }
+        existing.metadata_json = encode_receipt_metadata(metadata, &ledger)?;
+        CaptureCatalogStore::upsert_session_with_capture(self.capture.as_ref(), &existing).await?;
+        Ok(true)
+    }
+}
+
 fn ensure_catalog_deadline(
     deadline: Option<CaptureCommitDeadline>,
 ) -> Result<(), CaptureCatalogError> {
@@ -7272,16 +7913,45 @@ async fn verify_artifact_registration_authority(
         } else {
             // Quarantine rows stay in the repository database. A capture
             // transaction cannot see them, and the two files are not attached.
-            let repo = crate::internal::db::open_paired_repository(txn)
+            let storage = crate::internal::db::connection_storage_root(txn)
                 .await
                 .map_err(|_| CaptureCatalogError::Database)?;
-            repo.query_one_raw(Statement::from_sql_and_values(
-                repo.get_database_backend(),
-                quarantine_sql,
-                quarantine_values,
-            ))
-            .await
-            .map_err(|_| CaptureCatalogError::Database)?
+            match crate::storage::runtime::detect_repo_backend(&storage)
+                .map_err(|_| CaptureCatalogError::Database)?
+            {
+                crate::storage::StorageBackendKind::Redb => {
+                    let meta =
+                        crate::storage::runtime::open_repo_metadata_store_read_only(&storage)
+                            .await
+                            .map_err(|_| CaptureCatalogError::Database)?;
+                    let present = crate::internal::metadata::MetadataKv::get_with_store(
+                        meta.as_ref(),
+                        crate::internal::metadata::MetadataScope::AgentCaptureQuarantine,
+                        &fence.scope.repo_id,
+                        checkpoint_id,
+                    )
+                    .await
+                    .map_err(|_| CaptureCatalogError::Database)?
+                    .is_some();
+                    return if !present {
+                        Ok(())
+                    } else {
+                        Err(CaptureCatalogError::InvalidRequest)
+                    };
+                }
+                crate::storage::StorageBackendKind::Sqlite => {
+                    let repo = crate::internal::db::open_paired_repository(txn)
+                        .await
+                        .map_err(|_| CaptureCatalogError::Database)?;
+                    repo.query_one_raw(Statement::from_sql_and_values(
+                        repo.get_database_backend(),
+                        quarantine_sql,
+                        quarantine_values,
+                    ))
+                    .await
+                    .map_err(|_| CaptureCatalogError::Database)?
+                }
+            }
         };
         return if quarantined.is_none() {
             Ok(())

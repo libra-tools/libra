@@ -630,6 +630,214 @@ async fn prepare_existing_identity(
     .await
 }
 
+/// Store-backed doctor replay request operating directly on
+/// [`crate::storage::CaptureStore`], [`crate::storage::ConfigStore`],
+/// [`crate::storage::MetadataStore`], and [`crate::storage::GitStateStore`]
+/// without opening SQLite.
+#[allow(dead_code)]
+pub(crate) struct DoctorReplayStoreRequest<'a> {
+    pub(crate) capture: &'a dyn crate::storage::CaptureStore,
+    pub(crate) config: &'a dyn crate::storage::ConfigStore,
+    pub(crate) meta: &'a dyn crate::storage::MetadataStore,
+    pub(crate) git_state: &'a dyn crate::storage::GitStateStore,
+    pub(crate) scope: &'a crate::internal::ai::capture_scope::CaptureScope,
+    pub(crate) checkpoint_id: &'a str,
+    pub(crate) storage: &'a Path,
+    pub(crate) root: &'a Path,
+    pub(crate) deadline: CaptureCommitDeadline,
+    pub(crate) manual: bool,
+}
+
+/// Store-backed counterpart to [`replay_for_doctor_with_child_status`] that
+/// validates scope, pending/quarantined headers, retained alias, chunk
+/// integrity, and durable checkpoint status on Redb without touching SQLite.
+#[allow(dead_code)]
+pub(crate) async fn replay_status_with_capture(
+    request: DoctorReplayStoreRequest<'_>,
+) -> Result<ArtifactRecoveryResult> {
+    let DoctorReplayStoreRequest {
+        capture,
+        config,
+        meta,
+        git_state,
+        scope,
+        checkpoint_id,
+        storage,
+        root,
+        deadline,
+        manual,
+    } = request;
+    if std::time::Instant::now() >= deadline.monotonic() {
+        return Ok(ArtifactRecoveryResult {
+            outcome: ArtifactRecoveryOutcome::RetryLater,
+            waiting_for_children: false,
+        });
+    }
+    if super::key::assert_capture_key_storage_binding_with_store(
+        config,
+        git_state,
+        scope,
+        storage,
+        root,
+        deadline.monotonic(),
+    )
+    .await
+    .is_err()
+    {
+        return Ok(ArtifactRecoveryResult {
+            outcome: ArtifactRecoveryOutcome::RetryLater,
+            waiting_for_children: false,
+        });
+    }
+    if !manual {
+        let batch = pending::pending_candidates_for_scope_with_store(meta, config, scope).await?;
+        let candidate_ids = batch
+            .headers
+            .iter()
+            .map(|candidate| candidate.binding.checkpoint_id.as_str())
+            .collect::<Vec<_>>();
+        match candidate_disposition(checkpoint_id, &candidate_ids, batch.window_full) {
+            CandidateDisposition::Selected => {}
+            CandidateDisposition::Deferred => {
+                return Ok(ArtifactRecoveryResult {
+                    outcome: ArtifactRecoveryOutcome::DeferredByBatchLimit,
+                    waiting_for_children: false,
+                });
+            }
+            CandidateDisposition::Refused => {
+                return Ok(ArtifactRecoveryResult {
+                    outcome: ArtifactRecoveryOutcome::ManualRequired,
+                    waiting_for_children: false,
+                });
+            }
+        }
+    }
+    let Some((header, namespace)) =
+        pending::header_for_checkpoint_with_store(meta, &scope.repo_id, checkpoint_id).await?
+    else {
+        return Ok(ArtifactRecoveryResult {
+            outcome: ArtifactRecoveryOutcome::ManualRequired,
+            waiting_for_children: false,
+        });
+    };
+    if header.binding.scope != *scope
+        || header.binding.checkpoint_id != checkpoint_id
+        || (manual
+            && (namespace != crate::internal::metadata::MetadataScope::AgentCaptureQuarantine
+                || header.manual_attempted))
+        || (!manual && namespace != crate::internal::metadata::MetadataScope::AgentCapturePending)
+    {
+        return Ok(ArtifactRecoveryResult {
+            outcome: ArtifactRecoveryOutcome::ManualRequired,
+            waiting_for_children: false,
+        });
+    }
+    let identity = match prepare_existing_identity_with_capture(
+        capture, config, meta, git_state, &header, storage, root, deadline,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(error) if pending::retryable_load_failure(&error, deadline.monotonic()) => {
+            return Ok(ArtifactRecoveryResult {
+                outcome: ArtifactRecoveryOutcome::RetryLater,
+                waiting_for_children: false,
+            });
+        }
+        Err(_) => {
+            return Ok(ArtifactRecoveryResult {
+                outcome: ArtifactRecoveryOutcome::ManualRequired,
+                waiting_for_children: false,
+            });
+        }
+    };
+    let envelope = match pending::load_chunks_with_store(meta, &header).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(ArtifactRecoveryResult {
+                outcome: ArtifactRecoveryOutcome::ManualRequired,
+                waiting_for_children: false,
+            });
+        }
+    };
+    if super::key::authenticate_pending_envelope_in_scope_with_store(
+        config,
+        git_state,
+        scope,
+        storage,
+        root,
+        &envelope,
+        Some(header.mac()),
+        deadline.monotonic(),
+    )
+    .await
+    .is_err()
+    {
+        return Ok(ArtifactRecoveryResult {
+            outcome: ArtifactRecoveryOutcome::ManualRequired,
+            waiting_for_children: false,
+        });
+    }
+    let already_committed = TracesCheckpointStore::durable_replay_exists_with_capture(
+        capture,
+        checkpoint_id,
+        identity.context().session_id(),
+        CheckpointScope::Committed,
+    )
+    .await
+    .context("classify durable checkpoint from capture store")?;
+    Ok(ArtifactRecoveryResult {
+        outcome: if already_committed {
+            ArtifactRecoveryOutcome::AlreadyComplete
+        } else {
+            ArtifactRecoveryOutcome::Completed
+        },
+        waiting_for_children: false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_existing_identity_with_capture(
+    capture: &dyn crate::storage::CaptureStore,
+    config: &dyn crate::storage::ConfigStore,
+    meta: &dyn crate::storage::MetadataStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    header: &PendingHeader,
+    storage: &Path,
+    root: &Path,
+    deadline: CaptureCommitDeadline,
+) -> Result<PreparedPendingAlias> {
+    let record = pending_identity::lookup_with_store(
+        meta,
+        config,
+        &header.binding.scope.repo_id,
+        &header.binding.session_id,
+    )
+    .await?
+    .context("retained capture identity is missing")?;
+    let context = record
+        .resolve_with_capture(
+            capture,
+            config,
+            git_state,
+            &header.binding.scope,
+            storage,
+            root,
+            deadline.monotonic(),
+        )
+        .await?;
+    PendingSessionAlias::prepare_with_store(
+        config,
+        git_state,
+        &context,
+        Some(record),
+        storage,
+        root,
+        deadline.monotonic(),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

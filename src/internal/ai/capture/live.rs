@@ -48,6 +48,7 @@ use crate::internal::{
             catalog::{
                 CaptureCatalogApplyRequest, CaptureCatalogApplyResult, CaptureCatalogDiagnostic,
                 CaptureCatalogPort, CaptureCatalogRetryableStage, CaptureCatalogStore,
+                CaptureStoreCatalogPort,
             },
             coordinator::{
                 CaptureCoordinatorError, CaptureCoordinatorReservation,
@@ -70,6 +71,132 @@ use crate::internal::{
 /// Concrete live-hook reservation. The catalog port remains opaque to hook
 /// runtime; it can only be consumed through `execute_preapplied`.
 pub(crate) type LiveCaptureReservation = CaptureCoordinatorReservation<CaptureCatalogStore>;
+
+/// Store-backed live-hook reservation using [`CaptureStoreCatalogPort`].
+#[allow(dead_code)]
+pub(crate) type LiveCaptureStoreReservation =
+    CaptureCoordinatorReservation<CaptureStoreCatalogPort>;
+
+/// Store-backed counterpart to [`reserve_capture_catalog_until`] using
+/// [`crate::storage::CaptureStore`] without opening SQLite.
+#[allow(dead_code)]
+pub(crate) async fn reserve_capture_catalog_with_capture(
+    capture: std::sync::Arc<dyn crate::storage::CaptureStore>,
+    request: &CaptureCatalogApplyRequest,
+    deadline: Option<CaptureCommitDeadline>,
+) -> Result<CaptureCoordinatorReserveOutcome<CaptureStoreCatalogPort>, CaptureCoordinatorError> {
+    let catalog = match deadline {
+        Some(deadline) => CaptureStoreCatalogPort::new_until(capture, deadline),
+        None => CaptureStoreCatalogPort::new(capture),
+    };
+    let result = reserve_catalog_through_port(&catalog, request).await?;
+    match result {
+        result @ (CaptureCatalogApplyResult::Applied { .. }
+        | CaptureCatalogApplyResult::ResumePending { .. }) => {
+            Ok(CaptureCoordinatorReserveOutcome::Reserved(Box::new(
+                CaptureCoordinatorReservation::from_preapplied(catalog, request.clone(), result),
+            )))
+        }
+        CaptureCatalogApplyResult::AlreadyApplied => {
+            Ok(CaptureCoordinatorReserveOutcome::AlreadyApplied)
+        }
+        CaptureCatalogApplyResult::ConflictUnchanged { conflict } => {
+            Ok(CaptureCoordinatorReserveOutcome::ConflictUnchanged { conflict })
+        }
+    }
+}
+
+/// Store-backed counterpart to [`record_live_maintenance_lock_failure_until`].
+#[allow(dead_code)]
+pub(crate) async fn record_live_maintenance_lock_failure_with_capture(
+    capture: std::sync::Arc<dyn crate::storage::CaptureStore>,
+    request: &CaptureCatalogApplyRequest,
+    deadline: Option<CaptureCommitDeadline>,
+) {
+    update_live_retryable_diagnostic_with_capture(
+        capture,
+        request,
+        CaptureCatalogDiagnostic::RecordRetryableCheckpointFailure {
+            stage: CaptureCatalogRetryableStage::MaintenanceLock,
+            failed_at: Utc::now().timestamp(),
+        },
+        deadline,
+    )
+    .await;
+}
+
+/// Store-backed counterpart to [`record_live_checkpoint_write_failure_until`].
+#[allow(dead_code)]
+pub(crate) async fn record_live_checkpoint_write_failure_with_capture(
+    capture: std::sync::Arc<dyn crate::storage::CaptureStore>,
+    request: &CaptureCatalogApplyRequest,
+    deadline: Option<CaptureCommitDeadline>,
+) {
+    update_live_retryable_diagnostic_with_capture(
+        capture,
+        request,
+        CaptureCatalogDiagnostic::RecordRetryableCheckpointFailure {
+            stage: CaptureCatalogRetryableStage::CheckpointWrite,
+            failed_at: Utc::now().timestamp(),
+        },
+        deadline,
+    )
+    .await;
+}
+
+/// Store-backed counterpart to [`clear_live_retryable_checkpoint_failure_until`].
+#[allow(dead_code)]
+pub(crate) async fn clear_live_retryable_checkpoint_failure_with_capture(
+    capture: std::sync::Arc<dyn crate::storage::CaptureStore>,
+    request: &CaptureCatalogApplyRequest,
+    deadline: Option<CaptureCommitDeadline>,
+) {
+    update_live_retryable_diagnostic_with_capture(
+        capture,
+        request,
+        CaptureCatalogDiagnostic::ClearRetryableCheckpointFailure,
+        deadline,
+    )
+    .await;
+}
+
+async fn update_live_retryable_diagnostic_with_capture(
+    capture: std::sync::Arc<dyn crate::storage::CaptureStore>,
+    request: &CaptureCatalogApplyRequest,
+    diagnostic: CaptureCatalogDiagnostic,
+    deadline: Option<CaptureCommitDeadline>,
+) {
+    let catalog = match deadline {
+        Some(deadline) => CaptureStoreCatalogPort::new_until(capture, deadline),
+        None => CaptureStoreCatalogPort::new(capture),
+    };
+    match catalog.update_diagnostic(request, diagnostic).await {
+        Ok(true) => {
+            tracing::debug!(
+                target: "agent.capture.diagnostic",
+                replay_key = %request.action().action_key(),
+                diagnostic_outcome = "updated",
+                "capture retry diagnostic updated"
+            );
+        }
+        Ok(false) => {
+            tracing::debug!(
+                target: "agent.capture.diagnostic",
+                replay_key = %request.action().action_key(),
+                diagnostic_outcome = "fenced",
+                "capture retry diagnostic was not applied after a concurrent mutation"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "agent.capture.diagnostic",
+                replay_key = %request.action().action_key(),
+                diagnostic_outcome = "unavailable",
+                "capture retry diagnostic could not be persisted"
+            );
+        }
+    }
+}
 
 /// Start a live reservation under one invocation's transient absolute
 /// deadline. The deadline is retained by the concrete catalog port carried in
@@ -432,6 +559,32 @@ pub(crate) async fn read_repository_hash_kind(
     hash_kind_from_object_format_lookup(lookup).map_err(|_| active_repository_failure(class))
 }
 
+/// Store-backed counterpart to [`set_hash_kind_from_connection`].
+#[allow(dead_code)]
+pub(crate) async fn set_hash_kind_from_store(
+    config: &dyn crate::storage::ConfigStore,
+) -> Result<()> {
+    let hash_kind = read_repository_hash_kind_with_store(config).await?;
+    set_hash_kind(hash_kind);
+    Ok(())
+}
+
+/// Store-backed counterpart to [`read_repository_hash_kind`].
+#[allow(dead_code)]
+pub(crate) async fn read_repository_hash_kind_with_store(
+    config: &dyn crate::storage::ConfigStore,
+) -> Result<git_internal::hash::HashKind> {
+    let lookup = ConfigKv::get_with_store(config, "core.objectformat")
+        .await
+        .map(|entry| entry.map(|e| e.value));
+    let class = if lookup.is_err() {
+        ActiveRepositoryFailureClass::ObjectFormatUnreadable
+    } else {
+        ActiveRepositoryFailureClass::ObjectFormatUnsupported
+    };
+    hash_kind_from_object_format_lookup(lookup).map_err(|_| active_repository_failure(class))
+}
+
 /// Map a `core.objectformat` lookup onto [`HashKind`].
 ///
 /// - `Ok(Some(value))` → [`crate::internal::object_format::parse_config_value`]
@@ -688,6 +841,143 @@ pub(crate) async fn latest_committed_checkpoint_id(
         .context("failed to read parent committed checkpoint id")
 }
 
+/// Store-backed counterpart to [`load_capture_state`] using
+/// [`crate::storage::CaptureStore`] without opening SQLite.
+#[allow(dead_code)]
+pub(crate) async fn load_capture_state_with_capture(
+    capture: &dyn crate::storage::CaptureStore,
+    agent_kind: &str,
+    provider_session_id: &str,
+    scope: &CaptureScope,
+) -> Result<Option<DurableCaptureState>> {
+    let sessions = capture
+        .list_sessions_by_started_desc()
+        .await
+        .map_err(|err| anyhow::anyhow!("read durable agent capture state from store: {err}"))?;
+    let Some(row) = sessions.into_iter().find(|s| {
+        s.agent_kind.as_str() == agent_kind
+            && s.provider_session_id == provider_session_id
+            && s.scope_state == crate::storage::CaptureScopeState::Scoped
+            && s.repo_id.as_deref() == Some(scope.repo_id.as_str())
+            && s.worktree_id.as_deref() == Some(scope.worktree_id.as_str())
+            && s.workspace_id == scope.workspace_id
+            && s.workspace_fence == scope.workspace_fence
+    }) else {
+        return Ok(None);
+    };
+    let phase = CapturePhase::from_db(row.state.as_str())
+        .context("validate durable agent capture state")?;
+    Ok(Some(DurableCaptureState {
+        phase,
+        stopped_at: row.stopped_at,
+        sync_revision: row.sync_revision,
+    }))
+}
+
+/// Store-backed counterpart to [`scoped_owner_agent_kind`].
+#[allow(dead_code)]
+pub(crate) async fn scoped_owner_agent_kind_with_capture(
+    capture: &dyn crate::storage::CaptureStore,
+    provider_session_id: &str,
+    scope: &CaptureScope,
+) -> Result<Option<String>> {
+    let mut sessions = capture
+        .list_sessions_by_started_desc()
+        .await
+        .map_err(|err| anyhow::anyhow!("read scoped owner agent kind from store: {err}"))?;
+    sessions.retain(|s| {
+        s.provider_session_id == provider_session_id
+            && s.scope_state == crate::storage::CaptureScopeState::Scoped
+            && s.repo_id.as_deref() == Some(scope.repo_id.as_str())
+            && s.worktree_id.as_deref() == Some(scope.worktree_id.as_str())
+            && s.workspace_id == scope.workspace_id
+            && s.workspace_fence == scope.workspace_fence
+    });
+    sessions.sort_by_key(|s| (s.started_at, s.session_id.clone()));
+    Ok(sessions
+        .into_iter()
+        .next()
+        .map(|s| s.agent_kind.as_str().to_owned()))
+}
+
+/// Store-backed counterpart to [`terminal_session_identity_changed`].
+#[allow(dead_code)]
+pub(crate) async fn terminal_session_identity_changed_with_capture(
+    capture: &dyn crate::storage::CaptureStore,
+    deadline: Option<CaptureCommitDeadline>,
+    agent_kind: &str,
+    envelope: &SessionHookEnvelope,
+    session_id: &str,
+) -> Result<bool> {
+    await_agent_traces_pure_read_until(
+        deadline,
+        "classify terminal capture identity conflict",
+        async {
+            let sessions = capture
+                .list_sessions_by_started_desc()
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!("query recorded terminal capture identity: {err}")
+                })?;
+            Ok(sessions.iter().any(|s| {
+                s.agent_kind.as_str() == agent_kind
+                    && s.provider_session_id == envelope.session_id
+                    && (s.session_id != session_id || s.working_dir != envelope.cwd)
+            }))
+        },
+    )
+    .await
+}
+
+/// Store-backed counterpart to [`session_concurrent_active`].
+#[allow(dead_code)]
+pub(crate) async fn session_concurrent_active_with_capture(
+    capture: &dyn crate::storage::CaptureStore,
+    event_kind: LifecycleEventKind,
+    libra_session_id: &str,
+    working_dir: &str,
+    scope: &CaptureScope,
+) -> Result<bool> {
+    if !matches!(event_kind, LifecycleEventKind::TurnStart) {
+        return Ok(false);
+    }
+    let sessions = capture
+        .list_sessions_by_started_desc()
+        .await
+        .map_err(|err| anyhow::anyhow!("count concurrent active sessions from store: {err}"))?;
+    Ok(sessions.iter().any(|s| {
+        s.state == crate::storage::CaptureSessionState::Active
+            && s.working_dir == working_dir
+            && s.session_id != libra_session_id
+            && s.scope_state == crate::storage::CaptureScopeState::Scoped
+            && s.repo_id.as_deref() == Some(scope.repo_id.as_str())
+            && s.worktree_id.as_deref() == Some(scope.worktree_id.as_str())
+            && s.workspace_id == scope.workspace_id
+            && s.workspace_fence == scope.workspace_fence
+    }))
+}
+
+/// Store-backed counterpart to [`latest_committed_checkpoint_id`].
+#[allow(dead_code)]
+pub(crate) async fn latest_committed_checkpoint_id_with_capture(
+    capture: &dyn crate::storage::CaptureStore,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let mut checkpoints = capture
+        .list_checkpoints_by_session(session_id)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("resolve latest committed checkpoint from capture store: {err}")
+        })?;
+    checkpoints.retain(|c| c.scope == crate::storage::CaptureCheckpointScope::Committed);
+    checkpoints.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.checkpoint_id.cmp(&a.checkpoint_id))
+    });
+    Ok(checkpoints.into_iter().next().map(|c| c.checkpoint_id))
+}
+
 // ---------------------------------------------------------------------------
 // Export-job runner lease (ADR-ACF-10, ACF-20). A provider's transcript
 // exporter never receives this lease; capture holds it around the export and
@@ -928,6 +1218,206 @@ impl LiveExportLeasePort for ExportJobLeaseStore<'_> {
         )
         .await
         .map(|_| ())
+    }
+}
+
+/// Store-backed counterpart to [`ExportJobLeaseStore`] operating directly on
+/// [`crate::storage::CaptureStore`] without opening SQLite.
+#[allow(dead_code)]
+pub(crate) struct CaptureStoreExportJobLeaseStore {
+    capture: std::sync::Arc<dyn crate::storage::CaptureStore>,
+}
+
+#[allow(dead_code)]
+impl CaptureStoreExportJobLeaseStore {
+    pub(crate) fn new(capture: std::sync::Arc<dyn crate::storage::CaptureStore>) -> Self {
+        Self { capture }
+    }
+
+    fn job_id_for(target: &LiveExportTarget<'_>) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            target.scope.repo_id,
+            target.scope.worktree_id,
+            target.agent_kind,
+            target.provider_session_id
+        )
+    }
+}
+
+impl LiveExportLeasePort for CaptureStoreExportJobLeaseStore {
+    async fn observe_idle(
+        &self,
+        target: &LiveExportTarget<'_>,
+        owner: &str,
+        now_ms: i64,
+        deadline: CaptureCommitDeadline,
+    ) -> Result<LiveExportAdmission> {
+        if Instant::now() >= deadline.monotonic() {
+            anyhow::bail!("export lease deadline expired before observe_idle");
+        }
+        let job_id = Self::job_id_for(target);
+        let existing = self
+            .capture
+            .get_export_job(&job_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("read export job from capture store: {err}"))?;
+        let lease_ttl_ms = 60_000_i64;
+        if let Some(mut job) = existing {
+            let next_obs = job.observed_generation.saturating_add(1);
+            let lease_live = job.state == crate::storage::CaptureExportJobState::Inflight
+                && job.lease_expires_at.is_some_and(|exp| exp > now_ms);
+            if lease_live {
+                job.observed_generation = next_obs;
+                job.updated_at = now_ms;
+                self.capture
+                    .upsert_export_job(&job)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("update export job observation: {err}"))?;
+                return Ok(LiveExportAdmission::RecordedOnly);
+            }
+            let next_fence = job.fence_token.unwrap_or(0).saturating_add(1);
+            job.owner = Some(owner.to_owned());
+            job.lease_expires_at = Some(now_ms.saturating_add(lease_ttl_ms));
+            job.fence_token = Some(next_fence);
+            job.observed_generation = next_obs;
+            job.state = crate::storage::CaptureExportJobState::Inflight;
+            job.updated_at = now_ms;
+            self.capture
+                .upsert_export_job(&job)
+                .await
+                .map_err(|err| anyhow::anyhow!("acquire export job lease: {err}"))?;
+            return Ok(LiveExportAdmission::Runner {
+                fence_token: next_fence,
+                target_generation: next_obs,
+            });
+        }
+        let job = crate::storage::AgentExportJobRecord {
+            job_id,
+            agent_kind: target.agent_kind.to_owned(),
+            provider_session_id: target.provider_session_id.to_owned(),
+            owner: Some(owner.to_owned()),
+            lease_expires_at: Some(now_ms.saturating_add(lease_ttl_ms)),
+            fence_token: Some(1),
+            observed_generation: 1,
+            processed_generation: 0,
+            state: crate::storage::CaptureExportJobState::Inflight,
+            last_error_code: None,
+            created_at: now_ms,
+            updated_at: now_ms,
+            ttl_expires_at: now_ms.saturating_add(86_400_000),
+            repo_id: Some(target.scope.repo_id.clone()),
+            worktree_id: Some(target.scope.worktree_id.clone()),
+            workspace_id: target.scope.workspace_id.clone(),
+            workspace_fence: target.scope.workspace_fence,
+            scope_state: crate::storage::CaptureScopeState::Scoped,
+        };
+        self.capture
+            .upsert_export_job(&job)
+            .await
+            .map_err(|err| anyhow::anyhow!("create export job lease: {err}"))?;
+        Ok(LiveExportAdmission::Runner {
+            fence_token: 1,
+            target_generation: 1,
+        })
+    }
+
+    async fn release_failed(
+        &self,
+        target: &LiveExportTarget<'_>,
+        owner: &str,
+        fence_token: i64,
+        _deadline: CaptureCommitDeadline,
+    ) -> Result<()> {
+        let job_id = Self::job_id_for(target);
+        let Some(mut job) = self
+            .capture
+            .get_export_job(&job_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("read export job for failed release: {err}"))?
+        else {
+            return Ok(());
+        };
+        if job.owner.as_deref() == Some(owner) && job.fence_token == Some(fence_token) {
+            job.owner = None;
+            job.lease_expires_at = None;
+            job.state = crate::storage::CaptureExportJobState::Failed;
+            job.last_error_code = Some("LBR-AGENT-005".to_owned());
+            job.updated_at = Utc::now().timestamp_millis();
+            self.capture
+                .upsert_export_job(&job)
+                .await
+                .map_err(|err| anyhow::anyhow!("release failed export job lease: {err}"))?;
+        }
+        Ok(())
+    }
+
+    async fn release_dirty(
+        &self,
+        target: &LiveExportTarget<'_>,
+        owner: &str,
+        fence_token: i64,
+        _deadline: CaptureCommitDeadline,
+    ) -> Result<()> {
+        let job_id = Self::job_id_for(target);
+        let Some(mut job) = self
+            .capture
+            .get_export_job(&job_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("read export job for dirty release: {err}"))?
+        else {
+            return Ok(());
+        };
+        if job.owner.as_deref() == Some(owner) && job.fence_token == Some(fence_token) {
+            job.owner = None;
+            job.lease_expires_at = None;
+            job.state = crate::storage::CaptureExportJobState::Dirty;
+            job.updated_at = Utc::now().timestamp_millis();
+            self.capture
+                .upsert_export_job(&job)
+                .await
+                .map_err(|err| anyhow::anyhow!("release dirty export job lease: {err}"))?;
+        }
+        Ok(())
+    }
+
+    async fn advance_and_release(
+        &self,
+        target: &LiveExportTarget<'_>,
+        owner: &str,
+        fence_token: i64,
+        target_generation: i64,
+        deadline: CaptureCommitDeadline,
+    ) -> Result<()> {
+        if Instant::now() >= deadline.monotonic() {
+            anyhow::bail!("export lease deadline expired before advance_and_release");
+        }
+        let job_id = Self::job_id_for(target);
+        let Some(mut job) = self
+            .capture
+            .get_export_job(&job_id)
+            .await
+            .map_err(|err| anyhow::anyhow!("read export job for advance: {err}"))?
+        else {
+            anyhow::bail!("export job missing on advance_and_release");
+        };
+        if job.owner.as_deref() != Some(owner) || job.fence_token != Some(fence_token) {
+            anyhow::bail!("export job fence lost on advance_and_release");
+        }
+        job.processed_generation = job.processed_generation.max(target_generation);
+        job.owner = None;
+        job.lease_expires_at = None;
+        job.state = if job.observed_generation > job.processed_generation {
+            crate::storage::CaptureExportJobState::Dirty
+        } else {
+            crate::storage::CaptureExportJobState::Idle
+        };
+        job.updated_at = Utc::now().timestamp_millis();
+        self.capture
+            .upsert_export_job(&job)
+            .await
+            .map_err(|err| anyhow::anyhow!("advance and release export job: {err}"))?;
+        Ok(())
     }
 }
 

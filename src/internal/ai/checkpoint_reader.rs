@@ -26,8 +26,15 @@ use git_internal::{
 };
 use thiserror::Error;
 
-use crate::internal::ai::observed_agents::reasoning::{
-    ReasoningProvider, ReasoningSourceKind, artifact_locator_is_valid,
+use crate::{
+    internal::ai::observed_agents::reasoning::{
+        ReasoningProvider, ReasoningSourceKind, artifact_locator_is_valid,
+    },
+    storage::{
+        backend::StorageBackendKind,
+        capture_store::{CaptureCheckpointScope, CaptureStore},
+        config_store::ConfigStore,
+    },
 };
 
 type ReaderResult<T> = Result<T, CheckpointReaderError>;
@@ -1035,6 +1042,18 @@ pub(crate) struct CheckpointCatalog {
     kind: HashKind,
 }
 
+impl CheckpointCatalog {
+    #[allow(dead_code)]
+    pub(crate) fn checkpoint_id(&self) -> &str {
+        &self.checkpoint_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn tree_oid(&self) -> ObjectHash {
+        self.tree_oid
+    }
+}
+
 /// A metadata role pinned by the same database snapshot as the session view.
 /// Raw OIDs cannot construct this capability outside this owner.
 pub(crate) struct CheckpointMetadataRead {
@@ -1045,6 +1064,11 @@ pub(crate) struct CheckpointMetadataRead {
 impl CheckpointMetadataRead {
     pub(crate) fn checkpoint_id(&self) -> &str {
         &self.catalog.checkpoint_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn metadata_oid(&self) -> ObjectHash {
+        self.metadata_oid
     }
 
     pub(crate) fn read(self, budget: &CheckpointReadBudget) -> ReaderResult<Vec<u8>> {
@@ -1330,6 +1354,100 @@ pub(crate) async fn latest_session_metadata_in_snapshot(
     }))
 }
 
+/// Read the latest committed checkpoint metadata for `session_id` using
+/// backend-neutral read-only [`CaptureStore`] and [`ConfigStore`] handles (`RB-22`).
+#[allow(dead_code)]
+pub(crate) async fn latest_session_metadata_with_stores(
+    capture: &dyn CaptureStore,
+    config: &dyn ConfigStore,
+    storage: &Path,
+    session_id: &str,
+    budget: &CheckpointReadBudget,
+) -> ReaderResult<Option<CheckpointMetadataRead>> {
+    budget.check()?;
+    let mut checkpoints = capture
+        .list_checkpoints_by_session(session_id)
+        .await
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    budget.check()?;
+    checkpoints.retain(|cp| cp.scope == CaptureCheckpointScope::Committed);
+    checkpoints.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.checkpoint_id.cmp(&a.checkpoint_id))
+    });
+    let Some(latest) = checkpoints.into_iter().next() else {
+        return Ok(None);
+    };
+    validate_checkpoint_id(&latest.checkpoint_id)?;
+    let kind = object_format_kind_from_config_store(config).await?;
+    let tree_oid = crate::internal::object_format::parse_hex_for_kind(kind, &latest.tree_oid)
+        .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
+    let metadata_oid =
+        crate::internal::object_format::parse_hex_for_kind(kind, &latest.metadata_blob_oid)
+            .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
+    Ok(Some(CheckpointMetadataRead {
+        metadata_oid,
+        catalog: CheckpointCatalog {
+            storage: storage.to_path_buf(),
+            checkpoint_id: latest.checkpoint_id,
+            tree_oid,
+            kind,
+        },
+    }))
+}
+
+async fn object_format_kind_from_config_store(config: &dyn ConfigStore) -> ReaderResult<HashKind> {
+    let entry = config
+        .get("core.objectformat")
+        .await
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    let Some(entry) = entry else {
+        return Ok(HashKind::Sha1);
+    };
+    if entry.encrypted {
+        return Err(CheckpointReaderError::UnknownLayout);
+    }
+    crate::internal::object_format::parse_config_value(&entry.value)
+        .map_err(|_| CheckpointReaderError::UnknownLayout)
+}
+
+/// Load a checkpoint catalog row using backend-neutral read-only [`ConfigStore`]
+/// and [`CaptureStore`] handles (`RB-22`).
+pub(crate) async fn load_checkpoint_catalog_with_stores(
+    storage: &Path,
+    config: &dyn ConfigStore,
+    capture: &dyn CaptureStore,
+    checkpoint_id: &str,
+    budget: &CheckpointReadBudget,
+) -> ReaderResult<CheckpointCatalog> {
+    validate_checkpoint_id(checkpoint_id)?;
+    budget.check()?;
+    let kind = object_format_kind_from_config_store(config).await?;
+    let row = capture
+        .get_checkpoint(checkpoint_id)
+        .await
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    budget.check()?;
+    let Some(row) = row else {
+        return Err(CheckpointReaderError::fatal(format!(
+            "no checkpoint matches id '{checkpoint_id}'; list captured checkpoints with \
+             `libra agent checkpoint list`"
+        )));
+    };
+    if row.checkpoint_id != checkpoint_id {
+        return Err(CheckpointReaderError::RoleProof);
+    }
+    let tree_oid = crate::internal::object_format::parse_hex_for_kind(kind, &row.tree_oid)
+        .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
+    Ok(CheckpointCatalog {
+        storage: storage.to_path_buf(),
+        checkpoint_id: row.checkpoint_id,
+        tree_oid,
+        kind,
+    })
+}
+
 /// Load a catalog row using one connection and one absolute query deadline.
 /// The dedicated connection is closed before this function returns authority
 /// to a filesystem worker. It never initializes a missing database or schema.
@@ -1338,166 +1456,204 @@ pub(crate) async fn load_checkpoint_catalog(
     checkpoint_id: &str,
     budget: &CheckpointReadBudget,
 ) -> ReaderResult<CheckpointCatalog> {
-    use sea_orm::sqlx::{
-        Row,
-        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    };
-
     validate_checkpoint_id(checkpoint_id)?;
     budget.check()?;
-    let phase_end = Instant::now() + Duration::from_millis(200);
-    let end = budget
-        .deadline
-        .map_or(phase_end, |caller| caller.min(phase_end));
-    let timeout_at = tokio::time::Instant::from_std(end);
-    let options = SqliteConnectOptions::new()
-        .filename(storage.join(crate::utils::util::DATABASE))
-        .read_only(true)
-        .create_if_missing(false)
-        .busy_timeout(Duration::ZERO);
-    let progress_budget = budget.clone();
-    // Preserve db.rs's SQLx 0.9 reaper safeguard for this readonly owner too.
-    let pool = SqlitePoolOptions::new()
-        .idle_timeout(None)
-        .max_lifetime(None)
-        .max_connections(1)
-        .min_connections(0)
-        .acquire_timeout(end.saturating_duration_since(Instant::now()))
-        .test_before_acquire(false)
-        .after_connect(move |connection, _| {
-            let progress_budget = progress_budget.clone();
-            Box::pin(async move {
-                #[cfg(test)]
-                let instructions = if progress_budget.catalog_observer.is_some() {
-                    1 // Observe real SQLite VM progress even for tiny fixture queries.
-                } else {
-                    1000
-                };
-                #[cfg(not(test))]
-                let instructions = 1000;
-                connection
-                    .lock_handle()
-                    .await?
-                    .set_progress_handler(instructions, move || {
-                        #[cfg(test)]
-                        progress_budget.observe_catalog(CatalogTestPhase::Progress);
-                        Instant::now() < end && progress_budget.check().is_ok()
-                    });
-                Ok(())
-            })
-        })
-        .connect_lazy_with(options);
-
-    let acquired = tokio::time::timeout_at(timeout_at, pool.acquire()).await;
-    let result = match acquired {
-        Ok(Ok(mut connection)) => {
-            // Failure paths close this connection, rather than returning a live
-            // lease to a pool whose query may still be winding down.
-            connection.close_on_drop();
-            let query = async {
-                budget.check()?;
-                let tables = sea_orm::sqlx::query(
-                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('agent_checkpoint', 'config_kv')",
-            ).fetch_all(&mut *connection).await
+    match crate::storage::runtime::detect_repo_backend(storage)
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?
+    {
+        StorageBackendKind::Redb => {
+            let config = crate::storage::runtime::open_repo_config_store_read_only(storage)
+                .await
                 .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
-                let names = tables
-                    .iter()
-                    .map(|row| row.try_get::<String, _>("name"))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| CheckpointReaderError::UnknownLayout)?;
-                if !names.iter().any(|name| name == "config_kv") {
-                    return Err(CheckpointReaderError::UnknownLayout);
-                }
-                if crate::internal::ai::capture::store::capture_database_path(storage).is_file() {
-                    let (format, encrypted) = object_format_on_sqlx(&mut connection).await?;
-                    return capture_checkpoint_catalog(storage, checkpoint_id, format, encrypted)
-                        .await;
-                }
-                if !names.iter().any(|name| name == "agent_checkpoint") {
-                    return Err(CheckpointReaderError::fatal(format!(
-                        "no checkpoint matches '{checkpoint_id}': agent_checkpoint table not yet present \
-                         (run `libra init`?)"
-                    )));
-                }
-                // One statement observes the named row and its format in the same
-                // SQLite read snapshot. Bounded substrings avoid allocating an
-                // unbounded corrupt catalog value; overlength values fail below.
-                let rows = sea_orm::sqlx::query(
-                "SELECT substr(checkpoint_id, 1, 129) AS checkpoint_id, substr(tree_oid, 1, 66) AS tree_oid, \
-                 (SELECT substr(value, 1, 17) FROM config_kv WHERE key = 'core.objectformat' ORDER BY id DESC LIMIT 1) AS format, \
-                 (SELECT encrypted FROM config_kv WHERE key = 'core.objectformat' ORDER BY id DESC LIMIT 1) AS encrypted \
-                 FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 2",
-            ).bind(checkpoint_id).fetch_all(&mut *connection).await
+            let capture = crate::storage::runtime::open_capture_store_read_only(storage)
+                .await
                 .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
-                budget.check()?;
-                if rows.is_empty() {
-                    return Err(CheckpointReaderError::fatal(format!(
-                        "no checkpoint matches id '{checkpoint_id}'; list captured checkpoints with \
-                         `libra agent checkpoint list`"
-                    )));
-                }
-                if rows.len() != 1 {
-                    return Err(CheckpointReaderError::RoleProof);
-                }
-                // INVARIANT: empty and non-singleton results were refused above.
-                let row = &rows[0];
-                let actual_id: String = row
-                    .try_get("checkpoint_id")
-                    .map_err(|_| CheckpointReaderError::RoleProof)?;
-                if actual_id != checkpoint_id {
-                    return Err(CheckpointReaderError::RoleProof);
-                }
-                let format: Option<String> = row
-                    .try_get("format")
-                    .map_err(|_| CheckpointReaderError::UnknownLayout)?;
-                let encrypted: Option<i64> = row
-                    .try_get("encrypted")
-                    .map_err(|_| CheckpointReaderError::UnknownLayout)?;
-                if encrypted.is_some_and(|value| value != 0) {
-                    return Err(CheckpointReaderError::UnknownLayout);
-                }
-                let kind = match format {
-                    Some(format) => crate::internal::object_format::parse_config_value(&format)
-                        .map_err(|_| CheckpointReaderError::UnknownLayout)?,
-                    None => HashKind::Sha1,
-                };
-                let tree_oid: String = row
-                    .try_get("tree_oid")
-                    .map_err(|_| CheckpointReaderError::RoleProof)?;
-                let tree_oid = crate::internal::object_format::parse_hex_for_kind(kind, &tree_oid)
-                    .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
-                Ok(CheckpointCatalog {
-                    storage: storage.to_path_buf(),
-                    checkpoint_id: actual_id,
-                    tree_oid,
-                    kind,
-                })
-            };
-            let query_result = match tokio::time::timeout_at(timeout_at, query).await {
-                Ok(result) => result,
-                Err(_) => Err(CheckpointReaderError::CatalogUnavailable),
-            };
-            // Keep ownership outside the timed query future. A deadline can
-            // cancel a query, but cannot turn dropping close() into a joined
-            // SQLite worker. Always finish closure, then refuse late authority.
-            let close_result = connection.close().await;
-            #[cfg(test)]
-            budget.observe_catalog(CatalogTestPhase::ConnectionCloseFinished);
-            match close_result {
-                Ok(()) => query_result,
-                Err(_) => Err(CheckpointReaderError::CatalogUnavailable),
-            }
+            return load_checkpoint_catalog_with_stores(
+                storage,
+                config.as_ref(),
+                capture.as_ref(),
+                checkpoint_id,
+                budget,
+            )
+            .await;
         }
-        Ok(Err(_)) | Err(_) => Err(CheckpointReaderError::CatalogUnavailable),
-    };
-    pool.close().await;
-    #[cfg(test)]
-    budget.observe_catalog(CatalogTestPhase::PoolCloseFinished);
-    budget.check()?;
-    if Instant::now() >= end {
-        return Err(CheckpointReaderError::CatalogUnavailable);
+        StorageBackendKind::Sqlite => {
+            use sea_orm::sqlx::{
+                Row,
+                sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+            };
+
+            let phase_end = Instant::now() + Duration::from_millis(200);
+            let end = budget
+                .deadline
+                .map_or(phase_end, |caller| caller.min(phase_end));
+            let timeout_at = tokio::time::Instant::from_std(end);
+            let options = SqliteConnectOptions::new()
+                .filename(storage.join(crate::utils::util::DATABASE))
+                .read_only(true)
+                .create_if_missing(false)
+                .busy_timeout(Duration::ZERO);
+            let progress_budget = budget.clone();
+            // Preserve db.rs's SQLx 0.9 reaper safeguard for this readonly owner too.
+            let pool = SqlitePoolOptions::new()
+                .idle_timeout(None)
+                .max_lifetime(None)
+                .max_connections(1)
+                .min_connections(0)
+                .acquire_timeout(end.saturating_duration_since(Instant::now()))
+                .test_before_acquire(false)
+                .after_connect(move |connection, _| {
+                    let progress_budget = progress_budget.clone();
+                    Box::pin(async move {
+                        #[cfg(test)]
+                        let instructions = if progress_budget.catalog_observer.is_some() {
+                            1 // Observe real SQLite VM progress even for tiny fixture queries.
+                        } else {
+                            1000
+                        };
+                        #[cfg(not(test))]
+                        let instructions = 1000;
+                        connection.lock_handle().await?.set_progress_handler(
+                            instructions,
+                            move || {
+                                #[cfg(test)]
+                                progress_budget.observe_catalog(CatalogTestPhase::Progress);
+                                Instant::now() < end && progress_budget.check().is_ok()
+                            },
+                        );
+                        Ok(())
+                    })
+                })
+                .connect_lazy_with(options);
+
+            let acquired = tokio::time::timeout_at(timeout_at, pool.acquire()).await;
+            let result = match acquired {
+                Ok(Ok(mut connection)) => {
+                    // Failure paths close this connection, rather than returning a live
+                    // lease to a pool whose query may still be winding down.
+                    connection.close_on_drop();
+                    let query = async {
+                        budget.check()?;
+                        let tables = sea_orm::sqlx::query(
+                            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('agent_checkpoint', 'config_kv')",
+                        )
+                        .fetch_all(&mut *connection)
+                        .await
+                        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+                        let names = tables
+                            .iter()
+                            .map(|row| row.try_get::<String, _>("name"))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|_| CheckpointReaderError::UnknownLayout)?;
+                        if !names.iter().any(|name| name == "config_kv") {
+                            return Err(CheckpointReaderError::UnknownLayout);
+                        }
+                        if crate::internal::ai::capture::store::capture_database_path(storage)
+                            .is_file()
+                        {
+                            let (format, encrypted) =
+                                object_format_on_sqlx(&mut connection).await?;
+                            return capture_checkpoint_catalog(
+                                storage,
+                                checkpoint_id,
+                                format,
+                                encrypted,
+                            )
+                            .await;
+                        }
+                        if !names.iter().any(|name| name == "agent_checkpoint") {
+                            return Err(CheckpointReaderError::fatal(format!(
+                                "no checkpoint matches '{checkpoint_id}': agent_checkpoint table not yet present \
+                                 (run `libra init`?)"
+                            )));
+                        }
+                        // One statement observes the named row and its format in the same
+                        // SQLite read snapshot. Bounded substrings avoid allocating an
+                        // unbounded corrupt catalog value; overlength values fail below.
+                        let rows = sea_orm::sqlx::query(
+                            "SELECT substr(checkpoint_id, 1, 129) AS checkpoint_id, substr(tree_oid, 1, 66) AS tree_oid, \
+                             (SELECT substr(value, 1, 17) FROM config_kv WHERE key = 'core.objectformat' ORDER BY id DESC LIMIT 1) AS format, \
+                             (SELECT encrypted FROM config_kv WHERE key = 'core.objectformat' ORDER BY id DESC LIMIT 1) AS encrypted \
+                             FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 2",
+                        )
+                        .bind(checkpoint_id)
+                        .fetch_all(&mut *connection)
+                        .await
+                        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+                        budget.check()?;
+                        if rows.is_empty() {
+                            return Err(CheckpointReaderError::fatal(format!(
+                                "no checkpoint matches id '{checkpoint_id}'; list captured checkpoints with \
+                                 `libra agent checkpoint list`"
+                            )));
+                        }
+                        if rows.len() != 1 {
+                            return Err(CheckpointReaderError::RoleProof);
+                        }
+                        // INVARIANT: empty and non-singleton results were refused above.
+                        let row = &rows[0];
+                        let actual_id: String = row
+                            .try_get("checkpoint_id")
+                            .map_err(|_| CheckpointReaderError::RoleProof)?;
+                        if actual_id != checkpoint_id {
+                            return Err(CheckpointReaderError::RoleProof);
+                        }
+                        let format: Option<String> = row
+                            .try_get("format")
+                            .map_err(|_| CheckpointReaderError::UnknownLayout)?;
+                        let encrypted: Option<i64> = row
+                            .try_get("encrypted")
+                            .map_err(|_| CheckpointReaderError::UnknownLayout)?;
+                        if encrypted.is_some_and(|value| value != 0) {
+                            return Err(CheckpointReaderError::UnknownLayout);
+                        }
+                        let kind = match format {
+                            Some(format) => {
+                                crate::internal::object_format::parse_config_value(&format)
+                                    .map_err(|_| CheckpointReaderError::UnknownLayout)?
+                            }
+                            None => HashKind::Sha1,
+                        };
+                        let tree_oid: String = row
+                            .try_get("tree_oid")
+                            .map_err(|_| CheckpointReaderError::RoleProof)?;
+                        let tree_oid =
+                            crate::internal::object_format::parse_hex_for_kind(kind, &tree_oid)
+                                .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
+                        Ok(CheckpointCatalog {
+                            storage: storage.to_path_buf(),
+                            checkpoint_id: actual_id,
+                            tree_oid,
+                            kind,
+                        })
+                    };
+                    let query_result = match tokio::time::timeout_at(timeout_at, query).await {
+                        Ok(result) => result,
+                        Err(_) => Err(CheckpointReaderError::CatalogUnavailable),
+                    };
+                    // Keep ownership outside the timed query future. A deadline can
+                    // cancel a query, but cannot turn dropping close() into a joined
+                    // SQLite worker. Always finish closure, then refuse late authority.
+                    let close_result = connection.close().await;
+                    #[cfg(test)]
+                    budget.observe_catalog(CatalogTestPhase::ConnectionCloseFinished);
+                    match close_result {
+                        Ok(()) => query_result,
+                        Err(_) => Err(CheckpointReaderError::CatalogUnavailable),
+                    }
+                }
+                Ok(Err(_)) | Err(_) => Err(CheckpointReaderError::CatalogUnavailable),
+            };
+            pool.close().await;
+            #[cfg(test)]
+            budget.observe_catalog(CatalogTestPhase::PoolCloseFinished);
+            budget.check()?;
+            if Instant::now() >= end {
+                return Err(CheckpointReaderError::CatalogUnavailable);
+            }
+            result
+        }
     }
-    result
 }
 
 fn classify_catalog_io(message: &str) -> CheckpointReaderError {
@@ -1516,36 +1672,55 @@ fn classify_catalog_io(message: &str) -> CheckpointReaderError {
 }
 
 async fn repository_object_format(storage: &Path) -> ReaderResult<(Option<String>, Option<i64>)> {
-    use sea_orm::{ConnectionTrait, Statement};
+    match crate::storage::runtime::detect_repo_backend(storage)
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?
+    {
+        StorageBackendKind::Redb => {
+            let config = crate::storage::runtime::open_repo_config_store_read_only(storage)
+                .await
+                .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+            let entry = config
+                .get("core.objectformat")
+                .await
+                .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+            Ok(match entry {
+                Some(entry) => (Some(entry.value), Some(i64::from(entry.encrypted))),
+                None => (None, None),
+            })
+        }
+        StorageBackendKind::Sqlite => {
+            use sea_orm::{ConnectionTrait, Statement};
 
-    let path = storage.join(crate::utils::util::DATABASE);
-    let Some(path) = path.to_str() else {
-        return Err(CheckpointReaderError::CatalogUnavailable);
-    };
-    let conn = crate::internal::db::open_connection_without_schema_management(
-        path,
-        Duration::from_millis(200),
-    )
-    .await
-    .map_err(|error| classify_catalog_io(&error.to_string()))?;
-    let row = conn
-        .query_one_raw(Statement::from_string(
-            conn.get_database_backend(),
-            "SELECT substr(value, 1, 17) AS format, encrypted \
-             FROM config_kv WHERE key = 'core.objectformat' ORDER BY id DESC LIMIT 1"
-                .to_owned(),
-        ))
-        .await
-        .map_err(|error| classify_catalog_io(&error.to_string()))?;
-    let Some(row) = row else {
-        return Ok((None, None));
-    };
-    Ok((
-        row.try_get_by("format")
-            .map_err(|_| CheckpointReaderError::UnknownLayout)?,
-        row.try_get_by("encrypted")
-            .map_err(|_| CheckpointReaderError::UnknownLayout)?,
-    ))
+            let path = storage.join(crate::utils::util::DATABASE);
+            let Some(path) = path.to_str() else {
+                return Err(CheckpointReaderError::CatalogUnavailable);
+            };
+            let conn = crate::internal::db::open_connection_without_schema_management(
+                path,
+                Duration::from_millis(200),
+            )
+            .await
+            .map_err(|error| classify_catalog_io(&error.to_string()))?;
+            let row = conn
+                .query_one_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT substr(value, 1, 17) AS format, encrypted \
+                     FROM config_kv WHERE key = 'core.objectformat' ORDER BY id DESC LIMIT 1"
+                        .to_owned(),
+                ))
+                .await
+                .map_err(|error| classify_catalog_io(&error.to_string()))?;
+            let Some(row) = row else {
+                return Ok((None, None));
+            };
+            Ok((
+                row.try_get_by("format")
+                    .map_err(|_| CheckpointReaderError::UnknownLayout)?,
+                row.try_get_by("encrypted")
+                    .map_err(|_| CheckpointReaderError::UnknownLayout)?,
+            ))
+        }
+    }
 }
 
 async fn object_format_on_sqlx(
@@ -1577,8 +1752,6 @@ async fn capture_checkpoint_catalog(
     format: Option<String>,
     encrypted: Option<i64>,
 ) -> ReaderResult<CheckpointCatalog> {
-    use sea_orm::{ConnectionTrait, Statement};
-
     if encrypted.is_some_and(|value| value != 0) {
         return Err(CheckpointReaderError::UnknownLayout);
     }
@@ -1587,55 +1760,91 @@ async fn capture_checkpoint_catalog(
             .map_err(|_| CheckpointReaderError::UnknownLayout)?,
         None => HashKind::Sha1,
     };
-    let capture =
-        crate::internal::ai::capture::store::open_readonly(storage, Duration::from_millis(200))
-            .await
-            .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
-    if !crate::internal::db::connection_has_table(&capture, "agent_checkpoint")
-        .await
+    match crate::storage::runtime::detect_repo_backend(storage)
         .map_err(|_| CheckpointReaderError::CatalogUnavailable)?
     {
-        return Err(CheckpointReaderError::fatal(format!(
-            "no checkpoint matches '{checkpoint_id}': agent_checkpoint table not yet present \
-             (run `libra init`?)"
-        )));
+        StorageBackendKind::Redb => {
+            let capture = crate::storage::runtime::open_capture_store_read_only(storage)
+                .await
+                .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+            let row = capture
+                .get_checkpoint(checkpoint_id)
+                .await
+                .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+            let Some(row) = row else {
+                return Err(CheckpointReaderError::fatal(format!(
+                    "no checkpoint matches id '{checkpoint_id}'; list captured checkpoints with \
+                     `libra agent checkpoint list`"
+                )));
+            };
+            if row.checkpoint_id != checkpoint_id {
+                return Err(CheckpointReaderError::RoleProof);
+            }
+            let tree_oid = crate::internal::object_format::parse_hex_for_kind(kind, &row.tree_oid)
+                .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
+            Ok(CheckpointCatalog {
+                storage: storage.to_path_buf(),
+                checkpoint_id: row.checkpoint_id,
+                tree_oid,
+                kind,
+            })
+        }
+        StorageBackendKind::Sqlite => {
+            use sea_orm::{ConnectionTrait, Statement};
+
+            let capture = crate::internal::ai::capture::store::open_readonly(
+                storage,
+                Duration::from_millis(200),
+            )
+            .await
+            .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+            if !crate::internal::db::connection_has_table(&capture, "agent_checkpoint")
+                .await
+                .map_err(|_| CheckpointReaderError::CatalogUnavailable)?
+            {
+                return Err(CheckpointReaderError::fatal(format!(
+                    "no checkpoint matches '{checkpoint_id}': agent_checkpoint table not yet present \
+                     (run `libra init`?)"
+                )));
+            }
+            let rows = capture
+                .query_all_raw(Statement::from_sql_and_values(
+                    capture.get_database_backend(),
+                    "SELECT substr(checkpoint_id, 1, 129) AS checkpoint_id, substr(tree_oid, 1, 66) AS tree_oid \
+                     FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 2",
+                    [checkpoint_id.into()],
+                ))
+                .await
+                .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+            if rows.is_empty() {
+                return Err(CheckpointReaderError::fatal(format!(
+                    "no checkpoint matches id '{checkpoint_id}'; list captured checkpoints with \
+                     `libra agent checkpoint list`"
+                )));
+            }
+            if rows.len() != 1 {
+                return Err(CheckpointReaderError::RoleProof);
+            }
+            let row = &rows[0];
+            let actual_id: String = row
+                .try_get_by("checkpoint_id")
+                .map_err(|_| CheckpointReaderError::RoleProof)?;
+            if actual_id != checkpoint_id {
+                return Err(CheckpointReaderError::RoleProof);
+            }
+            let tree_oid: String = row
+                .try_get_by("tree_oid")
+                .map_err(|_| CheckpointReaderError::RoleProof)?;
+            let tree_oid = crate::internal::object_format::parse_hex_for_kind(kind, &tree_oid)
+                .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
+            Ok(CheckpointCatalog {
+                storage: storage.to_path_buf(),
+                checkpoint_id: actual_id,
+                tree_oid,
+                kind,
+            })
+        }
     }
-    let rows = capture
-        .query_all_raw(Statement::from_sql_and_values(
-            capture.get_database_backend(),
-            "SELECT substr(checkpoint_id, 1, 129) AS checkpoint_id, substr(tree_oid, 1, 66) AS tree_oid \
-             FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 2",
-            [checkpoint_id.into()],
-        ))
-        .await
-        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
-    if rows.is_empty() {
-        return Err(CheckpointReaderError::fatal(format!(
-            "no checkpoint matches id '{checkpoint_id}'; list captured checkpoints with \
-             `libra agent checkpoint list`"
-        )));
-    }
-    if rows.len() != 1 {
-        return Err(CheckpointReaderError::RoleProof);
-    }
-    let row = &rows[0];
-    let actual_id: String = row
-        .try_get_by("checkpoint_id")
-        .map_err(|_| CheckpointReaderError::RoleProof)?;
-    if actual_id != checkpoint_id {
-        return Err(CheckpointReaderError::RoleProof);
-    }
-    let tree_oid: String = row
-        .try_get_by("tree_oid")
-        .map_err(|_| CheckpointReaderError::RoleProof)?;
-    let tree_oid = crate::internal::object_format::parse_hex_for_kind(kind, &tree_oid)
-        .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
-    Ok(CheckpointCatalog {
-        storage: storage.to_path_buf(),
-        checkpoint_id: actual_id,
-        tree_oid,
-        kind,
-    })
 }
 
 fn validate_checkpoint_id(id: &str) -> ReaderResult<()> {

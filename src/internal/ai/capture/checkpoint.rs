@@ -501,6 +501,37 @@ impl<'a> AuthenticatedPendingEnvelope<'a> {
         Ok(Self { bytes, scope })
     }
 
+    /// Store-backed counterpart to [`Self::verify`] using [`crate::storage::ConfigStore`]
+    /// and [`crate::storage::GitStateStore`] without opening SQLite.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn verify_with_store(
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        storage: &Path,
+        root: &Path,
+        scope: &'a CaptureScope,
+        bytes: &'a [u8],
+        mac: &str,
+        deadline: Instant,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            bytes.first() == Some(&b'{'),
+            "capture recovery authentication failed; run `libra agent doctor`"
+        );
+        super::key::authenticate_pending_envelope_in_scope_with_store(
+            config,
+            git_state,
+            scope,
+            storage,
+            root,
+            bytes,
+            Some(mac),
+            deadline,
+        )
+        .await?;
+        Ok(Self { bytes, scope })
+    }
+
     pub(crate) fn bytes(&self) -> &[u8] {
         self.bytes
     }
@@ -4456,14 +4487,158 @@ impl<'a> TracesCheckpointStore<'a> {
         &self,
         stage: CheckpointStoreStage,
     ) -> Result<DatabaseConnection, CheckpointStoreError> {
-        let failure = CheckpointStoreError::StoreFailure { stage };
         match crate::internal::db::connection_has_table(self.conn, "metadata_kv").await {
             Ok(true) => Ok(self.conn.clone()),
-            Ok(false) => crate::internal::db::repository_peer(self.conn)
-                .await
-                .map_err(|_| failure),
-            Err(_) => Err(failure),
+            Ok(false) => {
+                let storage = crate::internal::db::connection_storage_root(self.conn)
+                    .await
+                    .map_err(|_| CheckpointStoreError::StoreFailure { stage })?;
+                match crate::storage::runtime::detect_repo_backend(&storage)
+                    .map_err(|_| CheckpointStoreError::StoreFailure { stage })?
+                {
+                    crate::storage::StorageBackendKind::Redb => {
+                        Err(CheckpointStoreError::StoreFailure { stage })
+                    }
+                    crate::storage::StorageBackendKind::Sqlite => {
+                        crate::internal::db::repository_peer(self.conn)
+                            .await
+                            .map_err(|_| CheckpointStoreError::StoreFailure { stage })
+                    }
+                }
+            }
+            Err(_) => Err(CheckpointStoreError::StoreFailure { stage }),
         }
+    }
+
+    /// Store-backed counterpart to [`Self::durable_replay_exists_for`] using
+    /// [`crate::storage::CaptureStore`] without opening SQLite.
+    #[allow(dead_code)]
+    pub(crate) async fn durable_replay_exists_with_capture(
+        capture: &dyn crate::storage::CaptureStore,
+        checkpoint_id: &str,
+        session_id: &str,
+        scope: CheckpointScope,
+    ) -> Result<bool, CheckpointStoreError> {
+        let expected_scope = match scope {
+            CheckpointScope::Temporary => crate::storage::CaptureCheckpointScope::Temporary,
+            CheckpointScope::Committed => crate::storage::CaptureCheckpointScope::Committed,
+            CheckpointScope::Subagent => crate::storage::CaptureCheckpointScope::Subagent,
+        };
+        let row = capture.get_checkpoint(checkpoint_id).await.map_err(|_| {
+            CheckpointStoreError::StoreFailure {
+                stage: CheckpointStoreStage::CatalogTransaction,
+            }
+        })?;
+        Ok(row.is_some_and(|cp| cp.session_id == session_id && cp.scope == expected_scope))
+    }
+
+    /// Fetch a checkpoint record directly from [`crate::storage::CaptureStore`].
+    #[allow(dead_code)]
+    pub(crate) async fn get_checkpoint_with_capture(
+        capture: &dyn crate::storage::CaptureStore,
+        checkpoint_id: &str,
+    ) -> Result<Option<crate::storage::AgentCheckpointRecord>, CheckpointStoreError> {
+        capture.get_checkpoint(checkpoint_id).await.map_err(|_| {
+            CheckpointStoreError::StoreFailure {
+                stage: CheckpointStoreStage::CatalogTransaction,
+            }
+        })
+    }
+
+    /// List checkpoints for a session directly from [`crate::storage::CaptureStore`].
+    #[allow(dead_code)]
+    pub(crate) async fn list_checkpoints_for_session_with_capture(
+        capture: &dyn crate::storage::CaptureStore,
+        session_id: &str,
+    ) -> Result<Vec<crate::storage::AgentCheckpointRecord>, CheckpointStoreError> {
+        capture
+            .list_checkpoints_by_session(session_id)
+            .await
+            .map_err(|_| CheckpointStoreError::StoreFailure {
+                stage: CheckpointStoreStage::CatalogTransaction,
+            })
+    }
+
+    /// Write a traces in-flight marker into [`crate::storage::MetadataStore`].
+    #[allow(dead_code)]
+    pub(crate) async fn write_traces_inflight_marker_with_store(
+        meta: &dyn crate::storage::MetadataStore,
+        session_id: &str,
+        attempt_id: &str,
+        marker_json: &str,
+    ) -> Result<(), CheckpointStoreError> {
+        crate::internal::metadata::MetadataKv::set_with_store(
+            meta,
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            session_id,
+            attempt_id,
+            marker_json,
+            crate::internal::metadata::MetadataValueType::Text,
+        )
+        .await
+        .map_err(|_| CheckpointStoreError::StoreFailure {
+            stage: CheckpointStoreStage::Marker,
+        })?;
+        Ok(())
+    }
+
+    /// Clear a traces in-flight marker from [`crate::storage::MetadataStore`].
+    #[allow(dead_code)]
+    pub(crate) async fn clear_traces_inflight_marker_with_store(
+        meta: &dyn crate::storage::MetadataStore,
+        session_id: &str,
+        attempt_id: &str,
+    ) -> Result<bool, CheckpointStoreError> {
+        crate::internal::metadata::MetadataKv::unset_with_store(
+            meta,
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            session_id,
+            attempt_id,
+        )
+        .await
+        .map_err(|_| CheckpointStoreError::StoreFailure {
+            stage: CheckpointStoreStage::Cleanup,
+        })
+    }
+
+    /// Publish a checkpoint (and optional session upsert) atomically across
+    /// `git.redb` and `capture.redb` via [`crate::storage::cross_store::CrossStoreCoordinator`].
+    ///
+    /// Commits strictly in `GitStore -> CaptureStore` order via the persisted
+    /// `META_CROSS_STORE_INTENT` outbox so generation counters stay synchronized
+    /// and gaps are replayed in ascending order rather than skipped (`ADR-RB-06`).
+    #[cfg(feature = "storage-redb")]
+    #[allow(dead_code)]
+    pub(crate) async fn publish_checkpoint_with_cross_store(
+        coordinator: &crate::storage::cross_store::CrossStoreCoordinator,
+        ref_op: &crate::storage::cross_store::CrossStoreRefCasOp,
+        session: Option<crate::storage::AgentSessionRecord>,
+        checkpoint: crate::storage::AgentCheckpointRecord,
+        dedup_prefix: &str,
+    ) -> Result<crate::storage::cross_store::CrossStoreCommitOutcome, CheckpointStoreError> {
+        let mut items = Vec::with_capacity(2);
+        if let Some(session_rec) = session {
+            items.push(crate::storage::CaptureBatchItem {
+                dedup_key: format!(
+                    "checkpoint:{dedup_prefix}:session:{}",
+                    session_rec.session_id
+                ),
+                payload: crate::storage::CaptureBatchPayload::UpsertSession(session_rec),
+            });
+        }
+        items.push(crate::storage::CaptureBatchItem {
+            dedup_key: format!(
+                "checkpoint:{dedup_prefix}:checkpoint:{}",
+                checkpoint.checkpoint_id
+            ),
+            payload: crate::storage::CaptureBatchPayload::UpsertCheckpoint(checkpoint),
+        });
+        coordinator
+            .commit_ref_cas_with_capture(ref_op, &items)
+            .await
+            .map_err(|_| CheckpointStoreError::StoreFailure {
+                stage: CheckpointStoreStage::CatalogTransaction,
+            })
     }
 
     async fn retire_ordinary_marker(

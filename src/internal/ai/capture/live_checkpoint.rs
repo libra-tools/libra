@@ -153,6 +153,22 @@ async fn cleanup_failed_checkpoint_side_effects(
     release_reserved_checkpoint_side_effects(conn, cleanup, deadline).await;
 }
 
+/// Store-backed counterpart to [`cleanup_failed_checkpoint_side_effects`] using
+/// [`crate::storage::CaptureStore`] without opening SQLite.
+#[allow(dead_code)]
+pub(crate) async fn cleanup_failed_checkpoint_side_effects_with_capture(
+    capture: std::sync::Arc<dyn crate::storage::CaptureStore>,
+    diagnostic_request: &CaptureCatalogApplyRequest,
+    deadline: Option<CaptureCommitDeadline>,
+) {
+    super::live::record_live_checkpoint_write_failure_with_capture(
+        capture,
+        diagnostic_request,
+        deadline,
+    )
+    .await;
+}
+
 /// Release pre-checkpoint coverage reservations on a terminal outcome that
 /// deliberately did not attempt a checkpoint. Unlike a real store failure,
 /// `Adopted`, `AlreadyComplete`, and durable quarantine have their own
@@ -2205,10 +2221,63 @@ async fn checkpoint_parent_commit(
     conn: &sea_orm::DatabaseConnection,
     label: &str,
 ) -> Result<Option<String>> {
-    let repo = crate::internal::db::repository_peer(conn)
+    let has_config = crate::internal::db::connection_has_table(conn, "config_kv")
         .await
-        .with_context(|| format!("failed to open the repository database while writing {label}"))?;
-    match crate::internal::head::Head::current_commit_result_with_conn(&repo).await {
+        .with_context(|| format!("failed to inspect repository tables while writing {label}"))?;
+    if has_config {
+        return match crate::internal::head::Head::current_commit_result_with_conn(conn).await {
+            Ok(commit) => Ok(commit.map(|hash| hash.to_string())),
+            Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
+                if detail.contains("HEAD reference is missing") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(anyhow!(
+                "failed to resolve HEAD while writing {label}: {err}"
+            )),
+        };
+    }
+    let storage = crate::internal::db::connection_storage_root(conn)
+        .await
+        .with_context(|| format!("failed to locate storage root while writing {label}"))?;
+    match crate::storage::runtime::detect_repo_backend(&storage)
+        .with_context(|| format!("failed to detect storage backend while writing {label}"))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            let git = crate::storage::runtime::open_git_store_read_only(&storage)
+                .await
+                .with_context(|| format!("failed to open redb git store while writing {label}"))?;
+            checkpoint_parent_commit_with_store(git.as_ref(), label).await
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let repo = crate::internal::db::repository_peer(conn)
+                .await
+                .with_context(|| {
+                    format!("failed to open the repository database while writing {label}")
+                })?;
+            match crate::internal::head::Head::current_commit_result_with_conn(&repo).await {
+                Ok(commit) => Ok(commit.map(|hash| hash.to_string())),
+                Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
+                    if detail.contains("HEAD reference is missing") =>
+                {
+                    Ok(None)
+                }
+                Err(err) => Err(anyhow!(
+                    "failed to resolve HEAD while writing {label}: {err}"
+                )),
+            }
+        }
+    }
+}
+
+/// Store-backed counterpart to [`checkpoint_parent_commit`] using
+/// [`crate::storage::GitStore`] without opening SQLite.
+#[allow(dead_code)]
+pub(crate) async fn checkpoint_parent_commit_with_store(
+    git: &dyn crate::storage::GitStore,
+    label: &str,
+) -> Result<Option<String>> {
+    match crate::internal::head::Head::current_commit_result_with_store(git).await {
         Ok(commit) => Ok(commit.map(|hash| hash.to_string())),
         Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
             if detail.contains("HEAD reference is missing") =>
@@ -2216,9 +2285,173 @@ async fn checkpoint_parent_commit(
             Ok(None)
         }
         Err(err) => Err(anyhow!(
-            "failed to resolve HEAD while writing {label}: {err}"
+            "failed to resolve HEAD from git store while writing {label}: {err}"
         )),
     }
+}
+
+/// Materialize checkpoint objects into `<storage>/objects` and atomically
+/// publish the traces ref CAS + session + checkpoint records across
+/// `git.redb` and `capture.redb` via
+/// [`crate::storage::cross_store::CrossStoreCoordinator::commit_ref_cas_with_capture`].
+#[cfg(feature = "storage-redb")]
+#[allow(dead_code)]
+pub(crate) async fn publish_live_checkpoint_with_cross_store(
+    storage: &std::path::Path,
+    coordinator: &crate::storage::cross_store::CrossStoreCoordinator,
+    traces_branch_name: &str,
+    session: crate::storage::AgentSessionRecord,
+    mut checkpoint: crate::storage::AgentCheckpointRecord,
+    metadata_json: &[u8],
+    transcript_bytes: &[u8],
+) -> Result<(
+    crate::storage::AgentCheckpointRecord,
+    crate::storage::cross_store::CrossStoreCommitOutcome,
+)> {
+    use std::str::FromStr;
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::{
+            ObjectTrait,
+            blob::Blob,
+            commit::Commit,
+            signature::{Signature, SignatureType},
+            tree::{Tree, TreeItem, TreeItemMode},
+            types::ObjectType,
+        },
+    };
+
+    use crate::storage::{GitStore, RefKey, RefTarget, cross_store::CrossStoreRefCasOp};
+
+    if checkpoint.checkpoint_id.len() < 3 || !checkpoint.checkpoint_id.is_ascii() {
+        bail!("invalid checkpoint_id for cross-store publication");
+    }
+    let client =
+        crate::utils::client_storage::ClientStorage::init_local_existing(storage.join("objects"));
+
+    let metadata_blob = Blob::from_content_bytes(metadata_json.to_vec());
+    client
+        .put(&metadata_blob.id, &metadata_blob.data, ObjectType::Blob)
+        .context("write checkpoint metadata blob")?;
+    let transcript_blob = Blob::from_content_bytes(transcript_bytes.to_vec());
+    client
+        .put(&transcript_blob.id, &transcript_blob.data, ObjectType::Blob)
+        .context("write checkpoint transcript blob")?;
+
+    let inner_tree = Tree::from_tree_items(vec![
+        TreeItem::new(
+            TreeItemMode::Blob,
+            metadata_blob.id,
+            "metadata.json".to_string(),
+        ),
+        TreeItem::new(
+            TreeItemMode::Blob,
+            transcript_blob.id,
+            "transcript.jsonl".to_string(),
+        ),
+    ])
+    .map_err(|err| anyhow!("build checkpoint leaf tree: {err}"))?;
+    let inner_data = inner_tree
+        .to_data()
+        .context("serialize checkpoint leaf tree")?;
+    client
+        .put(&inner_tree.id, &inner_data, ObjectType::Tree)
+        .context("write checkpoint leaf tree")?;
+
+    let prefix_tree = Tree::from_tree_items(vec![TreeItem::new(
+        TreeItemMode::Tree,
+        inner_tree.id,
+        checkpoint.checkpoint_id[2..].to_string(),
+    )])
+    .map_err(|err| anyhow!("build checkpoint prefix tree: {err}"))?;
+    let prefix_data = prefix_tree
+        .to_data()
+        .context("serialize checkpoint prefix tree")?;
+    client
+        .put(&prefix_tree.id, &prefix_data, ObjectType::Tree)
+        .context("write checkpoint prefix tree")?;
+
+    let checkpoint_tree = Tree::from_tree_items(vec![TreeItem::new(
+        TreeItemMode::Tree,
+        prefix_tree.id,
+        checkpoint.checkpoint_id[..2].to_string(),
+    )])
+    .map_err(|err| anyhow!("build checkpoint root subdir tree: {err}"))?;
+    let checkpoint_tree_data = checkpoint_tree
+        .to_data()
+        .context("serialize checkpoint root subdir tree")?;
+    client
+        .put(&checkpoint_tree.id, &checkpoint_tree_data, ObjectType::Tree)
+        .context("write checkpoint root subdir tree")?;
+
+    let root_tree = Tree::from_tree_items(vec![TreeItem::new(
+        TreeItemMode::Tree,
+        checkpoint_tree.id,
+        "checkpoint".to_string(),
+    )])
+    .map_err(|err| anyhow!("build traces root tree: {err}"))?;
+    let root_tree_data = root_tree.to_data().context("serialize traces root tree")?;
+    client
+        .put(&root_tree.id, &root_tree_data, ObjectType::Tree)
+        .context("write traces root tree")?;
+
+    let ref_key = RefKey::LocalBranch {
+        name: traces_branch_name.to_string(),
+    };
+    let expected = coordinator
+        .git_store()
+        .get_ref(&ref_key)
+        .await
+        .map_err(|err| anyhow!("read current traces ref from git store: {err}"))?;
+    let mut parents = Vec::new();
+    if let Some(RefTarget::Direct(hex)) = &expected {
+        let parent_hash = ObjectHash::from_str(hex)
+            .map_err(|err| anyhow!("parse parent traces commit hash: {err}"))?;
+        parents.push(parent_hash);
+    }
+
+    let author = Signature::new(
+        SignatureType::Author,
+        "Libra".to_string(),
+        "capture@libra".to_string(),
+    );
+    let committer = Signature::new(
+        SignatureType::Committer,
+        "Libra".to_string(),
+        "capture@libra".to_string(),
+    );
+    let message = format!("checkpoint {}", checkpoint.checkpoint_id);
+    let commit = Commit::new(author, committer, root_tree.id, parents, &message);
+    let commit_data = commit
+        .to_data()
+        .context("serialize traces checkpoint commit")?;
+    client
+        .put(&commit.id, &commit_data, ObjectType::Commit)
+        .context("write traces checkpoint commit")?;
+
+    checkpoint.tree_oid = root_tree.id.to_string();
+    checkpoint.metadata_blob_oid = metadata_blob.id.to_string();
+    checkpoint.traces_commit = commit.id.to_string();
+
+    let ref_op = CrossStoreRefCasOp {
+        key: ref_key,
+        expected,
+        new_target: Some(RefTarget::Direct(commit.id.to_string())),
+        reflogs: Vec::new(),
+        publication: None,
+    };
+    let dedup_prefix = checkpoint.checkpoint_id.clone();
+    let outcome = super::checkpoint::TracesCheckpointStore::publish_checkpoint_with_cross_store(
+        coordinator,
+        &ref_op,
+        Some(session),
+        checkpoint.clone(),
+        &dedup_prefix,
+    )
+    .await
+    .map_err(|err| anyhow!("commit cross-store checkpoint intent: {err}"))?;
+    Ok((checkpoint, outcome))
 }
 
 /// Class (a) for an elapsed capture deadline: release this invocation's
@@ -7553,5 +7786,715 @@ pub(crate) mod tests {
             .release_failed(&target, "foreign-runner", fence_token, deadline)
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_capture_catalog_checkpoint_and_cross_store_intent() {
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        use crate::{
+            internal::{
+                ai::{
+                    capture::{
+                        catalog::{
+                            CaptureCatalogAction, CaptureCatalogApplyRequest,
+                            CaptureCatalogMutation, CaptureCatalogSession, CaptureCatalogStore,
+                            resolve_pending_session_context_with_capture,
+                        },
+                        checkpoint::{AuthenticatedPendingEnvelope, TracesCheckpointStore},
+                        key::{
+                            assert_capture_key_storage_binding_with_store,
+                            authenticate_pending_envelope_in_scope_with_store,
+                            derive_snapshot_content_commitment_in_scope_with_store,
+                        },
+                        live::{
+                            CaptureStoreExportJobLeaseStore, LiveExportAdmission,
+                            LiveExportLeasePort, LiveExportTarget,
+                            latest_committed_checkpoint_id_with_capture,
+                            load_capture_state_with_capture, read_repository_hash_kind_with_store,
+                            reserve_capture_catalog_with_capture,
+                            scoped_owner_agent_kind_with_capture,
+                            session_concurrent_active_with_capture, set_hash_kind_from_store,
+                        },
+                        pending::{
+                            PendingBinding, PendingHeader, gc_parent_roots_with_store,
+                            has_header_for_checkpoint_with_store, has_pending_hint_with_store,
+                            header_for_checkpoint_with_store, load_chunks_with_store,
+                            pending_candidates_for_scope_with_store,
+                            persist_header_and_chunks_with_store, remove_artifact_with_store,
+                            retains_unpublished_artifact_for_checkpoint_with_capture,
+                        },
+                        pending_identity::{PendingSessionAlias, lookup_with_store},
+                        recovery::{
+                            ArtifactRecoveryOutcome, DoctorReplayStoreRequest,
+                            replay_status_with_capture,
+                        },
+                        state::{CapturePhase, LifecycleReducerInput, reduce_lifecycle},
+                        summary::SessionSummaryRead,
+                    },
+                    capture_scope::{CaptureCommitDeadline, CaptureScope},
+                    checkpoint_reader::CheckpointReadBudget,
+                    hooks::LifecycleEventKind,
+                    traces::CheckpointScope,
+                },
+                metadata::MetadataScope,
+                workspace::RepoIdentity,
+            },
+            storage::{
+                AgentCheckpointRecord, CaptureCheckpointScope, RedbCaptureStore, RedbGitStore,
+                RedbRepairContext, RefCasOutcome, RefKey, RefTarget, StorageBackendKind,
+                cross_store::CrossStoreCoordinator,
+                runtime::{
+                    detect_repo_backend, open_capture_store_read_write,
+                    open_git_state_store_read_only, open_git_store_read_only,
+                    open_repo_config_store_read_only, open_repo_metadata_store_read_write,
+                    resolve_repo_capture_redb_path, resolve_repo_git_redb_path,
+                },
+            },
+            utils::test::ChangeDirGuard,
+        };
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let repo_dir = tmp.path().join("redb-capture-repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        let dot_libra = repo_dir.join(".libra");
+
+        #[cfg(not(feature = "storage-sqlite"))]
+        {
+            use clap::Parser;
+            let output = crate::utils::output::OutputConfig {
+                pager: false,
+                quiet: true,
+                ..crate::utils::output::OutputConfig::default()
+            };
+            crate::command::init::execute_safe(
+                crate::command::init::InitArgs::try_parse_from([
+                    "init",
+                    "-q",
+                    "-b",
+                    "main",
+                    repo_dir.to_string_lossy().as_ref(),
+                ])
+                .expect("parse init args"),
+                &output,
+            )
+            .await
+            .expect("init pure-redb repo");
+        }
+        #[cfg(feature = "storage-sqlite")]
+        {
+            crate::storage::runtime::init_redb_repository_storage(&dot_libra)
+                .await
+                .expect("init redb storage layout");
+            std::fs::create_dir_all(dot_libra.join("objects")).expect("mkdir objects");
+            let cfg_rw = crate::storage::runtime::open_repo_config_store_read_write(&dot_libra)
+                .await
+                .expect("open redb config rw");
+            let _ = RepoIdentity::resolve_or_init_with_store(cfg_rw.as_ref())
+                .await
+                .expect("init repo id");
+            crate::internal::config::ConfigKv::set_with_store(
+                cfg_rw.as_ref(),
+                "core.objectformat",
+                "sha1",
+                false,
+            )
+            .await
+            .expect("set core.objectformat");
+            let git_rw = crate::storage::runtime::open_git_store_read_write(&dot_libra)
+                .await
+                .expect("open redb git rw");
+            let _ = git_rw
+                .update_ref_cas(
+                    &RefKey::LocalHead { worktree_id: None },
+                    None,
+                    Some(&RefTarget::Symbolic("refs/heads/main".to_string())),
+                    &[],
+                )
+                .await
+                .expect("init HEAD");
+        }
+
+        let _cwd = ChangeDirGuard::new(&repo_dir);
+        assert_eq!(
+            detect_repo_backend(&dot_libra).expect("detect redb backend"),
+            StorageBackendKind::Redb
+        );
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "pure-redb repo must not create libra.db"
+        );
+        assert!(
+            !dot_libra.join("private").join("capture.db").exists(),
+            "pure-redb repo must not create private/capture.db"
+        );
+
+        let capture = open_capture_store_read_write(&dot_libra, RedbRepairContext::WriteCommand)
+            .await
+            .expect("open redb capture store");
+        let config = open_repo_config_store_read_only(&dot_libra)
+            .await
+            .expect("open redb config store");
+        let meta = open_repo_metadata_store_read_write(&dot_libra)
+            .await
+            .expect("open redb metadata store");
+        let git_state = open_git_state_store_read_only(&dot_libra)
+            .await
+            .expect("open redb git state store");
+        let git = open_git_store_read_only(&dot_libra)
+            .await
+            .expect("open redb git store");
+
+        // 1. live.rs: hash kind + catalog reservation + state queries + export lease
+        let hash_kind = read_repository_hash_kind_with_store(config.as_ref())
+            .await
+            .expect("read object format from redb config");
+        assert_eq!(hash_kind, git_internal::hash::HashKind::Sha1);
+        set_hash_kind_from_store(config.as_ref())
+            .await
+            .expect("set hash kind from redb config");
+
+        let repo_id = RepoIdentity::resolve_with_store(config.as_ref())
+            .await
+            .expect("resolve repo id from redb config");
+        let scope = CaptureScope {
+            repo_id: repo_id.as_str().to_owned(),
+            worktree_id: String::new(),
+            workspace_id: None,
+            workspace_fence: None,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let event_id = uuid::Uuid::new_v4();
+        let provider_sid = "codex-redb-session-1";
+        let session_id = format!("codex__{provider_sid}");
+        let working_dir = repo_dir.to_string_lossy().to_string();
+
+        let action_plan = reduce_lifecycle(LifecycleReducerInput {
+            current: None,
+            event_kind: LifecycleEventKind::SessionStart,
+            event_id,
+            occurred_at: now,
+            deadline: None,
+        })
+        .expect("reduce session start");
+        let catalog_session = CaptureCatalogSession::new(
+            session_id.clone(),
+            "codex",
+            provider_sid,
+            working_dir.clone(),
+        )
+        .expect("catalog session");
+        let catalog_action =
+            CaptureCatalogAction::from_ingress(event_id, None, LifecycleEventKind::SessionStart)
+                .expect("catalog action");
+        let catalog_mutation =
+            CaptureCatalogMutation::from_reducer(None, &action_plan, now).expect("mutation");
+        let apply_req = CaptureCatalogApplyRequest::new(
+            scope.clone(),
+            catalog_session,
+            catalog_action,
+            catalog_mutation,
+        )
+        .expect("apply request");
+
+        let reserved = reserve_capture_catalog_with_capture(Arc::clone(&capture), &apply_req, None)
+            .await
+            .expect("reserve catalog in redb capture store");
+        assert!(matches!(
+            reserved,
+            crate::internal::ai::capture::coordinator::CaptureCoordinatorReserveOutcome::Reserved(
+                _
+            )
+        ));
+
+        let durable_state =
+            load_capture_state_with_capture(capture.as_ref(), "codex", provider_sid, &scope)
+                .await
+                .expect("load capture state")
+                .expect("session row present");
+        assert_eq!(durable_state.phase, CapturePhase::Active);
+        assert_eq!(
+            scoped_owner_agent_kind_with_capture(capture.as_ref(), provider_sid, &scope)
+                .await
+                .expect("owner kind"),
+            Some("codex".to_string())
+        );
+        assert!(
+            !session_concurrent_active_with_capture(
+                capture.as_ref(),
+                LifecycleEventKind::TurnStart,
+                &session_id,
+                &working_dir,
+                &scope,
+            )
+            .await
+            .expect("concurrent active check")
+        );
+
+        let lease_store = CaptureStoreExportJobLeaseStore::new(Arc::clone(&capture));
+        let deadline = CaptureCommitDeadline::from_established_pair(
+            Instant::now() + Duration::from_secs(10),
+            chrono::Utc::now().timestamp_millis() + 10_000,
+        );
+        let export_target = LiveExportTarget {
+            agent_kind: "codex",
+            provider_session_id: provider_sid,
+            scope: &scope,
+        };
+        let admission = lease_store
+            .observe_idle(
+                &export_target,
+                "owner-1",
+                chrono::Utc::now().timestamp_millis(),
+                deadline,
+            )
+            .await
+            .expect("observe idle in capture store");
+        let LiveExportAdmission::Runner {
+            fence_token,
+            target_generation,
+        } = admission
+        else {
+            panic!("expected runner admission on fresh export job");
+        };
+        lease_store
+            .advance_and_release(
+                &export_target,
+                "owner-1",
+                fence_token,
+                target_generation,
+                deadline,
+            )
+            .await
+            .expect("advance and release export lease");
+
+        // 2. catalog.rs + key.rs + pending_identity.rs + pending.rs + recovery.rs
+        let listed_sessions = CaptureCatalogStore::list_sessions_with_capture(capture.as_ref())
+            .await
+            .expect("list sessions from capture store");
+        assert_eq!(listed_sessions.len(), 1);
+        let pending_ctx = resolve_pending_session_context_with_capture(
+            capture.as_ref(),
+            config.as_ref(),
+            &scope,
+            &session_id,
+        )
+        .await
+        .expect("resolve pending session context");
+
+        let key_deadline = Instant::now() + Duration::from_secs(10);
+        let bound_storage = assert_capture_key_storage_binding_with_store(
+            config.as_ref(),
+            git_state.as_ref(),
+            &scope,
+            &dot_libra,
+            &repo_dir,
+            key_deadline,
+        )
+        .await
+        .expect("assert capture key storage binding");
+        assert_eq!(bound_storage, dot_libra.canonicalize().expect("canon"));
+
+        // Derive snapshot content commitment (initializes private dedup key under .libra/private)
+        let preimage = [0x42u8; 32];
+        let source_commitment = derive_snapshot_content_commitment_in_scope_with_store(
+            config.as_ref(),
+            git_state.as_ref(),
+            &scope,
+            &dot_libra,
+            &repo_dir,
+            &preimage,
+            key_deadline,
+        )
+        .await
+        .expect("derive snapshot commitment");
+        assert!(source_commitment.starts_with("source/hmac-v2/"));
+
+        let prepared_alias = PendingSessionAlias::prepare_with_store(
+            config.as_ref(),
+            git_state.as_ref(),
+            &pending_ctx,
+            None,
+            &dot_libra,
+            &repo_dir,
+            key_deadline,
+        )
+        .await
+        .expect("prepare pending alias");
+
+        let checkpoint_id = uuid::Uuid::new_v4().to_string();
+        let envelope_bytes = br#"{"version":1,"kind":"redb_pending_test"}"#.to_vec();
+        let envelope_mac = authenticate_pending_envelope_in_scope_with_store(
+            config.as_ref(),
+            git_state.as_ref(),
+            &scope,
+            &dot_libra,
+            &repo_dir,
+            &envelope_bytes,
+            None,
+            key_deadline,
+        )
+        .await
+        .expect("authenticate pending envelope");
+        let _witness = AuthenticatedPendingEnvelope::verify_with_store(
+            config.as_ref(),
+            git_state.as_ref(),
+            &dot_libra,
+            &repo_dir,
+            &scope,
+            &envelope_bytes,
+            &envelope_mac,
+            key_deadline,
+        )
+        .await
+        .expect("verify authenticated pending envelope");
+
+        let binding = PendingBinding {
+            scope: scope.clone(),
+            session_id: prepared_alias.alias().to_owned(),
+            checkpoint_id: checkpoint_id.clone(),
+            event_id: event_id.to_string(),
+            action_key: format!("capture-lifecycle-v1:{event_id}"),
+            receipt_key: format!("action:{event_id}"),
+            marker_generation: uuid::Uuid::new_v4().to_string(),
+            source_commitment,
+            reserved_revision: durable_state.sync_revision,
+            original_deadline_millis: Some(chrono::Utc::now().timestamp_millis() + 10_000),
+            deferrable: true,
+            first_attempt_millis: chrono::Utc::now().timestamp_millis(),
+            parent_commit: None,
+            parent_unborn: true,
+        };
+        let pending_header =
+            PendingHeader::new_for_store(binding, envelope_mac, envelope_bytes.len())
+                .expect("construct validated pending header");
+        persist_header_and_chunks_with_store(meta.as_ref(), &pending_header, &envelope_bytes)
+            .await
+            .expect("persist pending header and chunks");
+        prepared_alias
+            .publish_for_artifact_with_capture(
+                capture.as_ref(),
+                config.as_ref(),
+                meta.as_ref(),
+                &checkpoint_id,
+            )
+            .await
+            .expect("publish pending alias");
+
+        assert!(
+            has_pending_hint_with_store(meta.as_ref(), config.as_ref(), &scope)
+                .await
+                .expect("has pending hint")
+        );
+        let (loaded_header, ns) =
+            header_for_checkpoint_with_store(meta.as_ref(), &scope.repo_id, &checkpoint_id)
+                .await
+                .expect("header lookup")
+                .expect("header present");
+        assert_eq!(ns, MetadataScope::AgentCapturePending);
+        assert_eq!(loaded_header.binding.checkpoint_id, checkpoint_id);
+        assert!(
+            retains_unpublished_artifact_for_checkpoint_with_capture(
+                meta.as_ref(),
+                capture.as_ref(),
+                &scope.repo_id,
+                &checkpoint_id,
+            )
+            .await
+            .expect("retains unpublished artifact")
+        );
+        assert_eq!(
+            load_chunks_with_store(meta.as_ref(), &loaded_header)
+                .await
+                .expect("load chunks"),
+            envelope_bytes
+        );
+        let candidates =
+            pending_candidates_for_scope_with_store(meta.as_ref(), config.as_ref(), &scope)
+                .await
+                .expect("pending candidates");
+        assert_eq!(candidates.headers.len(), 1);
+        assert!(
+            gc_parent_roots_with_store(meta.as_ref())
+                .await
+                .expect("gc parent roots")
+                .is_empty()
+        );
+        let looked_up_alias = lookup_with_store(
+            meta.as_ref(),
+            config.as_ref(),
+            &scope.repo_id,
+            prepared_alias.alias(),
+        )
+        .await
+        .expect("lookup alias")
+        .expect("alias present");
+        let resolved_ctx = looked_up_alias
+            .resolve_with_capture(
+                capture.as_ref(),
+                config.as_ref(),
+                git_state.as_ref(),
+                &scope,
+                &dot_libra,
+                &repo_dir,
+                key_deadline,
+            )
+            .await
+            .expect("resolve alias with capture");
+        assert_eq!(resolved_ctx.session_id(), session_id);
+
+        // Recovery pre-checkpoint: artifact is authenticated and ready to complete
+        let pre_recovery = replay_status_with_capture(DoctorReplayStoreRequest {
+            capture: capture.as_ref(),
+            config: config.as_ref(),
+            meta: meta.as_ref(),
+            git_state: git_state.as_ref(),
+            scope: &scope,
+            checkpoint_id: &checkpoint_id,
+            storage: &dot_libra,
+            root: &repo_dir,
+            deadline,
+            manual: false,
+        })
+        .await
+        .expect("pre-checkpoint recovery status");
+        assert_eq!(pre_recovery.outcome, ArtifactRecoveryOutcome::Completed);
+
+        // 3. Cross-store checkpoint publication (GitStore -> CaptureStore via CrossStoreCoordinator)
+        let parent_commit = checkpoint_parent_commit_with_store(git.as_ref(), "redb-test")
+            .await
+            .expect("resolve parent commit from redb git store");
+        assert!(parent_commit.is_none());
+
+        let metadata_json = serde_json::json!({
+            "schema_version": 2,
+            "checkpoint_id": checkpoint_id,
+            "session_id": session_id,
+            "agent_kind": "codex",
+            "provider_session_id": provider_sid,
+            "scope": "committed",
+            "extraction": {
+                "schema_version": 1,
+                "present": true,
+                "partial": false,
+                "model": "gpt-5.4",
+                "title": "Redb cross-store checkpoint",
+                "prompt_count": 1,
+                "modified_files": ["src/main.rs"],
+                "token_usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "total_tokens": 150
+                }
+            }
+        });
+        let metadata_bytes = serde_json::to_vec(&metadata_json).expect("serialize metadata");
+        let transcript_bytes = br#"{"role":"user","content":"hello redb"}\n"#.to_vec();
+
+        let session_record =
+            CaptureCatalogStore::get_session_with_capture(capture.as_ref(), &session_id)
+                .await
+                .expect("get session record")
+                .expect("session record present");
+        let checkpoint_record = AgentCheckpointRecord {
+            checkpoint_id: checkpoint_id.clone(),
+            session_id: session_id.clone(),
+            parent_checkpoint_id: None,
+            scope: CaptureCheckpointScope::Committed,
+            parent_commit: None,
+            tree_oid: "0".repeat(40),
+            metadata_blob_oid: "0".repeat(40),
+            traces_commit: "0".repeat(40),
+            tool_use_id: None,
+            subagent_session_id: None,
+            description: Some("redb cross-store test checkpoint".to_string()),
+            created_at: now,
+            sync_revision: session_record.sync_revision,
+        };
+
+        // Drop trait handles before opening concrete Redb stores for CrossStoreCoordinator
+        // (avoids holding duplicate writable redb handles in the same process).
+        drop(capture);
+        drop(config);
+        drop(meta);
+        drop(git_state);
+        drop(git);
+
+        let git_redb_path = resolve_repo_git_redb_path(&dot_libra).expect("git.redb path");
+        let cap_redb_path = resolve_repo_capture_redb_path(&dot_libra).expect("capture.redb path");
+        let redb_git = RedbGitStore::open_read_write(&git_redb_path).expect("open redb git rw");
+        let redb_cap =
+            RedbCaptureStore::open_read_write(&cap_redb_path, RedbRepairContext::WriteCommand)
+                .await
+                .expect("open redb capture rw");
+        let coordinator = CrossStoreCoordinator::new(redb_git.clone(), redb_cap.clone());
+
+        let (published_cp, commit_outcome) = publish_live_checkpoint_with_cross_store(
+            &dot_libra,
+            &coordinator,
+            "libra-traces-test",
+            session_record.clone(),
+            checkpoint_record,
+            &metadata_bytes,
+            &transcript_bytes,
+        )
+        .await
+        .expect("publish live checkpoint with cross-store coordinator");
+
+        assert_eq!(commit_outcome.generation, 1);
+        assert!(matches!(
+            commit_outcome.ref_outcome,
+            RefCasOutcome::Applied { .. }
+        ));
+        assert!(commit_outcome.replayed_generations.is_empty());
+        assert_eq!(commit_outcome.capture_applied, 2);
+
+        // Verify three-step consistent snapshot sees matching generation + Git ref + Capture session
+        let consistent = coordinator
+            .snapshot_consistent_read_only()
+            .await
+            .expect("three-step consistent read-only snapshot");
+        assert_eq!(consistent.generation(), 1);
+        let traces_ref = consistent
+            .get_git_ref(&RefKey::LocalBranch {
+                name: "libra-traces-test".to_string(),
+            })
+            .expect("read traces ref from snapshot");
+        assert_eq!(
+            traces_ref,
+            Some(RefTarget::Direct(published_cp.traces_commit.clone()))
+        );
+        let snap_session = consistent
+            .get_capture_session(&session_id)
+            .expect("read capture session from snapshot")
+            .expect("session present in consistent snapshot");
+        assert_eq!(snap_session.session_id, session_id);
+        drop(consistent);
+
+        // Verify durable checkpoint query + latest committed checkpoint + recovery AlreadyComplete
+        assert!(
+            TracesCheckpointStore::durable_replay_exists_with_capture(
+                &redb_cap,
+                &checkpoint_id,
+                &session_id,
+                CheckpointScope::Committed,
+            )
+            .await
+            .expect("durable replay exists")
+        );
+        assert_eq!(
+            latest_committed_checkpoint_id_with_capture(&redb_cap, &session_id)
+                .await
+                .expect("latest committed checkpoint"),
+            Some(checkpoint_id.clone())
+        );
+
+        drop(coordinator);
+        drop(redb_git);
+        drop(redb_cap);
+
+        // Re-open runtime stores for summary, post-commit recovery, and artifact cleanup
+        let capture = open_capture_store_read_write(&dot_libra, RedbRepairContext::WriteCommand)
+            .await
+            .expect("reopen redb capture store");
+        let config = open_repo_config_store_read_only(&dot_libra)
+            .await
+            .expect("reopen redb config store");
+        let meta = open_repo_metadata_store_read_write(&dot_libra)
+            .await
+            .expect("reopen redb metadata store");
+        let git_state = open_git_state_store_read_only(&dot_libra)
+            .await
+            .expect("reopen redb git state store");
+
+        assert!(
+            !retains_unpublished_artifact_for_checkpoint_with_capture(
+                meta.as_ref(),
+                capture.as_ref(),
+                &scope.repo_id,
+                &checkpoint_id,
+            )
+            .await
+            .expect("artifact is now published")
+        );
+        let post_recovery = replay_status_with_capture(DoctorReplayStoreRequest {
+            capture: capture.as_ref(),
+            config: config.as_ref(),
+            meta: meta.as_ref(),
+            git_state: git_state.as_ref(),
+            scope: &scope,
+            checkpoint_id: &checkpoint_id,
+            storage: &dot_libra,
+            root: &repo_dir,
+            deadline,
+            manual: false,
+        })
+        .await
+        .expect("post-checkpoint recovery status");
+        assert_eq!(
+            post_recovery.outcome,
+            ArtifactRecoveryOutcome::AlreadyComplete
+        );
+
+        let retained_after_cleanup = remove_artifact_with_store(
+            meta.as_ref(),
+            config.as_ref(),
+            &scope.repo_id,
+            &checkpoint_id,
+            &[prepared_alias.alias().to_owned()],
+        )
+        .await
+        .expect("remove pending artifact");
+        assert!(!retained_after_cleanup);
+        assert!(
+            !has_header_for_checkpoint_with_store(meta.as_ref(), &scope.repo_id, &checkpoint_id)
+                .await
+                .expect("header removed")
+        );
+
+        // 4. summary.rs: read back real checkpoint metadata from objects + CaptureStore
+        let budget =
+            CheckpointReadBudget::new(Instant::now() + Duration::from_secs(5), Arc::new(|| false));
+        let summary_read = SessionSummaryRead::prepare_for_with_capture(
+            capture.as_ref(),
+            config.as_ref(),
+            &dot_libra,
+            &session_id,
+            "codex",
+            budget,
+        )
+        .await
+        .expect("prepare summary with capture store");
+        let summary = summary_read
+            .finish_result()
+            .await
+            .expect("finish summary read from redb objects");
+        assert_eq!(summary.status, "available");
+        assert_eq!(
+            summary.as_of_checkpoint.as_deref(),
+            Some(checkpoint_id.as_str())
+        );
+        assert_eq!(summary.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(
+            summary.title.as_deref(),
+            Some("Redb cross-store checkpoint")
+        );
+        assert_eq!(summary.prompt_count, Some(1));
+        assert_eq!(summary.modified_file_count, Some(1));
+
+        // 5. Final invariant: zero SQLite DB files created anywhere in .libra
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "libra.db must never be created in pure-redb capture workflow"
+        );
+        assert!(
+            !dot_libra.join("private").join("capture.db").exists(),
+            "private/capture.db must never be created in pure-redb capture workflow"
+        );
     }
 }

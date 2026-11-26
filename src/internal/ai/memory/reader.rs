@@ -552,3 +552,269 @@ pub fn normalize_path_text(text: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// Backend-agnostic `GitStateStore` read-side (RB-23).
+// ---------------------------------------------------------------------------
+
+fn from_storage_source_kind(kind: crate::storage::MemorySourceKind) -> SourceKind {
+    match kind {
+        crate::storage::MemorySourceKind::Commit => SourceKind::Commit,
+        crate::storage::MemorySourceKind::AgentSession => SourceKind::AgentSession,
+        crate::storage::MemorySourceKind::AgentRun => SourceKind::AgentRun,
+        crate::storage::MemorySourceKind::BridgeOperation => SourceKind::BridgeOperation,
+    }
+}
+
+fn from_storage_outcome(outcome: crate::storage::MemoryOutcome) -> Outcome {
+    match outcome {
+        crate::storage::MemoryOutcome::Succeeded => Outcome::Succeeded,
+        crate::storage::MemoryOutcome::Failed => Outcome::Failed,
+        crate::storage::MemoryOutcome::Aborted => Outcome::Aborted,
+        crate::storage::MemoryOutcome::Partial => Outcome::Partial,
+        crate::storage::MemoryOutcome::Unknown => Outcome::Unknown,
+    }
+}
+
+fn record_to_episode(record: crate::storage::MemoryEpisodeRecord) -> Episode {
+    Episode {
+        episode_id: record.episode_id,
+        repo_id: record.repo_id,
+        source_kind: from_storage_source_kind(record.source_kind),
+        source_key: record.source_key,
+        outcome: from_storage_outcome(record.outcome),
+        actor: record.actor,
+        started_at: record.started_at,
+        ended_at: record.ended_at,
+        anchor_commit: record.anchor_commit,
+        change_id: record.change_id,
+        title: record.title,
+        body: record.body,
+        content_digest: record.content_digest,
+        producer: producer_lease(&record.producer),
+        rules_version: record.rules_version,
+        evidence: Vec::new(),
+        paths: Vec::new(),
+    }
+}
+
+async fn attach_children_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    episodes: &mut [Episode],
+) -> Result<(), MemoryError> {
+    use crate::internal::ai::memory::episode::{EvidenceEdge, PathRow};
+
+    for episode in episodes.iter_mut() {
+        let ev_rows = state_store
+            .list_memory_episode_evidence(&episode.episode_id)
+            .await?;
+        episode.evidence = ev_rows
+            .into_iter()
+            .map(|row| EvidenceEdge {
+                kind: row.kind.as_str().to_string(),
+                ref_id: row.ref_id,
+                link_confidence: row.link_confidence.as_str().to_string(),
+                resolution_status: row.resolution_status.as_str().to_string(),
+            })
+            .collect();
+
+        let path_rows = state_store
+            .list_memory_episode_paths(&episode.episode_id)
+            .await?;
+        episode.paths = path_rows
+            .into_iter()
+            .map(|row| PathRow {
+                code_path: row.code_path,
+                change_kind: row.change_kind.as_str().to_string(),
+                blob_oid_at_end: row.blob_oid_at_end,
+                ended_at: row.ended_at,
+            })
+            .collect();
+    }
+    Ok(())
+}
+
+/// Read the persisted commit-source projection state and derive freshness via
+/// [`crate::storage::GitStateStore`].
+pub async fn read_status_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    repo_id: &str,
+) -> Result<Option<ProjectionStatus>, MemoryError> {
+    let Some(state) = state_store
+        .get_memory_projection_state(repo_id, crate::storage::MemorySourceKind::Commit)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let operations = super::projection::commit_operations_with_store(state_store, repo_id).await?;
+    let current_fingerprint = commit_fingerprint(&operations);
+    Ok(Some(ProjectionStatus {
+        schema_version: state.schema_version,
+        rules_version: state.rules_version,
+        horizon_truncated: state.horizon_truncated,
+        revoked_count: state.revoked_count,
+        aged_out_count: state.aged_out_count,
+        rebuilt_at: state.rebuilt_at,
+        is_fresh: state.fingerprint == current_fingerprint,
+    }))
+}
+
+/// Return `Some(true)` if the commit projection is stale, `Some(false)` if it
+/// is fresh, and `None` when no projection has ever been derived.
+pub async fn projection_is_stale_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    repo_id: &str,
+) -> Result<Option<bool>, MemoryError> {
+    match read_status_with_store(state_store, repo_id).await? {
+        Some(status) => Ok(Some(!status.is_fresh)),
+        None => Ok(None),
+    }
+}
+
+/// List every Episode currently in the projection window for `repo_id` via
+/// [`crate::storage::GitStateStore`], ordered deterministically by
+/// `(source_kind ASC, source_key ASC)`.
+pub async fn list_episodes_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    repo_id: &str,
+) -> Result<Vec<Episode>, MemoryError> {
+    let mut episodes: Vec<Episode> = state_store
+        .list_memory_episodes(repo_id)
+        .await?
+        .into_iter()
+        .map(record_to_episode)
+        .collect();
+    episodes.sort_by(|a, b| {
+        a.source_kind
+            .as_str()
+            .cmp(b.source_kind.as_str())
+            .then_with(|| a.source_key.cmp(&b.source_key))
+    });
+    attach_children_with_store(state_store, &mut episodes).await?;
+    Ok(episodes)
+}
+
+/// Bounded deterministic episode read via [`crate::storage::GitStateStore`]:
+/// at most `limit` rows in projection order, attaching children only for the
+/// selected set.
+pub async fn list_episodes_bounded_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    repo_id: &str,
+    limit: usize,
+) -> Result<Vec<Episode>, MemoryError> {
+    let mut episodes: Vec<Episode> = state_store
+        .list_memory_episodes(repo_id)
+        .await?
+        .into_iter()
+        .map(record_to_episode)
+        .collect();
+    episodes.sort_by(|a, b| {
+        a.source_kind
+            .as_str()
+            .cmp(b.source_kind.as_str())
+            .then_with(|| a.source_key.cmp(&b.source_key))
+    });
+    episodes.truncate(limit);
+    attach_children_with_store(state_store, &mut episodes).await?;
+    Ok(episodes)
+}
+
+/// Read a single Episode by id for `repo_id` via [`crate::storage::GitStateStore`].
+pub async fn read_episode_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    repo_id: &str,
+    episode_id: &str,
+) -> Result<Option<Episode>, MemoryError> {
+    let Some(record) = state_store.get_memory_episode(episode_id).await? else {
+        return Ok(None);
+    };
+    if record.repo_id != repo_id {
+        return Ok(None);
+    }
+    let mut episode = record_to_episode(record);
+    attach_children_with_store(state_store, std::slice::from_mut(&mut episode)).await?;
+    Ok(Some(episode))
+}
+
+/// Query projected Episodes touching `code_path` via the `MEMORY_BY_PATH`
+/// secondary index on [`crate::storage::GitStateStore`], ordered strictly by
+/// `(ended_at DESC, episode_id ASC)` and filtered to `repo_id`.
+pub async fn search_episodes_by_path_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    repo_id: &str,
+    code_path: &[u8],
+    since_ended_at: Option<i64>,
+    until_ended_at: Option<i64>,
+    limit: Option<usize>,
+) -> Result<Vec<Episode>, MemoryError> {
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let path_rows = state_store
+        .query_memory_paths_by_path(code_path, since_ended_at, until_ended_at, None)
+        .await?;
+    let mut out = Vec::new();
+    for path_row in path_rows {
+        if let Some(episode) =
+            read_episode_with_store(state_store, repo_id, &path_row.episode_id).await?
+        {
+            out.push(episode);
+            if let Some(cap) = limit
+                && out.len() >= cap
+            {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read the projected search document row for `episode_id` from
+/// `memory_episode_search_doc`.
+pub async fn read_episode_search_doc_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    episode_id: &str,
+) -> Result<Option<crate::storage::MemoryEpisodeSearchDocRecord>, MemoryError> {
+    Ok(state_store
+        .get_memory_episode_search_doc(episode_id)
+        .await?)
+}
+
+/// Full-text substring search across `memory_episode_search_doc` for `repo_id`,
+/// ordered deterministically by `(ended_at DESC, episode_id ASC)`.
+pub async fn search_episodes_text_with_store(
+    state_store: &dyn crate::storage::GitStateStore,
+    repo_id: &str,
+    query: &str,
+    limit: Option<usize>,
+) -> Result<Vec<Episode>, MemoryError> {
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let needle = query.trim().to_ascii_lowercase();
+    let docs = state_store.list_memory_episode_search_docs().await?;
+    let mut matched = Vec::new();
+    for doc in docs {
+        let matches_query = needle.is_empty()
+            || doc.title.to_ascii_lowercase().contains(&needle)
+            || doc.body.to_ascii_lowercase().contains(&needle)
+            || doc.paths_text.to_ascii_lowercase().contains(&needle);
+        if !matches_query {
+            continue;
+        }
+        if let Some(episode) =
+            read_episode_with_store(state_store, repo_id, &doc.episode_id).await?
+        {
+            matched.push(episode);
+        }
+    }
+    matched.sort_by(|a, b| {
+        b.ended_at
+            .cmp(&a.ended_at)
+            .then_with(|| a.episode_id.cmp(&b.episode_id))
+    });
+    if let Some(cap) = limit {
+        matched.truncate(cap);
+    }
+    Ok(matched)
+}

@@ -67,7 +67,14 @@ use super::{
         safe_turn_projection,
     },
 };
-use crate::utils::client_storage::ClientStorage;
+use crate::{
+    storage::capture_store::{
+        AgentSubagentContentClaimRecord, AgentSubagentContentRevisionRecord,
+        AgentSubagentLinkRecord, CaptureStore, CaptureSubagentClaimState,
+        CaptureSubagentSourceChannel,
+    },
+    utils::client_storage::ClientStorage,
+};
 
 /// New content claims use a repository-keyed HMAC source key.  Schema V1
 /// rows remain immutable/read-only proof: a live capture must never create a
@@ -8065,6 +8072,297 @@ async fn capture_discovered_subagent_contents_inner(
         .await?;
     }
     Ok(())
+}
+
+/// Outcome of reserving a subagent content claim via [`CaptureStore`] (`RB-22`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubagentClaimReserveOutcome {
+    /// This caller holds the reservation lease under `fence_token`.
+    Reserved {
+        fence_token: i64,
+        next_revision: i64,
+    },
+    /// Content digest matches the already-committed current revision.
+    Unchanged {
+        current_revision: i64,
+        current_checkpoint_id: String,
+    },
+    /// Another writer owns an unexpired lease on this subagent source.
+    InFlight,
+}
+
+/// Fetch one `agent_subagent_content_claim` record via [`CaptureStore`] (`RB-22`).
+pub async fn get_subagent_content_claim_with_capture(
+    capture: &dyn CaptureStore,
+    parent_session_id: &str,
+    provider_kind: &str,
+    source_key: &str,
+    content_schema_version: i64,
+) -> Result<Option<AgentSubagentContentClaimRecord>> {
+    capture
+        .get_subagent_content_claim(
+            parent_session_id,
+            provider_kind,
+            source_key,
+            content_schema_version,
+        )
+        .await
+        .context("read agent_subagent_content_claim from capture store")
+}
+
+/// List all `agent_subagent_content_revision` rows for a subagent source via
+/// [`CaptureStore`] (`RB-22`).
+pub async fn list_subagent_content_revisions_with_capture(
+    capture: &dyn CaptureStore,
+    parent_session_id: &str,
+    provider_kind: &str,
+    source_key: &str,
+    content_schema_version: i64,
+) -> Result<Vec<AgentSubagentContentRevisionRecord>> {
+    capture
+        .list_subagent_content_revisions(
+            parent_session_id,
+            provider_kind,
+            source_key,
+            content_schema_version,
+        )
+        .await
+        .context("list agent_subagent_content_revision rows from capture store")
+}
+
+/// Fetch one `agent_subagent_link` record via [`CaptureStore`] (`RB-22`).
+pub async fn get_subagent_link_with_capture(
+    capture: &dyn CaptureStore,
+    content_checkpoint_id: &str,
+) -> Result<Option<AgentSubagentLinkRecord>> {
+    capture
+        .get_subagent_link(content_checkpoint_id)
+        .await
+        .context("read agent_subagent_link from capture store")
+}
+
+/// Upsert one `agent_subagent_link` record via [`CaptureStore`] (`RB-22`).
+pub async fn upsert_subagent_link_with_capture(
+    capture: &dyn CaptureStore,
+    record: &AgentSubagentLinkRecord,
+) -> Result<()> {
+    capture
+        .upsert_subagent_link(record)
+        .await
+        .context("upsert agent_subagent_link in capture store")
+}
+
+/// Reserve a subagent content source claim via [`CaptureStore`] (`RB-22`).
+#[allow(clippy::too_many_arguments)]
+pub async fn reserve_subagent_content_claim_with_capture(
+    capture: &dyn CaptureStore,
+    parent_session_id: &str,
+    provider_kind: &str,
+    source_key: &str,
+    content_schema_version: i64,
+    content_digest: &str,
+    attempt_checkpoint_id: Option<&str>,
+    owner: &str,
+    now_ms: i64,
+) -> Result<SubagentClaimReserveOutcome> {
+    let lease_expires_at = now_ms
+        .checked_add(SUBAGENT_CONTENT_LEASE_MS)
+        .context("subagent content lease timestamp overflow")?;
+    let existing = capture
+        .get_subagent_content_claim(
+            parent_session_id,
+            provider_kind,
+            source_key,
+            content_schema_version,
+        )
+        .await
+        .context("read existing subagent content claim from capture store")?;
+
+    let (record, fence_token, next_revision) = match existing {
+        None => {
+            let record = AgentSubagentContentClaimRecord {
+                parent_session_id: parent_session_id.to_string(),
+                provider_kind: provider_kind.to_string(),
+                source_key: source_key.to_string(),
+                content_schema_version,
+                current_revision: 0,
+                current_checkpoint_id: None,
+                current_digest: None,
+                state: CaptureSubagentClaimState::Reserved,
+                attempt_digest: Some(content_digest.to_string()),
+                attempt_checkpoint_id: attempt_checkpoint_id.map(str::to_string),
+                owner: Some(owner.to_string()),
+                lease_expires_at: Some(lease_expires_at),
+                fence_token: 1,
+                created_at: now_ms,
+                updated_at: now_ms,
+                revision_cursor: 0,
+                sync_revision: 1,
+            };
+            (record, 1, 1)
+        }
+        Some(mut current) => {
+            if current.current_revision > 0
+                && current.current_digest.as_deref() == Some(content_digest)
+                && let Some(cp_id) = current.current_checkpoint_id.clone()
+            {
+                return Ok(SubagentClaimReserveOutcome::Unchanged {
+                    current_revision: current.current_revision,
+                    current_checkpoint_id: cp_id,
+                });
+            }
+            if current.state == CaptureSubagentClaimState::Reserved
+                && current.lease_expires_at.is_some_and(|exp| exp > now_ms)
+            {
+                return Ok(SubagentClaimReserveOutcome::InFlight);
+            }
+            let next_fence = current
+                .fence_token
+                .checked_add(1)
+                .context("subagent content fence_token overflow")?;
+            let next_rev = current
+                .current_revision
+                .checked_add(1)
+                .context("subagent content revision overflow")?;
+            current.state = CaptureSubagentClaimState::Reserved;
+            current.attempt_digest = Some(content_digest.to_string());
+            current.attempt_checkpoint_id = attempt_checkpoint_id.map(str::to_string);
+            current.owner = Some(owner.to_string());
+            current.lease_expires_at = Some(lease_expires_at);
+            current.fence_token = next_fence;
+            current.updated_at = now_ms;
+            current.sync_revision = current.sync_revision.saturating_add(1);
+            (current, next_fence, next_rev)
+        }
+    };
+
+    capture
+        .upsert_subagent_content_claim(&record)
+        .await
+        .context("persist subagent content claim reservation in capture store")?;
+    Ok(SubagentClaimReserveOutcome::Reserved {
+        fence_token,
+        next_revision,
+    })
+}
+
+/// Commit a reserved subagent content claim as a new immutable revision via
+/// [`CaptureStore`] (`RB-22`).
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_subagent_content_revision_with_capture(
+    capture: &dyn CaptureStore,
+    parent_session_id: &str,
+    provider_kind: &str,
+    source_key: &str,
+    content_schema_version: i64,
+    owner: &str,
+    fence_token: i64,
+    checkpoint_id: &str,
+    content_digest: &str,
+    source_channel: CaptureSubagentSourceChannel,
+    partial: bool,
+    now_ms: i64,
+) -> Result<AgentSubagentContentRevisionRecord> {
+    let mut claim = capture
+        .get_subagent_content_claim(
+            parent_session_id,
+            provider_kind,
+            source_key,
+            content_schema_version,
+        )
+        .await
+        .context("read reserved subagent content claim before commit")?
+        .context("subagent content claim is missing before commit")?;
+    if claim.state != CaptureSubagentClaimState::Reserved
+        || claim.owner.as_deref() != Some(owner)
+        || claim.fence_token != fence_token
+    {
+        bail!(
+            "subagent content claim ownership fence changed before commit for checkpoint {checkpoint_id}"
+        );
+    }
+    let next_revision = claim
+        .current_revision
+        .checked_add(1)
+        .context("subagent content revision overflow")?;
+    let revision = AgentSubagentContentRevisionRecord {
+        parent_session_id: parent_session_id.to_string(),
+        provider_kind: provider_kind.to_string(),
+        source_key: source_key.to_string(),
+        content_schema_version,
+        revision: next_revision,
+        checkpoint_id: checkpoint_id.to_string(),
+        content_digest: content_digest.to_string(),
+        source_channel,
+        partial,
+        created_at: now_ms,
+    };
+    capture
+        .put_subagent_content_revision(&revision)
+        .await
+        .context("insert agent_subagent_content_revision in capture store")?;
+
+    claim.current_revision = next_revision;
+    claim.current_checkpoint_id = Some(checkpoint_id.to_string());
+    claim.current_digest = Some(content_digest.to_string());
+    claim.state = CaptureSubagentClaimState::Idle;
+    claim.attempt_digest = None;
+    claim.attempt_checkpoint_id = None;
+    claim.owner = None;
+    claim.lease_expires_at = None;
+    claim.updated_at = now_ms;
+    claim.revision_cursor = next_revision;
+    claim.sync_revision = claim.sync_revision.saturating_add(1);
+    capture
+        .upsert_subagent_content_claim(&claim)
+        .await
+        .context("advance agent_subagent_content_claim after revision commit")?;
+    Ok(revision)
+}
+
+/// Release a reserved subagent content claim under `(owner, fence_token)` via
+/// [`CaptureStore`] (`RB-22`).
+#[allow(clippy::too_many_arguments)]
+pub async fn release_subagent_content_claim_with_capture(
+    capture: &dyn CaptureStore,
+    parent_session_id: &str,
+    provider_kind: &str,
+    source_key: &str,
+    content_schema_version: i64,
+    owner: &str,
+    fence_token: i64,
+    now_ms: i64,
+) -> Result<bool> {
+    let Some(mut claim) = capture
+        .get_subagent_content_claim(
+            parent_session_id,
+            provider_kind,
+            source_key,
+            content_schema_version,
+        )
+        .await
+        .context("read reserved subagent content claim for release")?
+    else {
+        return Ok(false);
+    };
+    if claim.state != CaptureSubagentClaimState::Reserved
+        || claim.owner.as_deref() != Some(owner)
+        || claim.fence_token != fence_token
+    {
+        return Ok(false);
+    }
+    claim.state = CaptureSubagentClaimState::Idle;
+    claim.attempt_digest = None;
+    claim.attempt_checkpoint_id = None;
+    claim.owner = None;
+    claim.lease_expires_at = None;
+    claim.updated_at = now_ms;
+    claim.sync_revision = claim.sync_revision.saturating_add(1);
+    capture
+        .upsert_subagent_content_claim(&claim)
+        .await
+        .context("release subagent content claim reservation in capture store")?;
+    Ok(true)
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 //!
 //! stdout receives one JSON-RPC message per line. Diagnostics stay off stdout.
 
-use std::{collections::VecDeque, io::ErrorKind};
+use std::{collections::VecDeque, io::ErrorKind, path::Path};
 
 use serde_json::Value;
 use tokio::{
@@ -13,34 +13,85 @@ use tokio::{
 
 use super::protocol::{self, InboundLine, MAX_LINE_BYTES, Session};
 
+/// Read the repository identifier (`libra.repoid`) from a backend-agnostic
+/// [`crate::storage::ConfigStore`], falling back to `"unavailable"` when
+/// absent, encrypted, empty, or sentinel.
+pub async fn repository_id_with_store(store: &dyn crate::storage::ConfigStore) -> String {
+    let Ok(Some(entry)) = store.get("libra.repoid").await else {
+        return "unavailable".to_string();
+    };
+    if entry.encrypted || entry.value.trim().is_empty() || entry.value == "unknown-repo" {
+        "unavailable".to_string()
+    } else {
+        entry.value
+    }
+}
+
+async fn repository_id_for_storage_inner(storage: &Path) -> crate::storage::StorageResult<String> {
+    match crate::storage::runtime::detect_repo_backend(storage)? {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let store =
+                    crate::storage::runtime::open_repo_config_store_read_only(storage).await?;
+                Ok(repository_id_with_store(store.as_ref()).await)
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                Ok("unavailable".to_string())
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let db_path = storage.join(crate::utils::util::DATABASE);
+                let Ok(conn) =
+                    crate::internal::db::open_database_without_migrations(&db_path).await
+                else {
+                    return Ok("unavailable".to_string());
+                };
+                use sea_orm::{ConnectionTrait, Statement};
+                let Ok(Some(row)) = conn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        conn.get_database_backend(),
+                        "SELECT value, encrypted FROM config_kv WHERE key = ? ORDER BY id DESC LIMIT 1",
+                        ["libra.repoid".into()],
+                    ))
+                    .await
+                else {
+                    return Ok("unavailable".to_string());
+                };
+                let Ok(value) = row.try_get_by_index::<String>(0) else {
+                    return Ok("unavailable".to_string());
+                };
+                let encrypted = row.try_get_by_index::<bool>(1).unwrap_or(true);
+                if encrypted || value.trim().is_empty() || value == "unknown-repo" {
+                    Ok("unavailable".to_string())
+                } else {
+                    Ok(value)
+                }
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                Ok("unavailable".to_string())
+            }
+        }
+    }
+}
+
+/// Resolve the repository identifier (`libra.repoid`) for `storage` across
+/// both SQLite and `redb` repositories without mutating schema state.
+pub async fn repository_id_for_storage(storage: &Path) -> String {
+    repository_id_for_storage_inner(storage)
+        .await
+        .unwrap_or_else(|_| "unavailable".to_string())
+}
+
 async fn repository_id() -> String {
     let Ok(storage) = crate::utils::util::try_get_storage_path(None) else {
         return "unavailable".to_string();
     };
-    let db_path = storage.join(crate::utils::util::DATABASE);
-    let Ok(conn) = crate::internal::db::open_database_without_migrations(&db_path).await else {
-        return "unavailable".to_string();
-    };
-    use sea_orm::{ConnectionTrait, Statement};
-    let Ok(Some(row)) = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            conn.get_database_backend(),
-            "SELECT value, encrypted FROM config_kv WHERE key = ? ORDER BY id DESC LIMIT 1",
-            ["libra.repoid".into()],
-        ))
-        .await
-    else {
-        return "unavailable".to_string();
-    };
-    let Ok(value) = row.try_get_by_index::<String>(0) else {
-        return "unavailable".to_string();
-    };
-    let encrypted = row.try_get_by_index::<bool>(1).unwrap_or(true);
-    if encrypted || value.trim().is_empty() || value == "unknown-repo" {
-        "unavailable".to_string()
-    } else {
-        value
-    }
+    repository_id_for_storage(&storage).await
 }
 
 pub async fn serve<R, W>(reader: R, mut writer: W) -> std::io::Result<()>

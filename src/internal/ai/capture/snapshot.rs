@@ -686,6 +686,86 @@ impl CaptureSnapshot {
         })
     }
 
+    /// Store-backed counterpart to [`Self::try_into_verified_ordinary_partial_in_scope_until`].
+    #[allow(dead_code)]
+    pub(crate) async fn try_into_verified_ordinary_partial_in_scope_with_store(
+        mut self,
+        config: &dyn crate::storage::ConfigStore,
+        git_state: &dyn crate::storage::GitStateStore,
+        scope: &CaptureScope,
+        storage: &Path,
+        authorized_root: &Path,
+        deadline: Instant,
+    ) -> Result<VerifiedOrdinaryPartialSnapshot, Box<Self>> {
+        if !self.has_verified_ordinary_partial_permit() || Instant::now() >= deadline {
+            self.downgrade_for_commitment_failure(
+                CaptureSnapshotPartialReason::SourceAuthorizationMismatch,
+            );
+            return Err(Box::new(self));
+        }
+        let Some(preimage) = self.redacted_digest_preimage() else {
+            self.downgrade_for_commitment_failure(
+                CaptureSnapshotPartialReason::SourceCommitmentUnavailable,
+            );
+            return Err(Box::new(self));
+        };
+        let digest_matches = self
+            .transcript_redacted
+            .as_ref()
+            .is_some_and(|bytes| <[u8; 32]>::from(Sha256::digest(bytes.bytes())) == preimage);
+        if !digest_matches {
+            self.downgrade_for_commitment_failure(
+                CaptureSnapshotPartialReason::SourceAuthorizationMismatch,
+            );
+            return Err(Box::new(self));
+        }
+        let commitment = super::key::derive_snapshot_content_commitment_in_scope_with_store(
+            config,
+            git_state,
+            scope,
+            storage,
+            authorized_root,
+            &preimage,
+            deadline,
+        )
+        .await;
+        let Ok(commitment) = commitment else {
+            self.downgrade_for_commitment_failure(
+                CaptureSnapshotPartialReason::SourceCommitmentUnavailable,
+            );
+            return Err(Box::new(self));
+        };
+        if Instant::now() >= deadline || !self.bind_source_commitment(commitment) {
+            self.downgrade_for_commitment_failure(
+                CaptureSnapshotPartialReason::SourceCommitmentUnavailable,
+            );
+            return Err(Box::new(self));
+        }
+        let Some(permit) = self.ordinary_partial_permit.take() else {
+            self.downgrade_for_commitment_failure(
+                CaptureSnapshotPartialReason::SourceAuthorizationMismatch,
+            );
+            return Err(Box::new(self));
+        };
+        let projection = self.safe_projection();
+        let Some(transcript) = self.transcript_redacted.take() else {
+            self.downgrade_for_commitment_failure(CaptureSnapshotPartialReason::SourceReadError);
+            return Err(Box::new(self));
+        };
+        let binding = VerifiedOrdinaryPartialBinding {
+            scope: scope.clone(),
+            agent_kind: "opencode",
+            capture_session: permit.capture_session().to_owned(),
+            source_session: permit.source_session().to_owned(),
+        };
+        Ok(VerifiedOrdinaryPartialSnapshot {
+            transcript,
+            projection,
+            redaction_report: self.redaction_report,
+            binding,
+        })
+    }
+
     /// A readiness check only; ownership is still moved to the actual
     /// writer or returned by the ordinary consuming rejection.
     #[cfg(test)]

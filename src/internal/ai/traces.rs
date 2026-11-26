@@ -26,6 +26,10 @@ use crate::{
         hooks::lifecycle::LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION,
         observed_agents::{Completeness, CoverageSchemaVersion, RedactedBytes},
     },
+    storage::{
+        capture_store::{AgentCheckpointRecord, CaptureStore},
+        config_store::MetadataStore,
+    },
     utils::json::normalize_json_value,
 };
 
@@ -2910,6 +2914,153 @@ pub async fn agent_checkpoint_id_for_traces_commit<C: ConnectionTrait>(
             .context("decode agent_checkpoint.checkpoint_id")
     })
     .transpose()
+}
+
+/// List live (or cleanup-pending) traces in-flight markers via a read-only
+/// [`MetadataStore`] handle (`RB-22`).
+pub async fn list_live_traces_inflight_markers_with_metadata_store(
+    metadata: &dyn MetadataStore,
+    now_ms: i64,
+) -> Result<Vec<TracesInflightMarker>> {
+    let entries = metadata
+        .list_metadata_scope(crate::internal::metadata::MetadataScope::AgentTracesInflight.as_str())
+        .await
+        .context("failed to list traces in-flight markers from metadata store")?;
+    let mut live = Vec::new();
+    for entry in entries {
+        let marker =
+            decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key)?;
+        if !marker.time_fields_trustworthy(now_ms) {
+            bail!(
+                "traces in-flight marker carries an implausible timestamp; inspect it \
+                 with `libra agent doctor` before destructive maintenance"
+            );
+        }
+        if marker.cleanup_pending || marker.is_live(now_ms) {
+            live.push(marker);
+        }
+    }
+    Ok(live)
+}
+
+/// List all traces in-flight markers via a read-only [`MetadataStore`] handle (`RB-22`).
+#[allow(dead_code)]
+pub(crate) async fn list_all_traces_inflight_markers_with_metadata_store(
+    metadata: &dyn MetadataStore,
+) -> Result<Vec<TracesInflightMarker>> {
+    let entries = metadata
+        .list_metadata_scope(crate::internal::metadata::MetadataScope::AgentTracesInflight.as_str())
+        .await
+        .context("failed to list traces in-flight markers from metadata store")?;
+    entries
+        .into_iter()
+        .map(|entry| {
+            decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key)
+        })
+        .collect()
+}
+
+/// Read the durable terminal-attempt marker status via a read-only
+/// [`MetadataStore`] handle (`RB-22`).
+#[allow(dead_code)]
+pub(crate) async fn terminal_attempt_marker_status_with_metadata_store(
+    metadata: &dyn MetadataStore,
+    session_id: &str,
+    checkpoint_id: &str,
+    marker_generation: &str,
+) -> Result<TerminalAttemptMarkerStatus> {
+    let entry = metadata
+        .get_metadata(
+            crate::internal::metadata::MetadataScope::AgentTracesInflight.as_str(),
+            session_id,
+            checkpoint_id,
+        )
+        .await
+        .context("read terminal traces marker state from metadata store")?;
+    let Some(entry) = entry else {
+        return Ok(TerminalAttemptMarkerStatus::Absent);
+    };
+    let Ok(marker) =
+        decode_and_validate_traces_inflight_marker(&entry.value, session_id, checkpoint_id)
+    else {
+        return Ok(TerminalAttemptMarkerStatus::Incompatible);
+    };
+    if marker.generation.as_deref() == Some(marker_generation) {
+        Ok(TerminalAttemptMarkerStatus::RegisteredExact)
+    } else {
+        Ok(TerminalAttemptMarkerStatus::Incompatible)
+    }
+}
+
+/// Persist a traces in-flight marker via [`MetadataStore`] (`RB-22`).
+pub async fn write_traces_inflight_marker_with_metadata_store(
+    metadata: &dyn MetadataStore,
+    marker: &TracesInflightMarker,
+) -> Result<()> {
+    let payload = serde_json::to_string(marker).context("serialize traces in-flight marker")?;
+    metadata
+        .set_metadata(
+            crate::internal::metadata::MetadataScope::AgentTracesInflight.as_str(),
+            &marker.session_id,
+            &marker.attempt_id,
+            &payload,
+            "json",
+        )
+        .await
+        .context("write traces in-flight marker to metadata store")?;
+    Ok(())
+}
+
+/// Clear a traces in-flight marker via [`MetadataStore`] (`RB-22`).
+pub async fn clear_traces_inflight_marker_with_metadata_store(
+    metadata: &dyn MetadataStore,
+    session_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    metadata
+        .unset_metadata(
+            crate::internal::metadata::MetadataScope::AgentTracesInflight.as_str(),
+            session_id,
+            attempt_id,
+        )
+        .await
+        .context("clear traces in-flight marker from metadata store")
+}
+
+/// Probe the checkpoint catalog by `traces_commit` via a read-only
+/// [`CaptureStore`] handle (`RB-22`).
+pub async fn agent_checkpoint_id_for_traces_commit_with_capture(
+    capture: &dyn CaptureStore,
+    commit_hash: &str,
+) -> Result<Option<String>> {
+    let sessions = capture
+        .list_sessions_by_started_desc()
+        .await
+        .context("list sessions while probing agent_checkpoint by traces_commit")?;
+    for session in sessions {
+        let checkpoints = capture
+            .list_checkpoints_by_session(&session.session_id)
+            .await
+            .context("list session checkpoints while probing traces_commit")?;
+        if let Some(found) = checkpoints
+            .into_iter()
+            .find(|cp| cp.traces_commit == commit_hash)
+        {
+            return Ok(Some(found.checkpoint_id));
+        }
+    }
+    Ok(None)
+}
+
+/// List checkpoints for `session_id` via a read-only [`CaptureStore`] handle (`RB-22`).
+pub async fn list_checkpoints_for_session_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+) -> Result<Vec<AgentCheckpointRecord>> {
+    capture
+        .list_checkpoints_by_session(session_id)
+        .await
+        .context("list agent_checkpoint rows for session from capture store")
 }
 
 #[cfg(test)]

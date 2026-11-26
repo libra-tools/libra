@@ -6554,8 +6554,10 @@ mod args_tests {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "storage-redb")]
     use clap::Parser;
 
+    #[cfg(feature = "storage-redb")]
     use super::*;
 
     #[cfg(feature = "storage-redb")]

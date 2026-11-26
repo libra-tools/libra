@@ -31,31 +31,37 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statemen
 
 #[cfg(test)]
 pub(crate) use crate::internal::ai::capture::catalog::CaptureImportSessionLifecycleState as ImportSessionLifecycleState;
-use crate::internal::{
-    ai::{
-        capture::{
-            catalog::{CaptureCatalogStore, CaptureImportSessionCommit},
-            checkpoint::{
-                CheckpointCatalogMutation, NativeVersionedReasoningCoveragePlan,
-                ReasoningCoveragePlan, ReasoningIdentityReadContext, ReasoningTurnIdentity,
-                StoreBoundNativeVersionedPermit,
+use crate::{
+    internal::{
+        ai::{
+            capture::{
+                catalog::{CaptureCatalogStore, CaptureImportSessionCommit},
+                checkpoint::{
+                    CheckpointCatalogMutation, NativeVersionedReasoningCoveragePlan,
+                    ReasoningCoveragePlan, ReasoningIdentityReadContext, ReasoningTurnIdentity,
+                    StoreBoundNativeVersionedPermit,
+                },
+            },
+            capture_scope::{
+                CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
+                authorize_final_capture_commit,
+            },
+            history::{CheckpointScope, TracesCommitCtx, TracesTxnExtra},
+            observed_agents::{
+                COVERAGE_SCHEMA_VERSION, Completeness, CoverageSchemaVersion, NormalizedTurn,
+                encode_coverage_turn_for_schema, redact_turns_with_report, select_coverage_schema,
             },
         },
-        capture_scope::{
-            CaptureCommitDeadline, CaptureFinalCommitAuthorizationError, CaptureScope,
-            authorize_final_capture_commit,
-        },
-        history::{CheckpointScope, TracesCommitCtx, TracesTxnExtra},
-        observed_agents::{
-            COVERAGE_SCHEMA_VERSION, Completeness, CoverageSchemaVersion, NormalizedTurn,
-            encode_coverage_turn_for_schema, redact_turns_with_report, select_coverage_schema,
+        metadata::{
+            MetadataKv, MetadataScope, MetadataValueType, ReasoningIdentityKind,
+            ReasoningIdentityRecord, ReasoningIdentityRecordBody, ReasoningIdentityRecordContext,
+            ReasoningIdentityRecordV2, ReasoningIdentitySessionMap, ReasoningIdentitySessionMapV2,
+            validate_reasoning_identity_private_map_keys,
         },
     },
-    metadata::{
-        MetadataKv, MetadataScope, MetadataValueType, ReasoningIdentityKind,
-        ReasoningIdentityRecord, ReasoningIdentityRecordBody, ReasoningIdentityRecordContext,
-        ReasoningIdentityRecordV2, ReasoningIdentitySessionMap, ReasoningIdentitySessionMapV2,
-        validate_reasoning_identity_private_map_keys,
+    storage::capture_store::{
+        AgentCoverageClaimRecord, AgentCoverageConflictRecord, AgentCoverageRevisionRecord,
+        CaptureCompleteness, CaptureCoverageClaimState, CaptureSourceChannel, CaptureStore,
     },
 };
 
@@ -3863,6 +3869,459 @@ impl TracesTxnExtra for VersionedLiveClaimCommitPlan {
     fn requires_versioned_coverage_binding(&self) -> bool {
         true
     }
+}
+
+fn capture_completeness(completeness: Completeness) -> CaptureCompleteness {
+    match completeness {
+        Completeness::Incomplete => CaptureCompleteness::Incomplete,
+        Completeness::Complete => CaptureCompleteness::Complete,
+    }
+}
+
+fn capture_source_channel_and_state(
+    source_channel: &str,
+) -> Result<(CaptureSourceChannel, CaptureCoverageClaimState)> {
+    match source_channel {
+        "live" => Ok((
+            CaptureSourceChannel::Live,
+            CaptureCoverageClaimState::ReservedLive,
+        )),
+        "export" => Ok((
+            CaptureSourceChannel::Export,
+            CaptureCoverageClaimState::ReservedLive,
+        )),
+        "import" => Ok((
+            CaptureSourceChannel::Import,
+            CaptureCoverageClaimState::ReservedImport,
+        )),
+        other => bail!("unsupported coverage source channel '{other}'"),
+    }
+}
+
+/// Fetch one `agent_coverage_claim` row via [`CaptureStore`] (`RB-22`).
+pub async fn get_coverage_claim_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    logical_turn_key: &str,
+    coverage_schema_version: CoverageSchemaVersion,
+) -> Result<Option<AgentCoverageClaimRecord>> {
+    capture
+        .get_coverage_claim(
+            session_id,
+            logical_turn_key,
+            coverage_schema_version.as_i64(),
+        )
+        .await
+        .context("query agent_coverage_claim from capture store")
+}
+
+/// Fetch one `agent_coverage_conflict` row via [`CaptureStore`] (`RB-22`).
+pub async fn get_coverage_conflict_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    logical_turn_key: &str,
+    coverage_schema_version: CoverageSchemaVersion,
+) -> Result<Option<AgentCoverageConflictRecord>> {
+    capture
+        .get_coverage_conflict(
+            session_id,
+            logical_turn_key,
+            coverage_schema_version.as_i64(),
+        )
+        .await
+        .context("query agent_coverage_conflict from capture store")
+}
+
+/// List all `agent_coverage_revision` rows for a turn via [`CaptureStore`] (`RB-22`).
+pub async fn list_coverage_revisions_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    logical_turn_key: &str,
+    coverage_schema_version: CoverageSchemaVersion,
+) -> Result<Vec<AgentCoverageRevisionRecord>> {
+    capture
+        .list_coverage_revisions(
+            session_id,
+            logical_turn_key,
+            coverage_schema_version.as_i64(),
+        )
+        .await
+        .context("list agent_coverage_revision rows from capture store")
+}
+
+/// Reserve turn coverage claims on [`CaptureStore`] following ADR-DR-09
+/// arbitration (fresh insert, equivalent no-op, incomplete->complete upgrade,
+/// complete-vs-different-complete conflict persistence, live lease skip, and
+/// expired-lease takeover) (`RB-22`).
+pub async fn reserve_turn_claims_for_channel_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    turns: &[NormalizedTurn],
+    owner: &str,
+    now_ms: i64,
+    source_channel: &'static str,
+) -> Result<LiveReservationOutcome> {
+    let (channel, reserved_state) = capture_source_channel_and_state(source_channel)?;
+    let Some(session) = capture
+        .get_session(session_id)
+        .await
+        .context("verify session availability for coverage reservation in capture store")?
+    else {
+        bail!("agent session was erased or is unavailable for coverage reservation");
+    };
+    let tombstones = capture
+        .list_import_tombstones()
+        .await
+        .context("verify coverage reservation tombstone barrier in capture store")?;
+    if tombstones.iter().any(|t| {
+        t.agent_kind == session.agent_kind.as_str()
+            && t.provider_session_id == session.provider_session_id
+    }) {
+        bail!("agent session was erased or is unavailable for coverage reservation");
+    }
+
+    let mut outcome = LiveReservationOutcome::default();
+    let lease_expires_at = lease_deadline(now_ms)?;
+
+    for turn in turns {
+        let encoded = encode_coverage_turn_for_schema(COVERAGE_SCHEMA_VERSION, turn)?;
+        let digest = encoded.digest_hex;
+        let incoming_completeness = capture_completeness(turn.completeness);
+        let existing = capture
+            .get_coverage_claim(session_id, &turn.logical_turn_key, COVERAGE_SCHEMA_VERSION)
+            .await
+            .context("read existing agent_coverage_claim from capture store")?;
+
+        match existing {
+            None => {
+                let record = AgentCoverageClaimRecord {
+                    session_id: session_id.to_string(),
+                    logical_turn_key: turn.logical_turn_key.clone(),
+                    coverage_schema_version: COVERAGE_SCHEMA_VERSION,
+                    coverage_digest: digest.clone(),
+                    completeness: incoming_completeness,
+                    revision: 0,
+                    state: reserved_state,
+                    attempt_checkpoint_id: None,
+                    owner: Some(owner.to_string()),
+                    lease_expires_at: Some(lease_expires_at),
+                    fence_token: Some(1),
+                    checkpoint_id: None,
+                    traces_commit: None,
+                    source_channel: channel,
+                    created_at: now_ms,
+                    updated_at: now_ms,
+                };
+                capture
+                    .upsert_coverage_claim(&record)
+                    .await
+                    .context("insert agent_coverage_claim reservation in capture store")?;
+                outcome.reserved.push(ReservedTurnClaim {
+                    logical_turn_key: turn.logical_turn_key.clone(),
+                    coverage_digest: digest,
+                    completeness: turn.completeness,
+                    fence_token: 1,
+                    next_revision: 1,
+                });
+            }
+            Some(mut incumbent) => match incumbent.state {
+                CaptureCoverageClaimState::CatalogCommitted => {
+                    let completeness_upgrade = incumbent.completeness
+                        == CaptureCompleteness::Incomplete
+                        && incoming_completeness == CaptureCompleteness::Complete;
+                    if incumbent.coverage_digest == digest && !completeness_upgrade {
+                        outcome.skipped_covered += 1;
+                    } else if completeness_upgrade {
+                        let new_fence = incumbent
+                            .fence_token
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .context("coverage claim fence token overflow")?;
+                        let next_rev = next_revision(incumbent.revision)?;
+                        incumbent.state = reserved_state;
+                        incumbent.owner = Some(owner.to_string());
+                        incumbent.lease_expires_at = Some(lease_expires_at);
+                        incumbent.fence_token = Some(new_fence);
+                        incumbent.coverage_digest = digest.clone();
+                        incumbent.completeness = incoming_completeness;
+                        incumbent.source_channel = channel;
+                        incumbent.updated_at = now_ms;
+                        capture
+                            .upsert_coverage_claim(&incumbent)
+                            .await
+                            .context("upgrade incomplete coverage claim in capture store")?;
+                        outcome.reserved.push(ReservedTurnClaim {
+                            logical_turn_key: turn.logical_turn_key.clone(),
+                            coverage_digest: digest,
+                            completeness: turn.completeness,
+                            fence_token: new_fence,
+                            next_revision: next_rev,
+                        });
+                    } else if incumbent.completeness == CaptureCompleteness::Complete
+                        && incoming_completeness == CaptureCompleteness::Incomplete
+                    {
+                        outcome.skipped_covered += 1;
+                    } else if incumbent.completeness == CaptureCompleteness::Complete
+                        && incoming_completeness == CaptureCompleteness::Complete
+                    {
+                        let mut sanitized_turn = turn.clone();
+                        let redaction_report =
+                            redact_turns_with_report(std::slice::from_mut(&mut sanitized_turn));
+                        let sanitized_encoded = encode_coverage_turn_for_schema(
+                            COVERAGE_SCHEMA_VERSION,
+                            &sanitized_turn,
+                        )?;
+                        if sanitized_encoded.digest_hex == incumbent.coverage_digest {
+                            outcome.skipped_covered += 1;
+                        } else {
+                            let incoming_canonical_json =
+                                String::from_utf8(sanitized_encoded.canonical_bytes)
+                                    .context("coverage conflict canonical evidence is not UTF-8")?;
+                            let incoming_redaction_report_json =
+                                serde_json::to_string(&redaction_report)
+                                    .context("serialize coverage conflict redaction report")?;
+                            let incumbent_revision = incumbent.revision;
+                            let incumbent_digest = incumbent.coverage_digest.clone();
+                            let incumbent_checkpoint_id = incumbent.checkpoint_id.clone();
+                            incumbent.state = CaptureCoverageClaimState::Conflicted;
+                            incumbent.updated_at = now_ms;
+                            capture
+                                .upsert_coverage_claim(&incumbent)
+                                .await
+                                .context("mark agent_coverage_claim conflicted in capture store")?;
+                            if capture
+                                .get_coverage_conflict(
+                                    session_id,
+                                    &turn.logical_turn_key,
+                                    COVERAGE_SCHEMA_VERSION,
+                                )
+                                .await
+                                .context("check existing coverage conflict in capture store")?
+                                .is_none()
+                            {
+                                let conflict = AgentCoverageConflictRecord {
+                                    session_id: session_id.to_string(),
+                                    logical_turn_key: turn.logical_turn_key.clone(),
+                                    coverage_schema_version: COVERAGE_SCHEMA_VERSION,
+                                    incumbent_revision,
+                                    incumbent_digest,
+                                    incumbent_checkpoint_id,
+                                    incoming_digest: sanitized_encoded.digest_hex,
+                                    incoming_source_channel: channel,
+                                    incoming_observed_at: now_ms,
+                                    incoming_canonical_json,
+                                    incoming_redaction_report_json,
+                                };
+                                capture.upsert_coverage_conflict(&conflict).await.context(
+                                    "persist sanitized coverage conflict challenger in capture store",
+                                )?;
+                            }
+                            outcome.conflicted += 1;
+                        }
+                    } else {
+                        // Incomplete vs different Incomplete: advance revision on new incomplete snapshot.
+                        let new_fence = incumbent
+                            .fence_token
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .context("coverage claim fence token overflow")?;
+                        let next_rev = next_revision(incumbent.revision)?;
+                        incumbent.state = reserved_state;
+                        incumbent.owner = Some(owner.to_string());
+                        incumbent.lease_expires_at = Some(lease_expires_at);
+                        incumbent.fence_token = Some(new_fence);
+                        incumbent.coverage_digest = digest.clone();
+                        incumbent.completeness = incoming_completeness;
+                        incumbent.source_channel = channel;
+                        incumbent.updated_at = now_ms;
+                        capture
+                            .upsert_coverage_claim(&incumbent)
+                            .await
+                            .context("re-own incomplete coverage claim in capture store")?;
+                        outcome.reserved.push(ReservedTurnClaim {
+                            logical_turn_key: turn.logical_turn_key.clone(),
+                            coverage_digest: digest,
+                            completeness: turn.completeness,
+                            fence_token: new_fence,
+                            next_revision: next_rev,
+                        });
+                    }
+                }
+                CaptureCoverageClaimState::Conflicted => {
+                    outcome.conflicted += 1;
+                }
+                CaptureCoverageClaimState::ReservedLive
+                | CaptureCoverageClaimState::ReservedImport => {
+                    if incumbent.lease_expires_at == Some(ARTIFACT_RETAINED_LEASE_MS) {
+                        outcome.skipped_inflight += 1;
+                        outcome.skipped_retained += 1;
+                    } else if incumbent.lease_expires_at.is_some_and(|exp| exp > now_ms) {
+                        outcome.skipped_inflight += 1;
+                    } else {
+                        let new_fence = incumbent
+                            .fence_token
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .context("coverage claim fence token overflow")?;
+                        let next_rev = next_revision(incumbent.revision)?;
+                        incumbent.state = reserved_state;
+                        incumbent.owner = Some(owner.to_string());
+                        incumbent.lease_expires_at = Some(lease_expires_at);
+                        incumbent.fence_token = Some(new_fence);
+                        incumbent.coverage_digest = digest.clone();
+                        incumbent.completeness = incoming_completeness;
+                        incumbent.source_channel = channel;
+                        incumbent.updated_at = now_ms;
+                        capture
+                            .upsert_coverage_claim(&incumbent)
+                            .await
+                            .context("take over expired coverage claim in capture store")?;
+                        outcome.reserved.push(ReservedTurnClaim {
+                            logical_turn_key: turn.logical_turn_key.clone(),
+                            coverage_digest: digest,
+                            completeness: turn.completeness,
+                            fence_token: new_fence,
+                            next_revision: next_rev,
+                        });
+                    }
+                }
+                CaptureCoverageClaimState::Abandoned => {
+                    let new_fence = incumbent
+                        .fence_token
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .context("coverage claim fence token overflow")?;
+                    let next_rev = next_revision(incumbent.revision)?;
+                    incumbent.state = reserved_state;
+                    incumbent.owner = Some(owner.to_string());
+                    incumbent.lease_expires_at = Some(lease_expires_at);
+                    incumbent.fence_token = Some(new_fence);
+                    incumbent.coverage_digest = digest.clone();
+                    incumbent.completeness = incoming_completeness;
+                    incumbent.source_channel = channel;
+                    incumbent.updated_at = now_ms;
+                    capture
+                        .upsert_coverage_claim(&incumbent)
+                        .await
+                        .context("re-reserve abandoned coverage claim in capture store")?;
+                    outcome.reserved.push(ReservedTurnClaim {
+                        logical_turn_key: turn.logical_turn_key.clone(),
+                        coverage_digest: digest,
+                        completeness: turn.completeness,
+                        fence_token: new_fence,
+                        next_revision: next_rev,
+                    });
+                }
+            },
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// Commit reserved coverage claims into `agent_coverage_revision` and advance
+/// `agent_coverage_claim` to `catalog_committed` via [`CaptureStore`] (`RB-22`).
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_reserved_turn_claims_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    owner: &str,
+    checkpoint_id: &str,
+    traces_commit: &str,
+    source_channel: &'static str,
+    claims: &[ReservedTurnClaim],
+    now_ms: i64,
+) -> Result<()> {
+    let (channel, expected_state) = capture_source_channel_and_state(source_channel)?;
+    for claim in claims {
+        let prev_revision = claim
+            .next_revision
+            .checked_sub(1)
+            .context("invalid reserved turn claim next_revision")?;
+        let mut current = capture
+            .get_coverage_claim(session_id, &claim.logical_turn_key, COVERAGE_SCHEMA_VERSION)
+            .await
+            .context("read reserved coverage claim before commit")?
+            .context("reserved coverage claim is missing before commit")?;
+        ensure!(
+            current.state == expected_state
+                && current.owner.as_deref() == Some(owner)
+                && current.fence_token == Some(claim.fence_token)
+                && current.revision == prev_revision,
+            "coverage claim ownership fence changed before commit for turn '{}'",
+            claim.logical_turn_key
+        );
+        let revision = AgentCoverageRevisionRecord {
+            session_id: session_id.to_string(),
+            logical_turn_key: claim.logical_turn_key.clone(),
+            coverage_schema_version: COVERAGE_SCHEMA_VERSION,
+            revision: claim.next_revision,
+            checkpoint_id: checkpoint_id.to_string(),
+            coverage_digest: claim.coverage_digest.clone(),
+            completeness: capture_completeness(claim.completeness),
+            source_channel: channel,
+            created_at: now_ms,
+        };
+        capture
+            .put_coverage_revision(&revision)
+            .await
+            .context("insert agent_coverage_revision in capture store")?;
+
+        current.state = CaptureCoverageClaimState::CatalogCommitted;
+        current.revision = claim.next_revision;
+        current.coverage_digest = claim.coverage_digest.clone();
+        current.completeness = capture_completeness(claim.completeness);
+        current.checkpoint_id = Some(checkpoint_id.to_string());
+        current.traces_commit = Some(traces_commit.to_string());
+        current.owner = None;
+        current.lease_expires_at = None;
+        current.attempt_checkpoint_id = None;
+        current.updated_at = now_ms;
+        capture
+            .upsert_coverage_claim(&current)
+            .await
+            .context("commit agent_coverage_claim in capture store")?;
+    }
+    Ok(())
+}
+
+/// Abandon still-owned uncommitted reservations via [`CaptureStore`] (`RB-22`).
+pub async fn abandon_reserved_turn_claims_with_capture(
+    capture: &dyn CaptureStore,
+    session_id: &str,
+    owner: &str,
+    source_channel: &'static str,
+    claims: &[ReservedTurnClaim],
+    now_ms: i64,
+) -> Result<usize> {
+    let (_, expected_state) = capture_source_channel_and_state(source_channel)?;
+    let mut abandoned = 0usize;
+    for claim in claims {
+        let Some(mut current) = capture
+            .get_coverage_claim(session_id, &claim.logical_turn_key, COVERAGE_SCHEMA_VERSION)
+            .await
+            .context("read reserved coverage claim for abandonment")?
+        else {
+            continue;
+        };
+        if current.state == expected_state
+            && current.owner.as_deref() == Some(owner)
+            && current.fence_token == Some(claim.fence_token)
+        {
+            current.state = CaptureCoverageClaimState::Abandoned;
+            current.owner = None;
+            current.lease_expires_at = None;
+            current.attempt_checkpoint_id = None;
+            current.fence_token = Some(current.fence_token.unwrap_or(0).saturating_add(1));
+            current.updated_at = now_ms;
+            capture
+                .upsert_coverage_claim(&current)
+                .await
+                .context("abandon reserved coverage claim in capture store")?;
+            abandoned += 1;
+        }
+    }
+    Ok(abandoned)
 }
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
 //! Explicit repository-local issuer enrollment. Neither wire data nor a
 //! catalog match grants receipt, field or artifact authority.
 
-use std::{collections::BTreeSet, path::Path, time::Duration};
+#[cfg(any(feature = "storage-sqlite", test))]
+use std::time::Duration;
+use std::{collections::BTreeSet, path::Path};
 
 use anyhow::{Context, Result, bail};
 use sea_orm::{ConnectionTrait, Statement};
@@ -10,13 +12,16 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{approved_build, attest, codec};
+#[cfg(any(feature = "storage-sqlite", test))]
+use crate::internal::db;
+#[cfg(feature = "storage-sqlite")]
+use crate::utils::util::DATABASE;
 use crate::{
     internal::{
         ai::observed_agents::{coverage::parse_canon_value, trust},
         config::ConfigKv,
-        db,
     },
-    utils::util::{DATABASE, try_get_request_paths},
+    utils::util::try_get_request_paths,
 };
 
 pub const REGISTRY_KEY: &str = "agent.native_origin.opencode.v1";
@@ -273,6 +278,35 @@ pub async fn read_with_conn<C: ConnectionTrait>(conn: &C) -> Result<Option<Regis
     Ok(Some(registry))
 }
 
+/// Backend-agnostic counterpart of [`read_with_conn`] using [`crate::storage::ConfigStore`].
+pub async fn read_with_store(store: &dyn crate::storage::ConfigStore) -> Result<Option<Registry>> {
+    let all_rows = store
+        .list_all()
+        .await
+        .map_err(|err| anyhow::anyhow!("inspect reserved native-origin registry rows: {err}"))?;
+    let matches: Vec<_> = all_rows
+        .into_iter()
+        .filter(|entry| entry.key.eq_ignore_ascii_case(REGISTRY_KEY))
+        .collect();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if matches.len() != 1 {
+        return Err(NativeOriginError::Registry.into());
+    }
+    let row = &matches[0];
+    if row.key != REGISTRY_KEY || row.encrypted {
+        return Err(NativeOriginError::Registry.into());
+    }
+    if row.value.len() > REGISTRY_BYTE_CAP {
+        return Err(NativeOriginError::Capacity.into());
+    }
+    let registry: Registry =
+        decode_owned(row.value.as_bytes()).map_err(|_| NativeOriginError::Registry)?;
+    registry.validate()?;
+    Ok(Some(registry))
+}
+
 /// Current permission data for a new native capture, import or pending replay.
 /// The caller must independently measure approved executable provenance first,
 /// then use this read on its permission snapshot connection. This returns
@@ -308,6 +342,38 @@ pub async fn active_issuer_with_conn(
     Ok(Some(record))
 }
 
+/// Backend-agnostic counterpart of [`active_issuer_with_conn`] using [`crate::storage::ConfigStore`].
+pub async fn active_issuer_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    issuer: &str,
+    provenance: &trust::Provenance,
+) -> Result<Option<IssuerRecord>> {
+    let Some(registry) = read_with_store(store).await? else {
+        return Ok(None);
+    };
+    let Some(record) = registry
+        .issuers
+        .into_iter()
+        .find(|record| record.issuer == issuer && record.state == IssuerState::Active)
+    else {
+        return Ok(None);
+    };
+    let Some(current) = trust::read_trust_with_store(store, trust::OPENCODE_EXPORTER_SLUG).await?
+    else {
+        return Ok(None);
+    };
+    let dirs = trust::read_trusted_dirs_with_store(store).await?;
+    if current.path != Path::new(&record.producer_path)
+        || current.sha256 != record.producer_binary_digest
+        || trust::provenance_drifted(provenance, &current)
+        || !trust::path_within_trusted_dirs(&current.path, &dirs)
+    {
+        return Ok(None);
+    }
+    Ok(Some(record))
+}
+
+#[cfg(any(feature = "storage-sqlite", test))]
 async fn commit_revocation(conn: &sea_orm::DatabaseTransaction) -> Result<Revocation> {
     // Validate the bounded canonical row before any mutation. Both writes are
     // private to the existing write-lock-first transaction owned by `revoke`.
@@ -350,36 +416,111 @@ async fn commit_revocation(conn: &sea_orm::DatabaseTransaction) -> Result<Revoca
     })
 }
 
+/// Backend-agnostic counterpart of [`revoke`] using [`crate::storage::ConfigStore`].
+pub async fn revoke_with_store(store: &dyn crate::storage::ConfigStore) -> Result<Revocation> {
+    let previous = read_with_store(store).await?;
+    let removed = trust::revoke_trust_with_store(store, trust::OPENCODE_EXPORTER_SLUG).await?;
+    let Some(mut registry) = previous else {
+        return Ok(Revocation {
+            removed,
+            native_revoked: 0,
+            native_epoch: None,
+        });
+    };
+    let native_revoked = registry
+        .issuers
+        .iter()
+        .filter(|record| record.state != IssuerState::Revoked)
+        .count();
+    if native_revoked > 0 {
+        for record in &mut registry.issuers {
+            record.state = IssuerState::Revoked;
+        }
+        registry.epoch = registry
+            .epoch
+            .checked_add(1)
+            .ok_or(NativeOriginError::Epoch)?;
+        registry.validate()?;
+        let value = serde_json::to_vec(&registry).context("encode native-origin revocation")?;
+        if value.len() > REGISTRY_BYTE_CAP {
+            return Err(NativeOriginError::Capacity.into());
+        }
+        let text = std::str::from_utf8(&value).context("encode native-origin revocation text")?;
+        ConfigKv::set_with_store(store, REGISTRY_KEY, text, false)
+            .await
+            .context("persist native-origin revocation in store")?;
+    }
+    Ok(Revocation {
+        removed,
+        native_revoked,
+        native_epoch: Some(registry.epoch),
+    })
+}
+
 /// Explicit combined OpenCode untrust. Automatic provenance revalidation still
 /// removes binary trust alone; it suspends admission without revoking issuers.
 pub async fn revoke() -> Result<Revocation> {
     let (storage, _, _) = try_get_request_paths(None)
         .context("native-origin revocation requires a Libra repository")?;
-    let conn = db::get_db_conn_instance_for_path(&storage.join(DATABASE))
-        .await
-        .context("open repository for native-origin revocation")?;
-    let txn = tokio::time::timeout(Duration::from_secs(5), db::begin_write_transaction(&conn))
-        .await
-        .context("native-origin revocation writer is busy; retry the explicit untrust")?
-        .context("acquire native-origin revocation writer lock; retry the explicit untrust")?;
-    match commit_revocation(&txn).await {
-        Ok(result) => {
-            txn.commit().await.context(
-                "commit native-origin revocation; inspect exporter trust and registry before retrying",
-            )?;
-            Ok(result)
-        }
-        Err(primary) => {
-            if let Err(rollback) = txn.rollback().await {
-                bail!(
-                    "native-origin revocation refused: {primary}; rollback failed: {rollback}; inspect the repository before retrying"
-                );
+    match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(|err| anyhow::anyhow!("detect repository storage backend: {err}"))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let store = crate::storage::runtime::open_repo_config_store_read_write(&storage)
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!("open repository store for native-origin revocation: {err}")
+                    })?;
+                revoke_with_store(store.as_ref()).await
             }
-            Err(primary)
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                bail!("this Libra binary was compiled without `storage-redb`");
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = db::get_db_conn_instance_for_path(&storage.join(DATABASE))
+                    .await
+                    .context("open repository for native-origin revocation")?;
+                let txn = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    db::begin_write_transaction(&conn),
+                )
+                .await
+                .context("native-origin revocation writer is busy; retry the explicit untrust")?
+                .context(
+                    "acquire native-origin revocation writer lock; retry the explicit untrust",
+                )?;
+                match commit_revocation(&txn).await {
+                    Ok(result) => {
+                        txn.commit().await.context(
+                            "commit native-origin revocation; inspect exporter trust and registry before retrying",
+                        )?;
+                        Ok(result)
+                    }
+                    Err(primary) => {
+                        if let Err(rollback) = txn.rollback().await {
+                            bail!(
+                                "native-origin revocation refused: {primary}; rollback failed: {rollback}; inspect the repository before retrying"
+                            );
+                        }
+                        Err(primary)
+                    }
+                }
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                bail!("this Libra binary was compiled without `storage-sqlite`");
+            }
         }
     }
 }
 
+#[cfg(any(feature = "storage-sqlite", test))]
 async fn commit_registration<C: ConnectionTrait>(
     conn: &C,
     prepared: &attest::PreparedRegistration,
@@ -437,40 +578,147 @@ async fn commit_registration<C: ConnectionTrait>(
     })
 }
 
+async fn commit_registration_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    prepared: &attest::PreparedRegistration,
+    expected_epoch: u64,
+) -> Result<Registration> {
+    let current = trust::read_trust_with_store(store, trust::OPENCODE_EXPORTER_SLUG).await?;
+    let dirs = trust::read_trusted_dirs_with_store(store).await?;
+    if current.as_ref() != Some(&prepared.exporter_trust)
+        || !trust::path_within_trusted_dirs(&prepared.exporter_trust.path, &dirs)
+    {
+        return Err(NativeOriginError::PriorTrust.into());
+    }
+    let previous = read_with_store(store).await?;
+    let epoch = previous.as_ref().map_or(0, |registry| registry.epoch);
+    if epoch != expected_epoch {
+        return Err(NativeOriginError::Epoch.into());
+    }
+    let mut registry = previous.unwrap_or(Registry {
+        version: 1,
+        epoch: 0,
+        issuers: Vec::new(),
+    });
+    if registry
+        .issuers
+        .iter()
+        .any(|record| record.issuer == prepared.record.issuer)
+    {
+        return Err(NativeOriginError::ExistingIssuer.into());
+    }
+    if registry.issuers.len() >= ISSUER_CAP {
+        return Err(NativeOriginError::Capacity.into());
+    }
+    for record in &mut registry.issuers {
+        if record.state == IssuerState::Active {
+            record.state = IssuerState::VerifyOnly;
+        }
+    }
+    registry.epoch = epoch.checked_add(1).ok_or(NativeOriginError::Epoch)?;
+    registry.issuers.push(prepared.record.clone());
+    registry.validate()?;
+    let value = serde_json::to_vec(&registry).context("encode complete native-origin registry")?;
+    if value.len() > REGISTRY_BYTE_CAP {
+        return Err(NativeOriginError::Capacity.into());
+    }
+    let text = std::str::from_utf8(&value).context("encode native-origin registry text")?;
+    ConfigKv::set_with_store(store, REGISTRY_KEY, text, false)
+        .await
+        .context("persist native-origin registry in store")?;
+    Ok(Registration {
+        epoch: registry.epoch,
+        issuer: prepared.record.issuer.clone(),
+        key_generation: prepared.record.key_generation,
+        policy_digest: prepared.record.policy_digest.clone(),
+        observer_executable_sha256: prepared.observer_executable_sha256.clone(),
+    })
+}
+
+/// Backend-agnostic counterpart of [`register`] using [`crate::storage::ConfigStore`].
+pub async fn register_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    worktree: &Path,
+    manifest: &Path,
+    expected_epoch: u64,
+) -> Result<Registration> {
+    let before = read_with_store(store).await?;
+    if before.as_ref().map_or(0, |registry| registry.epoch) != expected_epoch {
+        return Err(NativeOriginError::Epoch.into());
+    }
+    let prepared = attest::prepare_with_store(store, worktree, manifest).await?;
+    commit_registration_with_store(store, &prepared, expected_epoch).await
+}
+
 /// Explicit CLI owner. Handshake does not hold a database writer lock. The
 /// final same-connection trust reread, epoch CAS and one row write linearize
 /// only after the existing write-lock-first transaction has been acquired.
 pub async fn register(manifest: &Path, expected_epoch: u64) -> Result<Registration> {
     let (storage, worktree, _) = try_get_request_paths(None)
         .context("native-origin registration requires a Libra repository")?;
-    let conn = db::get_db_conn_instance_for_path(&storage.join(DATABASE))
-        .await
-        .context("open repository for native-origin registration")?;
-    // A preflight refusal avoids spawning a producer for corrupt state. This
-    // read never substitutes for the transaction's authoritative reread.
-    let before = read_with_conn(&conn).await?;
-    if before.as_ref().map_or(0, |registry| registry.epoch) != expected_epoch {
-        return Err(NativeOriginError::Epoch.into());
-    }
-    let prepared = attest::prepare(&conn, &worktree, manifest).await?;
-    let txn = tokio::time::timeout(Duration::from_secs(5), db::begin_write_transaction(&conn))
-        .await
-        .context("native-origin registry writer is busy; reread the epoch and retry")?
-        .context("acquire native-origin registry writer lock; reread the epoch and retry")?;
-    match commit_registration(&txn, &prepared, expected_epoch).await {
-        Ok(result) => {
-            txn.commit().await.context(
-                "commit native-origin registration; inspect the registry epoch before retrying",
-            )?;
-            Ok(result)
-        }
-        Err(primary) => {
-            if let Err(rollback) = txn.rollback().await {
-                bail!(
-                    "native-origin registration refused: {primary}; rollback failed: {rollback}; inspect the repository before retrying"
-                );
+    match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(|err| anyhow::anyhow!("detect repository storage backend: {err}"))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let store = crate::storage::runtime::open_repo_config_store_read_write(&storage)
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "open repository store for native-origin registration: {err}"
+                        )
+                    })?;
+                register_with_store(store.as_ref(), &worktree, manifest, expected_epoch).await
             }
-            Err(primary)
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                bail!("this Libra binary was compiled without `storage-redb`");
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let conn = db::get_db_conn_instance_for_path(&storage.join(DATABASE))
+                    .await
+                    .context("open repository for native-origin registration")?;
+                // A preflight refusal avoids spawning a producer for corrupt state. This
+                // read never substitutes for the transaction's authoritative reread.
+                let before = read_with_conn(&conn).await?;
+                if before.as_ref().map_or(0, |registry| registry.epoch) != expected_epoch {
+                    return Err(NativeOriginError::Epoch.into());
+                }
+                let prepared = attest::prepare(&conn, &worktree, manifest).await?;
+                let txn = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    db::begin_write_transaction(&conn),
+                )
+                .await
+                .context("native-origin registry writer is busy; reread the epoch and retry")?
+                .context(
+                    "acquire native-origin registry writer lock; reread the epoch and retry",
+                )?;
+                match commit_registration(&txn, &prepared, expected_epoch).await {
+                    Ok(result) => {
+                        txn.commit().await.context(
+                            "commit native-origin registration; inspect the registry epoch before retrying",
+                        )?;
+                        Ok(result)
+                    }
+                    Err(primary) => {
+                        if let Err(rollback) = txn.rollback().await {
+                            bail!(
+                                "native-origin registration refused: {primary}; rollback failed: {rollback}; inspect the repository before retrying"
+                            );
+                        }
+                        Err(primary)
+                    }
+                }
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                bail!("this Libra binary was compiled without `storage-sqlite`");
+            }
         }
     }
 }

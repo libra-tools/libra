@@ -104,6 +104,73 @@ pub async fn insert_task_run_row<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Capture every existing `(task_id, run_id, base_commit_ref)` for `task_ids`
+/// via [`crate::storage::GitStateStore`] before a rebuild mutates rows.
+pub async fn snapshot_task_run_base_commit_refs_with_store(
+    store: &dyn crate::storage::GitStateStore,
+    task_ids: &[String],
+) -> crate::storage::StorageResult<RebuildSnapshot> {
+    let mut unique_ids = std::collections::BTreeSet::new();
+    for task_id in task_ids {
+        if !task_id.is_empty() {
+            unique_ids.insert(task_id.as_str());
+        }
+    }
+    let mut refs = HashMap::new();
+    for task_id in unique_ids {
+        let rows = store.list_ai_index_task_runs(task_id).await?;
+        for row in rows {
+            refs.insert((row.task_id, row.run_id), row.base_commit_ref);
+        }
+    }
+    Ok(RebuildSnapshot { refs })
+}
+
+/// Rebuild `ai_index_task_run` rows on a backend-agnostic
+/// [`crate::storage::GitStateStore`], snapshotting existing `base_commit_ref`
+/// values before write and backfilling whenever a rebuilt row omits it (GC-08).
+pub async fn rebuild_task_run_index_with_store(
+    store: &dyn crate::storage::GitStateStore,
+    rows: &[TaskRunIndexRow],
+) -> crate::storage::StorageResult<()> {
+    let task_ids: Vec<String> = rows.iter().map(|row| row.task_id.clone()).collect();
+    let snapshot = snapshot_task_run_base_commit_refs_with_store(store, &task_ids).await?;
+    for row in rows {
+        let tagged = row.base_commit_ref.clone().or_else(|| {
+            snapshot
+                .refs
+                .get(&(row.task_id.clone(), row.run_id.clone()))
+                .cloned()
+                .flatten()
+        });
+        let record = crate::storage::AiIndexTaskRunRecord {
+            task_id: row.task_id.clone(),
+            run_id: row.run_id.clone(),
+            is_latest: row.is_latest,
+            created_at: row.created_at,
+            base_commit_ref: tagged,
+        };
+        store.upsert_ai_index_task_run(&record).await?;
+    }
+    Ok(())
+}
+
+/// Insert or upsert a single `ai_index_task_run` row via
+/// [`crate::storage::GitStateStore`].
+pub async fn insert_task_run_row_with_store(
+    store: &dyn crate::storage::GitStateStore,
+    row: &TaskRunIndexRow,
+) -> crate::storage::StorageResult<()> {
+    let record = crate::storage::AiIndexTaskRunRecord {
+        task_id: row.task_id.clone(),
+        run_id: row.run_id.clone(),
+        is_latest: row.is_latest,
+        created_at: row.created_at,
+        base_commit_ref: row.base_commit_ref.clone(),
+    };
+    store.upsert_ai_index_task_run(&record).await
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectionTrait, Statement};

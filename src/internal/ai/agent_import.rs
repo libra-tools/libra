@@ -93,6 +93,10 @@ use crate::{
         },
         metadata::{MetadataKv, MetadataScope},
     },
+    storage::capture_store::{
+        AgentImportIdentityRecord, AgentImportTombstoneRecord, CaptureImportIdentityState,
+        CaptureScopeState, CaptureStore, is_capture_tombstone_error,
+    },
     utils::{json::normalize_json_value, util},
 };
 
@@ -6198,6 +6202,255 @@ pub async fn restore_tombstone(
         .await
         .context("commit erased-session restore")?;
     Ok(deleted.rows_affected() == 1)
+}
+
+/// Fast tombstone check via [`CaptureStore`] (`RB-22`).
+pub async fn session_is_tombstoned_with_capture(
+    capture: &dyn CaptureStore,
+    kind: AgentKind,
+    provider_session_id: &str,
+) -> Result<bool> {
+    let tombstones = capture
+        .list_import_tombstones()
+        .await
+        .context("check agent import tombstone in capture store")?;
+    Ok(tombstones.iter().any(|tombstone| {
+        tombstone.agent_kind == kind.as_db_str()
+            && tombstone.provider_session_id == provider_session_id
+    }))
+}
+
+/// Persist an erasure tombstone in `agent_import_tombstone` via [`CaptureStore`] (`RB-22`).
+pub async fn record_import_tombstone_with_capture(
+    capture: &dyn CaptureStore,
+    kind: AgentKind,
+    provider_session_id: &str,
+    erased_session_id: &str,
+    source_fingerprint: Option<&str>,
+    erased_at: i64,
+) -> Result<AgentImportTombstoneRecord> {
+    let record = AgentImportTombstoneRecord {
+        tombstone_id: uuid::Uuid::new_v4().to_string(),
+        agent_kind: kind.as_db_str().to_string(),
+        provider_session_id: provider_session_id.to_string(),
+        erased_session_id: erased_session_id.to_string(),
+        source_fingerprint: source_fingerprint.map(str::to_string),
+        erased_at,
+    };
+    capture
+        .put_import_tombstone(&record)
+        .await
+        .context("persist agent import tombstone in capture store")?;
+    Ok(record)
+}
+
+/// Fetch one `agent_import_identity` row by `identity_id` via [`CaptureStore`] (`RB-22`).
+pub async fn get_import_identity_with_capture(
+    capture: &dyn CaptureStore,
+    identity_id: &str,
+) -> Result<Option<AgentImportIdentityRecord>> {
+    capture
+        .get_import_identity(identity_id)
+        .await
+        .context("read agent_import_identity from capture store")
+}
+
+/// Persist one `agent_import_identity` row via [`CaptureStore`], preserving
+/// fail-closed tombstone re-import rejection (`ImportError::Erased`) (`RB-22`).
+pub async fn upsert_import_identity_with_capture(
+    capture: &dyn CaptureStore,
+    record: &AgentImportIdentityRecord,
+) -> Result<()> {
+    if let Some(kind) = AgentKind::from_db_str(&record.agent_kind)
+        && session_is_tombstoned_with_capture(capture, kind, &record.provider_session_id).await?
+    {
+        return Err(ImportError::Erased.into());
+    }
+    match capture.upsert_import_identity(record).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_capture_tombstone_error(&err) => Err(ImportError::Erased.into()),
+        Err(err) => Err(err).context("upsert agent_import_identity in capture store"),
+    }
+}
+
+/// Acquire or renew an import identity lease via [`CaptureStore`], enforcing
+/// workspace scope compatibility and tombstone re-import rejection (`RB-22`).
+pub async fn acquire_import_identity_lease_with_capture(
+    capture: &dyn CaptureStore,
+    request: &ImportRequest,
+    scope: &CaptureScope,
+    owner: &str,
+    now_ms: i64,
+) -> Result<AgentImportIdentityRecord> {
+    scope
+        .assert_provider_session_compatible_with_capture(capture, &request.provider_session_id)
+        .await?;
+    if session_is_tombstoned_with_capture(capture, request.agent_kind, &request.provider_session_id)
+        .await?
+    {
+        return Err(ImportError::Erased.into());
+    }
+    let id = identity_id(request);
+    let lease_expires_at = now_ms.saturating_add(IMPORT_LEASE_MS);
+    let record = match capture
+        .get_import_identity(&id)
+        .await
+        .context("read existing agent_import_identity from capture store")?
+    {
+        Some(mut existing) => {
+            if !scope.matches_scope_fields(
+                existing.scope_state,
+                existing.repo_id.as_deref(),
+                existing.worktree_id.as_deref(),
+                existing.workspace_id.as_deref(),
+                existing.workspace_fence,
+            ) {
+                return Err(ImportError::RepositoryConflict.into());
+            }
+            if existing.owner.as_deref().is_some_and(|o| o != owner)
+                && existing.lease_expires_at.is_some_and(|exp| exp > now_ms)
+            {
+                return Err(ImportError::LeaseBusy.into());
+            }
+            let next_fence = existing.fence_token.unwrap_or(0).saturating_add(1);
+            existing.observed_digest = Some(request.content_digest.clone());
+            existing.state = CaptureImportIdentityState::Leased;
+            existing.owner = Some(owner.to_string());
+            existing.lease_expires_at = Some(lease_expires_at);
+            existing.fence_token = Some(next_fence);
+            existing.updated_at = now_ms;
+            existing
+        }
+        None => AgentImportIdentityRecord {
+            identity_id: id,
+            agent_kind: request.agent_kind.as_db_str().to_string(),
+            provider_session_id: request.provider_session_id.clone(),
+            source_kind: request.source_kind.clone(),
+            source_id: request.source_id.clone(),
+            schema_version: request.identity_schema_version,
+            observed_digest: Some(request.content_digest.clone()),
+            committed_digest: None,
+            attempt_id: None,
+            attempt_checkpoint_id: None,
+            next_ordinal: 0,
+            state: CaptureImportIdentityState::Leased,
+            owner: Some(owner.to_string()),
+            lease_expires_at: Some(lease_expires_at),
+            fence_token: Some(1),
+            last_error_code: None,
+            created_at: now_ms,
+            updated_at: now_ms,
+            repo_id: Some(scope.repo_id.clone()),
+            worktree_id: Some(scope.worktree_id.clone()),
+            workspace_id: scope.workspace_id.clone(),
+            workspace_fence: scope.workspace_fence,
+            scope_state: CaptureScopeState::Scoped,
+        },
+    };
+    upsert_import_identity_with_capture(capture, &record).await?;
+    Ok(record)
+}
+
+/// Finalize a leased import identity as `committed` under `(owner, fence_token)`
+/// via [`CaptureStore`] (`RB-22`).
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_import_identity_with_capture(
+    capture: &dyn CaptureStore,
+    identity_id: &str,
+    scope: &CaptureScope,
+    owner: &str,
+    fence_token: i64,
+    committed_digest: &str,
+    next_ordinal: i64,
+    now_ms: i64,
+) -> Result<AgentImportIdentityRecord> {
+    let mut existing = capture
+        .get_import_identity(identity_id)
+        .await
+        .context("read agent_import_identity before commit")?
+        .context("agent_import_identity is missing before commit")?;
+    if !scope.matches_scope_fields(
+        existing.scope_state,
+        existing.repo_id.as_deref(),
+        existing.worktree_id.as_deref(),
+        existing.workspace_id.as_deref(),
+        existing.workspace_fence,
+    ) {
+        return Err(ImportError::RepositoryConflict.into());
+    }
+    if existing.owner.as_deref() != Some(owner) || existing.fence_token != Some(fence_token) {
+        return Err(ImportError::LeaseBusy.into());
+    }
+    existing.committed_digest = Some(committed_digest.to_string());
+    existing.next_ordinal = next_ordinal;
+    existing.state = CaptureImportIdentityState::Committed;
+    existing.owner = None;
+    existing.lease_expires_at = None;
+    existing.last_error_code = None;
+    existing.updated_at = now_ms;
+    upsert_import_identity_with_capture(capture, &existing).await?;
+    Ok(existing)
+}
+
+/// Load existing session ownership snapshot via [`CaptureStore`] (`RB-22`).
+pub async fn load_existing_session_ownership_with_capture(
+    capture: &dyn CaptureStore,
+    kind: AgentKind,
+    provider_session_id: &str,
+) -> Result<Option<ExistingSessionOwnershipSnapshot>> {
+    let sessions = capture
+        .list_sessions_by_started_desc()
+        .await
+        .context("query existing agent import ownership snapshot from capture store")?;
+    Ok(sessions
+        .into_iter()
+        .find(|s| {
+            s.agent_kind.as_str() == kind.as_db_str()
+                && s.provider_session_id == provider_session_id
+        })
+        .map(|s| ExistingSessionOwnershipSnapshot {
+            session_id: s.session_id,
+            agent_kind: s.agent_kind.as_str().to_string(),
+            provider_session_id: s.provider_session_id,
+            working_dir: s.working_dir,
+            metadata_json: s.metadata_json,
+        }))
+}
+
+/// Scope-aware existing session ownership lookup via [`CaptureStore`] (`RB-22`).
+pub async fn load_existing_session_ownership_in_scope_with_capture(
+    capture: &dyn CaptureStore,
+    kind: AgentKind,
+    provider_session_id: &str,
+    scope: &CaptureScope,
+) -> Result<Option<ExistingSessionOwnershipSnapshot>> {
+    scope
+        .assert_provider_session_compatible_with_capture(capture, provider_session_id)
+        .await?;
+    let sessions = capture
+        .list_sessions_by_started_desc()
+        .await
+        .context("query scoped agent import ownership snapshot from capture store")?;
+    Ok(sessions
+        .into_iter()
+        .find(|s| {
+            s.agent_kind.as_str() == kind.as_db_str()
+                && s.provider_session_id == provider_session_id
+                && scope.matches_scope_fields(
+                    s.scope_state,
+                    s.repo_id.as_deref(),
+                    s.worktree_id.as_deref(),
+                    s.workspace_id.as_deref(),
+                    s.workspace_fence,
+                )
+        })
+        .map(|s| ExistingSessionOwnershipSnapshot {
+            session_id: s.session_id,
+            agent_kind: s.agent_kind.as_str().to_string(),
+            provider_session_id: s.provider_session_id,
+            working_dir: s.working_dir,
+            metadata_json: s.metadata_json,
+        }))
 }
 
 #[cfg(test)]
@@ -13409,6 +13662,907 @@ pub(crate) mod tests {
             Instant::now() + Duration::from_secs(10),
         )
         .expect("old ordinary helper projection remains usable");
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn redb_ai_import_coverage_history_and_export_services() {
+        use std::sync::Arc;
+
+        use git_internal::internal::object::{
+            ObjectTrait,
+            commit::Commit,
+            signature::{Signature, SignatureType},
+            tree::{Tree, TreeItem, TreeItemMode},
+        };
+
+        use crate::{
+            internal::ai::{
+                capture_scope::{
+                    get_workspace_scope_audit_with_capture,
+                    list_workspace_scope_audits_with_capture,
+                    record_workspace_scope_audit_with_capture,
+                },
+                checkpoint_reader::{
+                    CheckpointReadBudget, latest_session_metadata_with_stores,
+                    load_checkpoint_catalog,
+                },
+                commit_recovery::{inspect_prepared_with_stores, prepare_page_with_git_store},
+                coverage_gate::{
+                    commit_reserved_turn_claims_with_capture, get_coverage_claim_with_capture,
+                    get_coverage_conflict_with_capture, list_coverage_revisions_with_capture,
+                    reserve_turn_claims_for_channel_with_capture,
+                },
+                export_job::{
+                    AdvanceOutcome, ExportJobTarget, IdleOutcome, advance_and_release_with_capture,
+                    advance_processed_with_capture, get_export_job_for_session_with_capture,
+                    observe_idle_with_capture,
+                },
+                history::{
+                    AI_REF, agent_sessions_for_commit_with_capture, get_object_hash_with_git_store,
+                    list_object_types_with_git_store, resolve_history_head_with_git_store,
+                },
+                observed_agents::SemanticRecord,
+                subagent_content::{
+                    SUBAGENT_CONTENT_SCHEMA_VERSION, SubagentClaimReserveOutcome,
+                    commit_subagent_content_revision_with_capture,
+                    get_subagent_content_claim_with_capture, get_subagent_link_with_capture,
+                    list_subagent_content_revisions_with_capture,
+                    reserve_subagent_content_claim_with_capture, upsert_subagent_link_with_capture,
+                },
+                traces::{
+                    agent_checkpoint_id_for_traces_commit_with_capture,
+                    list_checkpoints_for_session_with_capture,
+                    list_live_traces_inflight_markers_with_metadata_store,
+                    write_traces_inflight_marker_with_metadata_store,
+                },
+            },
+            storage::{
+                backend::StorageBackendKind,
+                capture_store::{
+                    AgentCheckpointRecord, AgentSessionRecord, AgentSubagentLinkRecord,
+                    CaptureAgentKind, CaptureCheckpointScope, CaptureCoverageClaimState,
+                    CaptureExportJobState, CaptureImportIdentityState, CaptureScopeState,
+                    CaptureSessionState, CaptureSubagentClaimState, CaptureSubagentLinkState,
+                    CaptureSubagentSourceChannel,
+                },
+                git_store::{RefKey, RefTarget},
+                opener::RedbRepairContext,
+                runtime::{
+                    detect_repo_backend, init_redb_repository_storage,
+                    open_capture_store_read_only, open_capture_store_read_write,
+                    open_git_state_store_read_only, open_git_store_read_only,
+                    open_git_store_read_write, open_repo_config_store_read_only,
+                    open_repo_config_store_read_write, open_repo_metadata_store_read_only,
+                    open_repo_metadata_store_read_write,
+                },
+            },
+        };
+
+        let tmp = tempfile::tempdir().expect("create pure-redb tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize repo root");
+        let storage = root.join(util::ROOT_DIR);
+        std::fs::create_dir_all(storage.join("objects")).expect("create objects dir");
+
+        let _paths = init_redb_repository_storage(&storage)
+            .await
+            .expect("init redb repository storage");
+        assert_eq!(
+            detect_repo_backend(&storage).expect("detect redb backend"),
+            StorageBackendKind::Redb
+        );
+
+        // Seed repository identity (`libra.repoid`) on pure Redb config store.
+        {
+            let config_rw = open_repo_config_store_read_write(&storage)
+                .await
+                .expect("open redb config store rw");
+            config_rw
+                .set("libra.repoid", "repo-rb22-pure-redb", false)
+                .await
+                .expect("set libra.repoid");
+        }
+
+        // Resolve canonical CaptureScope using read-only Redb stores.
+        let scope = {
+            let config_ro = open_repo_config_store_read_only(&storage)
+                .await
+                .expect("open redb config store ro");
+            let state_ro = open_git_state_store_read_only(&storage)
+                .await
+                .expect("open redb git state store ro");
+            let resolved =
+                CaptureScope::resolve_with_stores(config_ro.as_ref(), state_ro.as_ref(), &root)
+                    .await
+                    .expect("resolve capture scope on redb");
+            let main_scope = CaptureScope::main_for_config_store(config_ro.as_ref())
+                .await
+                .expect("resolve main capture scope on redb");
+            assert_eq!(resolved, main_scope);
+            assert_eq!(resolved.repo_id, "repo-rb22-pure-redb");
+            resolved
+        };
+
+        // Write real Git objects (blobs, trees, commits) for AI history, checkpoints, and user HEAD.
+        let intent_blob_oid =
+            crate::utils::object::write_git_object(&storage, "blob", br#"{"intent":"rb22"}"#)
+                .expect("write intent blob");
+        let intent_subtree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            intent_blob_oid,
+            "intent-rb22".to_string(),
+        )])
+        .expect("build intent subtree");
+        let intent_subtree_oid = crate::utils::object::write_git_object(
+            &storage,
+            "tree",
+            &intent_subtree.to_data().expect("encode intent subtree"),
+        )
+        .expect("write intent subtree");
+        let ai_root_tree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Tree,
+            intent_subtree_oid,
+            "intent".to_string(),
+        )])
+        .expect("build ai root tree");
+        let ai_root_tree_oid = crate::utils::object::write_git_object(
+            &storage,
+            "tree",
+            &ai_root_tree.to_data().expect("encode ai root tree"),
+        )
+        .expect("write ai root tree");
+        let ai_commit = Commit::new(
+            Signature::new(
+                SignatureType::Author,
+                "Libra".to_string(),
+                "ai@libra".to_string(),
+            ),
+            Signature::new(
+                SignatureType::Committer,
+                "Libra".to_string(),
+                "ai@libra".to_string(),
+            ),
+            ai_root_tree_oid,
+            vec![],
+            "Update intent/intent-rb22",
+        );
+        let ai_commit_oid = crate::utils::object::write_git_object(
+            &storage,
+            "commit",
+            &ai_commit.to_data().expect("encode ai commit"),
+        )
+        .expect("write ai commit");
+
+        let user_commit = Commit::new(
+            Signature::new(
+                SignatureType::Author,
+                "Dev".to_string(),
+                "dev@libra".to_string(),
+            ),
+            Signature::new(
+                SignatureType::Committer,
+                "Dev".to_string(),
+                "dev@libra".to_string(),
+            ),
+            ai_root_tree_oid,
+            vec![],
+            "Implement RB-22\n\nLibra-Agent-Session: codex__sess-rb22\n",
+        );
+        let user_commit_oid = crate::utils::object::write_git_object(
+            &storage,
+            "commit",
+            &user_commit.to_data().expect("encode user commit"),
+        )
+        .expect("write user commit");
+
+        // Publish refs on Redb GitStore (`libra/intent`, `main`, `HEAD -> main`).
+        {
+            let git_rw = open_git_store_read_write(&storage)
+                .await
+                .expect("open redb git store rw");
+            git_rw
+                .update_ref_cas(
+                    &RefKey::LocalBranch {
+                        name: AI_REF.to_string(),
+                    },
+                    None,
+                    Some(&RefTarget::Direct(ai_commit_oid.to_string())),
+                    &[],
+                )
+                .await
+                .expect("create AI_REF branch");
+            git_rw
+                .update_ref_cas(
+                    &RefKey::LocalBranch {
+                        name: "main".to_string(),
+                    },
+                    None,
+                    Some(&RefTarget::Direct(user_commit_oid.to_string())),
+                    &[],
+                )
+                .await
+                .expect("create main branch");
+            git_rw
+                .update_ref_cas(
+                    &RefKey::LocalHead { worktree_id: None },
+                    None,
+                    Some(&RefTarget::Symbolic("main".to_string())),
+                    &[],
+                )
+                .await
+                .expect("point HEAD to main");
+        }
+
+        // Write a live TracesInflightMarker on Redb MetadataStore.
+        let now_ms = Utc::now().timestamp_millis();
+        let marker = TracesInflightMarker::new("codex__sess-rb22", "attempt-rb22-live", now_ms);
+        {
+            let metadata_rw = open_repo_metadata_store_read_write(&storage)
+                .await
+                .expect("open redb metadata store rw");
+            write_traces_inflight_marker_with_metadata_store(metadata_rw.as_ref(), &marker)
+                .await
+                .expect("write traces inflight marker on redb");
+        }
+
+        let cp1_tree_oid = ai_root_tree_oid.to_string();
+        let cp1_meta_oid = intent_blob_oid.to_string();
+        let cp1_traces_commit = ai_commit_oid.to_string();
+        let cp2_traces_commit = user_commit_oid.to_string();
+
+        // Exercise AC1 & AC2 read/write workflows on Redb CaptureStore.
+        {
+            let capture_rw =
+                open_capture_store_read_write(&storage, RedbRepairContext::WriteCommand)
+                    .await
+                    .expect("open redb capture store rw");
+
+            // Seed scoped agent_session row.
+            let session = AgentSessionRecord {
+                session_id: "codex__sess-rb22".to_string(),
+                agent_kind: CaptureAgentKind::Codex,
+                provider_session_id: "sess-rb22".to_string(),
+                thread_id: Some("thread-rb22".to_string()),
+                state: CaptureSessionState::Active,
+                working_dir: root.to_string_lossy().to_string(),
+                worktree_id: Some(scope.worktree_id.clone()),
+                parent_commit: Some(user_commit_oid.to_string()),
+                parent_session_id: None,
+                metadata_json: r#"{"mode":"rb22"}"#.to_string(),
+                redaction_report: r#"{"redacted":0}"#.to_string(),
+                started_at: now_ms - 10_000,
+                last_event_at: now_ms,
+                stopped_at: None,
+                schema_version: 1,
+                sync_revision: 1,
+                repo_id: Some(scope.repo_id.clone()),
+                workspace_id: scope.workspace_id.clone(),
+                workspace_fence: scope.workspace_fence,
+                scope_state: CaptureScopeState::Scoped,
+            };
+            capture_rw
+                .upsert_session(&session)
+                .await
+                .expect("seed scoped session in redb capture store");
+
+            // Verify existing session ownership lookup in scope.
+            let owned = load_existing_session_ownership_in_scope_with_capture(
+                capture_rw.as_ref(),
+                AgentKind::Codex,
+                "sess-rb22",
+                &scope,
+            )
+            .await
+            .expect("load session ownership in scope")
+            .expect("session ownership present");
+            assert_eq!(owned.session_id, "codex__sess-rb22");
+
+            // Foreign scope must be rejected by capture_scope check.
+            let foreign_scope = CaptureScope {
+                repo_id: "other-repo".to_string(),
+                worktree_id: String::new(),
+                workspace_id: None,
+                workspace_fence: None,
+            };
+            assert!(
+                foreign_scope
+                    .assert_provider_session_compatible_with_capture(
+                        capture_rw.as_ref(),
+                        "sess-rb22",
+                    )
+                    .await
+                    .is_err(),
+                "foreign scope must reject existing scoped provider session"
+            );
+
+            // AC1: Import identity lifecycle on Redb.
+            let mut import_req =
+                cov2_import_test_request(&root, &scope, vec![cov2_test_turn("turn-1", 0)]);
+            import_req.provider_session_id = "sess-rb22".to_string();
+            import_req.session_id = "codex__sess-rb22".to_string();
+            import_req.content_digest = "digest-rb22-v1".to_string();
+            let leased = acquire_import_identity_lease_with_capture(
+                capture_rw.as_ref(),
+                &import_req,
+                &scope,
+                "importer-1",
+                now_ms,
+            )
+            .await
+            .expect("acquire import identity lease");
+            assert_eq!(leased.state, CaptureImportIdentityState::Leased);
+            assert_eq!(leased.fence_token, Some(1));
+
+            let committed = commit_import_identity_with_capture(
+                capture_rw.as_ref(),
+                &leased.identity_id,
+                &scope,
+                "importer-1",
+                1,
+                "digest-rb22-v1",
+                1,
+                now_ms + 50,
+            )
+            .await
+            .expect("commit import identity");
+            assert_eq!(committed.state, CaptureImportIdentityState::Committed);
+            assert_eq!(
+                get_import_identity_with_capture(capture_rw.as_ref(), &leased.identity_id)
+                    .await
+                    .expect("get import identity")
+                    .and_then(|r| r.committed_digest)
+                    .as_deref(),
+                Some("digest-rb22-v1")
+            );
+
+            // AC1: Tombstone re-import rejection on Redb (agent_import + export_job).
+            let _tomb = record_import_tombstone_with_capture(
+                capture_rw.as_ref(),
+                AgentKind::Codex,
+                "erased-sess-rb22",
+                "codex__erased-sess-rb22",
+                Some("fp-erased-rb22"),
+                now_ms,
+            )
+            .await
+            .expect("record import tombstone");
+            assert!(
+                session_is_tombstoned_with_capture(
+                    capture_rw.as_ref(),
+                    AgentKind::Codex,
+                    "erased-sess-rb22",
+                )
+                .await
+                .expect("check tombstone")
+            );
+            let mut erased_req =
+                cov2_import_test_request(&root, &scope, vec![cov2_test_turn("turn-erased", 0)]);
+            erased_req.provider_session_id = "erased-sess-rb22".to_string();
+            erased_req.session_id = "codex__erased-sess-rb22".to_string();
+            let erased_err = acquire_import_identity_lease_with_capture(
+                capture_rw.as_ref(),
+                &erased_req,
+                &scope,
+                "importer-2",
+                now_ms + 100,
+            )
+            .await
+            .expect_err("tombstone must reject re-import");
+            assert!(
+                matches!(
+                    erased_err.downcast_ref::<ImportError>(),
+                    Some(ImportError::Erased)
+                ),
+                "expected ImportError::Erased, got {erased_err:#}"
+            );
+            assert!(
+                observe_idle_with_capture(
+                    capture_rw.as_ref(),
+                    "codex",
+                    "erased-sess-rb22",
+                    &scope,
+                    "exporter-erased",
+                    now_ms + 100,
+                )
+                .await
+                .is_err(),
+                "tombstone must reject export job creation"
+            );
+
+            // AC1: Export job lifecycle on Redb.
+            let target = ExportJobTarget::new("opencode", "oc-export-rb22", &scope);
+            let IdleOutcome::Runner {
+                fence_token,
+                target_generation,
+                ..
+            } = observe_idle_with_capture(
+                capture_rw.as_ref(),
+                "opencode",
+                "oc-export-rb22",
+                &scope,
+                "runner-a",
+                now_ms,
+            )
+            .await
+            .expect("first export idle")
+            else {
+                panic!("first idle must acquire runner lease");
+            };
+            assert_eq!(fence_token, 1);
+            assert_eq!(target_generation, 1);
+            assert_eq!(
+                observe_idle_with_capture(
+                    capture_rw.as_ref(),
+                    "opencode",
+                    "oc-export-rb22",
+                    &scope,
+                    "runner-b",
+                    now_ms + 10,
+                )
+                .await
+                .expect("contending idle"),
+                IdleOutcome::RecordedOnly
+            );
+            assert_eq!(
+                advance_processed_with_capture(
+                    capture_rw.as_ref(),
+                    &target,
+                    "runner-a",
+                    fence_token,
+                    1,
+                    now_ms + 20,
+                )
+                .await
+                .expect("advance first generation"),
+                AdvanceOutcome::MoreWork {
+                    target_generation: 2
+                }
+            );
+            assert_eq!(
+                advance_and_release_with_capture(
+                    capture_rw.as_ref(),
+                    &target,
+                    "runner-a",
+                    fence_token,
+                    2,
+                    now_ms + 30,
+                )
+                .await
+                .expect("advance and release clean"),
+                AdvanceOutcome::Clean
+            );
+            let export_row = get_export_job_for_session_with_capture(
+                capture_rw.as_ref(),
+                "opencode",
+                "oc-export-rb22",
+            )
+            .await
+            .expect("get export job")
+            .expect("export job exists");
+            assert_eq!(export_row.state, CaptureExportJobState::Idle);
+            assert_eq!(export_row.observed_generation, 2);
+            assert_eq!(export_row.processed_generation, 2);
+
+            // AC2: Workspace scope audit on Redb.
+            let audit = record_workspace_scope_audit_with_capture(
+                capture_rw.as_ref(),
+                "codex",
+                "sess-rb22",
+                &scope,
+                Some("operator-rb22"),
+                now_ms,
+            )
+            .await
+            .expect("append workspace scope audit");
+            assert_eq!(
+                get_workspace_scope_audit_with_capture(capture_rw.as_ref(), &audit.audit_id)
+                    .await
+                    .expect("get scope audit"),
+                Some(audit.clone())
+            );
+            let audits =
+                list_workspace_scope_audits_with_capture(capture_rw.as_ref(), "codex", "sess-rb22")
+                    .await
+                    .expect("list scope audits");
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0].audit_id, audit.audit_id);
+
+            // Seed committed checkpoints for coverage & checkpoint_reader / traces tests.
+            let cp1 = AgentCheckpointRecord {
+                checkpoint_id: "cp-rb22-1".to_string(),
+                session_id: "codex__sess-rb22".to_string(),
+                parent_checkpoint_id: None,
+                scope: CaptureCheckpointScope::Committed,
+                parent_commit: Some(user_commit_oid.to_string()),
+                tree_oid: cp1_tree_oid.clone(),
+                metadata_blob_oid: cp1_meta_oid.clone(),
+                traces_commit: cp1_traces_commit.clone(),
+                tool_use_id: None,
+                subagent_session_id: None,
+                description: Some("rb22 incomplete turn".to_string()),
+                created_at: now_ms - 1000,
+                sync_revision: 1,
+            };
+            let cp2 = AgentCheckpointRecord {
+                checkpoint_id: "cp-rb22-2".to_string(),
+                session_id: "codex__sess-rb22".to_string(),
+                parent_checkpoint_id: Some("cp-rb22-1".to_string()),
+                scope: CaptureCheckpointScope::Committed,
+                parent_commit: Some(user_commit_oid.to_string()),
+                tree_oid: cp1_tree_oid.clone(),
+                metadata_blob_oid: cp1_meta_oid.clone(),
+                traces_commit: cp2_traces_commit.clone(),
+                tool_use_id: None,
+                subagent_session_id: None,
+                description: Some("rb22 complete turn".to_string()),
+                created_at: now_ms,
+                sync_revision: 2,
+            };
+            let cp_sub = AgentCheckpointRecord {
+                checkpoint_id: "cp-rb22-sub-1".to_string(),
+                session_id: "codex__sess-rb22".to_string(),
+                parent_checkpoint_id: Some("cp-rb22-2".to_string()),
+                scope: CaptureCheckpointScope::Subagent,
+                parent_commit: Some(user_commit_oid.to_string()),
+                tree_oid: cp1_tree_oid.clone(),
+                metadata_blob_oid: cp1_meta_oid.clone(),
+                traces_commit: cp2_traces_commit.clone(),
+                tool_use_id: Some("tool-sub-1".to_string()),
+                subagent_session_id: Some("sub-child-1".to_string()),
+                description: Some("rb22 subagent checkpoint".to_string()),
+                created_at: now_ms + 10,
+                sync_revision: 3,
+            };
+            capture_rw.upsert_checkpoint(&cp1).await.expect("seed cp1");
+            capture_rw.upsert_checkpoint(&cp2).await.expect("seed cp2");
+            capture_rw
+                .upsert_checkpoint(&cp_sub)
+                .await
+                .expect("seed cp_sub");
+
+            // AC2: Coverage claims, incomplete->complete revision upgrade, and conflict persistence.
+            let mut inc_turn = cov2_test_turn("turn-rb22", 0);
+            inc_turn.completeness = Completeness::Incomplete;
+            let res1 = reserve_turn_claims_for_channel_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                std::slice::from_ref(&inc_turn),
+                "live-writer-1",
+                now_ms,
+                "live",
+            )
+            .await
+            .expect("reserve incomplete turn");
+            assert_eq!(res1.reserved.len(), 1);
+            assert_eq!(res1.reserved[0].next_revision, 1);
+            commit_reserved_turn_claims_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                "live-writer-1",
+                "cp-rb22-1",
+                &cp1_traces_commit,
+                "live",
+                &res1.reserved,
+                now_ms + 1,
+            )
+            .await
+            .expect("commit incomplete revision 1");
+
+            let comp_turn = cov2_test_turn("turn-rb22", 0);
+            let res2 = reserve_turn_claims_for_channel_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                std::slice::from_ref(&comp_turn),
+                "live-writer-2",
+                now_ms + 2,
+                "live",
+            )
+            .await
+            .expect("upgrade incomplete -> complete");
+            assert_eq!(res2.reserved.len(), 1);
+            assert_eq!(res2.reserved[0].next_revision, 2);
+            commit_reserved_turn_claims_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                "live-writer-2",
+                "cp-rb22-2",
+                &cp2_traces_commit,
+                "live",
+                &res2.reserved,
+                now_ms + 3,
+            )
+            .await
+            .expect("commit complete revision 2");
+
+            let revisions = list_coverage_revisions_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                "turn-rb22",
+                CoverageSchemaVersion::V1,
+            )
+            .await
+            .expect("list coverage revisions");
+            assert_eq!(revisions.len(), 2);
+
+            let mut conflicting_turn = cov2_test_turn("turn-rb22", 0);
+            conflicting_turn.records = vec![SemanticRecord::User {
+                text: "conflicting synthetic prompt".to_string(),
+            }];
+            let res_conflict = reserve_turn_claims_for_channel_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                std::slice::from_ref(&conflicting_turn),
+                "import-writer-3",
+                now_ms + 4,
+                "import",
+            )
+            .await
+            .expect("detect complete-vs-different-complete conflict");
+            assert_eq!(res_conflict.conflicted, 1);
+            let claim_after = get_coverage_claim_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                "turn-rb22",
+                CoverageSchemaVersion::V1,
+            )
+            .await
+            .expect("get conflicted claim")
+            .expect("claim exists");
+            assert_eq!(claim_after.state, CaptureCoverageClaimState::Conflicted);
+            let conflict_row = get_coverage_conflict_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                "turn-rb22",
+                CoverageSchemaVersion::V1,
+            )
+            .await
+            .expect("get conflict record")
+            .expect("conflict persisted");
+            assert_eq!(conflict_row.incumbent_revision, 2);
+
+            // AC2: Subagent content claim, revision, and link on Redb.
+            let sub_res = reserve_subagent_content_claim_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                "codex",
+                "subagent-source-rb22",
+                SUBAGENT_CONTENT_SCHEMA_VERSION,
+                "sub-digest-1",
+                Some("cp-rb22-sub-1"),
+                "sub-owner-1",
+                now_ms,
+            )
+            .await
+            .expect("reserve subagent claim");
+            assert_eq!(
+                sub_res,
+                SubagentClaimReserveOutcome::Reserved {
+                    fence_token: 1,
+                    next_revision: 1,
+                }
+            );
+            assert_eq!(
+                reserve_subagent_content_claim_with_capture(
+                    capture_rw.as_ref(),
+                    "codex__sess-rb22",
+                    "codex",
+                    "subagent-source-rb22",
+                    SUBAGENT_CONTENT_SCHEMA_VERSION,
+                    "sub-digest-1",
+                    Some("cp-rb22-sub-1"),
+                    "sub-owner-2",
+                    now_ms + 5,
+                )
+                .await
+                .expect("contending subagent reservation"),
+                SubagentClaimReserveOutcome::InFlight
+            );
+            let sub_rev = commit_subagent_content_revision_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                "codex",
+                "subagent-source-rb22",
+                SUBAGENT_CONTENT_SCHEMA_VERSION,
+                "sub-owner-1",
+                1,
+                "cp-rb22-sub-1",
+                "sub-digest-1",
+                CaptureSubagentSourceChannel::Live,
+                false,
+                now_ms + 10,
+            )
+            .await
+            .expect("commit subagent revision");
+            assert_eq!(sub_rev.revision, 1);
+            let sub_claim = get_subagent_content_claim_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                "codex",
+                "subagent-source-rb22",
+                SUBAGENT_CONTENT_SCHEMA_VERSION,
+            )
+            .await
+            .expect("get subagent claim")
+            .expect("subagent claim exists");
+            assert_eq!(sub_claim.state, CaptureSubagentClaimState::Idle);
+            assert_eq!(sub_claim.current_revision, 1);
+            let sub_revs = list_subagent_content_revisions_with_capture(
+                capture_rw.as_ref(),
+                "codex__sess-rb22",
+                "codex",
+                "subagent-source-rb22",
+                SUBAGENT_CONTENT_SCHEMA_VERSION,
+            )
+            .await
+            .expect("list subagent revisions");
+            assert_eq!(sub_revs.len(), 1);
+            assert_eq!(
+                reserve_subagent_content_claim_with_capture(
+                    capture_rw.as_ref(),
+                    "codex__sess-rb22",
+                    "codex",
+                    "subagent-source-rb22",
+                    SUBAGENT_CONTENT_SCHEMA_VERSION,
+                    "sub-digest-1",
+                    None,
+                    "sub-owner-3",
+                    now_ms + 20,
+                )
+                .await
+                .expect("unchanged subagent digest"),
+                SubagentClaimReserveOutcome::Unchanged {
+                    current_revision: 1,
+                    current_checkpoint_id: "cp-rb22-sub-1".to_string(),
+                }
+            );
+            let sub_link = AgentSubagentLinkRecord {
+                content_checkpoint_id: "cp-rb22-sub-1".to_string(),
+                parent_session_id: "codex__sess-rb22".to_string(),
+                link_state: CaptureSubagentLinkState::Resolved,
+                boundary_checkpoint_id: Some("cp-rb22-2".to_string()),
+                stable_subagent_id: Some("sub-child-1".to_string()),
+                created_at: now_ms + 10,
+                updated_at: now_ms + 10,
+                sync_revision: 1,
+            };
+            upsert_subagent_link_with_capture(capture_rw.as_ref(), &sub_link)
+                .await
+                .expect("upsert subagent link");
+            assert_eq!(
+                get_subagent_link_with_capture(capture_rw.as_ref(), "cp-rb22-sub-1")
+                    .await
+                    .expect("get subagent link"),
+                Some(sub_link)
+            );
+        }
+
+        // AC3: Strictly read-only snapshots across checkpoint_reader, commit_recovery, history, and traces.
+        let capture_ro = open_capture_store_read_only(&storage)
+            .await
+            .expect("open redb capture store ro");
+        assert!(capture_ro.is_read_only());
+        let git_ro = open_git_store_read_only(&storage)
+            .await
+            .expect("open redb git store ro");
+        let state_ro = open_git_state_store_read_only(&storage)
+            .await
+            .expect("open redb git state store ro");
+        let config_ro = open_repo_config_store_read_only(&storage)
+            .await
+            .expect("open redb config store ro");
+        let metadata_ro = open_repo_metadata_store_read_only(&storage)
+            .await
+            .expect("open redb metadata store ro");
+
+        // checkpoint_reader on Redb
+        let budget =
+            CheckpointReadBudget::new(Instant::now() + Duration::from_secs(5), Arc::new(|| false));
+        let cp_catalog = load_checkpoint_catalog(&storage, "cp-rb22-2", &budget)
+            .await
+            .expect("load_checkpoint_catalog via redb backend dispatch");
+        assert_eq!(cp_catalog.checkpoint_id(), "cp-rb22-2");
+        assert_eq!(cp_catalog.tree_oid(), ai_root_tree_oid);
+        let latest_meta = latest_session_metadata_with_stores(
+            capture_ro.as_ref(),
+            config_ro.as_ref(),
+            &storage,
+            "codex__sess-rb22",
+            &budget,
+        )
+        .await
+        .expect("latest_session_metadata_with_stores on redb")
+        .expect("latest committed checkpoint metadata");
+        assert_eq!(latest_meta.checkpoint_id(), "cp-rb22-2");
+        assert_eq!(latest_meta.metadata_oid(), intent_blob_oid);
+
+        // commit_recovery on Redb (read-only inspection)
+        let prepared = prepare_page_with_git_store(git_ro.as_ref(), &storage, &scope, 1)
+            .await
+            .expect("prepare_page_with_git_store on redb");
+        let recovery_report = inspect_prepared_with_stores(
+            git_ro.as_ref(),
+            state_ro.as_ref(),
+            capture_ro.as_ref(),
+            &storage,
+            &scope,
+            1,
+            false,
+            &prepared,
+        )
+        .await
+        .expect("inspect_prepared_with_stores read-only on redb");
+        assert_eq!(recovery_report.reachable_commits_scanned, 1);
+        assert_eq!(recovery_report.trailer_candidates, 1);
+        assert_eq!(recovery_report.missing_links, 1);
+        assert!(!recovery_report.repair_applied);
+
+        // history read-only queries on Redb
+        assert_eq!(
+            resolve_history_head_with_git_store(git_ro.as_ref(), AI_REF)
+                .await
+                .expect("resolve history head on redb"),
+            Some(ai_commit_oid)
+        );
+        assert_eq!(
+            list_object_types_with_git_store(&storage, git_ro.as_ref(), AI_REF)
+                .await
+                .expect("list object types on redb"),
+            vec!["intent".to_string()]
+        );
+        assert_eq!(
+            get_object_hash_with_git_store(
+                &storage,
+                git_ro.as_ref(),
+                AI_REF,
+                "intent",
+                "intent-rb22"
+            )
+            .await
+            .expect("get object hash on redb"),
+            Some(intent_blob_oid)
+        );
+        assert!(
+            agent_sessions_for_commit_with_capture(capture_ro.as_ref(), user_commit_oid)
+                .await
+                .expect("agent_sessions_for_commit_with_capture on redb")
+                .is_empty()
+        );
+
+        // traces read-only queries on Redb
+        let live_markers = list_live_traces_inflight_markers_with_metadata_store(
+            metadata_ro.as_ref(),
+            now_ms + 50,
+        )
+        .await
+        .expect("list live traces inflight markers on redb");
+        assert_eq!(live_markers.len(), 1);
+        assert_eq!(live_markers[0].attempt_id, "attempt-rb22-live");
+        assert_eq!(
+            agent_checkpoint_id_for_traces_commit_with_capture(
+                capture_ro.as_ref(),
+                &cp2_traces_commit,
+            )
+            .await
+            .expect("probe checkpoint by traces_commit on redb")
+            .as_deref(),
+            Some("cp-rb22-2")
+        );
+        let session_cps =
+            list_checkpoints_for_session_with_capture(capture_ro.as_ref(), "codex__sess-rb22")
+                .await
+                .expect("list checkpoints for session on redb");
+        assert_eq!(session_cps.len(), 3);
+
+        // Assert pure-Redb repository never created SQLite libra.db or capture.db.
+        assert!(
+            !storage.join(util::DATABASE).exists(),
+            "pure-redb repo must not create libra.db"
+        );
+        assert!(
+            !storage.join("private").join("capture.db").exists(),
+            "pure-redb repo must not create capture.db"
+        );
     }
 }
 

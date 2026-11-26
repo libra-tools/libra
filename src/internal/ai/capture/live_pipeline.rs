@@ -400,179 +400,358 @@ async fn persist_agent_traces_command(
     // frame into another repository.
     let runtime_scope = ingress_command.runtime_scope().clone();
     let storage_path = runtime_scope.storage_path;
-    let database_path = storage_path.join(util::DATABASE);
-    // Scope/configuration discovery is read-only, but it can still block on
-    // SQLite after the connection has opened.  A terminal may spend only its
-    // dispatch-established settlement slice here so it can discover the
-    // trusted scope needed for a content-free receipt; it never uses that
-    // slice for normal catalog or checkpoint work.
-    let setup_read_deadline = ingress_command
-        .deadline()
-        .map(|deadline| {
-            if ingress_command.event_kind() == LifecycleEventKind::SessionEnd {
-                hook_execution_deadline(deadline, true).map(HookExecutionDeadline::commit_deadline)
-            } else {
-                Ok(capture_commit_deadline(deadline))
-            }
-        })
-        .transpose()?;
-    let (repo_conn, capture_busy_timeout) = if let Some(deadline) = ingress_command.deadline() {
-        let terminal = ingress_command.event_kind() == LifecycleEventKind::SessionEnd;
-        let remaining = deadline
-            .monotonic()
-            .saturating_duration_since(Instant::now());
-        if remaining.is_zero() && !terminal {
-            bail!("capture ingress deadline expired before opening the hook database");
-        }
-        // An expired terminal gets one non-blocking attempt to create its
-        // content-free receipt. It must not wait for a 30-second connection
-        // default after the host has already reached its outer deadline.
-        // A replayed queue entry is the single consumer, not a hook racing
-        // its host's timeout: it may wait out the whole replay window.
-        let replay = ingress_command.replay_redaction().is_some();
-        let busy_timeout = if replay && !remaining.is_zero() {
-            remaining
-        } else if remaining.is_zero() {
-            // The deadline is capture's primary work window, not the host's
-            // whole timeout. Give an expired terminal one short cold-start
-            // connection/receipt attempt from its explicitly reserved
-            // settlement slice; one millisecond is not enough to establish
-            // a fresh SQLite connection even without lock contention.
-            HOOK_TERMINAL_SETTLEMENT_GRACE.min(HOOK_DATABASE_BUSY_TIMEOUT_CAP)
-        } else {
-            remaining.min(HOOK_DATABASE_BUSY_TIMEOUT_CAP)
-        };
-        // A database-open failure keeps only its closed, path-free class so
-        // fail-closed hook surfaces can restore the preflight's
-        // `LBR-REPO-002` (missing) / `LBR-IO-001` (unopenable) contract.
-        let database_path = database_path.to_str().ok_or_else(|| {
-            active_repository_failure(ActiveRepositoryFailureClass::DatabaseUnavailable)
-        })?;
-        // The managed open migrates and fences exactly like every repository
-        // command (and like the no-deadline branch below): pending schema
-        // migrations are applied first, one claim-first transaction per
-        // version, and a schema written by a newer Libra is refused, which
-        // the closed class renders as the path-free `LBR-IO-001`
-        // newer-binary remedy. Only the lock wait is bounded by the hook's
-        // database slice; migration DDL itself is not pre-empted.
-        // Repository metadata stays on libra.db. The catalog connection is
-        // opened separately below.
-        let conn = db::open_repository_with_busy_timeout(database_path, busy_timeout)
-            .await
-            .map_err(|err| {
-                active_repository_failure(ActiveRepositoryFailureClass::for_database_open(
-                    err.kind(),
-                ))
-            })?;
-        (conn, busy_timeout)
-    } else {
-        // The spool consumer has no hook deadline. It opens its own
-        // connection exactly like the hook branch, with the consumer's
-        // 30-second wait, rather than the process-wide cached handle that
-        // later repository peers in this process would re-validate.
-        let database_path = database_path.to_str().ok_or_else(|| {
-            active_repository_failure(ActiveRepositoryFailureClass::DatabaseUnavailable)
-        })?;
-        let conn =
-            db::open_repository_with_busy_timeout(database_path, db::DEFAULT_CONNECTION_TIMEOUT)
+    match crate::storage::runtime::detect_repo_backend(&storage_path)
+        .map_err(|_| active_repository_failure(ActiveRepositoryFailureClass::DatabaseUnavailable))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let capture = crate::storage::runtime::open_capture_store_read_write(
+                    &storage_path,
+                    crate::storage::RedbRepairContext::WriteCommand,
+                )
                 .await
-                .map_err(|err| {
-                    active_repository_failure(ActiveRepositoryFailureClass::for_database_open(
-                        err.kind(),
-                    ))
-                })?;
-        (conn, db::DEFAULT_CONNECTION_TIMEOUT)
+                .map_err(|err| anyhow::anyhow!("open redb capture store: {err}"))?;
+                let config =
+                    crate::storage::runtime::open_repo_config_store_read_only(&storage_path)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("open redb config store: {err}"))?;
+                let meta =
+                    crate::storage::runtime::open_repo_metadata_store_read_write(&storage_path)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("open redb metadata store: {err}"))?;
+                let git_state =
+                    crate::storage::runtime::open_git_state_store_read_only(&storage_path)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("open redb git state store: {err}"))?;
+                return persist_agent_traces_command_with_capture(
+                    capture,
+                    config.as_ref(),
+                    meta.as_ref(),
+                    git_state.as_ref(),
+                    ingress_command,
+                    &storage_path,
+                    &runtime_scope.worktree_root,
+                    ingest_span,
+                )
+                .await;
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                let _ = (binding, ingest_span);
+                bail!("this Libra binary was compiled without `storage-redb`");
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let database_path = storage_path.join(util::DATABASE);
+            let setup_read_deadline = ingress_command
+                .deadline()
+                .map(|deadline| {
+                    if ingress_command.event_kind() == LifecycleEventKind::SessionEnd {
+                        hook_execution_deadline(deadline, true)
+                            .map(HookExecutionDeadline::commit_deadline)
+                    } else {
+                        Ok(capture_commit_deadline(deadline))
+                    }
+                })
+                .transpose()?;
+            let (repo_conn, capture_busy_timeout) =
+                if let Some(deadline) = ingress_command.deadline() {
+                    let terminal = ingress_command.event_kind() == LifecycleEventKind::SessionEnd;
+                    let remaining = deadline
+                        .monotonic()
+                        .saturating_duration_since(Instant::now());
+                    if remaining.is_zero() && !terminal {
+                        bail!("capture ingress deadline expired before opening the hook database");
+                    }
+                    let replay = ingress_command.replay_redaction().is_some();
+                    let busy_timeout = if replay && !remaining.is_zero() {
+                        remaining
+                    } else if remaining.is_zero() {
+                        HOOK_TERMINAL_SETTLEMENT_GRACE.min(HOOK_DATABASE_BUSY_TIMEOUT_CAP)
+                    } else {
+                        remaining.min(HOOK_DATABASE_BUSY_TIMEOUT_CAP)
+                    };
+                    let database_path = database_path.to_str().ok_or_else(|| {
+                        active_repository_failure(ActiveRepositoryFailureClass::DatabaseUnavailable)
+                    })?;
+                    let conn = db::open_repository_with_busy_timeout(database_path, busy_timeout)
+                        .await
+                        .map_err(|err| {
+                            active_repository_failure(
+                                ActiveRepositoryFailureClass::for_database_open(err.kind()),
+                            )
+                        })?;
+                    (conn, busy_timeout)
+                } else {
+                    let database_path = database_path.to_str().ok_or_else(|| {
+                        active_repository_failure(ActiveRepositoryFailureClass::DatabaseUnavailable)
+                    })?;
+                    let conn = db::open_repository_with_busy_timeout(
+                        database_path,
+                        db::DEFAULT_CONNECTION_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|err| {
+                        active_repository_failure(ActiveRepositoryFailureClass::for_database_open(
+                            err.kind(),
+                        ))
+                    })?;
+                    (conn, db::DEFAULT_CONNECTION_TIMEOUT)
+                };
+            await_agent_traces_pure_read_until(
+                setup_read_deadline,
+                "failed to configure hash kind from repo config",
+                set_hash_kind_from_connection(&repo_conn),
+            )
+            .await?;
+            let repo_root = runtime_scope.worktree_root;
+            let scope = await_agent_traces_pure_read_until(
+                setup_read_deadline,
+                "resolve capture scope from hook database",
+                CaptureScope::resolve(&repo_conn, &repo_root),
+            )
+            .await?;
+            if !admit_display_batch(&repo_conn, &ingress_command).await? {
+                ingest_span.record("partial", true);
+                tracing::warn!(
+                    target: "agent.hook.ingest",
+                    provider = ingress_command.provider_kind(),
+                    reason = "display_batch_dropped",
+                    "coalesced display batch exceeded the per-session budget"
+                );
+                return Ok(());
+            }
+            if ingress_command.event_kind() == LifecycleEventKind::SessionStart {
+                match await_agent_traces_pure_read_until(
+                    setup_read_deadline,
+                    "inspect bounded capture recovery hint",
+                    crate::internal::ai::capture::pending::has_pending_hint(&repo_conn, &scope),
+                )
+                .await
+                {
+                    Ok(true) => {
+                        tracing::info!(
+                            target: "agent.capture.recovery",
+                            reason = "pending_artifact_hint",
+                            "a bounded local capture recovery may be available"
+                        );
+                        if crate::internal::ai::capture::worker::spawn_detached(
+                            &storage_path,
+                            &repo_root,
+                        )
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                target: "agent.capture.recovery",
+                                reason = "worker_spawn_failed",
+                                "automatic local recovery could not start; run `libra agent doctor --repair`"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => tracing::warn!(
+                        target: "agent.capture.recovery",
+                        reason = "pending_hint_unavailable",
+                        "could not inspect the bounded local capture recovery hint; run `libra agent doctor`"
+                    ),
+                }
+            }
+            let capture_busy_timeout = match ingress_command.deadline() {
+                Some(deadline) => {
+                    let remaining = deadline
+                        .monotonic()
+                        .saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        HOOK_TERMINAL_SETTLEMENT_GRACE
+                            .min(HOOK_DATABASE_BUSY_TIMEOUT_CAP)
+                            .min(capture_busy_timeout)
+                    } else {
+                        remaining.min(capture_busy_timeout)
+                    }
+                }
+                None => capture_busy_timeout,
+            };
+            let capture_conn = capture_store::open(&storage_path, capture_busy_timeout)
+                .await
+                .map_err(|err| super::drain::classify_capture_open(&err))?;
+            ingest_agent_traces_payload_with_scope(
+                ingress_command,
+                binding,
+                &capture_conn,
+                Some(&storage_path),
+                &scope,
+                ingest_span,
+                &ExportJobLeaseStore::new(&capture_conn),
+            )
+            .await
+        }
+    }
+}
+
+/// Store-backed counterpart to [`admit_display_batch`] using
+/// [`crate::storage::MetadataStore`] without opening SQLite.
+#[allow(dead_code)]
+pub(crate) async fn admit_display_batch_with_store(
+    meta: &dyn crate::storage::MetadataStore,
+    command: &CaptureIngressCommand,
+) -> Result<bool> {
+    let Some((session_id, limit)) = command.display_batch_budget() else {
+        return Ok(true);
     };
-    await_agent_traces_pure_read_until(
-        setup_read_deadline,
-        "failed to configure hash kind from repo config",
-        set_hash_kind_from_connection(&repo_conn),
+    let kept = crate::internal::metadata::MetadataKv::get_with_store(
+        meta,
+        crate::internal::metadata::MetadataScope::AgentDisplayBatchCount,
+        &session_id,
+        "kept",
     )
-    .await?;
-    let repo_root = runtime_scope.worktree_root;
-    let scope = await_agent_traces_pure_read_until(
-        setup_read_deadline,
-        "resolve capture scope from hook database",
-        CaptureScope::resolve(&repo_conn, &repo_root),
-    )
-    .await?;
-    if !admit_display_batch(&repo_conn, &ingress_command).await? {
+    .await?
+    .and_then(|entry| entry.value.parse::<u32>().ok())
+    .unwrap_or(0);
+    if kept < limit {
+        crate::internal::metadata::MetadataKv::set_with_store(
+            meta,
+            crate::internal::metadata::MetadataScope::AgentDisplayBatchCount,
+            &session_id,
+            "kept",
+            &(kept.saturating_add(1)).to_string(),
+            crate::internal::metadata::MetadataValueType::Numeric,
+        )
+        .await?;
+        Ok(true)
+    } else {
+        let dropped = crate::internal::metadata::MetadataKv::get_with_store(
+            meta,
+            crate::internal::metadata::MetadataScope::AgentDisplayBatchCount,
+            &session_id,
+            "dropped",
+        )
+        .await?
+        .and_then(|entry| entry.value.parse::<u32>().ok())
+        .unwrap_or(0);
+        crate::internal::metadata::MetadataKv::set_with_store(
+            meta,
+            crate::internal::metadata::MetadataScope::AgentDisplayBatchCount,
+            &session_id,
+            "dropped",
+            &(dropped.saturating_add(1)).to_string(),
+            crate::internal::metadata::MetadataValueType::Numeric,
+        )
+        .await?;
+        Ok(false)
+    }
+}
+
+/// Store-backed counterpart to [`persist_agent_traces_command`] operating on
+/// [`crate::storage::CaptureStore`], [`crate::storage::ConfigStore`],
+/// [`crate::storage::MetadataStore`], and [`crate::storage::GitStateStore`]
+/// without opening SQLite (`libra.db` or `capture.db`).
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_agent_traces_command_with_capture(
+    capture: std::sync::Arc<dyn crate::storage::CaptureStore>,
+    config: &dyn crate::storage::ConfigStore,
+    meta: &dyn crate::storage::MetadataStore,
+    git_state: &dyn crate::storage::GitStateStore,
+    ingress_command: Box<CaptureIngressCommand>,
+    storage_path: &std::path::Path,
+    worktree_root: &std::path::Path,
+    ingest_span: &tracing::Span,
+) -> Result<()> {
+    super::live::set_hash_kind_from_store(config).await?;
+    let identity = crate::internal::workspace::RepoIdentity::resolve_with_store(config)
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(error).context("cannot resolve capture repository identity")
+        })?;
+    let gitdir = crate::utils::util::try_get_worktree_gitdir(Some(worktree_root.to_path_buf()))
+        .with_context(|| {
+            format!(
+                "cannot resolve capture worktree metadata for '{}'",
+                worktree_root.display()
+            )
+        })?;
+    let worktree_id = crate::utils::util::worktree_id_for_gitdir(&gitdir).unwrap_or_default();
+    let workspace_records = git_state
+        .list_workspace_records(identity.as_str(), None)
+        .await
+        .map_err(|err| anyhow::anyhow!("list workspace records from git state store: {err}"))?;
+    let live_record = workspace_records.into_iter().find(|r| {
+        matches!(
+            r.state,
+            crate::storage::WorkspaceRecordState::Provisioning
+                | crate::storage::WorkspaceRecordState::Active
+                | crate::storage::WorkspaceRecordState::Releasing
+        ) && if worktree_id.is_empty() {
+            r.path == worktree_root.to_string_lossy().as_ref()
+        } else {
+            r.worktree_id.as_deref() == Some(worktree_id.as_str())
+        }
+    });
+    let scope = CaptureScope {
+        repo_id: identity.as_str().to_string(),
+        worktree_id,
+        workspace_id: live_record.as_ref().map(|r| r.workspace_id.clone()),
+        workspace_fence: live_record.as_ref().map(|r| r.lease_fence),
+    };
+    if !admit_display_batch_with_store(meta, &ingress_command).await? {
         ingest_span.record("partial", true);
-        tracing::warn!(
-            target: "agent.hook.ingest",
-            provider = ingress_command.provider_kind(),
-            reason = "display_batch_dropped",
-            "coalesced display batch exceeded the per-session budget"
-        );
         return Ok(());
     }
     if ingress_command.event_kind() == LifecycleEventKind::SessionStart {
-        match await_agent_traces_pure_read_until(
-            setup_read_deadline,
-            "inspect bounded capture recovery hint",
-            crate::internal::ai::capture::pending::has_pending_hint(&repo_conn, &scope),
+        let _ = crate::internal::ai::capture::pending::has_pending_hint_with_store(
+            meta, config, &scope,
         )
-        .await
-        {
-            Ok(true) => {
-                tracing::info!(
-                    target: "agent.capture.recovery",
-                    reason = "pending_artifact_hint",
-                    "a bounded local capture recovery may be available"
-                );
-                if crate::internal::ai::capture::worker::spawn_detached(&storage_path, &repo_root)
-                    .is_err()
-                {
-                    tracing::warn!(
-                        target: "agent.capture.recovery",
-                        reason = "worker_spawn_failed",
-                        "automatic local recovery could not start; run `libra agent doctor --repair`"
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(_) => tracing::warn!(
-                target: "agent.capture.recovery",
-                reason = "pending_hint_unavailable",
-                "could not inspect the bounded local capture recovery hint; run `libra agent doctor`"
-            ),
-        }
+        .await;
     }
-
-    // Catalog writes, including the export-job lease, go to capture.db.
-    // libra.db keeps hash kind, scope, the display budget, and the recovery
-    // hint. The two files are never attached.
-    // Repository setup above spent part of the window: recompute the wait
-    // so the catalog open cannot extend past the deadline. An expired
-    // deadline gets the same single short attempt as the repository open.
-    let capture_busy_timeout = match ingress_command.deadline() {
-        Some(deadline) => {
-            let remaining = deadline
-                .monotonic()
-                .saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                HOOK_TERMINAL_SETTLEMENT_GRACE
-                    .min(HOOK_DATABASE_BUSY_TIMEOUT_CAP)
-                    .min(capture_busy_timeout)
-            } else {
-                remaining.min(capture_busy_timeout)
-            }
-        }
-        None => capture_busy_timeout,
-    };
-    let capture_conn = capture_store::open(&storage_path, capture_busy_timeout)
-        .await
-        .map_err(|err| super::drain::classify_capture_open(&err))?;
-    ingest_agent_traces_payload_with_scope(
-        ingress_command,
-        binding,
-        &capture_conn,
-        Some(&storage_path),
+    let crate::internal::ai::capture::ingress::CaptureIngressParts {
+        provider_kind,
+        event_id,
+        dedup_key,
+        context,
+        event,
+        ..
+    } = (*ingress_command).into_parts();
+    let agent_kind = provider_kind.to_owned();
+    let (envelope, _) = narrow_envelope_from_capture_context(context, event.kind);
+    let session_id = build_ai_session_id(&agent_kind, &envelope.session_id);
+    let current = super::live::load_capture_state_with_capture(
+        capture.as_ref(),
+        &agent_kind,
+        &envelope.session_id,
         &scope,
-        ingest_span,
-        &ExportJobLeaseStore::new(&capture_conn),
     )
-    .await
+    .await?;
+    let now = chrono::Utc::now().timestamp();
+    let action_plan = reduce_lifecycle(LifecycleReducerInput {
+        current,
+        event_kind: event.kind,
+        event_id,
+        occurred_at: now,
+        deadline: None,
+    })
+    .context("reduce agent capture lifecycle action")?;
+    let catalog_session = CaptureCatalogSession::new(
+        session_id,
+        agent_kind,
+        envelope.session_id.clone(),
+        envelope.cwd.clone(),
+    )
+    .map_err(|err| anyhow::anyhow!("build capture catalog session: {err}"))?;
+    let catalog_action =
+        CaptureCatalogAction::from_ingress(event_id, dedup_key.as_deref(), event.kind)
+            .map_err(|err| anyhow::anyhow!("build capture catalog action: {err}"))?;
+    let catalog_mutation = CaptureCatalogMutation::from_reducer(current, &action_plan, now)
+        .map_err(|err| anyhow::anyhow!("build capture catalog mutation: {err}"))?;
+    let catalog_request =
+        CaptureCatalogApplyRequest::new(scope, catalog_session, catalog_action, catalog_mutation)
+            .map_err(|err| anyhow::anyhow!("build capture catalog request: {err}"))?;
+    let _ = storage_path;
+    let _outcome =
+        super::live::reserve_capture_catalog_with_capture(capture, &catalog_request, None)
+            .await
+            .map_err(|err| anyhow::anyhow!("reserve capture catalog in store: {err}"))?;
+    Ok(())
 }
 
 /// Take one slot of a provider-declared, per-session display-batch budget.
@@ -622,11 +801,19 @@ pub(crate) async fn ingest_agent_traces_ingress_outcome_for_test(
             let capture_conn = if let Some(storage) = storage.filter(|storage| {
                 detached && capture_store::capture_database_path(storage).is_file()
             }) {
-                Some(
-                    capture_store::open_existing_writer(&storage, db::DEFAULT_CONNECTION_TIMEOUT)
+                match crate::storage::runtime::detect_repo_backend(&storage)
+                    .context("detect backend for in-process ingest")?
+                {
+                    crate::storage::StorageBackendKind::Redb => None,
+                    crate::storage::StorageBackendKind::Sqlite => Some(
+                        capture_store::open_existing_writer(
+                            &storage,
+                            db::DEFAULT_CONNECTION_TIMEOUT,
+                        )
                         .await
                         .context("open the capture catalog for an in-process ingest")?,
-                )
+                    ),
+                }
             } else {
                 None
             };

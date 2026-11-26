@@ -28,7 +28,9 @@ use sea_orm::ConnectionTrait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::internal::{config::ConfigKv, db::get_db_conn_instance};
+use crate::internal::config::ConfigKv;
+#[cfg(feature = "storage-sqlite")]
+use crate::internal::db::get_db_conn_instance;
 
 /// Config key prefix for trust records (one JSON value per slug).
 const TRUST_KEY_PREFIX: &str = "agent.trust.";
@@ -282,6 +284,44 @@ pub async fn read_trusted_dirs_with_conn<C: ConnectionTrait>(db: &C) -> Result<V
         .await
         .context("read agent.external_agents.trusted_dirs on registration connection")?;
     Ok(decode_trusted_dirs(entry.map(|entry| entry.value)))
+}
+
+/// Backend-agnostic counterpart of [`read_trusted_dirs_with_conn`] using [`crate::storage::ConfigStore`].
+pub async fn read_trusted_dirs_with_store(
+    store: &dyn crate::storage::ConfigStore,
+) -> Result<Vec<PathBuf>> {
+    let entry = ConfigKv::get_with_store(store, TRUSTED_DIRS_KEY)
+        .await
+        .context("read agent.external_agents.trusted_dirs from store")?;
+    Ok(decode_trusted_dirs(entry.map(|entry| entry.value)))
+}
+
+/// Backend-agnostic counterpart of [`add_trusted_dir`] using [`crate::storage::ConfigStore`].
+pub async fn add_trusted_dir_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    path: &Path,
+) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize trusted directory {}", path.display()))?;
+    ensure_dir_not_world_writable(&canonical)?;
+
+    let entry = ConfigKv::get_with_store(store, TRUSTED_DIRS_KEY)
+        .await
+        .context("read agent.external_agents.trusted_dirs from store")?;
+    let mut raw: Vec<String> = match entry {
+        Some(entry) => serde_json::from_str(&entry.value).unwrap_or_default(),
+        None => DEFAULT_TRUSTED_DIRS.iter().map(|s| s.to_string()).collect(),
+    };
+    let canonical_str = canonical.to_string_lossy().to_string();
+    if !raw.iter().any(|d| expand_tilde(d) == canonical) {
+        raw.push(canonical_str);
+        let value = serde_json::to_string(&raw).context("serialize trusted_dirs")?;
+        ConfigKv::set_with_store(store, TRUSTED_DIRS_KEY, &value, false)
+            .await
+            .context("persist agent.external_agents.trusted_dirs in store")?;
+    }
+    Ok(canonical)
 }
 
 /// A0-08: append `path` to the trusted-directory allowlist. The path is
@@ -688,6 +728,71 @@ pub async fn read_trust_with_conn<C: ConnectionTrait>(
         .map(Some)
 }
 
+/// Backend-agnostic counterpart of [`record_trust`] using [`crate::storage::ConfigStore`].
+pub async fn record_trust_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    slug: &str,
+    path: &Path,
+) -> Result<TrustRecord> {
+    let provenance = compute_provenance(path)?;
+    ensure_parent_not_world_writable(&provenance.canonical_path)?;
+    let dirs = read_trusted_dirs_with_store(store).await?;
+    if !path_within_trusted_dirs(&provenance.canonical_path, &dirs) {
+        bail!(
+            "external agent binary {} is not under a trusted directory; \
+             register its directory first with `libra agent rpc trust --dir <path>` \
+             (trusted dirs: {})",
+            provenance.canonical_path.display(),
+            dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let record = TrustRecord {
+        path: provenance.canonical_path.clone(),
+        sha256: provenance.sha256,
+        device: provenance.device,
+        inode: provenance.inode,
+        mtime: provenance.mtime,
+    };
+    let value = serde_json::to_string(&record).context("serialize trust record")?;
+    ConfigKv::set_with_store(store, &trust_key(slug), &value, false)
+        .await
+        .with_context(|| format!("persist trust record for '{slug}' in store"))?;
+    Ok(record)
+}
+
+/// Backend-agnostic counterpart of [`read_trust_with_conn`] using [`crate::storage::ConfigStore`].
+pub async fn read_trust_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    slug: &str,
+) -> Result<Option<TrustRecord>> {
+    let Some(entry) = ConfigKv::get_with_store(store, &trust_key(slug))
+        .await
+        .with_context(|| format!("read trust record for '{slug}' from store"))?
+    else {
+        return Ok(None);
+    };
+    if entry.encrypted {
+        bail!("trust record for '{slug}' is encrypted; restore a valid exporter trust record");
+    }
+    serde_json::from_str(&entry.value)
+        .map_err(|_| anyhow::anyhow!("trust record for '{slug}' is corrupt; restore a valid exporter trust record before registration"))
+        .map(Some)
+}
+
+/// Backend-agnostic counterpart of [`revoke_trust_with_conn`] using [`crate::storage::ConfigStore`].
+pub async fn revoke_trust_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    slug: &str,
+) -> Result<bool> {
+    ConfigKv::unset_with_store(store, &trust_key(slug))
+        .await
+        .with_context(|| format!("remove trust record for '{slug}' from store"))
+        .map(|removed| removed > 0)
+}
+
 /// Revoke through the caller's transaction; the native lifecycle owner can
 /// atomically revoke its registry without nesting a pooled acquisition.
 pub async fn revoke_trust_with_conn<C: ConnectionTrait>(db: &C, slug: &str) -> Result<bool> {
@@ -726,8 +831,81 @@ pub fn provenance_drifted(provenance: &Provenance, record: &TrustRecord) -> bool
 /// use [`revalidate_trust_with_conn`] so a refusal cannot revoke a different
 /// checkout.
 pub async fn revalidate_trust(slug: &str, record: &TrustRecord) -> Result<Provenance> {
-    let db = get_db_conn_instance().await;
-    revalidate_trust_with_conn(&db, slug, record).await
+    let storage = crate::utils::util::try_get_storage_path(None)
+        .context("revalidate external agent trust requires a Libra repository")?;
+    match crate::storage::runtime::detect_repo_backend(&storage)
+        .map_err(|err| anyhow::anyhow!("detect repository storage backend: {err}"))?
+    {
+        crate::storage::StorageBackendKind::Redb => {
+            #[cfg(feature = "storage-redb")]
+            {
+                let store = crate::storage::runtime::open_repo_config_store_read_write(&storage)
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!("open redb config store for trust revalidation: {err}")
+                    })?;
+                revalidate_trust_with_store(store.as_ref(), slug, record).await
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                bail!("this Libra binary was compiled without `storage-redb`");
+            }
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let db = get_db_conn_instance().await;
+                revalidate_trust_with_conn(&db, slug, record).await
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                bail!("this Libra binary was compiled without `storage-sqlite`");
+            }
+        }
+    }
+}
+
+/// Backend-agnostic counterpart of [`revalidate_trust_with_conn`] using [`crate::storage::ConfigStore`].
+pub async fn revalidate_trust_with_store(
+    store: &dyn crate::storage::ConfigStore,
+    slug: &str,
+    record: &TrustRecord,
+) -> Result<Provenance> {
+    let record_path = record.path.clone();
+    let provenance =
+        match tokio::task::spawn_blocking(move || compute_provenance(&record_path)).await {
+            Ok(Ok(provenance)) => provenance,
+            Ok(Err(err)) => {
+                let _ = revoke_trust_with_store(store, slug).await;
+                return Err(err.context(format!(
+                    "trusted binary for '{slug}' is no longer readable; trust revoked"
+                )));
+            }
+            Err(err) => {
+                let _ = revoke_trust_with_store(store, slug).await;
+                return Err(anyhow::Error::new(err).context(format!(
+                    "trusted binary for '{slug}' could not complete revalidation; trust revoked"
+                )));
+            }
+        };
+    if provenance_drifted(&provenance, record) {
+        let _ = revoke_trust_with_store(store, slug).await;
+        bail!(
+            "external agent binary for '{slug}' changed since it was trusted \
+             (sha256/device/inode/mtime drift); trust revoked — re-run \
+             'libra agent rpc trust {slug}' after verifying the binary"
+        );
+    }
+    let dirs = read_trusted_dirs_with_store(store).await?;
+    if !path_within_trusted_dirs(&provenance.canonical_path, &dirs) {
+        let _ = revoke_trust_with_store(store, slug).await;
+        bail!(
+            "external agent binary for '{slug}' is no longer under a trusted directory; \
+             trust revoked — re-register its directory with \
+             'libra agent rpc trust --dir <path>' then re-trust it"
+        );
+    }
+    Ok(provenance)
 }
 
 /// [`revalidate_trust`] on the caller's connection.
