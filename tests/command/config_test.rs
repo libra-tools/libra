@@ -7602,6 +7602,26 @@ mod value_pattern {
     }
 
     #[test]
+    fn test_cf_69_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        let out = run_libra_command(
+            &["config", "--replace-all", "upgrade.mode", "auto"],
+            repo.path(),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(129),
+            "replace-all refuses upgrade.mode: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("reserved upgrade.* namespace"),
+            "reserved namespace diagnostic"
+        );
+    }
+
+    #[test]
     fn test_cf_38_predicates() {
         let repo = tempdir().unwrap();
         assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
