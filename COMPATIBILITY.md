@@ -34,8 +34,14 @@ default newly initialized repositories and fresh user/system configuration scope
 - `libra config set --global` (and `--system`) pre-creates a non-overwriting read-only tombstone at
   `config.db` (`0400` global / `0444` system) before initializing `config.redb` and
   `config-format.json` (`backend = "redb"`, `finalized = true`, `legacy_sqlite_tombstone = true`).
-- Pure `storage-sqlite` builds (`--no-default-features --features storage-sqlite`) continue
+- Pure `storage-sqlite` builds (`--no-default-features --features storage-sqlite` or
+  `--no-default-features --features storage-sqlite,keyring`) continue
   defaulting fresh repositories and configuration scopes to SQLite (`libra.db` / `config.db`).
+- Source builds from `Cargo.toml` (`RB-34` / `REL-RB-02`) use
+  `default = ["storage-redb", "storage-queue"]`, so `cargo install` and
+  `cargo build --features keyring` compile the Redb + capture-queue stack without `storage-sqlite`
+  and fail closed with `libra-migrate` upgrade guidance on unmigrated SQLite repositories or
+  global/system config databases.
 - Fresh repositories on dual-backend builds can still opt into SQLite via
   `LIBRA_STORAGE_BACKEND=sqlite`. Existing repositories and config scopes obey manifest-first
   precedence and migrate losslessly in both directions via the companion `libra-migrate` binary

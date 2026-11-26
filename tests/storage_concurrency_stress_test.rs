@@ -4130,3 +4130,321 @@ fn packaged_release_default_redb_init_and_global_config_cutover() {
 fn packaged_release_artifacts_default_redb_cutover_and_sqlite_rollback() {
     packaged_release_audit::default_redb_cutover_and_sqlite_rollback_impl();
 }
+
+#[cfg(feature = "storage-redb")]
+mod final_default_keyring_audit {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+    };
+
+    use libra::storage::{
+        StorageBackendKind, config_store::CONFIG_REDB_FILE_NAME, manifest::read_storage_manifest,
+    };
+    use sha2::{Digest, Sha256};
+
+    fn verify_default_keyring_binary() -> PathBuf {
+        let raw = std::env::var("LIBRA_DEFAULT_KEYRING_BIN").unwrap_or_else(|_| {
+            panic!(
+                "LIBRA_DEFAULT_KEYRING_BIN must point to target/rb34-default-keyring/release/libra"
+            )
+        });
+        let expected_sha = std::env::var("LIBRA_DEFAULT_KEYRING_SHA256")
+            .unwrap_or_else(|_| panic!("LIBRA_DEFAULT_KEYRING_SHA256 must be set"))
+            .trim()
+            .to_ascii_lowercase();
+        assert_eq!(
+            expected_sha.len(),
+            64,
+            "LIBRA_DEFAULT_KEYRING_SHA256 must be a 64-hex SHA-256 digest, got '{expected_sha}'"
+        );
+        let bin = PathBuf::from(&raw);
+        assert!(
+            bin.is_file(),
+            "LIBRA_DEFAULT_KEYRING_BIN '{}' must exist as a regular file",
+            bin.display()
+        );
+        let bytes = fs::read(&bin)
+            .unwrap_or_else(|err| panic!("failed to read '{}': {err}", bin.display()));
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual_sha = hex::encode(hasher.finalize());
+        assert_eq!(
+            actual_sha,
+            expected_sha,
+            "SHA-256 mismatch for LIBRA_DEFAULT_KEYRING_BIN '{}'",
+            bin.display()
+        );
+        bin
+    }
+
+    fn run_default_bin(
+        bin: &Path,
+        cwd: &Path,
+        home: &Path,
+        global_db: &Path,
+        system_db: &Path,
+        args: &[&str],
+    ) -> Output {
+        Command::new(bin)
+            .current_dir(cwd)
+            .args(args)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("LIBRA_CONFIG_GLOBAL_DB", global_db)
+            .env("LIBRA_CONFIG_SYSTEM_DB", system_db)
+            .env("LIBRA_TEST", "1")
+            .env_remove("LIBRA_STORAGE_BACKEND")
+            .env_remove("LIBRA_CONFIG_BACKEND")
+            .output()
+            .unwrap_or_else(|err| panic!("failed to execute {} {:?}: {err}", bin.display(), args))
+    }
+
+    fn combined_output(out: &Output) -> String {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    /// Minimal unmigrated SQLite file header (distinct from Redb tombstone sentinel).
+    fn write_unmigrated_sqlite_fixture(path: &Path) {
+        let mut header = vec![0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        fs::write(path, &header).unwrap_or_else(|err| {
+            panic!("failed to write SQLite fixture '{}': {err}", path.display())
+        });
+    }
+
+    pub(super) fn init_and_unmigrated_repo_fail_closed_impl() {
+        let bin = verify_default_keyring_binary();
+        let tmp = tempfile::tempdir().expect("create RB-34 tempdir");
+        let home = tmp.path().join("home");
+        let global_dir = tmp.path().join("global-cfg");
+        let system_dir = tmp.path().join("system-cfg");
+        let fresh_repo = tmp.path().join("fresh-repo");
+        let legacy_repo = tmp.path().join("legacy-sqlite-repo");
+        fs::create_dir_all(home.join(".config")).expect("mkdir home/.config");
+        fs::create_dir_all(&global_dir).expect("mkdir global-cfg");
+        fs::create_dir_all(&system_dir).expect("mkdir system-cfg");
+        fs::create_dir_all(&fresh_repo).expect("mkdir fresh-repo");
+        fs::create_dir_all(legacy_repo.join(".libra")).expect("mkdir legacy-sqlite-repo/.libra");
+
+        let global_db = global_dir.join("config.db");
+        let system_db = system_dir.join("config.db");
+
+        // AC4: Default `libra init` creates Redb layout without creating `.libra/libra.db`.
+        let init_out = run_default_bin(
+            &bin,
+            &fresh_repo,
+            &home,
+            &global_db,
+            &system_db,
+            &["init", "--vault", "false"],
+        );
+        assert!(
+            init_out.status.success(),
+            "AC4: default+keyring `libra init` must succeed:\n{}",
+            combined_output(&init_out)
+        );
+        let dot_libra = fresh_repo.join(".libra");
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "AC4: default+keyring `libra init` must NOT create .libra/libra.db"
+        );
+        assert!(
+            dot_libra.join("redb/git.gen-00000001.redb").is_file(),
+            "AC4: expected .libra/redb/git.gen-00000001.redb"
+        );
+        assert!(
+            dot_libra
+                .join("private/capture.gen-00000001.redb")
+                .is_file(),
+            "AC4: expected .libra/private/capture.gen-00000001.redb"
+        );
+        let manifest = read_storage_manifest(&dot_libra)
+            .expect("read storage-format.json")
+            .expect("AC4: storage-format.json must exist after default init");
+        assert_eq!(manifest.backend, StorageBackendKind::Redb);
+        assert!(manifest.finalized);
+
+        // AC5: Opening an unmigrated SQLite repository (`.libra/libra.db` without
+        // `storage-format.json`) fails closed with `libra-migrate` upgrade guidance.
+        write_unmigrated_sqlite_fixture(&legacy_repo.join(".libra/libra.db"));
+        let status_out = run_default_bin(
+            &bin,
+            &legacy_repo,
+            &home,
+            &global_db,
+            &system_db,
+            &["status"],
+        );
+        assert!(
+            !status_out.status.success(),
+            "AC5: default+keyring binary must fail closed on unmigrated SQLite repo:\n{}",
+            combined_output(&status_out)
+        );
+        let rendered = combined_output(&status_out);
+        assert!(
+            rendered.contains("libra-migrate"),
+            "AC5: failure on unmigrated SQLite repo must include `libra-migrate` guidance:\n{rendered}"
+        );
+        assert!(
+            !legacy_repo.join(".libra/redb").exists(),
+            "AC5: failing closed on unmigrated SQLite repo must not create .libra/redb"
+        );
+    }
+
+    pub(super) fn rejects_unmigrated_global_get_and_set_impl() {
+        let bin = verify_default_keyring_binary();
+        let tmp = tempfile::tempdir().expect("create RB-34b global tempdir");
+        let home = tmp.path().join("home");
+        let global_dir = tmp.path().join("global-cfg");
+        let system_dir = tmp.path().join("system-cfg");
+        let work_dir = tmp.path().join("work");
+        fs::create_dir_all(home.join(".config")).expect("mkdir home/.config");
+        fs::create_dir_all(&global_dir).expect("mkdir global-cfg");
+        fs::create_dir_all(&system_dir).expect("mkdir system-cfg");
+        fs::create_dir_all(&work_dir).expect("mkdir work");
+
+        let global_db = global_dir.join("config.db");
+        let system_db = system_dir.join("config.db");
+        write_unmigrated_sqlite_fixture(&global_db);
+
+        // AC1: `libra config get --global` fails closed with `libra-migrate --global` guidance.
+        let get_out = run_default_bin(
+            &bin,
+            &work_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "get", "--global", "user.name"],
+        );
+        assert!(
+            !get_out.status.success(),
+            "AC1: `config get --global` must fail closed on unmigrated SQLite config.db:\n{}",
+            combined_output(&get_out)
+        );
+        let get_rendered = combined_output(&get_out);
+        assert!(
+            get_rendered.contains("libra-migrate --global"),
+            "AC1: `config get --global` must emit `libra-migrate --global` guidance:\n{get_rendered}"
+        );
+        assert!(
+            !global_dir.join(CONFIG_REDB_FILE_NAME).exists(),
+            "AC1: `config get --global` must never create competing config.redb"
+        );
+
+        // AC2: `libra config set --global` fails closed with `libra-migrate --global` guidance
+        // and NEVER creates `config.redb`.
+        let set_out = run_default_bin(
+            &bin,
+            &work_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "set", "--global", "user.name", "ShouldFail"],
+        );
+        assert!(
+            !set_out.status.success(),
+            "AC2: `config set --global` must fail closed on unmigrated SQLite config.db:\n{}",
+            combined_output(&set_out)
+        );
+        let set_rendered = combined_output(&set_out);
+        assert!(
+            set_rendered.contains("libra-migrate --global"),
+            "AC2: `config set --global` must emit `libra-migrate --global` guidance:\n{set_rendered}"
+        );
+        assert!(
+            !global_dir.join(CONFIG_REDB_FILE_NAME).exists(),
+            "AC2: `config set --global` must NEVER create competing config.redb"
+        );
+    }
+
+    pub(super) fn rejects_unmigrated_system_get_and_set_impl() {
+        let bin = verify_default_keyring_binary();
+        let tmp = tempfile::tempdir().expect("create RB-34b system tempdir");
+        let home = tmp.path().join("home");
+        let global_dir = tmp.path().join("global-cfg");
+        let system_dir = tmp.path().join("system-cfg");
+        let work_dir = tmp.path().join("work");
+        fs::create_dir_all(home.join(".config")).expect("mkdir home/.config");
+        fs::create_dir_all(&global_dir).expect("mkdir global-cfg");
+        fs::create_dir_all(&system_dir).expect("mkdir system-cfg");
+        fs::create_dir_all(&work_dir).expect("mkdir work");
+
+        let global_db = global_dir.join("config.db");
+        let system_db = system_dir.join("config.db");
+        write_unmigrated_sqlite_fixture(&system_db);
+
+        // AC3: `libra config get --system` fails closed with `libra-migrate --system` guidance.
+        let get_out = run_default_bin(
+            &bin,
+            &work_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "get", "--system", "user.name"],
+        );
+        assert!(
+            !get_out.status.success(),
+            "AC3: `config get --system` must fail closed on unmigrated SQLite system config.db:\n{}",
+            combined_output(&get_out)
+        );
+        let get_rendered = combined_output(&get_out);
+        assert!(
+            get_rendered.contains("libra-migrate --system"),
+            "AC3: `config get --system` must emit `libra-migrate --system` guidance:\n{get_rendered}"
+        );
+        assert!(
+            !system_dir.join(CONFIG_REDB_FILE_NAME).exists(),
+            "AC3: `config get --system` must never create competing config.redb"
+        );
+
+        // AC4: `libra config set --system` fails closed with `libra-migrate --system` guidance
+        // and NEVER creates `config.redb`.
+        let set_out = run_default_bin(
+            &bin,
+            &work_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "set", "--system", "user.name", "ShouldFail"],
+        );
+        assert!(
+            !set_out.status.success(),
+            "AC4: `config set --system` must fail closed on unmigrated SQLite system config.db:\n{}",
+            combined_output(&set_out)
+        );
+        let set_rendered = combined_output(&set_out);
+        assert!(
+            set_rendered.contains("libra-migrate --system"),
+            "AC4: `config set --system` must emit `libra-migrate --system` guidance:\n{set_rendered}"
+        );
+        assert!(
+            !system_dir.join(CONFIG_REDB_FILE_NAME).exists(),
+            "AC4: `config set --system` must NEVER create competing config.redb"
+        );
+    }
+}
+
+#[cfg(feature = "storage-redb")]
+#[test]
+fn default_redb_keyring_binary_init_and_unmigrated_repo_fail_closed() {
+    final_default_keyring_audit::init_and_unmigrated_repo_fail_closed_impl();
+}
+
+#[cfg(feature = "storage-redb")]
+#[test]
+fn final_default_keyring_binary_rejects_unmigrated_global_get_and_set() {
+    final_default_keyring_audit::rejects_unmigrated_global_get_and_set_impl();
+}
+
+#[cfg(feature = "storage-redb")]
+#[test]
+fn final_default_keyring_binary_rejects_unmigrated_system_get_and_set() {
+    final_default_keyring_audit::rejects_unmigrated_system_get_and_set_impl();
+}

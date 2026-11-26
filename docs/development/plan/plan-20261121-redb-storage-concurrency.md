@@ -9755,7 +9755,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 作为 `G-08` 家族 `REL-RB-02`（`RB-34` + `RB-34b` + `RB-34c`）的实现子卡，将 `Cargo.toml` 的 crate 默认特性切换为 `default = ["storage-redb", "storage-queue"]`（使 `cargo install` / `cargo build --features keyring` 等源码构建方默认启用 `redb` + 队列而不编译 `storage-sqlite`，同时完整保留 `--no-default-features --features storage-sqlite,keyring` 纯 SQLite 回退构建），并在 `tests/storage_concurrency_stress_test.rs` 验证最终纯默认 + `keyring` 二进制的红库新仓初始化与未迁移 SQLite 仓库 fail-closed 拒收，同步在 `COMPATIBILITY.md` 记录 Cargo 默认特性切换。
 
@@ -9817,7 +9817,7 @@
 
 **Task type:** `audit`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 作为 `G-08` 家族 `REL-RB-02` 的发布前只读审计子卡（不改动任何生产源码），于 `tests/storage_concurrency_stress_test.rs` 内交付针对**`RB-34` 切默认后独立构建于 `target/rb34-default-keyring/release/libra`（`--features keyring`，不含 `storage-sqlite`）的真实二进制**的全部 4 类未迁移配置 CLI 端到端拒收审计用例，逐一验证 `config get --global`、`config set --global`、`config get --system` 与 **`config set --system`** 全部 fail-closed 报错并输出 `libra-migrate --global/--system` 指引、绝不返回空配置、绝不新建竞争性 `config.redb`。
 
@@ -9874,7 +9874,7 @@
 
 **Task type:** `release`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 作为 `G-08` 家族 `REL-RB-02`（`RB-34` + `RB-34b`）的唯一原子发布点，本卡不引入任何新行为代码：核对 `Cargo.toml` 已切换为 `default = ["storage-redb", "storage-queue"]`，在独立 `--target-dir` 分别构建默认+`keyring` 二进制（`target/rb34-default-keyring/release/libra`）与纯 SQLite+`keyring` 回退二进制（`target/rb34-sqlite-keyring/release/libra`）并校验二者 SHA-256 相异，再针对 `target/rb34-default-keyring/release/libra` 统一重跑 `RB-34` 仓库门与 `RB-34b` 全部 4 类 Global/System 配置拒收审计（含 `config set --system` 零建 `config.redb`）、验证 `compat-offline-core` 显式 SQLite 锁定不失效，完成 `T-1 + T-2` 全量双矩阵测试与 `patch + 1` 发布。
 
@@ -10103,7 +10103,7 @@
 | `RB-11q`..`RB-30`（`Track A` 余卡 + `REL-RB-01` 全 30 卡） | `done` / `complete` | `98c4a3d`..本提交（`main`） | `0.30.588` | Track A 114/114 与 Track B `REL-RB-01` 全 30 卡（`RB-13`..`RB-30`）完成：146 生产接线文件与 `RB-29b` `syn 2.0` 全树 AST 审计发现的全部 36 个 `src/` 文件补齐配对 `StorageBackendKind::{Sqlite, Redb}` 运行时分发，4 组负向自测 + `syn_ast_per_callsite_storage_wiring_completeness_guard`（0 违规）+ `post_unlock_libra_migrate_binary_bidirectional_roundtrip` + 禁改 4 文件与 `init.rs:1-20` 逐字节校验 + `Cargo.toml` 默认 `storage-sqlite` + `base.yml` 解锁态选测 + 纯 Redb/纯 SQLite/双特性回归 + `fmt`/`nightly clippy -D warnings` 全绿；注：本 Linux 主机无外部网站仓库 `/Volumes/Sea/libra-backend`（`DEP-RB-03`），仓内 `docs/commands/{,zh-CN/}agent.md` 与 `docs/error-codes.md` 已 100% 同步并通过契约测试，外部网站同步按实记录待授权环境交付 |
 | `RB-31`..`RB-32b`（Milestone 7 Wave 1，4 卡） | `done` / `complete` | 本提交（`main`） | `0.30.589` | `.github/workflows/base.yml` 显式锁定 `compat-offline-core` 为 `--no-default-features --features storage-sqlite`，升级 `compat-redb-queue`（全量离线核心 + 压测 + 双特性 `libra-migrate`/AST 守卫）并补齐纯 Redb+`keyring` 与双后端+`keyring` 两步 `auth_keyring_backend` 验证（并修复 `src/internal/auth.rs` `repair_global_modes()` 避免对 Redb `0400` `config.db` 墓碑误改 `0600`）；`.github/workflows/release.yml` 全平台协同构建并暂存双后端 `libra`（含 `keyring`）与 `libra-migrate`（不含 `keyring`）；独立 `mktemp -d` 暂存双 `--release` 成品实测 `packaged_release_dual_backend_libra_and_migrate_coherence_pre_cutover`（SHA-256 核验、SQLite→Redb→SQLite 双向互操作、切前默认 `init` 与 `config set --global` 保持 SQLite 零建 `config.redb`）、`compat_matrix_alignment`、`compat_release_{rclone_env_guard,homebrew_verify}`、`fmt`、`nightly clippy -D warnings` 全绿 |
 | `RB-33`..`RB-33c`（`REL-RB-03` 家族，3 卡） | `done` / `complete` | 本提交（`main`） | `0.30.591` | `src/storage/backend.rs` 切换 `compiled_default()` 在启用 `storage-redb` 时默认为 `Redb`（纯 `storage-sqlite` 保持 `Sqlite`）；独立 `mktemp -d` 暂存双 `--release` 成品实测 `packaged_release_default_redb_init_and_global_config_cutover`（默认 Redb 建仓含 `0400` spool 墓碑与无 `libra.db`、默认全局配置 `0400` `config.db` 墓碑 + `config.redb` + `config-format.json`）与 `packaged_release_artifacts_default_redb_cutover_and_sqlite_rollback`（仓库/全局配置/全新 Redb 仓活 `capture-spool/ready/` 对账双向 SQLite 回退 + Step 2.6 解封旧 Hook 入队与落库），纯 SQLite `storage::`、双特性 `storage::backend::`、`post_unlock_libra_migrate_binary_bidirectional_roundtrip`、仓内 6 份 `ER-06a` 文档（`COMPATIBILITY.md`、`docs/error-codes.md`、`docs/commands/{,zh-CN/}{init,agent}.md`）及 `compat_command_docs_examples_section`/`compat_agent_docs_contract`/`compat_error_codes_doc_sync`、`fmt`、`nightly clippy -D warnings` 全绿；注：本 Linux 主机无外部网站仓库 `/Volumes/Sea/libra-backend`（`DEP-RB-03`），仓内文档已 100% 同步，外部网站同步按实留证 |
-| `RB-34`..`RB-34c`（剩余 3 卡） | `pending` | — | — | 151 / 154 卡已完成，最后 3 卡为 `REL-RB-02`（`RB-34`/`RB-34b`/`RB-34c` Cargo 默认 Feature 切至 `storage-redb,storage-queue` 与最终收口） |
+| `RB-34`..`RB-34c`（`REL-RB-02` 家族，3 卡 — **全部 154 / 154 卡收口**） | `done` / `complete` | 本提交（`main`） | `0.30.592` | `Cargo.toml` 切换为 `default = ["storage-redb", "storage-queue"]` 并同步 `COMPATIBILITY.md`；独立 `--target-dir` 双 release 构建通过且 SHA-256 相异（`target/rb34-default-keyring/release/libra` SHA-256 `d81406546c962caf5eec0abdf96b28af89520ed8e5ace3cdb9fe42f7c94187b7` vs `target/rb34-sqlite-keyring/release/libra` SHA-256 `2587d35ec706b5e202f893bde6caa6bf1576eaeffae7f6681b36d7adf71055b0`）；在最终默认+`keyring` 二进制上实跑 `default_redb_keyring_binary_init_and_unmigrated_repo_fail_closed`（默认 Redb 建仓零 `libra.db` + 未迁移 SQLite 仓 fail-closed 并输出 `libra-migrate` 指引）、`final_default_keyring_binary_rejects_unmigrated_global_get_and_set` 与 `final_default_keyring_binary_rejects_unmigrated_system_get_and_set`（`config get/set --global` 与 `config get/set --system` 全 4 路径 fail-closed 且零建 `config.redb`），显式 SQLite `--no-default-features --features storage-sqlite --test compat_matrix_alignment`、`compat_version_surface_sync`、`fmt`、`nightly clippy --all-targets --all-features -- -D warnings` 全绿，全计划 154 / 154 卡全部完成 |
 
 ## Codex review log
 

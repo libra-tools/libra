@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "libra"
-version = "0.30.591"
+version = "0.30.592"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
 [features]
-default = ["storage-sqlite"]
+default = ["storage-redb", "storage-queue"]
 storage-sqlite = []
 storage-redb = ["storage-queue", "dep:redb", "dep:postcard", "dep:crc32c"]
 storage-queue = ["dep:postcard", "dep:crc32c"]
