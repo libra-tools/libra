@@ -1067,3 +1067,5 @@ invalid get pattern exits 6.
 get value pattern miss exits 1.
 
 nul list records use key newline value nul.
+
+multiline values stay literal and secrets stay redacted.

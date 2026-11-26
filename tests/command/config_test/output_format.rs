@@ -306,3 +306,44 @@ fn test_cf_47_predicates() {
     assert_cli_success(&regexp, "-z --get-regexp");
     assert_eq!(regexp.stdout, b"alpha.one\nv1\0");
 }
+
+#[test]
+#[serial(env)]
+fn test_cf_51_predicates() {
+    const SENTINEL: &str = "cf51-plaintext-sentinel";
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "multi.value", "line1\nline2"],
+            repo.path(),
+        ),
+        "multiline",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "--local",
+                "--encrypt",
+                "ordinary.blob",
+                SENTINEL,
+            ],
+            repo.path(),
+        ),
+        "encrypted",
+    );
+    let listed = run_libra_command(&["config", "--local", "--list"], repo.path());
+    assert_cli_success(&listed, "--list");
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        text.contains("multi.value=line1\nline2"),
+        "multiline verbatim: {text}"
+    );
+    assert!(
+        text.contains("ordinary.blob=<REDACTED>"),
+        "encrypted redacted: {text}"
+    );
+    assert!(!text.contains(SENTINEL), "plaintext must not leak");
+}
