@@ -4,10 +4,10 @@
 //! While [`REDB_RUNTIME_UNLOCKED`] was `false` (Track A through `RB-28`), any
 //! runtime request selecting [`StorageBackendKind::Redb`] or calling
 //! [`assert_redb_runtime_unlocked`] failed closed with `LBR-CLI-003`. As of
-//! `RB-29a`, [`REDB_RUNTIME_UNLOCKED`] is `true` so explicit
-//! `LIBRA_STORAGE_BACKEND=redb` and live `libra-migrate` cutovers are active
-//! while `compiled_default()` remains `Sqlite` in dual-feature builds until
-//! `RB-33`.
+//! `RB-29a`, [`REDB_RUNTIME_UNLOCKED`] is `true`, and as of `RB-33`
+//! (`REL-RB-03`), [`StorageBackendKind::compiled_default`] selects
+//! [`StorageBackendKind::Redb`] whenever `storage-redb` is compiled (while
+//! pure `storage-sqlite` builds continue defaulting to `Sqlite`).
 
 use std::{env, ffi::OsString, fmt, path::Path};
 
@@ -26,9 +26,9 @@ pub const LIBRA_STORAGE_BACKEND_ENV: &str = "LIBRA_STORAGE_BACKEND";
 /// Compile-time pre-integration lock for the `redb` runtime and `libra-migrate`
 /// live cutover commands (`ADR-RB-01` #3).
 ///
-/// Unlocked in `RB-29a` so explicit `LIBRA_STORAGE_BACKEND=redb` and live
-/// `libra-migrate` cutovers are active while `compiled_default()` continues to
-/// select `Sqlite` in dual-feature builds until `RB-33`.
+/// Unlocked in `RB-29a`; as of `RB-33`, `compiled_default()` selects `Redb`
+/// whenever `storage-redb` is compiled while pure `storage-sqlite` builds
+/// continue defaulting to `Sqlite`.
 pub const REDB_RUNTIME_UNLOCKED: bool = true;
 
 /// Supported metadata storage engine backends.
@@ -63,8 +63,9 @@ impl StorageBackendKind {
     /// Compile-time default backend for newly initialized repositories when no
     /// manifest, legacy database, or environment override applies.
     ///
-    /// Defaults to `Sqlite` whenever `storage-sqlite` is compiled (prior to
-    /// `RB-33` runtime default cutover), and `Redb` in `storage-redb`-only builds.
+    /// As of `RB-33` (`REL-RB-03`), defaults to `Redb` whenever `storage-redb`
+    /// is compiled (including official dual-backend releases), and remains
+    /// `Sqlite` in pure `storage-sqlite` builds.
     #[must_use]
     pub const fn compiled_default() -> Self {
         Self::compiled_default_for(has_sqlite_backend(), has_redb_backend())
@@ -308,11 +309,11 @@ impl StorageBackendKind {
         Ok(selected)
     }
 
-    const fn compiled_default_for(sqlite_compiled: bool, _redb_compiled: bool) -> Self {
-        if sqlite_compiled {
-            Self::Sqlite
-        } else {
+    const fn compiled_default_for(_sqlite_compiled: bool, redb_compiled: bool) -> Self {
+        if redb_compiled {
             Self::Redb
+        } else {
+            Self::Sqlite
         }
     }
 }
@@ -378,9 +379,9 @@ mod tests {
                 }
                 Some("default_unset") => {
                     let kind = StorageBackendKind::resolve(&storage_dir).expect(
-                        "public resolve() with unset env must select sqlite before RB-33 cutover",
+                        "public resolve() with unset env must select redb after RB-33 cutover",
                     );
-                    assert_eq!(kind, StorageBackendKind::Sqlite);
+                    assert_eq!(kind, StorageBackendKind::Redb);
                     println!("RB01C_CHILD_OK:default_unset");
                     return;
                 }
@@ -989,11 +990,11 @@ mod tests {
             &empty_fresh_dir,
             &fragmented_fresh_dir,
         ] {
-            // Unset env uses compiled default (`Sqlite` prior to RB-33).
+            // Unset env uses compiled default (`Redb` as of RB-33 when `storage-redb` is compiled).
             assert_eq!(
                 StorageBackendKind::resolve_from_override(fresh_dir, None)
                     .expect("fresh empty repo with unset env must select compiled default"),
-                StorageBackendKind::Sqlite
+                StorageBackendKind::Redb
             );
 
             // Explicit `sqlite` override succeeds via live public `resolve()`.
@@ -1275,7 +1276,7 @@ mod tests {
         }
 
         // AC1: compile-time unlock flag is true, runtime gate passes, and
-        // compiled_default() stays Sqlite whenever storage-sqlite is compiled.
+        // compiled_default() selects Redb whenever storage-redb is compiled (`RB-33`).
         const {
             assert!(
                 REDB_RUNTIME_UNLOCKED,
@@ -1284,28 +1285,30 @@ mod tests {
         }
         assert_redb_runtime_unlocked()
             .expect("assert_redb_runtime_unlocked() must succeed in RB-29a");
-        if has_sqlite_backend() {
-            assert_eq!(
-                StorageBackendKind::compiled_default(),
-                StorageBackendKind::Sqlite,
-                "dual-feature compiled_default() must stay Sqlite until RB-33"
-            );
-        } else {
-            assert_eq!(
-                StorageBackendKind::compiled_default(),
-                StorageBackendKind::Redb,
-                "pure storage-redb compiled_default() must be Redb"
-            );
-        }
+        assert_eq!(
+            StorageBackendKind::compiled_default(),
+            StorageBackendKind::Redb,
+            "compiled_default() must select Redb whenever storage-redb is compiled (RB-33)"
+        );
 
         let root = tempdir().expect("create RB-29a tempdir");
         let fresh_dir = root.path().join("fresh");
         fs::create_dir_all(&fresh_dir).expect("mkdir fresh");
 
-        // Verify capability matrix defaults and explicit `redb` override (AC1 & AC2).
+        // Verify capability matrix defaults and explicit overrides (`RB-33`).
         assert_eq!(
             StorageBackendKind::resolve_with_capabilities(&fresh_dir, None, true, true)
-                .expect("dual-feature unset default must remain Sqlite"),
+                .expect("dual-feature unset default must select Redb after RB-33"),
+            StorageBackendKind::Redb
+        );
+        assert_eq!(
+            StorageBackendKind::resolve_with_capabilities(&fresh_dir, None, true, false)
+                .expect("pure storage-sqlite default must remain Sqlite"),
+            StorageBackendKind::Sqlite
+        );
+        assert_eq!(
+            StorageBackendKind::resolve_with_capabilities(&fresh_dir, Some("sqlite"), true, true)
+                .expect("dual-feature explicit sqlite override must succeed"),
             StorageBackendKind::Sqlite
         );
         assert_eq!(
@@ -1411,5 +1414,28 @@ mod tests {
         run_child("finalized_redb_unset", &finalized_redb_dir, None);
         run_child("legacy_sqlite_unset", &legacy_dir, None);
         run_child("legacy_sqlite_env_redb", &legacy_dir, Some("redb"));
+    }
+}
+
+#[cfg(all(test, feature = "storage-sqlite", not(feature = "storage-redb")))]
+mod sqlite_only_default_tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    /// `RB-33` AC2: pure `storage-sqlite` builds continue defaulting to `Sqlite`
+    /// even after `compiled_default()` switches to `Redb` when `storage-redb` is enabled.
+    #[test]
+    fn sqlite_only_compiled_default_remains_sqlite() {
+        assert_eq!(
+            StorageBackendKind::compiled_default(),
+            StorageBackendKind::Sqlite
+        );
+        let fresh = tempdir().expect("create fresh storage dir");
+        assert_eq!(
+            StorageBackendKind::resolve_from_override(fresh.path(), None)
+                .expect("pure storage-sqlite build must default fresh empty repo to Sqlite"),
+            StorageBackendKind::Sqlite
+        );
     }
 }

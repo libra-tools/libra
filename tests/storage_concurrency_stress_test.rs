@@ -669,18 +669,19 @@ mod dual_feature_stress {
             .expect("build current-thread tokio runtime for store verification");
 
         // -----------------------------------------------------------------
-        // 1. Seed a real SQLite repository (default backend before RB-33).
+        // 1. Seed a real SQLite repository (explicit `sqlite` override so this
+        //    bidirectional test keeps exercising SQLite -> redb -> sqlite after RB-33).
         // -----------------------------------------------------------------
-        run_libra(&repo_dir, None, &["init", "--vault", "false"]);
+        run_libra(&repo_dir, Some("sqlite"), &["init", "--vault", "false"]);
         let dot_libra = repo_dir.join(".libra");
         let sqlite_git_path = dot_libra.join("libra.db");
         assert!(
             sqlite_git_path.is_file(),
-            "default libra init must create legacy SQLite libra.db"
+            "explicit sqlite libra init must create legacy SQLite libra.db"
         );
         assert!(
             !storage_manifest_path(&dot_libra).exists(),
-            "fresh default SQLite init must not write storage-format.json"
+            "fresh SQLite init must not write storage-format.json"
         );
 
         run_libra(&repo_dir, None, &["config", "user.name", "RB29c Tester"]);
@@ -3021,17 +3022,24 @@ fn syn_ast_per_callsite_storage_wiring_completeness_guard() {
 mod packaged_release_audit {
     use std::{
         fs,
+        io::Write,
         path::{Path, PathBuf},
-        process::Command,
+        process::{Command, Stdio},
     };
 
     use libra::{
         internal::db::schema::DatabaseRole,
         storage::{
-            StorageBackendKind,
-            config_store::{CONFIG_REDB_FILE_NAME, ConfigStore},
+            AgentSessionRecord, CaptureAgentKind, CaptureScopeState, CaptureSessionState,
+            CaptureStore as _, ConfigStore as _, RedbCaptureStore, RedbRepairContext,
+            SqliteCaptureStore, SqliteConfigStore, StorageBackendKind,
+            config_store::{
+                CONFIG_REDB_FILE_NAME, is_config_sqlite_tombstone_sentinel,
+                read_config_format_manifest,
+            },
             manifest::{read_storage_manifest, resolve_redb_generation_paths},
-            sqlite::SqliteConfigStore,
+            migrate::capture_spool_dir_path,
+            queue::CAPTURE_SPOOL_TOMBSTONE_NAMES,
         },
     };
     use sha2::{Digest, Sha256};
@@ -3414,10 +3422,711 @@ mod packaged_release_audit {
             "restored SQLite HEAD commit must retain message and parent OID: {commit_obj}"
         );
     }
+
+    fn run_cmd_with_stdin(
+        bin: &Path,
+        cwd: &Path,
+        home: &Path,
+        global_db: &Path,
+        system_db: &Path,
+        args: &[&str],
+        stdin_bytes: &[u8],
+    ) -> std::process::Output {
+        let mut child = Command::new(bin)
+            .current_dir(cwd)
+            .args(args)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("LIBRA_CONFIG_GLOBAL_DB", global_db)
+            .env("LIBRA_CONFIG_SYSTEM_DB", system_db)
+            .env("LIBRA_TEST", "1")
+            .env_remove("LIBRA_STORAGE_BACKEND")
+            .env_remove("LIBRA_CONFIG_BACKEND")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|err| panic!("failed to spawn {} {:?}: {err}", bin.display(), args));
+        child
+            .stdin
+            .take()
+            .expect("child stdin piped")
+            .write_all(stdin_bytes)
+            .expect("write stdin payload");
+        child
+            .wait_with_output()
+            .unwrap_or_else(|err| panic!("failed waiting on {} {:?}: {err}", bin.display(), args))
+    }
+
+    fn make_rb33_session(session_id: &str, started_at: i64) -> AgentSessionRecord {
+        AgentSessionRecord {
+            session_id: session_id.to_string(),
+            agent_kind: CaptureAgentKind::Codex,
+            provider_session_id: format!("prov-{session_id}"),
+            thread_id: None,
+            state: CaptureSessionState::Stopped,
+            working_dir: "/tmp/rb33b-repo".to_string(),
+            worktree_id: Some("main".to_string()),
+            parent_commit: None,
+            parent_session_id: None,
+            metadata_json: serde_json::json!({ "origin": "rb33b" }).to_string(),
+            redaction_report: "{}".to_string(),
+            started_at,
+            last_event_at: started_at + 10,
+            stopped_at: Some(started_at + 20),
+            schema_version: 1,
+            sync_revision: 1,
+            repo_id: Some("rb33b-repo-id".to_string()),
+            workspace_id: Some("ws-rb33b".to_string()),
+            workspace_fence: Some(1),
+            scope_state: CaptureScopeState::Scoped,
+        }
+    }
+
+    fn build_live_spool_envelope_json(
+        event_id: &str,
+        dedup_key: &str,
+        provider_session_id: &str,
+        working_dir: &Path,
+        storage_path: &Path,
+    ) -> Vec<u8> {
+        let wd = working_dir.display().to_string();
+        let body = serde_json::json!({
+            "version": 1,
+            "agent_kind": "codex",
+            "hook_name": "codex",
+            "hook_command": "observe",
+            "provider_kind": "codex",
+            "provider_source": "codex_hook",
+            "frame_bytes": 128,
+            "event_id": event_id,
+            "identity_scheme": "generic_lifecycle_uuid_v5",
+            "dedup_key": dedup_key,
+            "hook_deadline": false,
+            "display_batch_limit": null,
+            "tool_link": null,
+            "child_hints": { "kind": "absent" },
+            "context": {
+                "provider_session_id": provider_session_id,
+                "working_dir": wd,
+                "storage_path": storage_path.display().to_string(),
+                "worktree_root": wd,
+            },
+            "event": {
+                "kind": "session_start",
+                "session_id": provider_session_id,
+                "session_ref": null,
+                "prompt": "rb33b live spool event",
+                "model": null,
+                "source": null,
+                "tool_name": null,
+                "tool_input": null,
+                "tool_response": null,
+                "assistant_message": null,
+                "timestamp": "2026-11-26T00:00:01Z",
+            },
+            "redaction": {
+                "matches": [],
+                "bytes_scanned": 128,
+                "bytes_redacted": 0,
+            },
+        });
+        serde_json::to_vec(&body).expect("serialize live spool envelope JSON")
+    }
+
+    pub(super) fn default_redb_init_and_global_config_cutover_impl() {
+        let libra_bin = verify_staged_binary_with_sidecar("LIBRA_PACKAGED_BIN");
+
+        let tmp = tempfile::tempdir().expect("create RB-33 tempdir");
+        let home = tmp.path().join("home");
+        let global_dir = tmp.path().join("global-cfg");
+        let system_dir = tmp.path().join("system-cfg");
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(home.join(".config")).expect("mkdir home/.config");
+        fs::create_dir_all(&global_dir).expect("mkdir global-cfg");
+        fs::create_dir_all(&system_dir).expect("mkdir system-cfg");
+        fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+        let global_db = global_dir.join("config.db");
+        let system_db = system_dir.join("config.db");
+
+        // AC3 & AC4: Staged dual-backend `libra` (with keyring, NO env override)
+        // defaults `libra init` to Redb + 0400 capture-spool tombstones without libra.db.
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["init", "--vault", "false"],
+        );
+        let dot_libra = repo_dir.join(".libra");
+        assert!(
+            !dot_libra.join("libra.db").exists(),
+            "AC3: default Redb `libra init` must NOT create .libra/libra.db"
+        );
+        let manifest = read_storage_manifest(&dot_libra)
+            .expect("read storage-format.json")
+            .expect("AC3: default Redb `libra init` must create .libra/storage-format.json");
+        assert_eq!(manifest.backend, StorageBackendKind::Redb);
+        assert!(manifest.finalized);
+        assert!(
+            dot_libra.join("redb/git.gen-00000001.redb").is_file(),
+            "AC3: expected .libra/redb/git.gen-00000001.redb"
+        );
+        assert!(
+            dot_libra
+                .join("private/capture.gen-00000001.redb")
+                .is_file(),
+            "AC3: expected .libra/private/capture.gen-00000001.redb"
+        );
+
+        let spool_dir = capture_spool_dir_path(&dot_libra);
+        for name in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let tomb = spool_dir.join(name);
+            let meta = fs::symlink_metadata(&tomb).unwrap_or_else(|err| {
+                panic!(
+                    "AC4: expected capture-spool/{name} tombstone at {}: {err}",
+                    tomb.display()
+                )
+            });
+            assert!(
+                meta.file_type().is_file(),
+                "AC4: capture-spool/{name} tombstone must be a regular file"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = meta.permissions().mode() & 0o777;
+                assert_eq!(
+                    mode, 0o400,
+                    "AC4: capture-spool/{name} tombstone must have mode 0400, got {mode:04o}"
+                );
+            }
+        }
+
+        // AC5: Staged dual-backend `libra` (NO env override) in isolated empty global dir
+        // runs `libra config set --global` -> creates 0400 hard-link tombstone `config.db`,
+        // `config.redb`, and `config-format.json(backend=redb, finalized=true, legacy_sqlite_tombstone=true)`.
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "set", "--global", "user.name", "DefaultRedbUser"],
+        );
+        assert!(
+            global_dir.join(CONFIG_REDB_FILE_NAME).is_file(),
+            "AC5: default Redb `libra config set --global` must create config.redb"
+        );
+        assert!(
+            is_config_sqlite_tombstone_sentinel(&global_db)
+                .expect("check global config.db tombstone sentinel"),
+            "AC5: global config.db must be a legacy SQLite tombstone sentinel"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::symlink_metadata(&global_db)
+                .expect("stat global config.db tombstone")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o400,
+                "AC5: global config.db tombstone must have mode 0400, got {mode:04o}"
+            );
+        }
+        let cfg_manifest = read_config_format_manifest(&global_dir, DatabaseRole::GlobalConfig)
+            .expect("read config-format.json")
+            .expect("AC5: config-format.json must exist after global Redb config set");
+        assert_eq!(cfg_manifest.backend, StorageBackendKind::Redb);
+        assert!(cfg_manifest.finalized);
+        assert!(
+            cfg_manifest.legacy_sqlite_tombstone,
+            "AC5: config-format.json must record legacy_sqlite_tombstone=true"
+        );
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["config", "get", "--global", "user.name"],
+            )
+            .trim(),
+            "DefaultRedbUser"
+        );
+    }
+
+    pub(super) fn default_redb_cutover_and_sqlite_rollback_impl() {
+        let libra_bin = verify_staged_binary_with_sidecar("LIBRA_PACKAGED_BIN");
+        let migrate_bin = verify_staged_binary_with_sidecar("LIBRA_MIGRATE_PACKAGED_BIN");
+
+        let tmp = tempfile::tempdir().expect("create RB-33b tempdir");
+        let home = tmp.path().join("home");
+        let global_dir = tmp.path().join("global-cfg");
+        let system_dir = tmp.path().join("system-cfg");
+        let repo_dir = tmp.path().join("repo-main");
+        let spool_repo_dir = tmp.path().join("repo-live-spool");
+        fs::create_dir_all(home.join(".config")).expect("mkdir home/.config");
+        fs::create_dir_all(&global_dir).expect("mkdir global-cfg");
+        fs::create_dir_all(&system_dir).expect("mkdir system-cfg");
+        fs::create_dir_all(&repo_dir).expect("mkdir repo-main");
+        fs::create_dir_all(&spool_repo_dir).expect("mkdir repo-live-spool");
+
+        let global_db = global_dir.join("config.db");
+        let system_db = system_dir.join("config.db");
+
+        // -----------------------------------------------------------------
+        // AC2: Global config default-Redb -> `libra-migrate --global --to sqlite`
+        // -> same staged `libra` reads 100% back.
+        // -----------------------------------------------------------------
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "set", "--global", "user.name", "Rb33b Global"],
+        );
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &[
+                "config",
+                "set",
+                "--global",
+                "user.email",
+                "rb33b@example.com",
+            ],
+        );
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &[
+                "config",
+                "set",
+                "--global",
+                "rb33b.global_key",
+                "global-default-redb-val",
+            ],
+        );
+        let global_cfg_before =
+            read_config_format_manifest(&global_dir, DatabaseRole::GlobalConfig)
+                .expect("read global config manifest before rollback")
+                .expect("global config-format.json must exist");
+        assert_eq!(global_cfg_before.backend, StorageBackendKind::Redb);
+        assert!(global_cfg_before.finalized);
+
+        let global_rev = run_cmd(
+            &migrate_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["--global", "--to", "sqlite"],
+        );
+        assert!(
+            global_rev.to_ascii_lowercase().contains("sqlite"),
+            "unexpected --global --to sqlite output: {global_rev}"
+        );
+        let global_cfg_after = read_config_format_manifest(&global_dir, DatabaseRole::GlobalConfig)
+            .expect("read global config manifest after rollback")
+            .expect("global config-format.json must remain finalized after rollback");
+        assert_eq!(global_cfg_after.backend, StorageBackendKind::Sqlite);
+        assert!(global_cfg_after.finalized);
+        assert!(!global_cfg_after.legacy_sqlite_tombstone);
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["config", "get", "--global", "rb33b.global_key"],
+            )
+            .trim(),
+            "global-default-redb-val"
+        );
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["config", "get", "--global", "user.name"],
+            )
+            .trim(),
+            "Rb33b Global"
+        );
+
+        // -----------------------------------------------------------------
+        // AC1: Staged `libra init` (default Redb) -> commits, branch, config,
+        // capture session -> staged `libra-migrate --to sqlite` -> same staged
+        // `libra` reads 100% back.
+        // -----------------------------------------------------------------
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["init", "--vault", "false"],
+        );
+        let dot_libra = repo_dir.join(".libra");
+        let init_manifest = read_storage_manifest(&dot_libra)
+            .expect("read default redb manifest")
+            .expect("manifest must exist");
+        assert_eq!(init_manifest.backend, StorageBackendKind::Redb);
+        assert!(init_manifest.finalized);
+
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["config", "rb33b.local_key", "written-on-default-redb"],
+        );
+        fs::write(repo_dir.join("post_cutover.txt"), "default redb commit\n")
+            .expect("write post_cutover.txt");
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["add", "post_cutover.txt"],
+        );
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["commit", "-m", "rb33b default redb commit", "--no-verify"],
+        );
+        run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["branch", "rb33b-branch"],
+        );
+        let expected_head = run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["rev-parse", "HEAD"],
+        )
+        .trim()
+        .to_string();
+
+        let redb_paths = resolve_redb_generation_paths(&dot_libra)
+            .expect("resolve redb paths")
+            .expect("redb paths must exist");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let seeded_session = make_rb33_session("rb33b-default-redb-session", 1_760_300_000);
+        rt.block_on(async {
+            let cap = RedbCaptureStore::open_read_write(
+                &redb_paths.capture_db_path,
+                RedbRepairContext::WriteCommand,
+            )
+            .await
+            .expect("open redb capture store");
+            cap.upsert_session(&seeded_session)
+                .await
+                .expect("write capture session on default Redb repo");
+        });
+
+        let repo_arg = repo_dir.to_str().expect("utf-8 repo path");
+        let rev_out = run_cmd(
+            &migrate_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["--to", "sqlite", "--repo", repo_arg],
+        );
+        assert!(
+            rev_out.contains("Migrated repository to sqlite"),
+            "unexpected repo --to sqlite output: {rev_out}"
+        );
+        let rev_manifest = read_storage_manifest(&dot_libra)
+            .expect("read manifest after rollback")
+            .expect("manifest must exist");
+        assert_eq!(rev_manifest.backend, StorageBackendKind::Sqlite);
+        assert!(rev_manifest.finalized);
+        assert!(dot_libra.join("libra.db").is_file());
+        assert!(dot_libra.join("private/capture.db").is_file());
+
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["rev-parse", "HEAD"],
+            )
+            .trim(),
+            expected_head
+        );
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["rev-parse", "rb33b-branch"],
+            )
+            .trim(),
+            expected_head
+        );
+        assert_eq!(
+            run_cmd(
+                &libra_bin,
+                &repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["config", "get", "rb33b.local_key"],
+            )
+            .trim(),
+            "written-on-default-redb"
+        );
+        let commit_body = run_cmd(
+            &libra_bin,
+            &repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["cat-file", "-p", "HEAD"],
+        );
+        assert!(
+            commit_body.contains("rb33b default redb commit"),
+            "restored SQLite commit must retain message: {commit_body}"
+        );
+        rt.block_on(async {
+            let sqlite_cap =
+                SqliteCaptureStore::open_read_only(&dot_libra.join("private/capture.db"))
+                    .await
+                    .expect("open rolled-back SqliteCaptureStore");
+            let row = sqlite_cap
+                .get_session("rb33b-default-redb-session")
+                .await
+                .expect("read session from rolled-back capture.db")
+                .expect("post-cutover Redb capture session must survive rollback to SQLite");
+            assert_eq!(row.session_id, seeded_session.session_id);
+        });
+
+        // -----------------------------------------------------------------
+        // AC3 & AC4: Fresh Redb repo missing spool tombstones with a live
+        // `capture-spool/ready/` event -> staged `libra-migrate --to sqlite`
+        // reconciles 100% into `capture.db`, and after Step 2.6 unfencing,
+        // a legacy SQLite hook resumes enqueueing normally into `capture-spool/ready/`.
+        // -----------------------------------------------------------------
+        run_cmd(
+            &libra_bin,
+            &spool_repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["init", "--vault", "false"],
+        );
+        let spool_dot_libra = spool_repo_dir.join(".libra");
+        let spool_dir = capture_spool_dir_path(&spool_dot_libra);
+        for name in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let p = spool_dir.join(name);
+            if p.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+                }
+                fs::remove_file(&p).expect("remove spool tombstone for AC3 fixture");
+            }
+        }
+        let ready_dir = spool_dir.join("ready");
+        fs::create_dir_all(&ready_dir).expect("create live capture-spool/ready");
+        let live_provider_session = "prov-rb33b-live-spool-session";
+        let live_env = build_live_spool_envelope_json(
+            "22222222-2222-4222-8222-222222222222",
+            "dedup-rb33b-live-spool",
+            live_provider_session,
+            &spool_repo_dir,
+            &spool_dot_libra,
+        );
+        fs::write(
+            ready_dir.join("1-20261126000001000-dedup-rb33b-live-spool.json"),
+            &live_env,
+        )
+        .expect("write live spool event");
+
+        let spool_repo_arg = spool_repo_dir.to_str().expect("utf-8 spool repo path");
+        let spool_rev = run_cmd(
+            &migrate_bin,
+            &spool_repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["--to", "sqlite", "--repo", spool_repo_arg],
+        );
+        assert!(
+            spool_rev.contains("Migrated repository to sqlite"),
+            "unexpected live-spool rollback output: {spool_rev}"
+        );
+        rt.block_on(async {
+            let sqlite_cap =
+                SqliteCaptureStore::open_read_only(&spool_dot_libra.join("private/capture.db"))
+                    .await
+                    .expect("open reconciled capture.db");
+            let sessions = sqlite_cap
+                .list_sessions_by_started_desc()
+                .await
+                .expect("list sessions in reconciled capture.db");
+            assert!(
+                sessions
+                    .iter()
+                    .any(|s| s.provider_session_id == live_provider_session),
+                "AC3: live capture-spool/ready event must be reconciled 100% into capture.db, got sessions: {:?}",
+                sessions
+                    .iter()
+                    .map(|s| (&s.session_id, &s.provider_session_id))
+                    .collect::<Vec<_>>()
+            );
+        });
+
+        // AC4: Verify Step 2.6 unfencing cleared all 0400 tombstones and a real legacy SQLite
+        // hook resumes enqueueing to `capture-spool/ready/` (hold consumer lock so the ready/
+        // entry is deterministically observable before draining).
+        for name in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let p = spool_dir.join(name);
+            assert!(
+                !p.is_file(),
+                "AC4: Step 2.6 must unfence capture-spool/{name} regular-file tombstone"
+            );
+        }
+        let consumer_lock_path = spool_dot_libra.join("private/capture-spool-consumer.lock");
+        let consumer_lock_file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&consumer_lock_path)
+            .expect("open capture-spool-consumer.lock");
+        consumer_lock_file
+            .lock()
+            .expect("hold capture-spool-consumer.lock to observe queued ready/ file");
+
+        let hook_payload = serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "rb33b-post-rollback-sqlite-hook",
+            "cwd": spool_repo_dir.display().to_string(),
+        }))
+        .expect("serialize post-rollback hook payload");
+        let hook_out = run_cmd_with_stdin(
+            &libra_bin,
+            &spool_repo_dir,
+            &home,
+            &global_db,
+            &system_db,
+            &["agent", "hooks", "claude-code", "session-start"],
+            &hook_payload,
+        );
+        assert!(
+            hook_out.status.success(),
+            "AC4: post-rollback SQLite hook must succeed (status={:?})\nstdout:\n{}\nstderr:\n{}",
+            hook_out.status.code(),
+            String::from_utf8_lossy(&hook_out.stdout),
+            String::from_utf8_lossy(&hook_out.stderr),
+        );
+        let ready_files: Vec<PathBuf> = fs::read_dir(&ready_dir)
+            .expect("read post-rollback capture-spool/ready")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect();
+        assert!(
+            !ready_files.is_empty(),
+            "AC4: post-rollback legacy SQLite hook must enqueue normally into capture-spool/ready/"
+        );
+        drop(consumer_lock_file);
+        // Drain (retrying briefly if the hook's detached worker holds the consumer lock)
+        // to verify end-to-end persistence of the newly enqueued SQLite hook event.
+        for _ in 0..20 {
+            run_cmd(
+                &libra_bin,
+                &spool_repo_dir,
+                &home,
+                &global_db,
+                &system_db,
+                &["__capture-spool-drain"],
+            );
+            let remaining = fs::read_dir(&ready_dir)
+                .expect("check ready_dir after drain")
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file())
+                .count();
+            if remaining == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        rt.block_on(async {
+            let sqlite_cap =
+                SqliteCaptureStore::open_read_only(&spool_dot_libra.join("private/capture.db"))
+                    .await
+                    .expect("open capture.db after post-rollback hook drain");
+            let sessions = sqlite_cap
+                .list_sessions_by_started_desc()
+                .await
+                .expect("list sessions after post-rollback hook drain");
+            assert!(
+                sessions
+                    .iter()
+                    .any(|s| s.provider_session_id == "rb33b-post-rollback-sqlite-hook"),
+                "AC4: drained post-rollback SQLite hook event must persist in capture.db; sessions={:?}, ready_files={ready_files:?}",
+                sessions
+                    .iter()
+                    .map(|s| (&s.session_id, &s.provider_session_id))
+                    .collect::<Vec<_>>()
+            );
+        });
+    }
 }
 
 #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
 #[test]
 fn packaged_release_dual_backend_libra_and_migrate_coherence_pre_cutover() {
     packaged_release_audit::pre_cutover_dual_backend_coherence_impl();
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[test]
+fn packaged_release_default_redb_init_and_global_config_cutover() {
+    packaged_release_audit::default_redb_init_and_global_config_cutover_impl();
+}
+
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+#[test]
+fn packaged_release_artifacts_default_redb_cutover_and_sqlite_rollback() {
+    packaged_release_audit::default_redb_cutover_and_sqlite_rollback_impl();
 }

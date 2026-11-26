@@ -244,9 +244,9 @@ hook 在本 hook 的整个捕获预算内（最多 30 秒）一直占着队列�
 库而不是仓库库：库 schema 由更新版本写入时报 `LBR-AGENT-048`，库忙时报
 `LBR-AGENT-047`，文件损坏或不可读时报 `LBR-IO-001`，各自给出不同的处理办法。
 
-在 Redb 仓库中，实时 hook 改为向 `.libra/private/capture-queue/{priority,normal}/`
+在 Redb 仓库中（官方双后端发行版新建仓库的默认后端），实时 hook 改为向 `.libra/private/capture-queue/{priority,normal}/`
 追加带 CRC32C 校验的二进制帧（`SessionEnd` 路由到 `priority/`，普通生命周期事件路由到
-`normal/`），绝不直接打开 `capture.redb`，也不写入 `capture-spool/`。手动排空执行
+`normal/`），绝不直接打开 `capture.redb`，也不写入 `capture-spool/`（该路径在经 `libra-migrate --to sqlite` 回退前保持 `0400` 墓碑保护）。手动排空执行
 `libra __capture-queue-drain`，严格先将 `priority/` 落库 `capture.redb` 再消费
 `normal/`。可选预览单写入者守护进程 `libra agent daemon` 持有
 `.libra/private/capture-queue/daemon.lock` 并持续排空双通道（`--once` 执行单次排空后退出）：

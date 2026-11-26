@@ -10,9 +10,9 @@ libra init [OPTIONS] [DIRECTORY]
 
 ## 说明
 
-`libra init` 创建新的 Libra 仓库，在 `.libra/libra.db` 中初始化 SQLite-backed 元数据，配置 `HEAD`，并可选导入已有本地 Git 仓库。
+`libra init` 创建新的 Libra 仓库，初始化仓库元数据存储（官方双后端发行版默认使用 Redb：创建 `.libra/redb/git.gen-00000001.redb`、`.libra/private/capture.gen-00000001.redb`、`.libra/storage-format.json` 与 `0400` 权限的 `.libra/private/capture-spool/{tmp,ready,quarantine}` 墓碑文件，不创建 `.libra/libra.db`；设置 `LIBRA_STORAGE_BACKEND=sqlite` 或使用纯 `storage-sqlite` 构建时仍创建 `.libra/libra.db`），配置 `HEAD`，并可选导入已有本地 Git 仓库。已有仓库可通过 `libra-migrate --to redb` / `libra-migrate --to sqlite` 无损双向迁移。
 
-在已有目录中运行 `libra init` 会创建 `.libra` 子目录，其中包含对象存储、SQLite 数据库、默认配置、指向初始分支的 HEAD，以及（默认）vault-backed PGP 签名密钥。如果给出 `DIRECTORY` 且该目录不存在，会先创建该目录。
+在已有目录中运行 `libra init` 会创建 `.libra` 子目录，其中包含对象存储、元数据数据库（官方发行版默认 Redb；覆盖或纯 SQLite 构建为 SQLite）、默认配置、指向初始分支的 HEAD，以及（默认）vault-backed PGP 签名密钥。如果给出 `DIRECTORY` 且该目录不存在，会先创建该目录。
 
 与 Git 一致，`libra init` 会让新工作树保持干净：**不会**创建默认 `.libraignore`。需要
 Libra 专有 ignore 规则时请自行创建（或转换现有 `.gitignore`）；ignore 来源按需读取，

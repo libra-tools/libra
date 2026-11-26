@@ -10,11 +10,17 @@ libra init [OPTIONS] [DIRECTORY]
 
 ## Description
 
-`libra init` creates a new Libra repository, seeds the SQLite-backed metadata in
-`.libra/libra.db`, configures `HEAD`, and optionally imports an existing local Git repository.
+`libra init` creates a new Libra repository, initializes its metadata storage
+(Redb by default in official dual-backend releases via `.libra/redb/git.gen-00000001.redb`,
+`.libra/private/capture.gen-00000001.redb`, `.libra/storage-format.json`, and `0400`
+`.libra/private/capture-spool/{tmp,ready,quarantine}` tombstones; or SQLite `.libra/libra.db` when
+`LIBRA_STORAGE_BACKEND=sqlite` is set or in pure `storage-sqlite` builds), configures `HEAD`, and
+optionally imports an existing local Git repository. Existing repositories migrate bidirectionally
+with `libra-migrate --to redb` or `libra-migrate --to sqlite`.
 
 Running `libra init` in an existing directory creates a `.libra` subdirectory with the
-object store, SQLite database, default configuration, HEAD pointing to the initial branch,
+object store, metadata database (Redb by default in official releases; SQLite when overridden or
+built SQLite-only), default configuration, HEAD pointing to the initial branch,
 and (by default) a vault-backed PGP signing key. If `DIRECTORY` is given and does not exist,
 it is created first.
 

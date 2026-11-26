@@ -21,6 +21,26 @@ describe whether a command has been modernized for CLIG (`--json` / `--machine`
 [`docs/development/commands/_general.md`](docs/development/commands/_general.md) and in each command
 batch document.
 
+## Storage backend default and bidirectional migration
+
+Official dual-backend releases (compiled with `storage-sqlite,storage-redb,storage-queue,keyring`)
+default newly initialized repositories and fresh user/system configuration scopes to **Redb**
+(`RB-33` / `REL-RB-03`):
+
+- `libra init` creates `.libra/redb/git.gen-00000001.redb`, `.libra/private/capture.gen-00000001.redb`,
+  `.libra/storage-format.json` (`backend = "redb"`, `finalized = true`), and read-only `0400`
+  tombstone files at `.libra/private/capture-spool/{tmp,ready,quarantine}` without creating
+  `.libra/libra.db`.
+- `libra config set --global` (and `--system`) pre-creates a non-overwriting read-only tombstone at
+  `config.db` (`0400` global / `0444` system) before initializing `config.redb` and
+  `config-format.json` (`backend = "redb"`, `finalized = true`, `legacy_sqlite_tombstone = true`).
+- Pure `storage-sqlite` builds (`--no-default-features --features storage-sqlite`) continue
+  defaulting fresh repositories and configuration scopes to SQLite (`libra.db` / `config.db`).
+- Fresh repositories on dual-backend builds can still opt into SQLite via
+  `LIBRA_STORAGE_BACKEND=sqlite`. Existing repositories and config scopes obey manifest-first
+  precedence and migrate losslessly in both directions via the companion `libra-migrate` binary
+  (`libra-migrate --to redb`, `libra-migrate --to sqlite`, and `--global` / `--system`).
+
 ## Fetch/remote refspec contract (P1-06)
 
 `fetch <remote> <src>:<dst>` writes the exact validated destination and an

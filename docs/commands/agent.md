@@ -293,10 +293,12 @@ database: a schema written by a newer Libra fails with `LBR-AGENT-048`, a busy
 database with `LBR-AGENT-047`, and a damaged or unreadable file with
 `LBR-IO-001`, each with its own remedy.
 
-On Redb repositories, realtime hooks instead append CRC32C-authenticated binary
+On Redb repositories (the default for new repositories created by official dual-backend releases),
+realtime hooks instead append CRC32C-authenticated binary
 frames to `.libra/private/capture-queue/{priority,normal}/` (`SessionEnd` routes
 to `priority/`; normal lifecycle events route to `normal/`) without opening
-`capture.redb` directly, and never write to `capture-spool/`. Manual draining
+`capture.redb` directly, and never write to `capture-spool/` (which carries `0400`
+tombstones until a repository is migrated back via `libra-migrate --to sqlite`). Manual draining
 runs `libra __capture-queue-drain`, which strictly drains `priority/` into
 `capture.redb` before consuming `normal/`. The optional preview single-writer
 daemon `libra agent daemon` holds `.libra/private/capture-queue/daemon.lock` and
