@@ -773,7 +773,7 @@ Git 在 key 未找到时以代码 1 退出，这在脚本中与其他错误难�
 | 子命令风格 | 无 | 有（`set/get/list/edit/path`） | 有（`set/get/list/unset/import/path`） |
 | 获取值 | `git config key` | `jj config get key` | `libra config get key` |
 | 列表 | `git config -l` | `jj config list` | `libra config list` |
-| 在编辑器中编辑 | `git config -e` | `jj config edit` | `libra config edit` / `-e` / `--edit`（`--file` 直接编辑文件） |
+| 在编辑器中编辑 | `git config -e` | `jj config edit` | `libra config edit` / `-e` / `--edit` |
 | 正则搜索 | `git config --get-regexp` | 无 | `libra config get --regexp` |
 | 显示来源 | `git config --show-origin` | 无 | `libra config list --show-origin` |
 | 类型转换 | `--type=bool\|int\|path` | 无（TOML 类型） | `--type=bool\|int\|path` + `--bool`/`--int`/`--path`（读取与设置时均规范化） |
@@ -922,3 +922,5 @@ expiry-date shortcut matches the type value.
 an existing config lock fails with no write.
 
 file writes reject vault options.
+
+edit temp files are mode 0600.

@@ -905,7 +905,7 @@ Git exits with code 1 when a key is not found, which is indistinguishable from o
 | Subcommand style | No | Yes (`set/get/list/edit/path`) | Yes (`set/get/list/unset/import/path`) |
 | Get value | `git config key` | `jj config get key` | `libra config get key` |
 | List | `git config -l` | `jj config list` | `libra config list` |
-| Edit in editor | `git config -e` | `jj config edit` | `libra config edit` / `-e` / `--edit` (`--file` edits the file directly) |
+| Edit in editor | `git config -e` | `jj config edit` | `libra config edit` / `-e` / `--edit` |
 | Regex search | `git config --get-regexp` | No | `libra config get --regexp` |
 | Show origin | `git config --show-origin` | No | `libra config list --show-origin` |
 | Type coercion | `--type=bool\|int\|path` | No (TOML types) | `--type=bool\|int\|path` + `--bool`/`--int`/`--path` (canonicalize on both read and set) |
@@ -1121,3 +1121,5 @@ expiry-date shortcut matches the type value.
 an existing config lock fails with no write.
 
 file writes reject vault options.
+
+edit temp files are mode 0600.

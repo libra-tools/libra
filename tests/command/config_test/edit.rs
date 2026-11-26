@@ -111,10 +111,15 @@ fn test_config_edit_tempfile_mode() {
         "init",
     );
     let log = temp.path().join("mode.log");
+    let temp_log = temp.path().join("path.log");
     let script = editor_script(
         temp.path(),
         "mode.sh",
-        &format!("stat -c %a \"$1\" > {}; exit 0", log.display()),
+        &format!(
+            "stat -c %a \"$1\" > {}; printf '%s' \"$1\" > {}; exit 0",
+            log.display(),
+            temp_log.display()
+        ),
     );
     let out = run_libra_command_with_env(
         &["config", "--edit"],
@@ -123,12 +128,53 @@ fn test_config_edit_tempfile_mode() {
     );
     assert_cli_success(&out, "edit");
     assert_eq!(fs::read_to_string(&log).unwrap().trim(), "600");
+    let success_temp = fs::read_to_string(&temp_log).unwrap();
+    assert!(
+        !std::path::Path::new(&success_temp).exists(),
+        "successful edit deletes {success_temp}"
+    );
 
-    let failing = editor_script(temp.path(), "fail.sh", "exit 1");
+    let fail_log = temp.path().join("fail-path.log");
+    let failing = editor_script(
+        temp.path(),
+        "fail.sh",
+        &format!("printf '%s' \"$1\" > {}; exit 1", fail_log.display()),
+    );
     let out = run_libra_command_with_env(
         &["config", "--edit"],
         &repo,
         &[("GIT_EDITOR", failing.as_str())],
     );
     assert!(!out.status.success(), "failing editor propagates");
+    let failed_temp = fs::read_to_string(&fail_log).unwrap();
+    assert!(
+        !std::path::Path::new(&failed_temp).exists(),
+        "failed editor deletes {failed_temp}"
+    );
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_t1300_edit() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], &repo),
+        "init",
+    );
+    let script = editor_script(
+        temp.path(),
+        "add.sh",
+        "printf '\\n[t1300]\\n\\tedit = works\\n' >> \"$1\"",
+    );
+    let out = run_libra_command_with_env(
+        &["config", "--edit"],
+        &repo,
+        &[("GIT_EDITOR", script.as_str())],
+    );
+    assert_cli_success(&out, "--edit works");
+    let value = run_libra_command(&["config", "--local", "--get", "t1300.edit"], &repo);
+    assert_cli_success(&value, "edited addition");
+    assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "works");
 }

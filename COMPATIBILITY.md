@@ -2089,3 +2089,5 @@ an existing config lock fails with no write.
 file writes reject vault options.
 
 | `config edit` | Supported via `edit`, `-e`, `--edit`; temp file is 0600 and syntax errors keep the temp path. |
+
+edit temp files are mode 0600.
