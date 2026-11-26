@@ -222,3 +222,16 @@ fn test_cf_84_predicates() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+#[test]
+#[serial(cwd)]
+fn test_file_read_matrix() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    fs::write(repo.path().join("cfg"), "[a]\nb = c\n").unwrap();
+    for flag in ["--file", "-f"] {
+        let out = run_libra_command(&["config", flag, "cfg", "--get", "a.b"], repo.path());
+        assert_cli_success(&out, flag);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "c", "{flag}");
+    }
+}

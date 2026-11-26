@@ -548,7 +548,7 @@ pub struct ConfigArgs {
     pub show_scope: bool,
     /// Read configuration from a Git-style INI file instead of the stores
     /// (`git config --file`). Read-only.
-    #[clap(long = "file", value_name = "PATH", hide = true)]
+    #[clap(short = 'f', long = "file", value_name = "PATH", hide = true)]
     pub file: Option<String>,
     /// Show only key names (`git config --name-only`)
     #[clap(long("name-only"), hide = true)]
