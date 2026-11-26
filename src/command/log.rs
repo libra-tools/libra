@@ -4578,36 +4578,7 @@ fn commit_diff_matches_regex(commit: &Commit, regex: &regex::Regex) -> Result<bo
     Ok(false)
 }
 
-/// Interpret a `--pretty=<value>` argument. Recognizes the named presets
-/// (`oneline`, `medium`, `short`, `full`, `fuller`, `reference`, `raw`) and the
-/// `format:` / `tformat:` prefixes (which carry a custom template). `medium`
-/// (and the empty value) map to the default full format — Git's default. Any
-/// other value is treated as a raw custom template, matching the prior behavior.
-pub(crate) fn parse_pretty_format(pretty: String) -> FormatType {
-    match pretty.as_str() {
-        "oneline" => FormatType::Oneline,
-        "medium" => FormatType::Full,
-        // Git prints nothing for an empty format (and `tformat:`); `format:`
-        // only emits the separators between commits.
-        "" => FormatType::Silent,
-        "tformat:" => FormatType::Silent,
-        "format:" => FormatType::Separator,
-        "short" => FormatType::Preset(LogPreset::Short),
-        "full" => FormatType::Preset(LogPreset::Full),
-        "fuller" => FormatType::Preset(LogPreset::Fuller),
-        "reference" => FormatType::Preset(LogPreset::Reference),
-        "raw" => FormatType::Preset(LogPreset::Raw),
-        _ => {
-            if let Some(fmt) = pretty.strip_prefix("format:") {
-                FormatType::Custom(fmt.to_string())
-            } else if let Some(fmt) = pretty.strip_prefix("tformat:") {
-                FormatType::Custom(fmt.to_string())
-            } else {
-                FormatType::Custom(pretty)
-            }
-        }
-    }
-}
+pub(crate) use libra_core::internal::log::formatter::parse_pretty_format;
 
 fn format_log_timestamp(timestamp: i64) -> String {
     chrono::DateTime::from_timestamp(timestamp, 0)

@@ -296,7 +296,7 @@ mod tests {
 
         // Balanced-bracket function-node allowlist targets must remain
         // parseable in client_storage.rs (B3-14 cloud semantic guard).
-        let src = include_str!("../../utils/client_storage.rs");
+        let src = include_str!("../../../crates/libra-core/src/utils/client_storage.rs");
         for name in [
             "expected_index_repair_oid_len",
             "valid_index_repair_oid",

@@ -2226,68 +2226,7 @@ fn write_raw_path(writer: &mut impl Write, path: &Path) -> io::Result<()> {
     }
 }
 
-/// Public so the wave-0 suite can pin the §B.6.6 escape matrix on paths
-/// (LF/CR) that cannot be created as files on every filesystem.
-pub fn quote_pathname(path: &Path, quote_path: bool) -> String {
-    let bytes = quote_pathname_bytes(path, quote_path);
-    match String::from_utf8(bytes) {
-        Ok(text) => text,
-        // String-typed callers can never hold raw non-UTF-8 bytes, so they
-        // keep the lossless octal-escaped form (every byte maps 1:1).
-        // Byte-oriented writers call `quote_pathname_bytes` and stay raw
-        // when `core.quotePath` is off (Git parity).
-        Err(_) => {
-            String::from_utf8(quote_pathname_bytes(path, true)).unwrap_or_else(|error| {
-                // INVARIANT: the quote_path=true form octal-escapes every
-                // byte >= 0x80, so it is pure ASCII and always valid UTF-8.
-                String::from_utf8_lossy(error.as_bytes()).into_owned()
-            })
-        }
-    }
-}
-
-/// Byte-faithful variant of [`quote_pathname`] for byte-oriented writers
-/// (§B.6.6): TAB/LF/CR/`"`/`\` are always escaped; bytes >= 0x80 are
-/// octal-escaped only while `quote_path` holds — with `core.quotePath=false`
-/// they are written RAW, including when the path is not valid UTF-8 (Git
-/// parity). `-z` surfaces never call this: they are raw end to end.
-pub fn quote_pathname_bytes(path: &Path, quote_path: bool) -> Vec<u8> {
-    // Escape the RAW OS path bytes (Unix), not a lossy `display()` copy, so
-    // a non-UTF-8 name renders its true bytes (`\377`) instead of U+FFFD
-    // replacement bytes. On non-Unix `display()` is the platform's stable
-    // encoding.
-    #[cfg(unix)]
-    let bytes: &[u8] = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes()
-    };
-    #[cfg(not(unix))]
-    let display = path.display().to_string();
-    #[cfg(not(unix))]
-    let bytes: &[u8] = display.as_bytes();
-    let needs_escape =
-        |b: u8| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || (quote_path && b >= 0x80);
-    if !bytes.iter().copied().any(needs_escape) {
-        return bytes.to_vec();
-    }
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 8);
-    out.push(b'"');
-    for &b in bytes {
-        match b {
-            b'\t' => out.extend_from_slice(b"\\t"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            _ if b < 0x20 || b == 0x7f || (quote_path && b >= 0x80) => {
-                out.extend_from_slice(format!("\\{b:03o}").as_bytes());
-            }
-            _ => out.push(b),
-        }
-    }
-    out.push(b'"');
-    out
-}
+pub use libra_core::utils::pathname_quote::{quote_pathname, quote_pathname_bytes};
 
 /// Short format output with color controlled by OutputConfig.
 ///

@@ -109,16 +109,7 @@ const PENDING_ENVELOPE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Local identity authentication is not provider-origin evidence. Only the
 /// checkpoint adapter can borrow native bindings; an identity MAC never mints
 /// a NativeProven reasoning carrier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReasoningIdentityMacPurpose {
-    /// Frozen identity-v1 descriptor/turn-slot purpose.
-    Descriptor,
-    /// Frozen identity-v1 record and whole-map purpose.
-    Record,
-    DescriptorV2,
-    RecordV2,
-    SessionMapV2,
-}
+pub(crate) use libra_core::internal::metadata_types::ReasoningIdentityMacPurpose;
 
 pub(crate) struct ReasoningIdentityAuthentication<'a> {
     pub(crate) purpose: ReasoningIdentityMacPurpose,
@@ -130,53 +121,17 @@ pub(crate) struct ReasoningIdentityAuthentication<'a> {
 #[error("private reasoning identity authentication failed; run libra agent doctor")]
 pub(crate) struct ReasoningIdentityMacMismatch;
 
-impl ReasoningIdentityMacPurpose {
-    /// The legacy variants remain the default for every existing v1 caller.
-    /// A caller handling an untrusted version must select a purpose before it
-    /// can borrow the repository key or accept a persisted tag.
-    pub(crate) fn descriptor_for_schema_version(version: i64) -> Result<Self> {
-        match version {
-            1 => Ok(Self::Descriptor),
-            2 => Ok(Self::DescriptorV2),
-            _ => bail!("unsupported private reasoning identity version; run libra agent doctor"),
+fn reasoning_identity_private_domain(
+    purpose: ReasoningIdentityMacPurpose,
+) -> PrivateArtifactMacDomain {
+    match purpose {
+        ReasoningIdentityMacPurpose::Descriptor => PrivateArtifactMacDomain::ReasoningDescriptor,
+        ReasoningIdentityMacPurpose::Record => PrivateArtifactMacDomain::ReasoningRecord,
+        ReasoningIdentityMacPurpose::DescriptorV2 => {
+            PrivateArtifactMacDomain::ReasoningDescriptorV2
         }
-    }
-
-    pub(crate) fn record_for_schema_version(version: i64) -> Result<Self> {
-        match version {
-            1 => Ok(Self::Record),
-            2 => Ok(Self::RecordV2),
-            _ => bail!("unsupported private reasoning identity version; run libra agent doctor"),
-        }
-    }
-
-    pub(crate) fn map_for_schema_version(version: i64) -> Result<Self> {
-        match version {
-            // identity-v1 deliberately used the Record purpose for its map.
-            1 => Ok(Self::Record),
-            2 => Ok(Self::SessionMapV2),
-            _ => bail!("unsupported private reasoning identity version; run libra agent doctor"),
-        }
-    }
-
-    pub(crate) fn prefix(self) -> &'static str {
-        match self {
-            Self::Descriptor => "reasoning-identity/hmac-v1/",
-            Self::Record => "reasoning-record/hmac-v1/",
-            Self::DescriptorV2 => "reasoning-identity/hmac-v2/",
-            Self::RecordV2 => "reasoning-record/hmac-v2/",
-            Self::SessionMapV2 => "reasoning-map/hmac-v2/",
-        }
-    }
-
-    fn private_domain(self) -> PrivateArtifactMacDomain {
-        match self {
-            Self::Descriptor => PrivateArtifactMacDomain::ReasoningDescriptor,
-            Self::Record => PrivateArtifactMacDomain::ReasoningRecord,
-            Self::DescriptorV2 => PrivateArtifactMacDomain::ReasoningDescriptorV2,
-            Self::RecordV2 => PrivateArtifactMacDomain::ReasoningRecordV2,
-            Self::SessionMapV2 => PrivateArtifactMacDomain::ReasoningMapV2,
-        }
+        ReasoningIdentityMacPurpose::RecordV2 => PrivateArtifactMacDomain::ReasoningRecordV2,
+        ReasoningIdentityMacPurpose::SessionMapV2 => PrivateArtifactMacDomain::ReasoningMapV2,
     }
 }
 
@@ -256,7 +211,7 @@ pub(crate) async fn authenticate_reasoning_identity_in_scope_until<C: sea_orm::C
             request.body,
             request.expected_mac,
             deadline,
-            request.purpose.private_domain(),
+            reasoning_identity_private_domain(request.purpose),
         )
         .context("cannot authenticate private reasoning identity; run libra agent doctor")
     })
@@ -856,7 +811,7 @@ pub(crate) fn authenticate_reasoning_identity_existing_key_for_test(
         body,
         expected_mac,
         Instant::now() + Duration::from_secs(5),
-        purpose.private_domain(),
+        reasoning_identity_private_domain(purpose),
     )
 }
 
@@ -2071,7 +2026,7 @@ mod tests {
         let mut prefixes = std::collections::BTreeSet::new();
         let mut tags = std::collections::BTreeSet::new();
         for purpose in purposes {
-            let domain = purpose.private_domain();
+            let domain = reasoning_identity_private_domain(purpose);
             assert!(prefixes.insert(purpose.prefix()));
             assert!(tags.insert(domain.tag()));
             let mac =
@@ -2082,15 +2037,11 @@ mod tests {
         assert_eq!(prefixes.len(), 5);
         assert_eq!(tags.len(), 5, "all five HMAC byte domains must differ");
         assert_eq!(
-            ReasoningIdentityMacPurpose::SessionMapV2
-                .private_domain()
-                .byte_cap(),
+            reasoning_identity_private_domain(ReasoningIdentityMacPurpose::SessionMapV2).byte_cap(),
             crate::internal::metadata::REASONING_IDENTITY_SESSION_MAP_MAX_BYTES
         );
         assert_eq!(
-            ReasoningIdentityMacPurpose::RecordV2
-                .private_domain()
-                .byte_cap(),
+            reasoning_identity_private_domain(ReasoningIdentityMacPurpose::RecordV2).byte_cap(),
             crate::internal::ai::traces::REASONING_ARTIFACT_MANIFEST_MAX_BYTES
         );
     }
@@ -2116,7 +2067,7 @@ mod tests {
                 body,
                 None,
                 deadline,
-                source.private_domain(),
+                reasoning_identity_private_domain(source),
             )
             .expect("derive source commitment");
             let suffix = mac.strip_prefix(source.prefix()).expect("source prefix");
@@ -2133,7 +2084,7 @@ mod tests {
                         body,
                         Some(&transplant),
                         deadline,
-                        target.private_domain(),
+                        reasoning_identity_private_domain(target),
                     )
                     .is_err(),
                     "a tag from {source:?} was accepted as {target:?}"
@@ -2145,7 +2096,7 @@ mod tests {
                     b"changed body",
                     Some(&mac),
                     deadline,
-                    source.private_domain(),
+                    reasoning_identity_private_domain(source),
                 )
                 .is_err()
             );
@@ -2193,7 +2144,7 @@ mod tests {
                     b"synthetic body",
                     None,
                     deadline,
-                    purpose.private_domain(),
+                    reasoning_identity_private_domain(purpose),
                 )
                 .is_err(),
                 "missing key must fail for {purpose:?}"
@@ -2211,7 +2162,7 @@ mod tests {
                 b"synthetic body",
                 None,
                 deadline,
-                purpose.private_domain(),
+                reasoning_identity_private_domain(purpose),
             )
             .expect("derive v2 tag from existing key");
             authenticate_private_artifact_existing_key(
@@ -2219,7 +2170,7 @@ mod tests {
                 b"synthetic body",
                 Some(&mac),
                 deadline,
-                purpose.private_domain(),
+                reasoning_identity_private_domain(purpose),
             )
             .expect("verify v2 tag from existing key");
         }
@@ -2245,7 +2196,7 @@ mod tests {
             body,
             None,
             deadline,
-            ReasoningIdentityMacPurpose::Descriptor.private_domain(),
+            reasoning_identity_private_domain(ReasoningIdentityMacPurpose::Descriptor),
         )
         .expect("derive descriptor with existing key");
         let record = authenticate_private_artifact_existing_key(
@@ -2253,7 +2204,7 @@ mod tests {
             body,
             None,
             deadline,
-            ReasoningIdentityMacPurpose::Record.private_domain(),
+            reasoning_identity_private_domain(ReasoningIdentityMacPurpose::Record),
         )
         .expect("derive record with existing key");
         let pending = authenticate_pending_envelope_existing_key(&storage, body, None, deadline)
@@ -2281,7 +2232,7 @@ mod tests {
                 body,
                 Some(&descriptor),
                 deadline,
-                ReasoningIdentityMacPurpose::Descriptor.private_domain(),
+                reasoning_identity_private_domain(ReasoningIdentityMacPurpose::Descriptor),
             )
             .expect("verify matching identity domain"),
             descriptor
@@ -2394,7 +2345,7 @@ mod tests {
             &body,
             None,
             deadline,
-            ReasoningIdentityMacPurpose::Record.private_domain(),
+            reasoning_identity_private_domain(ReasoningIdentityMacPurpose::Record),
         )
         .expect("authenticate the whole session map within its own cap");
         assert_eq!(
@@ -2403,7 +2354,7 @@ mod tests {
                 &body,
                 Some(&mac),
                 deadline,
-                ReasoningIdentityMacPurpose::Record.private_domain(),
+                reasoning_identity_private_domain(ReasoningIdentityMacPurpose::Record),
             )
             .expect("verify the whole session map within its own cap"),
             mac

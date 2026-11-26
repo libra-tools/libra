@@ -494,17 +494,6 @@ impl RebaseState {
         Ok(row.is_some())
     }
 
-    /// The row of an EXPLICITLY resolved scope (§C.4.2), for the pseudo-ref
-    /// projections. Reads only the database — a legacy common directory is
-    /// deliberately not adopted here, because §C.4.3 forbids attributing it to
-    /// a scope that cannot be proven to own it.
-    pub(crate) async fn load_for_scope(
-        scope: &crate::internal::worktree_scope::WorktreeScope,
-    ) -> Result<Option<Self>, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::load_from_db_in_scope(&db, scope.storage_key()).await
-    }
-
     pub(super) async fn load_from_db<C: ConnectionTrait>(db: &C) -> Result<Option<Self>, String> {
         Self::load_from_db_in_scope(db, &Self::scope_key()).await
     }

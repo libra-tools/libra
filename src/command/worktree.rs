@@ -36,10 +36,9 @@ pub(crate) use operations::*;
 #[cfg(all(unix, feature = "worktree-fuse"))]
 pub(crate) use registry::ensure_registry_v4_locked;
 pub(crate) use registry::{
-    DETACHED_MARKER, WorktreeEntry, WorktreeEntryState, WorktreeState, local_gitdir_for_scope,
-    registered_fuse_worktree_at, registered_fuse_worktree_paths, registered_worktree_locations,
-    registry_knows_linked_worktree, registry_knows_linked_worktree_in_storage,
-    resolve_worktree_selector,
+    DETACHED_MARKER, WorktreeEntry, WorktreeEntryState, WorktreeState,
+    registered_fuse_worktree_paths, registered_worktree_locations, registry_knows_linked_worktree,
+    registry_knows_linked_worktree_in_storage, resolve_worktree_selector,
 };
 #[cfg(all(test, unix))]
 use registry::{REGISTRY_SCHEMA_VERSION, WorktreeStateV1};
@@ -463,101 +462,7 @@ pub(crate) struct WorktreeUmountOutput {
     cleanup_root_removed: bool,
 }
 
-pub(crate) type WorktreeResult<T> = Result<T, WorktreeError>;
-
-#[derive(Debug)]
-pub(crate) enum WorktreeError {
-    InvalidTarget(String),
-    OperationBlocked(String),
-    NoSuchWorktree { path: String },
-    MainWorktree { action: &'static str, path: String },
-    LockedWorktree { action: &'static str, path: String },
-    DirtyWorktree { path: String },
-    StateRead { path: PathBuf, source: io::Error },
-    StateWrite { path: PathBuf, source: io::Error },
-    StateCorrupt { path: PathBuf, source: String },
-    StateRepair { source: io::Error },
-    IoRead(String),
-    IoWrite(String),
-}
-
-impl WorktreeError {
-    fn stable_code(&self) -> StableErrorCode {
-        match self {
-            Self::InvalidTarget(_)
-            | Self::NoSuchWorktree { .. }
-            | Self::MainWorktree { .. }
-            | Self::LockedWorktree { .. } => StableErrorCode::CliInvalidTarget,
-            Self::OperationBlocked(_) | Self::DirtyWorktree { .. } => {
-                StableErrorCode::ConflictOperationBlocked
-            }
-            Self::StateCorrupt { .. } | Self::StateRepair { .. } => StableErrorCode::RepoCorrupt,
-            Self::StateRead { .. } | Self::IoRead(_) => StableErrorCode::IoReadFailed,
-            Self::StateWrite { .. } | Self::IoWrite(_) => StableErrorCode::IoWriteFailed,
-        }
-    }
-
-    pub(crate) fn into_cli_error(self) -> CliError {
-        let code = self.stable_code();
-        let mut error = CliError::fatal(self.to_string()).with_stable_code(code);
-        if matches!(self, Self::DirtyWorktree { .. }) {
-            error = error.with_hint(
-                "commit or stash changes, or remove without --delete-dir to keep the directory",
-            );
-        }
-        error
-    }
-}
-
-impl std::fmt::Display for WorktreeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidTarget(message)
-            | Self::OperationBlocked(message)
-            | Self::IoRead(message)
-            | Self::IoWrite(message) => f.write_str(message),
-            Self::NoSuchWorktree { path } => write!(f, "no such worktree: {path}"),
-            Self::MainWorktree { action, path } => {
-                write!(f, "cannot {action} main worktree: {path}")
-            }
-            Self::LockedWorktree { action, path } => {
-                write!(f, "cannot {action} locked worktree: {path}")
-            }
-            Self::DirtyWorktree { path } => {
-                write!(
-                    f,
-                    "cannot delete dirty worktree '{path}' (uncommitted changes)"
-                )
-            }
-            Self::StateRead { path, source } => {
-                write!(
-                    f,
-                    "failed to read worktree state '{}': {source}",
-                    path.display()
-                )
-            }
-            Self::StateWrite { path, source } => {
-                write!(
-                    f,
-                    "failed to write worktree state '{}': {source}",
-                    path.display()
-                )
-            }
-            Self::StateCorrupt { path, source } => {
-                write!(
-                    f,
-                    "worktree state '{}' is corrupt: {source}",
-                    path.display()
-                )
-            }
-            Self::StateRepair { source } => {
-                write!(f, "failed to repair worktree state invariant: {source}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for WorktreeError {}
+pub(crate) use libra_core::internal::worktree_registry::{WorktreeError, WorktreeResult};
 
 /// RAII guard that temporarily changes the process current directory.
 ///

@@ -14,7 +14,7 @@
 
 use std::{fs, path::PathBuf};
 
-const TARGET_FILE: &str = "src/utils/util.rs";
+const TARGET_FILE: &str = "crates/libra-core/src/utils/util.rs";
 
 #[test]
 fn util_production_has_no_bare_unwrap_calls() {

@@ -12,7 +12,7 @@ const WALK_FILES: &[&str] = &[
     "src/command/rev_list_filter.rs",
     "src/command/rev_list_children.rs",
     "src/command/rev_list_cherry.rs",
-    "src/internal/merge_base.rs",
+    "crates/libra-core/src/internal/merge_base.rs",
     "src/command/status.rs",
     "src/command/status/input.rs",
     "src/command/status/scan.rs",
@@ -61,7 +61,8 @@ fn log_and_rev_list_walks_use_shallow_helper() {
 
 #[test]
 fn helper_module_is_the_parser() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/internal/shallow.rs");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/libra-core/src/internal/shallow.rs");
     assert!(path.is_file(), "src/internal/shallow.rs must exist");
     let text = fs::read_to_string(&path).expect("read shallow.rs");
     assert!(

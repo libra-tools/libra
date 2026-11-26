@@ -866,7 +866,7 @@ mod tests {
         assert!(captured.is_file());
         assert!(!captured.is_dir());
         assert!(!captured.is_symlink());
-        assert!(captured.len() > 0);
+        assert!(!captured.is_empty());
     }
 
     #[test]

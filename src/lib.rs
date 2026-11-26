@@ -33,7 +33,20 @@ pub mod lfs_structs;
 pub mod storage;
 pub mod utils;
 
+pub use libra_core::{cli_error, info_println};
 pub use utils::error::{CliError, CliErrorKind, CliResult};
+
+/// Install root-owned runtime hooks into `libra-core` (idempotent).
+///
+/// Called automatically from CLI dispatch, `command::load_object`,
+/// `command::get_target_commit`, and all direct `utils::util` revision
+/// resolution entrypoints so promisor lazy fetch never silently degrades when
+/// callers bypass `cli::parse`.
+pub(crate) fn ensure_runtime_hooks() {
+    libra_core::internal::lazy_fetch::register_lazy_fetch_hook(
+        crate::command::try_lazy_fetch_object,
+    );
+}
 
 /// Execute a Libra command synchronously.
 ///

@@ -114,7 +114,7 @@ flowchart LR
 ---
 
 ### `WSM-02B`: 解耦 `libra-core` 60 `prod` + 38 `test` 反边并剥离 `crates/libra-core`（`WSM-04` 必须前置底座）
-- **Lifecycle:** `pending` | **Acceptance:** `unverified`
+- **Lifecycle:** `in-progress` | **Acceptance:** `locally-verified`（2026-11-25 于分支 `feat/wsm-02b-workspace-libra-core` 完成实施、本地门禁验证与代码复核；设计方案与最终代码均经 `pi` `codex/gpt-6-luna` 复核通过（设计 R4 `VERDICT: PASS`，代码 R5 `VERDICT: PASS`, P0=0/P1=0/P2=0）；`cargo clippy --all-targets --all-features -- -D warnings`、`cargo doc --no-deps --all-features`、`cargo test --doc --workspace`、`cargo build --locked --release --features keyring`、`cargo check -p libra-core --features fastcdc,otlp,keyring,test-upgrade,test-bridge-hooks,test-live-agent`、`cargo nextest run -p libra-core --lib`、全部 18 个 `compat_*` / `db_migration_test` 守卫 + `worktree_doctor_test` 13/13、4 项新增回归测试及 1-to-1 双射均通过；待用户授权提交与合入）
 - **Dependencies:** `WSM-02`
 - **Write Set:** 根 `Cargo.toml`、`Cargo.lock`、`crates/libra-core/**`（含 `build.rs` 导出 `LIBRA_WORKSPACE_ROOT`）、`src/internal/{db,core}/**`（`repo_hooks.rs` 留在根包）、`src/utils/**`（`convert.rs` 留在根包）、`src/common_utils.rs`、`src/internal/protocol/https_client.rs`、`src/command/{index_pack,replace,status,status_probe,status_io_worker,worktree,config,mod}.rs`（原语下沉与 re-export）、**13 个固定路径 `tests/compat/*` 文件**（见审计第 6 节，含 `compat_object_hash_parsing_guard.rs:50,55,65`）、`tests/SRC_SERIAL_REGISTRY.tsv`（37 条）、`tests/SRC_SERIAL_CENSUS.tsv`（126 条）、2 处 `libra::` doctest（`utils/{telemetry,worktree}.rs`）
 - **Deliverables:**

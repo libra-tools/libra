@@ -255,7 +255,7 @@ async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64>, M
 fn every_migration_sql_file_is_referenced_by_the_registry() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let migrations_dir = PathBuf::from(manifest_dir).join("sql/migrations");
-    let db_src_dir = PathBuf::from(manifest_dir).join("src/internal/db");
+    let db_src_dir = PathBuf::from(manifest_dir).join("crates/libra-core/src/internal/db");
 
     let mut files = std::fs::read_dir(&migrations_dir)
         .expect("read sql/migrations")

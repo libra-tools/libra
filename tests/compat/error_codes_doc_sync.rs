@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 
-const ERROR_RS: &str = include_str!("../../src/utils/error.rs");
+const ERROR_RS: &str = include_str!("../../crates/libra-core/src/utils/error.rs");
 const ERROR_DOC: &str = include_str!("../../docs/error-codes.md");
 
 fn collect_code_literals(src: &str) -> BTreeSet<String> {

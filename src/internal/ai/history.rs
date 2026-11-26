@@ -103,7 +103,7 @@ use crate::{
 /// from `git gc` — the branch acts as a GC root.
 ///
 /// In the database, this is stored with kind='Branch' and name='libra/intent'.
-pub const AI_REF: &str = "libra/intent";
+pub use libra_core::internal::metadata_types::AI_REF;
 /// Maximum attempts to retry a SQLite operation that returns a transient
 /// "database is locked" error before propagating the failure.
 const SQLITE_BUSY_MAX_RETRIES: usize = 15;

@@ -835,8 +835,8 @@ async fn worktree_doctor_prefers_catalog_session_id_over_provider_id_collision()
 fn worktree_doctor_hints_are_inspect_only() {
     let mut sources = super::worktree_test::worktree_production_sources();
     sources.push((
-        Path::new("src/internal/workspace.rs").to_path_buf(),
-        include_str!("../../src/internal/workspace.rs").to_owned(),
+        Path::new("crates/libra-core/src/internal/workspace.rs").to_path_buf(),
+        include_str!("../../crates/libra-core/src/internal/workspace.rs").to_owned(),
     ));
     for (name, source) in sources {
         for (index, line) in source.lines().enumerate() {

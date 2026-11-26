@@ -578,7 +578,7 @@ pub const CHECKPOINT_CONTENT_HASH_COVERAGE: [&str; 4] = [
 /// layer 3): per-checkpoint entry count, manifest-byte and total-byte caps.
 /// Exceeding any budget fails the write closed — never a silent truncation.
 pub const REASONING_ARTIFACT_MAX_ENTRIES: usize = 512;
-pub const REASONING_ARTIFACT_MANIFEST_MAX_BYTES: usize = 256 * 1024;
+pub use libra_core::internal::metadata_types::REASONING_ARTIFACT_MANIFEST_MAX_BYTES;
 pub const REASONING_ARTIFACT_TOTAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// One opaque ciphertext artifact declared by the RG-02 writer: the

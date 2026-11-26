@@ -37,11 +37,20 @@ fn otlp_feature_stays_out_of_default() {
 
 #[test]
 fn otlp_use_sites_stay_cfg_gated() {
+    let core_utils_mod = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/libra-core/src/utils/mod.rs"
+    ))
+    .expect("read libra-core utils/mod.rs");
+    assert!(
+        core_utils_mod.contains("#[cfg(feature = \"otlp\")]\npub mod telemetry;"),
+        "the libra-core utils::telemetry module must stay feature-gated"
+    );
     let utils_mod = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/utils/mod.rs"))
         .expect("read utils/mod.rs");
     assert!(
-        utils_mod.contains("#[cfg(feature = \"otlp\")]\npub mod telemetry;"),
-        "the telemetry module must stay feature-gated"
+        utils_mod.contains("#[cfg(feature = \"otlp\")]\npub use libra_core::utils::telemetry;"),
+        "the root utils::telemetry re-export must stay feature-gated"
     );
     let main_rs = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
         .expect("read main.rs");

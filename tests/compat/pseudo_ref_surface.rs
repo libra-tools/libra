@@ -76,7 +76,7 @@ fn the_rev_parse_row_declares_every_pseudo_ref_name() {
 /// compares it to the literal list above, and to the names the row declares.
 #[test]
 fn the_service_declares_exactly_the_same_names() {
-    let source = include_str!("../../src/internal/pseudo_ref.rs");
+    let source = include_str!("../../crates/libra-core/src/internal/pseudo_ref.rs");
     let all = source
         .split_once("pub const ALL: [PseudoRef; ")
         .expect("`PseudoRef::ALL` is the declared set")

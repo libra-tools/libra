@@ -35,8 +35,11 @@ fn keyring_feature_stays_out_of_default() {
 
 #[test]
 fn keyring_use_sites_stay_cfg_gated() {
-    let auth_rs = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal/auth.rs"))
-        .expect("read auth.rs");
+    let auth_rs = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/libra-core/src/internal/auth.rs"
+    ))
+    .expect("read auth.rs");
     assert!(
         auth_rs.contains("#[cfg(feature = \"keyring\")]\nmod keyring_backend {"),
         "the keyring backend module must stay feature-gated"
