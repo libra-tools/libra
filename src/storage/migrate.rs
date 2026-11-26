@@ -43843,7 +43843,12 @@ async fn export_reverse_git_tables_to_sqlite(
         sync_reverse_sqlite_sequence(conn, r, "config_kv", seq).await?;
     }
 
-    // 4. metadata_kv
+    // 4. metadata_kv (clear migration-seeded rows such as stash_generation_fence
+    // so git.redb remains the exact authoritative source without UNIQUE collisions)
+    sea_orm::sqlx::query("DELETE FROM metadata_kv")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| map_reverse_sqlite_write_err(r, "metadata_kv", e))?;
     stream_redb_to_sqlite!(
         git_wtx,
         &existing,
@@ -53197,6 +53202,368 @@ async fn migrate_config_scope_inner(
             }
         }
     }
+}
+
+// ============================================================================
+// RB-11c: Strictly Read-Only `--dry-run` Migration Inspector (Zero Disk Writes)
+// ============================================================================
+
+/// Per-table row count summary reported by [`MigrationDryRunReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationDryRunTableStat {
+    /// Logical database label (`"git"`, `"capture"`, `"global_config"`, `"system_config"`).
+    pub database: &'static str,
+    /// Table name in the source database.
+    pub table: String,
+    /// Number of rows currently stored in this table.
+    pub row_count: u64,
+}
+
+/// Strictly read-only migration preview produced without writing or creating any file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationDryRunReport {
+    /// Logical migration scope (`"repository"`, `"global_config"`, `"system_config"`).
+    pub scope: &'static str,
+    /// Requested target backend.
+    pub target_backend: StorageBackendKind,
+    /// Currently authoritative backend on disk, if determined.
+    pub current_backend: Option<StorageBackendKind>,
+    /// `true` when the scope is already finalized on `target_backend`.
+    pub already_on_target: bool,
+    /// `true` when an unfinalized (`finalized == false`) manifest exists on disk.
+    pub manifest_pending: bool,
+    /// Per-table row counts collected from the source database(s).
+    pub tables: Vec<MigrationDryRunTableStat>,
+    /// Sum of `row_count` across all inspected tables.
+    pub total_rows: u64,
+    /// Combined byte size of source database file(s) on disk.
+    pub source_bytes: u64,
+    /// Estimated byte size of the target database file(s) after migration.
+    pub estimated_target_bytes: u64,
+}
+
+fn estimate_migrated_bytes(source_bytes: u64, target: StorageBackendKind) -> u64 {
+    if source_bytes == 0 {
+        return 0;
+    }
+    let scaled = match target {
+        StorageBackendKind::Redb => (u128::from(source_bytes) * 12) / 10,
+        StorageBackendKind::Sqlite => (u128::from(source_bytes) * 9) / 10,
+    };
+    let clamped = scaled.clamp(4096, u128::from(u64::MAX));
+    clamped as u64
+}
+
+fn file_size_if_present(path: &Path) -> StorageResult<u64> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(meta.len()),
+        Ok(_) => Ok(0),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(StorageBackendError::io(
+            "inspect source database size for dry-run",
+            err,
+        )),
+    }
+}
+
+async fn inspect_sqlite_tables_readonly_no_write(
+    path: &Path,
+    db_label: &'static str,
+    out_tables: &mut Vec<MigrationDryRunTableStat>,
+) -> StorageResult<u64> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "stat sqlite database for dry-run",
+                err,
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("dry-run source `{db_label}` database must be a regular file"),
+        });
+    }
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    let wal_len = file_size_if_present(&wal_path)?;
+    let total_bytes = meta.len().saturating_add(wal_len);
+    if meta.len() == 0 {
+        return Ok(total_bytes);
+    }
+
+    // Use `immutable(true)` whenever no active WAL sidecar exists so SQLite
+    // cannot create `-shm` or touch the parent directory even on read-only media.
+    let mut opts = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .busy_timeout(Duration::from_secs(2));
+    if wal_len == 0 {
+        opts = opts.immutable(true);
+    }
+    let mut conn = opts
+        .connect()
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("dry-run failed to open `{db_label}` SQLite read-only: {err}"),
+        })?;
+
+    let table_names: Vec<String> = sea_orm::sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!("dry-run failed to list `{db_label}` SQLite tables: {err}"),
+    })?;
+
+    for table in table_names {
+        if table == SQLITE_MIGRATED_FENCE_TABLE {
+            continue;
+        }
+        let escaped = table.replace('"', "\"\"");
+        let sql = format!("SELECT COUNT(*) FROM \"{escaped}\"");
+        let count: i64 = sea_orm::sqlx::query_scalar(sea_orm::sqlx::AssertSqlSafe(sql))
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("dry-run failed to count rows in `{db_label}.{table}`: {err}"),
+            })?;
+        out_tables.push(MigrationDryRunTableStat {
+            database: db_label,
+            table,
+            row_count: u64::try_from(count).unwrap_or(0),
+        });
+    }
+    let _ = conn.close().await;
+    Ok(total_bytes)
+}
+
+fn inspect_redb_tables_readonly_no_write(
+    path: &Path,
+    role: DatabaseRole,
+    db_label: &'static str,
+    out_tables: &mut Vec<MigrationDryRunTableStat>,
+) -> StorageResult<u64> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "stat redb database for dry-run",
+                err,
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("dry-run source `{db_label}` redb file must be a regular file"),
+        });
+    }
+    use redb::ReadableDatabase as _;
+    let db = open_redb_read_only(path, role)?;
+    let rtx = db
+        .begin_read()
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("dry-run failed to begin read tx on `{db_label}` redb: {err}"),
+        })?;
+    let mut table_names = Vec::new();
+    let handles = rtx
+        .list_tables()
+        .map_err(|err| map_redb_storage_err(err, "list redb tables for dry-run"))?;
+    for handle in handles {
+        let name = handle.name().to_string();
+        let table =
+            rtx.open_untyped_table(handle)
+                .map_err(|err| StorageBackendError::BackendInternal {
+                    detail: format!("dry-run failed to open redb table `{name}`: {err}"),
+                })?;
+        let row_count = table
+            .len()
+            .map_err(|err| map_redb_storage_err(err, "count redb table rows for dry-run"))?;
+        table_names.push((name, row_count));
+    }
+    table_names.sort_by(|a, b| a.0.cmp(&b.0));
+    for (table, row_count) in table_names {
+        out_tables.push(MigrationDryRunTableStat {
+            database: db_label,
+            table,
+            row_count,
+        });
+    }
+    Ok(meta.len())
+}
+
+/// Strictly read-only dry-run inspection for a repository's `<common_storage>`
+/// directory (`RB-11c` AC3). Never creates or modifies any file on disk.
+pub async fn dry_run_repository_migration(
+    common_storage: &Path,
+    target: StorageBackendKind,
+) -> StorageResult<MigrationDryRunReport> {
+    let manifest_opt = crate::storage::manifest::read_storage_manifest(common_storage)?;
+    let (current_backend, manifest_pending, redb_paths_opt) = match &manifest_opt {
+        Some(m) if !m.finalized => (Some(m.backend), true, None),
+        Some(m) => {
+            let paths = if m.backend == StorageBackendKind::Redb {
+                crate::storage::manifest::resolve_redb_generation_paths(common_storage)?
+            } else {
+                None
+            };
+            (Some(m.backend), false, paths)
+        }
+        None => {
+            let legacy = git_sqlite_db_path(common_storage);
+            if legacy.exists() {
+                (Some(StorageBackendKind::Sqlite), false, None)
+            } else {
+                (None, false, None)
+            }
+        }
+    };
+
+    let already_on_target = !manifest_pending && current_backend == Some(target);
+    let mut tables = Vec::new();
+    let mut source_bytes = 0u64;
+
+    if !already_on_target && !manifest_pending {
+        match target {
+            StorageBackendKind::Redb => {
+                let git_db = git_sqlite_db_path(common_storage);
+                source_bytes = source_bytes.saturating_add(
+                    inspect_sqlite_tables_readonly_no_write(&git_db, "git", &mut tables).await?,
+                );
+                let cap_db = capture_sqlite_db_path(common_storage);
+                source_bytes = source_bytes.saturating_add(
+                    inspect_sqlite_tables_readonly_no_write(&cap_db, "capture", &mut tables)
+                        .await?,
+                );
+            }
+            StorageBackendKind::Sqlite => {
+                if let Some(paths) = redb_paths_opt {
+                    source_bytes =
+                        source_bytes.saturating_add(inspect_redb_tables_readonly_no_write(
+                            &paths.git_db_path,
+                            DatabaseRole::Repository,
+                            "git",
+                            &mut tables,
+                        )?);
+                    if paths.capture_db_path.exists() {
+                        source_bytes =
+                            source_bytes.saturating_add(inspect_redb_tables_readonly_no_write(
+                                &paths.capture_db_path,
+                                DatabaseRole::Capture,
+                                "capture",
+                                &mut tables,
+                            )?);
+                    }
+                }
+            }
+        }
+    }
+
+    let total_rows = tables.iter().map(|t| t.row_count).sum();
+    let estimated_target_bytes = estimate_migrated_bytes(source_bytes, target);
+
+    Ok(MigrationDryRunReport {
+        scope: "repository",
+        target_backend: target,
+        current_backend,
+        already_on_target,
+        manifest_pending,
+        tables,
+        total_rows,
+        source_bytes,
+        estimated_target_bytes,
+    })
+}
+
+/// Strictly read-only dry-run inspection for a `GlobalConfig` or `SystemConfig`
+/// scope directory (`RB-11c` AC3). Never creates or modifies any file on disk.
+pub async fn dry_run_config_scope_migration(
+    role: DatabaseRole,
+    scope_dir: &Path,
+    target: StorageBackendKind,
+) -> StorageResult<MigrationDryRunReport> {
+    validate_config_migration_role(role)?;
+    let scope_label = match role {
+        DatabaseRole::GlobalConfig => "global_config",
+        DatabaseRole::SystemConfig => "system_config",
+        _ => "config",
+    };
+
+    let manifest_opt = crate::storage::config_store::read_config_format_manifest(scope_dir, role)?;
+    let (current_backend, manifest_pending) = match &manifest_opt {
+        Some(m) if !m.finalized => (Some(m.backend), true),
+        Some(m) => (Some(m.backend), false),
+        None => {
+            let sqlite_path =
+                crate::storage::config_store::config_sqlite_path_in_scope_dir(scope_dir);
+            let redb_path = crate::storage::config_store::config_redb_path_in_scope_dir(scope_dir);
+            if sqlite_path.exists()
+                && !crate::storage::config_store::is_config_sqlite_tombstone_sentinel(&sqlite_path)?
+            {
+                (Some(StorageBackendKind::Sqlite), false)
+            } else if redb_path.exists() {
+                (Some(StorageBackendKind::Redb), false)
+            } else {
+                (None, false)
+            }
+        }
+    };
+
+    let already_on_target = !manifest_pending && current_backend == Some(target);
+    let mut tables = Vec::new();
+    let mut source_bytes = 0u64;
+
+    if !already_on_target && !manifest_pending {
+        match target {
+            StorageBackendKind::Redb => {
+                let sqlite_path =
+                    crate::storage::config_store::config_sqlite_path_in_scope_dir(scope_dir);
+                if sqlite_path.exists()
+                    && !crate::storage::config_store::is_config_sqlite_tombstone_sentinel(
+                        &sqlite_path,
+                    )?
+                {
+                    source_bytes = inspect_sqlite_tables_readonly_no_write(
+                        &sqlite_path,
+                        scope_label,
+                        &mut tables,
+                    )
+                    .await?;
+                }
+            }
+            StorageBackendKind::Sqlite => {
+                let redb_path =
+                    crate::storage::config_store::config_redb_path_in_scope_dir(scope_dir);
+                if redb_path.exists() {
+                    source_bytes = inspect_redb_tables_readonly_no_write(
+                        &redb_path,
+                        role,
+                        scope_label,
+                        &mut tables,
+                    )?;
+                }
+            }
+        }
+    }
+
+    let total_rows = tables.iter().map(|t| t.row_count).sum();
+    let estimated_target_bytes = estimate_migrated_bytes(source_bytes, target);
+
+    Ok(MigrationDryRunReport {
+        scope: scope_label,
+        target_backend: target,
+        current_backend,
+        already_on_target,
+        manifest_pending,
+        tables,
+        total_rows,
+        source_bytes,
+        estimated_target_bytes,
+    })
 }
 
 #[cfg(test)]

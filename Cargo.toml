@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "libra"
-version = "0.30.551"
+version = "0.30.552"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -205,6 +205,11 @@ jsonschema = { version = "=0.59.0", default-features = false }
 # Compatibility-surface integration tests live under tests/compat/. Cargo's
 # default test discovery only picks up *.rs directly under tests/, so each
 # compat surface file must be registered here.
+[[bin]]
+name = "libra-migrate"
+path = "src/bin/libra_migrate.rs"
+required-features = ["storage-sqlite", "storage-redb"]
+
 [[test]]
 name = "agent_native_origin_test"
 path = "tests/agent_native_origin_test.rs"

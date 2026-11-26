@@ -305,3 +305,80 @@ jobs:
   # inside a single run), so the merge is the correctness-preserving shape.
   # Rollback: revert the commit that removed the job (ADR-NP-02).
 
+  compat-redb-storage:
+    name: compat-redb-storage
+
+    runs-on: [self-hosted]
+
+    timeout-minutes: 120
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "1"
+      RUST_MIN_STACK: "16777216"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Ensure GPUI native libraries
+        shell: bash
+        run: bash .github/scripts/ensure-gpui-build-deps.sh
+
+      - name: Preserve Rust toolchain cache paths
+        shell: bash
+        run: |
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+
+      - name: Prepare isolated test home
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/libra-redb-ci-home/.config"
+          chmod 700 "$RUNNER_TEMP/libra-redb-ci-home" "$RUNNER_TEMP/libra-redb-ci-home/.config"
+          scratch="$(mktemp -d /tmp/libra-redb-ci-scratch.XXXXXXXX)"
+          chmod 700 "$scratch"
+          echo "LIBRA_TEST_SCRATCH_DIR=$scratch" >> "$GITHUB_ENV"
+
+      - name: Install cargo-nextest (pinned 0.9.143)
+        run: |
+          if cargo nextest --version 2>/dev/null | grep -q "^cargo-nextest 0.9.143"; then
+            echo "cargo-nextest 0.9.143 already installed"
+          else
+            cargo install cargo-nextest --version 0.9.143 --locked --force
+          fi
+          cargo nextest --version
+
+      - name: Run isolated redb storage stack checks (RB-12)
+        env:
+          HOME: ${{ runner.temp }}/libra-redb-ci-home
+          USERPROFILE: ${{ runner.temp }}/libra-redb-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/libra-redb-ci-home/.config
+        run: |
+          set -euo pipefail
+          umask 0022
+          # 1. SQLite-only storage unit suite
+          cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'
+          # 2. Redb-only storage unit suite (implicitly validates storage-redb -> storage-queue)
+          cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(/^storage::/)'
+          # 3. Redb-only 32-producer + concurrent MVCC readers/writers stress test
+          cargo nextest run --no-tests=fail --no-default-features --features storage-redb --test storage_concurrency_stress_test -E 'test(=multiprocess_32_producers_and_concurrent_mvcc_readers_writers)'
+          # 4. Dual-feature storage unit suite
+          cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(/^storage::/)'
+          # 5. Dual-feature libra-migrate CLI unit suite
+          cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --bin libra-migrate
+          # 6. Dual-feature migration stress roundtrip & pre-unlock binary gate
+          cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --test storage_concurrency_stress_test -E 'test(=dual_feature_migration_and_stress_roundtrip) | test(=pre_unlock_libra_migrate_binary_rejects_cutover_with_libra_test_env)'
+
+      - name: Clean up CI scratch
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${LIBRA_TEST_SCRATCH_DIR:-}" ]; then
+            rm -rf "$LIBRA_TEST_SCRATCH_DIR"
+          fi
+
