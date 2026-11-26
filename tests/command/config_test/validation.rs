@@ -367,3 +367,23 @@ fn test_cf_31_predicates() {
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"));
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_36_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let ok = run_libra_command(
+        &["--json", "config", "--local", "user.name", "X"],
+        repo.path(),
+    );
+    assert_cli_success(&ok, "json success");
+    let parsed: serde_json::Value = serde_json::from_slice(&ok.stdout).expect("json");
+    assert_eq!(parsed["exit_code"], 0, "success exit_code: {parsed}");
+
+    let err = run_libra_command(&["--json", "config", "get", "nosuchkey"], repo.path());
+    assert_eq!(err.status.code(), Some(1));
+    let parsed: serde_json::Value = serde_json::from_slice(&err.stderr).expect("json error");
+    assert_eq!(parsed["error_code"], "LBR-CLI-002");
+    assert_eq!(parsed["exit_code"], 1);
+}

@@ -109,6 +109,7 @@ fn write_json_command_envelope<W: Write, T: Serialize>(
     let envelope = normalize_json_value(serde_json::json!({
         "ok": true,
         "command": command,
+        "exit_code": 0,
         "data": data,
     }));
     match format {
