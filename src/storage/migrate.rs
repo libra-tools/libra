@@ -29750,7 +29750,7 @@ async fn verify_quiesced_connection_ready_for_fence(
     source: &mut QuiescedSqliteConnection,
 ) -> StorageResult<()> {
     let role = source.role;
-    validate_repository_forward_role(role)?;
+    validate_any_migration_role(role)?;
     verify_connection_not_moved(&mut source.conn, role).await?;
 
     let wal_path = sqlite_sidecar_path(&source.path, "-wal");
@@ -50388,7 +50388,7 @@ fn open_verified_backup_redb_readonly_wtx(
         })?;
     let backend = ReverseNonBlockingFileBackend::new(file);
     let (db, _ctrl) = open_reverse_redb_with_backend(backend, role)?;
-    let wtx = try_begin_reverse_source_write_tx(&db, role)?;
+    let wtx = begin_checked_write_blocking(&db, role, Duration::ZERO)?;
     Ok((db, wtx))
 }
 
@@ -51495,6 +51495,1707 @@ async fn resume_reverse_migration_inner(
             already_finalized: false,
             durability,
         })
+    }
+}
+
+// ============================================================================
+// GlobalConfig & SystemConfig Bidirectional Offline Migration & Crash Recovery
+// (`ADR-RB-02` #2, `ADR-RB-07` #3, `GC-13`, `RB-11b`, `RB-11v`, `RB-11k`,
+// `RB-11w`, `RB-11f`, `RB-11n`, `RB-11g`, `RB-11o`)
+// ============================================================================
+
+/// Direction of a `GlobalConfig` / `SystemConfig` scoped configuration migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigMigrationDirection {
+    /// Forward migration (`config.db` SQLite -> `config.redb` Redb) with
+    /// permanent in-place read-only (`0400`/`0444`) fenced `config.db` tombstone.
+    ForwardSqliteToRedb,
+    /// Reverse migration (`config.redb` Redb -> `config.db` SQLite) replacing
+    /// the in-place tombstone with an authoritative `0600`/`0644` `config.db`.
+    ReverseRedbToSqlite,
+}
+
+/// Summary report returned after [`migrate_global_config`],
+/// [`migrate_system_config`], [`migrate_config_scope`], or
+/// [`resume_config_scope_migration`].
+#[derive(Debug, Clone)]
+pub struct ConfigMigrationReport {
+    /// Migrated configuration role (`GlobalConfig` or `SystemConfig`).
+    pub role: DatabaseRole,
+    /// Direction executed.
+    pub direction: ConfigMigrationDirection,
+    /// Authoritative scope generation recorded in `config-format.json`.
+    pub generation: u64,
+    /// Final persisted `config-format.json` (`finalized = true`).
+    pub manifest: crate::storage::config_store::ConfigFormatManifest,
+    /// Rows transferred in legacy `config` table.
+    pub config_rows_migrated: u64,
+    /// Rows transferred in `config_kv` table.
+    pub config_kv_rows_migrated: u64,
+    /// Rows transferred in `configuration_schema_versions` table.
+    pub schema_version_rows_migrated: u64,
+    /// Path to the verified backup file (if a backup was produced/verified).
+    pub backup_path: Option<PathBuf>,
+    /// Verified streaming SHA-256 of the backup file.
+    pub backup_sha256: Option<String>,
+    /// `true` if execution resumed from an interrupted `finalized = false` manifest.
+    pub resumed_from_unfinalized: bool,
+    /// `true` if SQLite hot rollback journal recovery occurred on `config.db`.
+    pub hot_journal_recovered: bool,
+    /// `true` if scope was already finalized at the requested target backend.
+    pub already_at_target: bool,
+}
+
+#[cfg(test)]
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigMigrationTestStage {
+    AfterExclusiveLockAcquired,
+    AfterForwardPendingManifest,
+    AfterForwardFencedBeforeStaged,
+    AfterForwardStagedBeforeRename,
+    AfterForwardRenamedBeforeFinalize,
+    AfterReversePendingManifest,
+    AfterReverseRedbFencedBeforeUnlink,
+    AfterReverseRedbUnlinkedBeforeStaged,
+    AfterReverseStagedBeforeRename,
+    AfterReverseRenamedBeforeFinalize,
+}
+
+#[cfg(test)]
+trait ConfigMigrationTestObserver {
+    fn on_stage(
+        &mut self,
+        stage: ConfigMigrationTestStage,
+        scope_dir: &Path,
+        role: DatabaseRole,
+    ) -> StorageResult<()>;
+}
+
+fn config_redb_tmp_path_in_scope(scope_dir: &Path) -> PathBuf {
+    scope_dir.join("config.redb.tmp")
+}
+
+fn config_sqlite_tmp_path_in_scope(scope_dir: &Path) -> PathBuf {
+    scope_dir.join("config.db.tmp")
+}
+
+fn config_sqlite_backup_path_in_scope(scope_dir: &Path, generation: u64) -> PathBuf {
+    scope_dir
+        .join(SQLITE_BACKUP_SUBDIR)
+        .join(format!("gen-{}", format_generation_id(generation)))
+        .join(crate::storage::config_store::CONFIG_SQLITE_FILE_NAME)
+}
+
+fn config_redb_backup_path_in_scope(scope_dir: &Path, generation: u64) -> PathBuf {
+    scope_dir
+        .join(REDB_BACKUP_SUBDIR)
+        .join(format!("gen-{}", format_generation_id(generation)))
+        .join(crate::storage::config_store::CONFIG_REDB_FILE_NAME)
+}
+
+fn validate_config_migration_role(role: DatabaseRole) -> StorageResult<()> {
+    match role {
+        DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => Ok(()),
+        other => Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "configuration scope migration rejected role {other}: expected GlobalConfig or SystemConfig"
+            ),
+        }),
+    }
+}
+
+fn apply_config_file_mode(
+    path: &Path,
+    role: DatabaseRole,
+    is_tombstone: bool,
+) -> StorageResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if is_tombstone {
+            crate::storage::config_store::expected_config_tombstone_mode(role)
+        } else {
+            crate::storage::config_store::expected_config_file_mode(role)
+        }
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: format!("no defined POSIX permission mode for {role}"),
+        })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|err| StorageBackendError::io("chmod config scope database file", err))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = role;
+        let mut perms = fs::metadata(path)
+            .map_err(|err| StorageBackendError::io("stat config scope database file", err))?
+            .permissions();
+        perms.set_readonly(is_tombstone);
+        fs::set_permissions(path, perms)
+            .map_err(|err| StorageBackendError::io("set readonly flag on config file", err))?;
+    }
+    Ok(())
+}
+
+fn clear_readonly_if_present(path: &Path, role: DatabaseRole) -> StorageResult<()> {
+    if fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+    apply_config_file_mode(path, role, false)
+}
+
+/// Canonical logical SHA-256 across the 3 configuration SQLite source tables
+/// (`config`, `config_kv`, `configuration_schema_versions`) on `c_mig`.
+async fn compute_config_sqlite_logical_sha256(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+) -> StorageResult<String> {
+    use sea_orm::sqlx::Row as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"LIBRA_CONFIG_SQLITE_LOGICAL_SHA256_V1\0");
+
+    // 1. configuration_schema_versions
+    hash_len_prefixed_bytes(&mut hasher, b"configuration_schema_versions");
+    if sqlite_table_exists_on_conn(conn, role, "configuration_schema_versions").await? {
+        let rows = sea_orm::sqlx::query(
+            "SELECT version, name, applied_at FROM configuration_schema_versions ORDER BY version ASC",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| map_reverse_sqlite_write_err(role, "configuration_schema_versions", e))?;
+        hasher.update((rows.len() as u64).to_le_bytes());
+        for row in rows {
+            let v: i64 = row.try_get(0).unwrap_or(0);
+            let name: String = row.try_get(1).unwrap_or_default();
+            let applied: String = row.try_get(2).unwrap_or_default();
+            hasher.update(v.to_le_bytes());
+            hash_len_prefixed_bytes(&mut hasher, name.as_bytes());
+            hash_len_prefixed_bytes(&mut hasher, applied.as_bytes());
+        }
+    }
+
+    // 2. config (legacy table)
+    hash_len_prefixed_bytes(&mut hasher, b"config");
+    if sqlite_table_exists_on_conn(conn, role, "config").await? {
+        let mut last_id = i64::MIN;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT id, configuration, name, \"key\", value FROM config \
+                 WHERE id > ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(last_id)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let id: i64 = row.try_get(0).unwrap_or(0);
+                last_id = id;
+                let cfg: String = row.try_get(1).unwrap_or_default();
+                let name: Option<String> = row.try_get(2).ok().flatten();
+                let key: String = row.try_get(3).unwrap_or_default();
+                let val: String = row.try_get(4).unwrap_or_default();
+                hasher.update(id.to_le_bytes());
+                hash_len_prefixed_bytes(&mut hasher, cfg.as_bytes());
+                match name {
+                    Some(n) => {
+                        hasher.update([1u8]);
+                        hash_len_prefixed_bytes(&mut hasher, n.as_bytes());
+                    }
+                    None => hasher.update([0u8]),
+                }
+                hash_len_prefixed_bytes(&mut hasher, key.as_bytes());
+                hash_len_prefixed_bytes(&mut hasher, val.as_bytes());
+            }
+        }
+    }
+
+    // 3. config_kv
+    hash_len_prefixed_bytes(&mut hasher, b"config_kv");
+    if sqlite_table_exists_on_conn(conn, role, "config_kv").await? {
+        let mut last_id = i64::MIN;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT id, \"key\", value, encrypted FROM config_kv \
+                 WHERE id > ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(last_id)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config_kv", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let id: i64 = row.try_get(0).unwrap_or(0);
+                last_id = id;
+                let key: String = row.try_get(1).unwrap_or_default();
+                let val: String = row.try_get(2).unwrap_or_default();
+                let enc: i64 = row.try_get(3).unwrap_or(0);
+                hasher.update(id.to_le_bytes());
+                hash_len_prefixed_bytes(&mut hasher, key.as_bytes());
+                hash_len_prefixed_bytes(&mut hasher, val.as_bytes());
+                hasher.update([u8::from(enc != 0)]);
+            }
+        }
+    }
+
+    Ok(sha256_hex_from_hasher(hasher))
+}
+
+/// Stream-export all 3 SQLite configuration tables (`config`, `config_kv`,
+/// `configuration_schema_versions`) from `conn` into staged `config.redb.tmp`
+/// in bounded `<= 500`-row batches with exact `RedbConfigStore` codecs and
+/// role POSIX permissions (`0600` Global / `0644` System).
+async fn export_config_sqlite_to_redb_tmp(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    redb_tmp_path: &Path,
+) -> StorageResult<(u64, u64, u64)> {
+    use sea_orm::sqlx::Row as _;
+
+    let _ = fs::remove_file(redb_tmp_path);
+    let mut builder = redb::Builder::new();
+    builder
+        .set_concurrency_mode(redb::ConcurrencyMode::MultiWriter)
+        .set_cache_size(FORWARD_MIGRATION_REDB_CACHE_BYTES);
+    let db = builder
+        .create(redb_tmp_path)
+        .map_err(|e| map_redb_database_err(e, role, "create staged config.redb.tmp"))?;
+    apply_config_file_mode(redb_tmp_path, role, false)?;
+
+    // Initialize `META_SCHEMA(role)` and all required tables in a single initial tx.
+    {
+        let wtx = begin_write_bounded_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+        init_meta_schema(&wtx, role)?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_LEGACY_TABLE)
+            .map_err(|e| map_redb_table_err(e, "init config table"))?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_KV_TABLE)
+            .map_err(|e| map_redb_table_err(e, "init config_kv table"))?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_KV_BY_KEY_INDEX)
+            .map_err(|e| map_redb_table_err(e, "init config_kv_by_key table"))?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_SCHEMA_VERSIONS_TABLE)
+            .map_err(|e| map_redb_table_err(e, "init configuration_schema_versions table"))?;
+        let _ = wtx
+            .open_table(redb_cfg::CONFIG_SEQ_TABLE)
+            .map_err(|e| map_redb_table_err(e, "init config_sequences table"))?;
+        wtx.commit()
+            .map_err(|e| map_redb_commit_err(e, "commit config.redb.tmp schema init"))?;
+    }
+
+    // 1. Stream `configuration_schema_versions`
+    let mut schema_count = 0u64;
+    if sqlite_table_exists_on_conn(conn, role, "configuration_schema_versions").await? {
+        let mut last_ver = i64::MIN;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT version, name, applied_at FROM configuration_schema_versions \
+                 WHERE version > ? ORDER BY version ASC LIMIT ?",
+            )
+            .bind(last_ver)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "configuration_schema_versions", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            let wtx = begin_checked_write_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+            {
+                let mut tbl = wtx
+                    .open_table(redb_cfg::CONFIG_SCHEMA_VERSIONS_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open configuration_schema_versions"))?;
+                for row in &rows {
+                    let version: i64 = row.try_get(0).map_err(|e| {
+                        map_reverse_sqlite_write_err(role, "configuration_schema_versions", e)
+                    })?;
+                    last_ver = version;
+                    let stored = MigSchemaReceiptStoredRow {
+                        name: row.try_get(1).unwrap_or_default(),
+                        applied_at: row.try_get(2).unwrap_or_default(),
+                    };
+                    let bytes = encode_versioned(redb_cfg::SCHEMA_RECEIPT_CODEC_VERSION, &stored)?;
+                    tbl.insert(version, bytes.as_slice()).map_err(|e| {
+                        map_redb_storage_err(e, "insert configuration_schema_versions")
+                    })?;
+                    schema_count = schema_count.saturating_add(1);
+                }
+            }
+            wtx.commit().map_err(|e| {
+                map_redb_commit_err(e, "commit configuration_schema_versions batch")
+            })?;
+        }
+    }
+
+    // 2. Stream `config` (legacy 3-column table)
+    let mut config_count = 0u64;
+    let mut config_max_id =
+        u64::try_from(read_sqlite_sequence_highwater(conn, role, "config").await?).unwrap_or(0);
+    if sqlite_table_exists_on_conn(conn, role, "config").await? {
+        let mut last_id = i64::MIN;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT id, configuration, name, \"key\", value FROM config \
+                 WHERE id > ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(last_id)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            let wtx = begin_checked_write_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+            {
+                let mut tbl = wtx
+                    .open_table(redb_cfg::CONFIG_LEGACY_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open config table"))?;
+                for row in &rows {
+                    let id_i64: i64 = row
+                        .try_get(0)
+                        .map_err(|e| map_reverse_sqlite_write_err(role, "config", e))?;
+                    last_id = id_i64;
+                    let id = u64::try_from(id_i64).map_err(|_| {
+                        StorageBackendError::BackendInternal {
+                            detail: "negative id in sqlite `config` table".to_string(),
+                        }
+                    })?;
+                    config_max_id = config_max_id.max(id);
+                    let entry = LegacyConfigEntry {
+                        configuration: row.try_get(1).unwrap_or_default(),
+                        name: row.try_get(2).ok().flatten(),
+                        key: row.try_get(3).unwrap_or_default(),
+                        value: row.try_get(4).unwrap_or_default(),
+                    };
+                    let bytes = encode_versioned(redb_cfg::CONFIG_LEGACY_CODEC_VERSION, &entry)?;
+                    tbl.insert(id, bytes.as_slice())
+                        .map_err(|e| map_redb_storage_err(e, "insert config"))?;
+                    config_count = config_count.saturating_add(1);
+                }
+            }
+            wtx.commit()
+                .map_err(|e| map_redb_commit_err(e, "commit config batch"))?;
+        }
+    }
+
+    // 3. Stream `config_kv` + `config_kv_by_key`
+    let mut kv_count = 0u64;
+    let mut kv_max_id =
+        u64::try_from(read_sqlite_sequence_highwater(conn, role, "config_kv").await?).unwrap_or(0);
+    if sqlite_table_exists_on_conn(conn, role, "config_kv").await? {
+        let mut last_id = i64::MIN;
+        let marker = encode_versioned(
+            redb_cfg::CONFIG_KV_INDEX_CODEC_VERSION,
+            &MigConfigKvIndexMarker {},
+        )?;
+        loop {
+            let rows = sea_orm::sqlx::query(
+                "SELECT id, \"key\", value, encrypted FROM config_kv \
+                 WHERE id > ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(last_id)
+            .bind(FORWARD_MIGRATION_STREAM_BATCH_ROWS as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config_kv", e))?;
+            if rows.is_empty() {
+                break;
+            }
+            let wtx = begin_checked_write_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+            {
+                let mut tbl = wtx
+                    .open_table(redb_cfg::CONFIG_KV_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open config_kv"))?;
+                let mut idx = wtx
+                    .open_table(redb_cfg::CONFIG_KV_BY_KEY_INDEX)
+                    .map_err(|e| map_redb_table_err(e, "open config_kv_by_key"))?;
+                for row in &rows {
+                    let id_i64: i64 = row
+                        .try_get(0)
+                        .map_err(|e| map_reverse_sqlite_write_err(role, "config_kv", e))?;
+                    last_id = id_i64;
+                    let id = u64::try_from(id_i64).map_err(|_| {
+                        StorageBackendError::BackendInternal {
+                            detail: "negative id in sqlite `config_kv` table".to_string(),
+                        }
+                    })?;
+                    kv_max_id = kv_max_id.max(id);
+                    let enc_i64: i64 = row.try_get(3).unwrap_or(0);
+                    let entry = MigConfigKvStoredRow {
+                        key: row.try_get(1).unwrap_or_default(),
+                        value: row.try_get(2).unwrap_or_default(),
+                        encrypted: enc_i64 != 0,
+                    };
+                    let bytes = encode_versioned(redb_cfg::CONFIG_KV_CODEC_VERSION, &entry)?;
+                    tbl.insert(id, bytes.as_slice())
+                        .map_err(|e| map_redb_storage_err(e, "insert config_kv"))?;
+                    idx.insert((entry.key.as_str(), id), marker.as_slice())
+                        .map_err(|e| map_redb_storage_err(e, "insert config_kv_by_key"))?;
+                    kv_count = kv_count.saturating_add(1);
+                }
+            }
+            wtx.commit()
+                .map_err(|e| map_redb_commit_err(e, "commit config_kv batch"))?;
+        }
+    }
+
+    // Persist monotonic sequence highwaters.
+    {
+        let wtx = begin_checked_write_blocking(&db, role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+        {
+            let mut seq = wtx
+                .open_table(redb_cfg::CONFIG_SEQ_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open config_sequences"))?;
+            let legacy_seq = encode_versioned(
+                redb_cfg::CONFIG_SEQ_CODEC_VERSION,
+                &MigConfigSequenceValue {
+                    last_id: config_max_id,
+                },
+            )?;
+            let kv_seq = encode_versioned(
+                redb_cfg::CONFIG_SEQ_CODEC_VERSION,
+                &MigConfigSequenceValue { last_id: kv_max_id },
+            )?;
+            seq.insert(MIG_SEQ_KEY_CONFIG_LEGACY, legacy_seq.as_slice())
+                .map_err(|e| map_redb_storage_err(e, "write config seq"))?;
+            seq.insert(MIG_SEQ_KEY_CONFIG_KV, kv_seq.as_slice())
+                .map_err(|e| map_redb_storage_err(e, "write config_kv seq"))?;
+        }
+        wtx.commit()
+            .map_err(|e| map_redb_commit_err(e, "commit config sequences"))?;
+    }
+
+    drop(db);
+    fsync_regular_file_nofollow(redb_tmp_path, "fsync staged config.redb.tmp")?;
+    // Verify staged `config.redb.tmp` opens cleanly as `RedbConfigStore`.
+    let _verify =
+        crate::storage::redb::config_store::RedbConfigStore::open_read_only(redb_tmp_path, role)?;
+    Ok((config_count, kv_count, schema_count))
+}
+
+/// Stream-export all 3 configuration tables (`config`, `config_kv`,
+/// `configuration_schema_versions`) from held `wtx` into staged SQLite
+/// `config.db.tmp` in bounded `<= 500`-row batches, verify `PRAGMA integrity_check == "ok"`,
+/// and `fsync`.
+async fn export_config_redb_to_sqlite_tmp(
+    wtx: &redb::WriteTransaction,
+    role: DatabaseRole,
+    sqlite_tmp_path: &Path,
+) -> StorageResult<(u64, u64, u64)> {
+    let _ = fs::remove_file(sqlite_tmp_path);
+    fs::write(sqlite_tmp_path, b"")
+        .map_err(|err| StorageBackendError::io("create staged config.db.tmp", err))?;
+    apply_config_file_mode(sqlite_tmp_path, role, false)?;
+
+    let mut conn = open_reverse_sqlite_tmp_conn_async(sqlite_tmp_path, role, false).await?;
+    let ddl = format!(
+        "{}\n{}\n{}",
+        crate::internal::db::schema::CONFIG_KV_SQL,
+        include_str!("../../sql/migrations/2026090601_legacy_config_table.sql"),
+        "CREATE TABLE IF NOT EXISTS configuration_schema_versions (\n\
+            version INTEGER PRIMARY KEY,\n\
+            name TEXT NOT NULL,\n\
+            applied_at TEXT NOT NULL\n\
+        );"
+    );
+    for stmt in ddl.split(';') {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        sea_orm::sqlx::query(AssertSqlSafe(trimmed.to_string()))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| map_reverse_sqlite_write_err(role, "config_ddl", e))?;
+    }
+
+    let existing_tables = list_existing_redb_tables(wtx)?;
+
+    // 1. Export `configuration_schema_versions`
+    let mut schema_count = 0u64;
+    if existing_tables.contains("configuration_schema_versions") {
+        let mut cursor: Option<i64> = None;
+        loop {
+            let mut batch: Vec<(i64, MigSchemaReceiptStoredRow)> = Vec::new();
+            {
+                let tbl = wtx
+                    .open_table(redb_cfg::CONFIG_SCHEMA_VERSIONS_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open configuration_schema_versions"))?;
+                let iter = match cursor {
+                    None => tbl.iter(),
+                    Some(last) => {
+                        tbl.range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                    }
+                }
+                .map_err(|e| map_redb_storage_err(e, "scan configuration_schema_versions"))?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(|e| {
+                        map_redb_storage_err(e, "read configuration_schema_versions")
+                    })?;
+                    let ver = k.value();
+                    let row: MigSchemaReceiptStoredRow =
+                        decode_versioned(v.value(), redb_cfg::SCHEMA_RECEIPT_CODEC_VERSION)?;
+                    cursor = Some(ver);
+                    batch.push((ver, row));
+                    if batch.len() >= FORWARD_MIGRATION_STREAM_BATCH_ROWS {
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut conn, role, "configuration_schema_versions").await?;
+            for (ver, row) in &batch {
+                sea_orm::sqlx::query(
+                    "INSERT INTO configuration_schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+                )
+                .bind(*ver)
+                .bind(&row.name)
+                .bind(&row.applied_at)
+                .execute(&mut conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(role, "configuration_schema_versions", e))?;
+                schema_count = schema_count.saturating_add(1);
+            }
+            commit_reverse_sqlite_batch(&mut conn, role, "configuration_schema_versions").await?;
+        }
+    }
+
+    // 2. Export `config` (legacy 3-column table)
+    let mut config_count = 0u64;
+    if existing_tables.contains("config") {
+        let mut cursor: Option<u64> = None;
+        loop {
+            let mut batch: Vec<(u64, LegacyConfigEntry)> = Vec::new();
+            {
+                let tbl = wtx
+                    .open_table(redb_cfg::CONFIG_LEGACY_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open config"))?;
+                let iter = match cursor {
+                    None => tbl.iter(),
+                    Some(last) => {
+                        tbl.range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                    }
+                }
+                .map_err(|e| map_redb_storage_err(e, "scan config"))?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(|e| map_redb_storage_err(e, "read config"))?;
+                    let id = k.value();
+                    let row: LegacyConfigEntry =
+                        decode_versioned(v.value(), redb_cfg::CONFIG_LEGACY_CODEC_VERSION)?;
+                    cursor = Some(id);
+                    batch.push((id, row));
+                    if batch.len() >= FORWARD_MIGRATION_STREAM_BATCH_ROWS {
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut conn, role, "config").await?;
+            for (id, row) in &batch {
+                let id_i64 =
+                    i64::try_from(*id).map_err(|_| StorageBackendError::BackendInternal {
+                        detail: "config id exceeds i64".to_string(),
+                    })?;
+                sea_orm::sqlx::query(
+                    "INSERT INTO config (id, configuration, name, \"key\", value) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(id_i64)
+                .bind(&row.configuration)
+                .bind(&row.name)
+                .bind(&row.key)
+                .bind(&row.value)
+                .execute(&mut conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(role, "config", e))?;
+                config_count = config_count.saturating_add(1);
+            }
+            commit_reverse_sqlite_batch(&mut conn, role, "config").await?;
+        }
+    }
+
+    // 3. Export `config_kv`
+    let mut kv_count = 0u64;
+    if existing_tables.contains("config_kv") {
+        let mut cursor: Option<u64> = None;
+        loop {
+            let mut batch: Vec<(u64, MigConfigKvStoredRow)> = Vec::new();
+            {
+                let tbl = wtx
+                    .open_table(redb_cfg::CONFIG_KV_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open config_kv"))?;
+                let iter = match cursor {
+                    None => tbl.iter(),
+                    Some(last) => {
+                        tbl.range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                    }
+                }
+                .map_err(|e| map_redb_storage_err(e, "scan config_kv"))?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(|e| map_redb_storage_err(e, "read config_kv"))?;
+                    let id = k.value();
+                    let row: MigConfigKvStoredRow =
+                        decode_versioned(v.value(), redb_cfg::CONFIG_KV_CODEC_VERSION)?;
+                    cursor = Some(id);
+                    batch.push((id, row));
+                    if batch.len() >= FORWARD_MIGRATION_STREAM_BATCH_ROWS {
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            begin_reverse_sqlite_batch(&mut conn, role, "config_kv").await?;
+            for (id, row) in &batch {
+                let id_i64 =
+                    i64::try_from(*id).map_err(|_| StorageBackendError::BackendInternal {
+                        detail: "config_kv id exceeds i64".to_string(),
+                    })?;
+                sea_orm::sqlx::query(
+                    "INSERT INTO config_kv (id, \"key\", value, encrypted) VALUES (?, ?, ?, ?)",
+                )
+                .bind(id_i64)
+                .bind(&row.key)
+                .bind(&row.value)
+                .bind(i64::from(row.encrypted))
+                .execute(&mut conn)
+                .await
+                .map_err(|e| map_reverse_sqlite_write_err(role, "config_kv", e))?;
+                kv_count = kv_count.saturating_add(1);
+            }
+            commit_reverse_sqlite_batch(&mut conn, role, "config_kv").await?;
+        }
+    }
+
+    // Sync `sqlite_sequence` from redb `config_sequences`.
+    if existing_tables.contains("config_sequences") {
+        let mut seq_pairs: Vec<(&'static str, i64)> = Vec::new();
+        {
+            let seq_tbl = wtx
+                .open_table(redb_cfg::CONFIG_SEQ_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open config_sequences"))?;
+            for key in [MIG_SEQ_KEY_CONFIG_LEGACY, MIG_SEQ_KEY_CONFIG_KV] {
+                if let Some(raw) = seq_tbl
+                    .get(key)
+                    .map_err(|e| map_redb_storage_err(e, "read config_sequences"))?
+                {
+                    let seq_val: MigConfigSequenceValue =
+                        decode_versioned(raw.value(), redb_cfg::CONFIG_SEQ_CODEC_VERSION)?;
+                    if let Ok(v) = i64::try_from(seq_val.last_id) {
+                        seq_pairs.push((key, v));
+                    }
+                }
+            }
+        }
+        for (tbl_name, seq_val) in seq_pairs {
+            sync_reverse_sqlite_sequence(&mut conn, role, tbl_name, seq_val).await?;
+        }
+    }
+
+    let ic_rows: Vec<String> = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_all(&mut conn)
+        .await
+        .map_err(|e| map_reverse_sqlite_write_err(role, "integrity_check", e))?;
+    if ic_rows.len() != 1 || ic_rows[0] != "ok" {
+        let _ = conn.close().await;
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("reverse config migration PRAGMA integrity_check failed for {role}"),
+        });
+    }
+    conn.close()
+        .await
+        .map_err(|e| StorageBackendError::BackendInternal {
+            detail: format!("reverse config migration failed closing config.db.tmp: {e}"),
+        })?;
+    fsync_regular_file_nofollow(sqlite_tmp_path, "fsync staged config.db.tmp")?;
+    Ok((config_count, kv_count, schema_count))
+}
+
+async fn verify_config_sqlite_file_integrity(path: &Path, role: DatabaseRole) -> StorageResult<()> {
+    let mut conn = open_reverse_sqlite_tmp_conn_async(path, role, true).await?;
+    let rows: Vec<String> = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+        .fetch_all(&mut conn)
+        .await
+        .map_err(|e| map_reverse_sqlite_write_err(role, "integrity_check", e))?;
+    let _ = conn.close().await;
+    if rows.len() != 1 || rows[0] != "ok" {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("config SQLite file failed PRAGMA integrity_check for {role}"),
+        });
+    }
+    Ok(())
+}
+
+/// Migrate `GlobalConfig` inside `scope_dir` to `target` (`Redb` or `Sqlite`),
+/// automatically resuming if an unfinalized `config-format.json` for `target`
+/// already exists (`RB-11b`, `RB-11k`, `RB-11f`, `RB-11n`, `RB-11g`, `RB-11o`).
+pub async fn migrate_global_config(
+    scope_dir: &Path,
+    target: StorageBackendKind,
+) -> StorageResult<ConfigMigrationReport> {
+    migrate_config_scope(DatabaseRole::GlobalConfig, scope_dir, target).await
+}
+
+/// Migrate `SystemConfig` inside `scope_dir` to `target` (`Redb` or `Sqlite`),
+/// automatically resuming if an unfinalized `config-format.json` for `target`
+/// already exists (`RB-11v`, `RB-11k`, `RB-11f`, `RB-11n`, `RB-11g`, `RB-11o`).
+pub async fn migrate_system_config(
+    scope_dir: &Path,
+    target: StorageBackendKind,
+) -> StorageResult<ConfigMigrationReport> {
+    migrate_config_scope(DatabaseRole::SystemConfig, scope_dir, target).await
+}
+
+/// Role-validated configuration scope migration entrypoint (`GC-13`).
+/// Rejects `Repository`, `Capture`, and `Derived` fail-closed.
+pub async fn migrate_config_scope(
+    role: DatabaseRole,
+    scope_dir: &Path,
+    target: StorageBackendKind,
+) -> StorageResult<ConfigMigrationReport> {
+    migrate_config_scope_inner(
+        role,
+        scope_dir,
+        target,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+/// Explicitly resume an interrupted `GlobalConfig` or `SystemConfig` migration
+/// recorded in `<scope_dir>/config-format.json` (`finalized == false`).
+pub async fn resume_config_scope_migration(
+    role: DatabaseRole,
+    scope_dir: &Path,
+) -> StorageResult<ConfigMigrationReport> {
+    validate_config_migration_role(role)?;
+    let manifest = crate::storage::config_store::read_config_format_manifest(scope_dir, role)?
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: format!("config scope migration resume found no config-format.json for {role}"),
+        })?;
+    migrate_config_scope_inner(
+        role,
+        scope_dir,
+        manifest.backend,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn migrate_config_scope_inner(
+    role: DatabaseRole,
+    scope_dir: &Path,
+    target: StorageBackendKind,
+    #[cfg(test)] mut observer: Option<&mut dyn ConfigMigrationTestObserver>,
+) -> StorageResult<ConfigMigrationReport> {
+    use crate::storage::config_store::{
+        ConfigFormatManifest, ConfigInitPhase, ConfigScopeLock, config_redb_path_in_scope_dir,
+        config_sqlite_path_in_scope_dir, is_config_sqlite_fenced_tombstone,
+        is_config_sqlite_tombstone_sentinel, publish_config_format_manifest,
+        read_config_format_manifest,
+    };
+
+    validate_config_migration_role(role)?;
+    if !scope_dir.is_dir() {
+        return Err(StorageBackendError::NotFound {
+            resource: format!("{role} scope directory"),
+        });
+    }
+
+    // Hold exclusive `LOCK_EX` on `<scope_dir>/config-migration.lock` for the
+    // ENTIRE migration / crash recovery duration (`ADR-RB-02` #2, `ADR-RB-07` #3).
+    let _scope_lock = ConfigScopeLock::try_lock_exclusive_bounded(scope_dir, role, Duration::ZERO)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage(
+            ConfigMigrationTestStage::AfterExclusiveLockAcquired,
+            scope_dir,
+            role,
+        )?;
+    }
+
+    let existing_manifest = read_config_format_manifest(scope_dir, role)?;
+
+    // Check if already finalized at target backend (idempotent no-op).
+    if let Some(ref m) = existing_manifest
+        && m.finalized
+        && m.backend == target
+    {
+        return Ok(ConfigMigrationReport {
+            role,
+            direction: match target {
+                StorageBackendKind::Redb => ConfigMigrationDirection::ForwardSqliteToRedb,
+                StorageBackendKind::Sqlite => ConfigMigrationDirection::ReverseRedbToSqlite,
+            },
+            generation: m.generation,
+            manifest: m.clone(),
+            config_rows_migrated: 0,
+            config_kv_rows_migrated: 0,
+            schema_version_rows_migrated: 0,
+            backup_path: None,
+            backup_sha256: None,
+            resumed_from_unfinalized: false,
+            hot_journal_recovered: false,
+            already_at_target: true,
+        });
+    }
+
+    if let Some(ref m) = existing_manifest
+        && !m.finalized
+        && m.backend != target
+    {
+        return Err(StorageBackendError::ManifestNotFinalized {
+            detail: format!(
+                "{role} has unfinalized config-format.json targeting {:?}; cannot start migration to {target:?}",
+                m.backend
+            ),
+        });
+    }
+
+    let sqlite_path = config_sqlite_path_in_scope_dir(scope_dir);
+    let redb_path = config_redb_path_in_scope_dir(scope_dir);
+    let redb_tmp_path = config_redb_tmp_path_in_scope(scope_dir);
+    let sqlite_tmp_path = config_sqlite_tmp_path_in_scope(scope_dir);
+
+    match target {
+        StorageBackendKind::Redb => {
+            // ================================================================
+            // Forward Config Migration (`Sqlite -> Redb`: `RB-11b`, `RB-11v`, `RB-11f`, `RB-11n`)
+            // ================================================================
+            let resumed = existing_manifest.as_ref().is_some_and(|m| !m.finalized);
+            let generation = match existing_manifest.as_ref() {
+                Some(m) if !m.finalized => m.generation,
+                Some(m) => m.generation.saturating_add(1),
+                None => 1,
+            };
+            let backup_path = config_sqlite_backup_path_in_scope(scope_dir, generation);
+            let mut hot_journal_recovered = false;
+
+            if let Some(mut m) = existing_manifest.filter(|m| !m.finalized) {
+                // --- Forward Crash Recovery (`RB-11f`, `RB-11n`) ---
+                if m.targets_staged_for_rename {
+                    // `RB-11f` AC3 & AC4: if `config.redb` is already in place, NEVER overwrite it!
+                    if !sqlite_path.is_file()
+                        || !(is_config_sqlite_fenced_tombstone(&sqlite_path)?
+                            || is_sqlite_file_migrated_fenced(&sqlite_path, role).await?)
+                    {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward config recovery rejected missing or unfenced config.db tombstone for {role}"
+                            ),
+                        });
+                    }
+                    apply_config_file_mode(&sqlite_path, role, true)?;
+
+                    if redb_path.is_file() {
+                        let _verify =
+                            crate::storage::redb::config_store::RedbConfigStore::open_read_only(
+                                &redb_path, role,
+                            )?;
+                        apply_config_file_mode(&redb_path, role, false)?;
+                        if redb_tmp_path.is_file() {
+                            let _ = fs::remove_file(&redb_tmp_path);
+                        }
+                        fsync_dir_best_effort(scope_dir)?;
+                    } else if redb_tmp_path.is_file() {
+                        let _verify =
+                            crate::storage::redb::config_store::RedbConfigStore::open_read_only(
+                                &redb_tmp_path,
+                                role,
+                            )?;
+                        fs::rename(&redb_tmp_path, &redb_path).map_err(|e| {
+                            StorageBackendError::io(
+                                "atomic rename config.redb.tmp to config.redb",
+                                e,
+                            )
+                        })?;
+                        apply_config_file_mode(&redb_path, role, false)?;
+                        fsync_dir_best_effort(scope_dir)?;
+                    } else {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward config recovery missing both config.redb and config.redb.tmp for {role}"
+                            ),
+                        });
+                    }
+
+                    let final_manifest =
+                        ConfigFormatManifest::new_redb_finalized(generation, true, role)?;
+                    publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+                    return Ok(ConfigMigrationReport {
+                        role,
+                        direction: ConfigMigrationDirection::ForwardSqliteToRedb,
+                        generation,
+                        manifest: final_manifest,
+                        config_rows_migrated: 0,
+                        config_kv_rows_migrated: 0,
+                        schema_version_rows_migrated: 0,
+                        backup_path: Some(backup_path),
+                        backup_sha256: m.backup_sha256,
+                        resumed_from_unfinalized: true,
+                        hot_journal_recovered: false,
+                        already_at_target: false,
+                    });
+                }
+
+                // Pre-`targets_staged_for_rename` forward recovery:
+                let src_state = m.source_db_state.unwrap_or(Phase2DbState::Pending);
+                if !sqlite_path.is_file() {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward config recovery failed closed: config.db is missing while source_db_state={src_state:?} for {role}"
+                        ),
+                    });
+                }
+
+                let journal_path = sqlite_sidecar_path(&sqlite_path, "-journal");
+                let has_hot_journal = path_exists_no_open(&journal_path)?;
+
+                // Check if `config.db` is already fenced cleanly (no hot rollback journal).
+                let already_fenced = if has_hot_journal {
+                    false
+                } else {
+                    is_config_sqlite_fenced_tombstone(&sqlite_path).unwrap_or(false)
+                        || is_sqlite_file_migrated_fenced(&sqlite_path, role)
+                            .await
+                            .unwrap_or(false)
+                };
+
+                let mut config_rows = 0u64;
+                let mut kv_rows = 0u64;
+                let mut schema_rows = 0u64;
+                let expected_backup_sha = m.backup_sha256.clone().ok_or_else(|| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward config recovery missing backup_sha256 in config-format.json for {role}"
+                        ),
+                    }
+                })?;
+
+                if already_fenced || src_state != Phase2DbState::Pending {
+                    // `RB-11n` AC3 & AC4: fenced state MUST verify `sqlite-backup` existence + real SHA-256!
+                    verify_reverse_backup_file_sha256(
+                        &backup_path,
+                        &expected_backup_sha,
+                        "config.db",
+                    )?;
+                    apply_config_file_mode(&sqlite_path, role, true)?;
+                    if !redb_tmp_path.is_file()
+                        || crate::storage::redb::config_store::RedbConfigStore::open_read_only(
+                            &redb_tmp_path,
+                            role,
+                        )
+                        .is_err()
+                    {
+                        let mut bak_conn =
+                            open_reverse_sqlite_tmp_conn_async(&backup_path, role, true).await?;
+                        let counts =
+                            export_config_sqlite_to_redb_tmp(&mut bak_conn, role, &redb_tmp_path)
+                                .await?;
+                        config_rows = counts.0;
+                        kv_rows = counts.1;
+                        schema_rows = counts.2;
+                        let _ = bak_conn.close().await;
+                    }
+                } else {
+                    // `config.db` is still `pending` (possibly with a torn page-1 sector + hot `-journal`!).
+                    clear_readonly_if_present(&sqlite_path, role)?;
+                    let meta = validate_sqlite_file_metadata(&sqlite_path, role)?;
+                    #[cfg(unix)]
+                    let protected_inodes: Vec<(u64, u64)> = Vec::new();
+                    let (prep, had_hot) = prepare_recovery_sqlite_source(
+                        &sqlite_path,
+                        role,
+                        &meta,
+                        #[cfg(unix)]
+                        &protected_inodes,
+                    )
+                    .await?;
+                    hot_journal_recovered = had_hot;
+                    #[cfg(test)]
+                    let mut conn = finalize_prepared_sqlite_quiescence_inner(
+                        prep,
+                        &QuiesceTestHooks::default(),
+                    )
+                    .await?;
+                    #[cfg(not(test))]
+                    let mut conn = finalize_prepared_sqlite_quiescence(prep).await?;
+
+                    // Verify `config.db` rolled back cleanly and matches (or re-export on drift).
+                    let current_logical =
+                        compute_config_sqlite_logical_sha256(&mut conn.conn, role).await?;
+                    let needs_reexport = m.source_logical_sha256.as_deref()
+                        != Some(current_logical.as_str())
+                        || !redb_tmp_path.is_file()
+                        || crate::storage::redb::config_store::RedbConfigStore::open_read_only(
+                            &redb_tmp_path,
+                            role,
+                        )
+                        .is_err();
+                    if needs_reexport {
+                        let counts =
+                            export_config_sqlite_to_redb_tmp(&mut conn.conn, role, &redb_tmp_path)
+                                .await?;
+                        config_rows = counts.0;
+                        kv_rows = counts.1;
+                        schema_rows = counts.2;
+                        m.source_logical_sha256 = Some(current_logical);
+                    }
+
+                    // Commit atomic rollback-journal fence `__libra_migrated_fence__` over `c_mig`.
+                    #[cfg(test)]
+                    let mut no_hook: Option<&mut dyn Phase2TestObserver> = None;
+                    let _ = fence_sqlite_connection_journaled_inner(
+                        &mut conn,
+                        #[cfg(test)]
+                        &mut no_hook,
+                    )
+                    .await?;
+                    conn.conn
+                        .close()
+                        .await
+                        .map_err(|e| StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward config recovery failed closing fenced config.db: {e}"
+                            ),
+                        })?;
+                    apply_config_file_mode(&sqlite_path, role, true)?;
+                    fsync_dir_best_effort(scope_dir)?;
+                }
+
+                // Persist `targets_staged_for_rename = true` -> atomic `rename(config.redb.tmp, config.redb)` -> `finalized = true`.
+                m.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+                m.legacy_sqlite_tombstone = true;
+                m.targets_staged_for_rename = true;
+                publish_config_format_manifest(scope_dir, role, &m)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterForwardStagedBeforeRename,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                fs::rename(&redb_tmp_path, &redb_path).map_err(|e| {
+                    StorageBackendError::io("atomic rename config.redb.tmp to config.redb", e)
+                })?;
+                apply_config_file_mode(&redb_path, role, false)?;
+                fsync_dir_best_effort(scope_dir)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterForwardRenamedBeforeFinalize,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                let final_manifest =
+                    ConfigFormatManifest::new_redb_finalized(generation, true, role)?;
+                publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+                return Ok(ConfigMigrationReport {
+                    role,
+                    direction: ConfigMigrationDirection::ForwardSqliteToRedb,
+                    generation,
+                    manifest: final_manifest,
+                    config_rows_migrated: config_rows,
+                    config_kv_rows_migrated: kv_rows,
+                    schema_version_rows_migrated: schema_rows,
+                    backup_path: Some(backup_path),
+                    backup_sha256: Some(expected_backup_sha),
+                    resumed_from_unfinalized: resumed,
+                    hot_journal_recovered,
+                    already_at_target: false,
+                });
+            }
+
+            // --- Fresh Forward Config Migration (`RB-11b`, `RB-11v`) ---
+            if !sqlite_path.is_file() {
+                return Err(StorageBackendError::NotFound {
+                    resource: format!("{role} config.db"),
+                });
+            }
+            let sqlite_meta = validate_sqlite_file_metadata(&sqlite_path, role)?;
+            let mut quiesced =
+                quiesce_sqlite_connection_only(&sqlite_path, role, &sqlite_meta).await?;
+            let logical_sha =
+                compute_config_sqlite_logical_sha256(&mut quiesced.conn, role).await?;
+            let (config_rows, kv_rows, schema_rows) =
+                export_config_sqlite_to_redb_tmp(&mut quiesced.conn, role, &redb_tmp_path).await?;
+
+            // Lock-safe `VACUUM INTO` backup on the SAME single `c_mig` connection!
+            let backup_parent =
+                backup_path
+                    .parent()
+                    .ok_or_else(|| StorageBackendError::BackendInternal {
+                        detail: "invalid config sqlite-backup path".to_string(),
+                    })?;
+            fs::create_dir_all(backup_parent)
+                .map_err(|e| StorageBackendError::io("create config sqlite-backup dir", e))?;
+            if backup_path.exists() {
+                let _ = fs::remove_file(&backup_path);
+            }
+            let backup_receipt = vacuum_into_lock_safe_backup(&mut quiesced, &backup_path).await?;
+            fsync_dir_best_effort(backup_parent)?;
+            let backup_sha = backup_receipt.backup_sha256;
+
+            // Step 2.1: Publish `config-format.json(backend="redb", finalized=false, init_phase=migration, ...)`.
+            let mut manifest = ConfigFormatManifest {
+                schema_version: crate::storage::config_store::CONFIG_FORMAT_MANIFEST_VERSION,
+                backend: StorageBackendKind::Redb,
+                finalized: false,
+                init_phase: Some(ConfigInitPhase::Migration),
+                generation,
+                legacy_sqlite_tombstone: false,
+                targets_staged_for_rename: false,
+                source_db_state: Some(Phase2DbState::Pending),
+                backup_sha256: Some(backup_sha.clone()),
+                source_logical_sha256: Some(logical_sha),
+            };
+            publish_config_format_manifest(scope_dir, role, &manifest)?;
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_stage(
+                    ConfigMigrationTestStage::AfterForwardPendingManifest,
+                    scope_dir,
+                    role,
+                )?;
+            }
+
+            // Step 2.2: Commit rollback-journal atomic fence `__libra_migrated_fence__` over `c_mig`,
+            // close `c_mig`, and PERMANENTLY RETAIN `config.db` in-place as `0400`/`0444` tombstone!
+            #[cfg(test)]
+            let mut no_hook: Option<&mut dyn Phase2TestObserver> = None;
+            let _ = fence_sqlite_connection_journaled_inner(
+                &mut quiesced,
+                #[cfg(test)]
+                &mut no_hook,
+            )
+            .await?;
+            quiesced
+                .conn
+                .close()
+                .await
+                .map_err(|e| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward config migration failed closing fenced config.db: {e}"
+                    ),
+                })?;
+            apply_config_file_mode(&sqlite_path, role, true)?;
+            fsync_dir_best_effort(scope_dir)?;
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_stage(
+                    ConfigMigrationTestStage::AfterForwardFencedBeforeStaged,
+                    scope_dir,
+                    role,
+                )?;
+            }
+
+            // Persist `targets_staged_for_rename = true` + `legacy_sqlite_tombstone = true`.
+            manifest.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+            manifest.legacy_sqlite_tombstone = true;
+            manifest.targets_staged_for_rename = true;
+            publish_config_format_manifest(scope_dir, role, &manifest)?;
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_stage(
+                    ConfigMigrationTestStage::AfterForwardStagedBeforeRename,
+                    scope_dir,
+                    role,
+                )?;
+            }
+
+            // Step 2.3: Atomic `rename(config.redb.tmp, config.redb)` with `0600`/`0644` permissions.
+            fs::rename(&redb_tmp_path, &redb_path).map_err(|e| {
+                StorageBackendError::io("atomic rename config.redb.tmp to config.redb", e)
+            })?;
+            apply_config_file_mode(&redb_path, role, false)?;
+            fsync_dir_best_effort(scope_dir)?;
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_stage(
+                    ConfigMigrationTestStage::AfterForwardRenamedBeforeFinalize,
+                    scope_dir,
+                    role,
+                )?;
+            }
+
+            // Step 2.4: Publish `finalized = true, legacy_sqlite_tombstone = true`.
+            let final_manifest = ConfigFormatManifest::new_redb_finalized(generation, true, role)?;
+            publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+
+            Ok(ConfigMigrationReport {
+                role,
+                direction: ConfigMigrationDirection::ForwardSqliteToRedb,
+                generation,
+                manifest: final_manifest,
+                config_rows_migrated: config_rows,
+                config_kv_rows_migrated: kv_rows,
+                schema_version_rows_migrated: schema_rows,
+                backup_path: Some(backup_path),
+                backup_sha256: Some(backup_sha),
+                resumed_from_unfinalized: false,
+                hot_journal_recovered: false,
+                already_at_target: false,
+            })
+        }
+
+        StorageBackendKind::Sqlite => {
+            // ================================================================
+            // Reverse Config Migration (`Redb -> Sqlite`: `RB-11k`, `RB-11g`, `RB-11o`)
+            // ================================================================
+            let generation = match existing_manifest.as_ref() {
+                Some(m) if !m.finalized => m.generation,
+                Some(m) => m.generation.saturating_add(1),
+                None => 1,
+            };
+            let backup_path = config_redb_backup_path_in_scope(scope_dir, generation);
+
+            if let Some(mut m) = existing_manifest.filter(|m| !m.finalized) {
+                // --- Reverse Crash Recovery (`RB-11g`, `RB-11o`) ---
+                if m.targets_staged_for_rename {
+                    // Check if `config.db` is ALREADY a valid unfenced SQLite DB
+                    // (`RB-11o` AC1 & AC2: post-rename crash + old binary write protection!).
+                    let already_published_live_sqlite = if sqlite_path.is_file() {
+                        let is_sentinel =
+                            is_config_sqlite_tombstone_sentinel(&sqlite_path).unwrap_or(false);
+                        let is_fenced = is_config_sqlite_fenced_tombstone(&sqlite_path)
+                            .unwrap_or(false)
+                            || is_sqlite_file_migrated_fenced(&sqlite_path, role)
+                                .await
+                                .unwrap_or(false);
+                        !is_sentinel && !is_fenced
+                    } else {
+                        false
+                    };
+
+                    if already_published_live_sqlite {
+                        verify_config_sqlite_file_integrity(&sqlite_path, role).await?;
+                        apply_config_file_mode(&sqlite_path, role, false)?;
+                        if sqlite_tmp_path.is_file() {
+                            let _ = fs::remove_file(&sqlite_tmp_path);
+                        }
+                        fsync_dir_best_effort(scope_dir)?;
+                    } else {
+                        // `RB-11o` AC3 & AC4: `config.db` is still a tombstone (or absent) —
+                        // verify `config.db.tmp`, clear readonly on Windows, and atomically replace!
+                        if !sqlite_tmp_path.is_file() {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "reverse config recovery missing config.db.tmp before tombstone replace for {role}"
+                                ),
+                            });
+                        }
+                        verify_config_sqlite_file_integrity(&sqlite_tmp_path, role).await?;
+                        clear_readonly_if_present(&sqlite_path, role)?;
+                        fs::rename(&sqlite_tmp_path, &sqlite_path).map_err(|e| {
+                            StorageBackendError::io(
+                                "atomic rename config.db.tmp over config.db tombstone",
+                                e,
+                            )
+                        })?;
+                        apply_config_file_mode(&sqlite_path, role, false)?;
+                        fsync_dir_best_effort(scope_dir)?;
+                    }
+
+                    let final_manifest =
+                        ConfigFormatManifest::new_sqlite_finalized(generation, role)?;
+                    publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+                    return Ok(ConfigMigrationReport {
+                        role,
+                        direction: ConfigMigrationDirection::ReverseRedbToSqlite,
+                        generation,
+                        manifest: final_manifest,
+                        config_rows_migrated: 0,
+                        config_kv_rows_migrated: 0,
+                        schema_version_rows_migrated: 0,
+                        backup_path: Some(backup_path),
+                        backup_sha256: m.backup_sha256,
+                        resumed_from_unfinalized: true,
+                        hot_journal_recovered: false,
+                        already_at_target: false,
+                    });
+                }
+
+                // Pre-`targets_staged_for_rename` reverse recovery (`RB-11g`):
+                let src_state = m.source_db_state.unwrap_or(Phase2DbState::Pending);
+                let expected_backup_sha = m.backup_sha256.clone().ok_or_else(|| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "reverse config recovery missing backup_sha256 in config-format.json for {role}"
+                        ),
+                    }
+                })?;
+
+                let mut config_rows = 0u64;
+                let mut kv_rows = 0u64;
+                let mut schema_rows = 0u64;
+
+                if !redb_path.is_file() {
+                    // `RB-11g` AC3 & AC4: `pending` while `config.redb` missing -> fail closed!
+                    if src_state == Phase2DbState::Pending {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "reverse config recovery failed closed: config.redb is unexpectedly missing while source_db_state=pending for {role}"
+                            ),
+                        });
+                    }
+                    // `RB-11g` AC1, AC2, AC5, AC6: legally unlinked -> verify real `redb-backup` SHA-256!
+                    verify_reverse_backup_file_sha256(
+                        &backup_path,
+                        &expected_backup_sha,
+                        "config.redb",
+                    )?;
+                    if !sqlite_tmp_path.is_file()
+                        || verify_config_sqlite_file_integrity(&sqlite_tmp_path, role)
+                            .await
+                            .is_err()
+                    {
+                        #[cfg(any(unix, windows))]
+                        {
+                            let (_bak_db, bak_wtx) =
+                                open_verified_backup_redb_readonly_wtx(&backup_path, role)?;
+                            let counts =
+                                export_config_redb_to_sqlite_tmp(&bak_wtx, role, &sqlite_tmp_path)
+                                    .await?;
+                            config_rows = counts.0;
+                            kv_rows = counts.1;
+                            schema_rows = counts.2;
+                        }
+                    }
+                    if m.source_db_state != Some(Phase2DbState::Unlinked) {
+                        m.source_db_state = Some(Phase2DbState::Unlinked);
+                        publish_config_format_manifest(scope_dir, role, &m)?;
+                    }
+                } else {
+                    #[cfg(any(unix, windows))]
+                    {
+                        let file = fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&redb_path)
+                            .map_err(|e| {
+                                StorageBackendError::io("open config.redb for reverse recovery", e)
+                            })?;
+                        let backend = ReverseNonBlockingFileBackend::new(file);
+                        backend.ensure_writer_byte_uncontended(
+                            ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+                        )?;
+                        let (db, ctrl) = open_reverse_redb_with_backend(backend, role)?;
+                        match begin_checked_write_blocking(&db, role, Duration::ZERO) {
+                            Ok(wtx) => {
+                                let current_sha = compute_file_sha256_streaming(&redb_path)?;
+                                if current_sha != expected_backup_sha
+                                    || !sqlite_tmp_path.is_file()
+                                    || verify_config_sqlite_file_integrity(&sqlite_tmp_path, role)
+                                        .await
+                                        .is_err()
+                                {
+                                    let counts = export_config_redb_to_sqlite_tmp(
+                                        &wtx,
+                                        role,
+                                        &sqlite_tmp_path,
+                                    )
+                                    .await?;
+                                    config_rows = counts.0;
+                                    kv_rows = counts.1;
+                                    schema_rows = counts.2;
+                                    if current_sha != expected_backup_sha {
+                                        let bak_dir = backup_path.parent().ok_or_else(|| {
+                                            StorageBackendError::BackendInternal {
+                                                detail: "invalid config redb-backup dir"
+                                                    .to_string(),
+                                            }
+                                        })?;
+                                        fs::create_dir_all(bak_dir).map_err(|e| {
+                                            StorageBackendError::io(
+                                                "create config redb-backup dir",
+                                                e,
+                                            )
+                                        })?;
+                                        stream_copy_and_replace_backup_file(
+                                            &redb_path,
+                                            bak_dir,
+                                            crate::storage::config_store::CONFIG_REDB_FILE_NAME,
+                                            &current_sha,
+                                        )?;
+                                        m.backup_sha256 = Some(current_sha.clone());
+                                        m.source_logical_sha256 = Some(current_sha);
+                                        publish_config_format_manifest(scope_dir, role, &m)?;
+                                    }
+                                }
+                                ctrl.enable_phase2_writes_and_flush()?;
+                                write_migration_tombstone(&wtx, role)?;
+                                wtx.commit().map_err(|e| {
+                                    map_redb_commit_err(
+                                        e,
+                                        "commit reverse recovery config.redb fence",
+                                    )
+                                })?;
+                                drop(db);
+                                m.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+                                publish_config_format_manifest(scope_dir, role, &m)?;
+                                unlink_regular_file_nofollow(
+                                    &redb_path,
+                                    scope_dir,
+                                    "unlink fenced config.redb",
+                                )?;
+                                m.source_db_state = Some(Phase2DbState::Unlinked);
+                                publish_config_format_manifest(scope_dir, role, &m)?;
+                            }
+                            Err(StorageBackendError::RepositoryMigrated { .. }) => {
+                                drop(db);
+                                verify_reverse_backup_file_sha256(
+                                    &backup_path,
+                                    &expected_backup_sha,
+                                    "config.redb",
+                                )?;
+                                m.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+                                publish_config_format_manifest(scope_dir, role, &m)?;
+                                unlink_regular_file_nofollow(
+                                    &redb_path,
+                                    scope_dir,
+                                    "unlink pre-fenced config.redb",
+                                )?;
+                                m.source_db_state = Some(Phase2DbState::Unlinked);
+                                publish_config_format_manifest(scope_dir, role, &m)?;
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }
+
+                // Step 2.3–2.5 convergence: `targets_staged_for_rename = true` -> replace tombstone -> `finalized = true`.
+                m.targets_staged_for_rename = true;
+                publish_config_format_manifest(scope_dir, role, &m)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseStagedBeforeRename,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                clear_readonly_if_present(&sqlite_path, role)?;
+                fs::rename(&sqlite_tmp_path, &sqlite_path).map_err(|e| {
+                    StorageBackendError::io(
+                        "atomic rename config.db.tmp over config.db tombstone",
+                        e,
+                    )
+                })?;
+                apply_config_file_mode(&sqlite_path, role, false)?;
+                fsync_dir_best_effort(scope_dir)?;
+                #[cfg(test)]
+                if let Some(obs) = observer {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseRenamedBeforeFinalize,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                let final_manifest = ConfigFormatManifest::new_sqlite_finalized(generation, role)?;
+                publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+                return Ok(ConfigMigrationReport {
+                    role,
+                    direction: ConfigMigrationDirection::ReverseRedbToSqlite,
+                    generation,
+                    manifest: final_manifest,
+                    config_rows_migrated: config_rows,
+                    config_kv_rows_migrated: kv_rows,
+                    schema_version_rows_migrated: schema_rows,
+                    backup_path: Some(backup_path),
+                    backup_sha256: m.backup_sha256,
+                    resumed_from_unfinalized: true,
+                    hot_journal_recovered: false,
+                    already_at_target: false,
+                });
+            }
+
+            // --- Fresh Reverse Config Migration (`RB-11k`) ---
+            if !redb_path.is_file() {
+                return Err(StorageBackendError::NotFound {
+                    resource: format!("{role} config.redb"),
+                });
+            }
+            #[cfg(any(unix, windows))]
+            {
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&redb_path)
+                    .map_err(|e| {
+                        StorageBackendError::io("open config.redb for reverse migration", e)
+                    })?;
+                let backend = ReverseNonBlockingFileBackend::new(file);
+                backend.ensure_writer_byte_uncontended(
+                    ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+                )?;
+                let (db, ctrl) = open_reverse_redb_with_backend(backend, role)?;
+                let wtx = match begin_checked_write_blocking(&db, role, Duration::ZERO) {
+                    Ok(wtx) => wtx,
+                    Err(StorageBackendError::WriteLockBusy { .. }) => {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "reverse config migration rejected: active external writer holds {role} config.redb"
+                            ),
+                        });
+                    }
+                    Err(err) => return Err(err),
+                };
+
+                let (config_rows, kv_rows, schema_rows) =
+                    export_config_redb_to_sqlite_tmp(&wtx, role, &sqlite_tmp_path).await?;
+
+                // Backup frozen `config.redb` to `<scope_dir>/redb-backup/gen-<id>/config.redb` + SHA-256 verify.
+                let bak_dir =
+                    backup_path
+                        .parent()
+                        .ok_or_else(|| StorageBackendError::BackendInternal {
+                            detail: "invalid config redb-backup dir".to_string(),
+                        })?;
+                fs::create_dir_all(bak_dir)
+                    .map_err(|e| StorageBackendError::io("create config redb-backup dir", e))?;
+                let backup_sha = compute_file_sha256_streaming(&redb_path)?;
+                stream_copy_and_replace_backup_file(
+                    &redb_path,
+                    bak_dir,
+                    crate::storage::config_store::CONFIG_REDB_FILE_NAME,
+                    &backup_sha,
+                )?;
+
+                // Step 2.1: Publish `config-format.json(backend="sqlite", finalized=false, init_phase=migration, ...)`.
+                let mut manifest = ConfigFormatManifest {
+                    schema_version: crate::storage::config_store::CONFIG_FORMAT_MANIFEST_VERSION,
+                    backend: StorageBackendKind::Sqlite,
+                    finalized: false,
+                    init_phase: Some(ConfigInitPhase::Migration),
+                    generation,
+                    legacy_sqlite_tombstone: false,
+                    targets_staged_for_rename: false,
+                    source_db_state: Some(Phase2DbState::Pending),
+                    backup_sha256: Some(backup_sha.clone()),
+                    source_logical_sha256: Some(backup_sha.clone()),
+                };
+                publish_config_format_manifest(scope_dir, role, &manifest)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReversePendingManifest,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                // Step 2.2: Fence `config.redb` (`META_SCHEMA u32::MAX`) -> persist `fenced_ready_to_unlink`
+                // -> `unlink(config.redb) + fsync_dir` -> persist `unlinked`.
+                ctrl.enable_phase2_writes_and_flush()?;
+                write_migration_tombstone(&wtx, role)?;
+                wtx.commit().map_err(|e| {
+                    map_redb_commit_err(e, "commit reverse config.redb META_SCHEMA fence")
+                })?;
+                drop(db);
+
+                manifest.source_db_state = Some(Phase2DbState::FencedReadyToUnlink);
+                publish_config_format_manifest(scope_dir, role, &manifest)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseRedbFencedBeforeUnlink,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                unlink_regular_file_nofollow(&redb_path, scope_dir, "unlink fenced config.redb")?;
+                manifest.source_db_state = Some(Phase2DbState::Unlinked);
+                publish_config_format_manifest(scope_dir, role, &manifest)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseRedbUnlinkedBeforeStaged,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                // Step 2.3: Persist `targets_staged_for_rename = true`.
+                manifest.targets_staged_for_rename = true;
+                publish_config_format_manifest(scope_dir, role, &manifest)?;
+                #[cfg(test)]
+                if let Some(obs) = observer.as_deref_mut() {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseStagedBeforeRename,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                // Step 2.4: Atomically replace `config.db` tombstone with `config.db.tmp` (`0600`/`0644`).
+                clear_readonly_if_present(&sqlite_path, role)?;
+                fs::rename(&sqlite_tmp_path, &sqlite_path).map_err(|e| {
+                    StorageBackendError::io(
+                        "atomic rename config.db.tmp over config.db tombstone",
+                        e,
+                    )
+                })?;
+                apply_config_file_mode(&sqlite_path, role, false)?;
+                fsync_dir_best_effort(scope_dir)?;
+                #[cfg(test)]
+                if let Some(obs) = observer {
+                    obs.on_stage(
+                        ConfigMigrationTestStage::AfterReverseRenamedBeforeFinalize,
+                        scope_dir,
+                        role,
+                    )?;
+                }
+
+                // Step 2.5: Publish `finalized = true, legacy_sqlite_tombstone = false`.
+                let final_manifest = ConfigFormatManifest::new_sqlite_finalized(generation, role)?;
+                publish_config_format_manifest(scope_dir, role, &final_manifest)?;
+
+                Ok(ConfigMigrationReport {
+                    role,
+                    direction: ConfigMigrationDirection::ReverseRedbToSqlite,
+                    generation,
+                    manifest: final_manifest,
+                    config_rows_migrated: config_rows,
+                    config_kv_rows_migrated: kv_rows,
+                    schema_version_rows_migrated: schema_rows,
+                    backup_path: Some(backup_path),
+                    backup_sha256: Some(backup_sha),
+                    resumed_from_unfinalized: false,
+                    hot_journal_recovered: false,
+                    already_at_target: false,
+                })
+            }
+            #[cfg(all(not(unix), not(windows)))]
+            {
+                let _ = (generation, backup_path);
+                Err(StorageBackendError::BackendInternal {
+                    detail: "reverse config migration unsupported on this platform".to_string(),
+                })
+            }
+        }
     }
 }
 
@@ -78578,5 +80279,1164 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             stored.is_some(),
             "AC5: live old-hook event published in State B must be 100% persisted in capture.db"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Milestone 4: GlobalConfig & SystemConfig Bidirectional Migration &
+    // Crash Recovery (`RB-11b`, `RB-11v`, `RB-11k`, `RB-11w`, `RB-11f`,
+    // `RB-11n`, `RB-11g`, `RB-11o`)
+    // ------------------------------------------------------------------------
+
+    struct CrashAtConfigStageObserver {
+        target: ConfigMigrationTestStage,
+    }
+
+    impl ConfigMigrationTestObserver for CrashAtConfigStageObserver {
+        fn on_stage(
+            &mut self,
+            stage: ConfigMigrationTestStage,
+            _scope_dir: &Path,
+            _role: DatabaseRole,
+        ) -> StorageResult<()> {
+            if stage == self.target {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!("injected config migration crash at {stage:?}"),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    async fn seed_sqlite_config_scope_fixture(scope_dir: &Path, role: DatabaseRole, tag: &str) {
+        fs::create_dir_all(scope_dir).expect("create config scope dir");
+        let db_path = crate::storage::config_store::config_sqlite_path_in_scope_dir(scope_dir);
+        fs::write(&db_path, b"").expect("touch config.db");
+        apply_config_file_mode(&db_path, role, false).expect("chmod config.db");
+
+        let mut conn = open_reverse_sqlite_tmp_conn_async(&db_path, role, false)
+            .await
+            .expect("open seed config.db");
+        let ddl = format!(
+            "{}\n{}\n{}",
+            crate::internal::db::schema::CONFIG_KV_SQL,
+            include_str!("../../sql/migrations/2026090601_legacy_config_table.sql"),
+            "CREATE TABLE IF NOT EXISTS configuration_schema_versions (\n\
+                version INTEGER PRIMARY KEY,\n\
+                name TEXT NOT NULL,\n\
+                applied_at TEXT NOT NULL\n\
+            );"
+        );
+        for stmt in ddl.split(';') {
+            let t = stmt.trim();
+            if !t.is_empty() {
+                sea_orm::sqlx::query(AssertSqlSafe(t.to_string()))
+                    .execute(&mut conn)
+                    .await
+                    .expect("exec config DDL");
+            }
+        }
+        sea_orm::sqlx::query(
+            "INSERT INTO configuration_schema_versions (version, name, applied_at) \
+             VALUES (2026090601, 'configuration_base', '2026-11-26T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed configuration_schema_versions");
+        sea_orm::sqlx::query(
+            "INSERT INTO config (configuration, name, \"key\", value) \
+             VALUES ('user', NULL, 'name', ?1), ('remote', 'origin', 'url', ?2)",
+        )
+        .bind(format!("legacy-user-{tag}"))
+        .bind(format!("https://example.test/{tag}.git"))
+        .execute(&mut conn)
+        .await
+        .expect("seed legacy config");
+        sea_orm::sqlx::query(
+            "INSERT INTO config_kv (\"key\", value, encrypted) \
+             VALUES ('user.email', ?1, 0), ('vault.secret', ?2, 1)",
+        )
+        .bind(format!("{tag}@example.test"))
+        .bind(format!("enc-{tag}"))
+        .execute(&mut conn)
+        .await
+        .expect("seed config_kv");
+        conn.close().await.expect("close seed config.db");
+    }
+
+    async fn assert_legacy_sqlite_config_open_fails_corrupt(db_path: &Path, role: DatabaseRole) {
+        // Simulate legacy binary (`config.rs:257`) observing `db_path.exists() == true`
+        // and attempting to query `config_kv` on the in-place fenced tombstone.
+        assert!(
+            db_path.is_file(),
+            "fenced config.db tombstone must remain in place"
+        );
+        let mut conn = open_reverse_sqlite_tmp_conn_async(db_path, role, true)
+            .await
+            .expect("SQLite open succeeds before schema parse");
+        let err = sea_orm::sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM config_kv")
+            .persistent(false)
+            .fetch_one(&mut conn)
+            .await
+            .expect_err(
+                "legacy SQLite binary MUST fail closed with SQLITE_CORRUPT / malformed schema",
+            );
+        let _ = conn.close().await;
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("malformed database schema") || msg.contains("corrupt"),
+            "expected SQLITE_CORRUPT/malformed schema, got: {msg}"
+        );
+    }
+
+    /// `RB-11b` AC1–AC4: `GlobalConfig` forward migration produces `0600`
+    /// `config.redb`, publishes `config-format.json(backend="redb", finalized=true,
+    /// legacy_sqlite_tombstone=true)`, permanently retains in-place `0400` fenced
+    /// `config.db` tombstone blocking legacy binaries with `SQLITE_CORRUPT`, and
+    /// never touches isolated `SystemConfig` or repository fixtures (`GC-13`).
+    #[tokio::test]
+    async fn gc13_global_config_forward_migration_tombstone_and_legacy_block() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+            open_config_scope_for_read,
+        };
+
+        let dir = tempdir().expect("rb11b tempdir");
+        let global_dir = dir.path().join("global");
+        let system_dir = dir.path().join("system");
+        let repo_sentinel = dir.path().join("repo-libra.db");
+        seed_sqlite_config_scope_fixture(&global_dir, DatabaseRole::GlobalConfig, "global").await;
+        seed_sqlite_config_scope_fixture(&system_dir, DatabaseRole::SystemConfig, "system").await;
+        fs::write(&repo_sentinel, b"REPO_SENTINEL_RB11B").expect("write repo sentinel");
+        let before_system =
+            fs::read(config_sqlite_path_in_scope_dir(&system_dir)).expect("snap sys");
+        let before_repo = fs::read(&repo_sentinel).expect("snap repo");
+
+        let report = migrate_global_config(&global_dir, StorageBackendKind::Redb)
+            .await
+            .expect("AC1: GlobalConfig forward migration must succeed");
+        assert_eq!(report.role, DatabaseRole::GlobalConfig);
+        assert!(report.manifest.finalized);
+        assert!(report.manifest.legacy_sqlite_tombstone);
+        assert_eq!(report.manifest.backend, StorageBackendKind::Redb);
+        assert_eq!(report.config_rows_migrated, 2);
+        assert_eq!(report.config_kv_rows_migrated, 2);
+        assert_eq!(report.schema_version_rows_migrated, 1);
+
+        let redb_path = config_redb_path_in_scope_dir(&global_dir);
+        let sqlite_path = config_sqlite_path_in_scope_dir(&global_dir);
+        assert!(redb_path.is_file());
+        assert!(
+            sqlite_path.is_file(),
+            "AC2: config.db tombstone must NOT be unlinked"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&redb_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+        }
+
+        // AC3: Legacy binary opening retained `0400` fenced `config.db` fails closed (`SQLITE_CORRUPT`).
+        assert_legacy_sqlite_config_open_fails_corrupt(&sqlite_path, DatabaseRole::GlobalConfig)
+            .await;
+
+        // Verify migrated Redb store serves all migrated entries.
+        let store = open_config_scope_for_read(
+            &global_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+        )
+        .await
+        .expect("open migrated GlobalConfig");
+        assert_eq!(store.backend(), StorageBackendKind::Redb);
+        assert_eq!(
+            store.get("user.email").await.unwrap().unwrap().value,
+            "global@example.test"
+        );
+        drop(store);
+
+        // AC4: `GC-13` strict isolation of SystemConfig and Repository.
+        assert_eq!(
+            fs::read(config_sqlite_path_in_scope_dir(&system_dir)).expect("sys after"),
+            before_system
+        );
+        assert_eq!(fs::read(&repo_sentinel).expect("repo after"), before_repo);
+    }
+
+    /// `RB-11v` AC1–AC4: `SystemConfig` forward migration produces `0644`
+    /// `config.redb`, retains `0444` fenced `config.db` tombstone blocking legacy
+    /// binaries with `SQLITE_CORRUPT`, and strictly isolates `GlobalConfig` & repo.
+    #[tokio::test]
+    async fn gc13_system_config_forward_migration_tombstone_and_legacy_block() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+            open_config_scope_for_read,
+        };
+
+        let dir = tempdir().expect("rb11v tempdir");
+        let global_dir = dir.path().join("global");
+        let system_dir = dir.path().join("system");
+        let repo_sentinel = dir.path().join("repo-libra.db");
+        seed_sqlite_config_scope_fixture(&global_dir, DatabaseRole::GlobalConfig, "global").await;
+        seed_sqlite_config_scope_fixture(&system_dir, DatabaseRole::SystemConfig, "system").await;
+        fs::write(&repo_sentinel, b"REPO_SENTINEL_RB11V").expect("write repo sentinel");
+        let before_global =
+            fs::read(config_sqlite_path_in_scope_dir(&global_dir)).expect("snap glb");
+        let before_repo = fs::read(&repo_sentinel).expect("snap repo");
+
+        let report = migrate_system_config(&system_dir, StorageBackendKind::Redb)
+            .await
+            .expect("AC1: SystemConfig forward migration must succeed");
+        assert_eq!(report.role, DatabaseRole::SystemConfig);
+        assert!(report.manifest.finalized);
+        assert!(report.manifest.legacy_sqlite_tombstone);
+        assert_eq!(report.manifest.backend, StorageBackendKind::Redb);
+
+        let redb_path = config_redb_path_in_scope_dir(&system_dir);
+        let sqlite_path = config_sqlite_path_in_scope_dir(&system_dir);
+        assert!(redb_path.is_file());
+        assert!(
+            sqlite_path.is_file(),
+            "AC2: SystemConfig config.db tombstone retained in place"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&redb_path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+            assert_eq!(
+                fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
+
+        // AC3: Legacy binary opening retained `0444` fenced `config.db` fails closed (`SQLITE_CORRUPT`).
+        assert_legacy_sqlite_config_open_fails_corrupt(&sqlite_path, DatabaseRole::SystemConfig)
+            .await;
+
+        let store = open_config_scope_for_read(
+            &system_dir,
+            DatabaseRole::SystemConfig,
+            StorageBackendKind::Redb,
+        )
+        .await
+        .expect("open migrated SystemConfig");
+        assert_eq!(store.backend(), StorageBackendKind::Redb);
+        assert_eq!(
+            store.get("user.email").await.unwrap().unwrap().value,
+            "system@example.test"
+        );
+        drop(store);
+
+        // AC4: `GC-13` strict isolation of GlobalConfig and Repository.
+        assert_eq!(
+            fs::read(config_sqlite_path_in_scope_dir(&global_dir)).expect("global after"),
+            before_global
+        );
+        assert_eq!(fs::read(&repo_sentinel).expect("repo after"), before_repo);
+    }
+
+    /// `RB-11k` AC1–AC3: bidirectional lossless roundtrip (`Sqlite -> Redb -> Sqlite`)
+    /// for BOTH `GlobalConfig` (`0600`) and `SystemConfig` (`0644`), verifying
+    /// 100% lossless preservation of `config`, `config_kv`, and
+    /// `configuration_schema_versions` plus tombstone replacement and `finalized = true,
+    /// legacy_sqlite_tombstone = false`.
+    #[tokio::test]
+    async fn gc13_global_and_system_config_reverse_migration_replaces_tombstone() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-rt", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-rt", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11k tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+
+            // Snapshot canonical 3-table logical SHA-256 BEFORE forward migration.
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            let mut before_conn = open_reverse_sqlite_tmp_conn_async(&sqlite_path, role, true)
+                .await
+                .expect("open before sqlite");
+            let before_sha = compute_config_sqlite_logical_sha256(&mut before_conn, role)
+                .await
+                .expect("before logical sha");
+            before_conn.close().await.expect("close before");
+
+            // Forward (`Sqlite -> Redb`)
+            let fwd = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("forward config migration");
+            assert!(fwd.manifest.finalized && fwd.manifest.legacy_sqlite_tombstone);
+
+            // Reverse (`Redb -> Sqlite`)
+            let rev = migrate_config_scope(role, &scope_dir, StorageBackendKind::Sqlite)
+                .await
+                .expect("reverse config migration must replace tombstone");
+            assert!(rev.manifest.finalized);
+            assert!(!rev.manifest.legacy_sqlite_tombstone);
+            assert_eq!(rev.manifest.backend, StorageBackendKind::Sqlite);
+            assert_eq!(rev.config_rows_migrated, 2);
+            assert_eq!(rev.config_kv_rows_migrated, 2);
+            assert_eq!(rev.schema_version_rows_migrated, 1);
+            assert!(!config_redb_path_in_scope_dir(&scope_dir).exists());
+            assert!(sqlite_path.is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            // Verify 100% lossless roundtrip across all 3 tables via exact logical SHA-256 equality!
+            let mut after_conn = open_reverse_sqlite_tmp_conn_async(&sqlite_path, role, true)
+                .await
+                .expect("open after sqlite");
+            let after_sha = compute_config_sqlite_logical_sha256(&mut after_conn, role)
+                .await
+                .expect("after logical sha");
+            after_conn.close().await.expect("close after");
+            assert_eq!(
+                after_sha, before_sha,
+                "AC3: 3-table logical SHA-256 must match 100% after Sqlite -> Redb -> Sqlite roundtrip ({role})"
+            );
+        }
+    }
+
+    /// `RB-11w` AC1–AC4: all 4 combinations (`GlobalConfig`/`SystemConfig` ×
+    /// `Sqlite`/`Redb`) fail closed with typed `LBR-IO-001` (`WriteLockBusy`)
+    /// under bounded lock timeout (`Duration::ZERO`) while migration holds
+    /// exclusive `LOCK_EX` on `config-migration.lock`.
+    #[tokio::test]
+    async fn config_migration_bounded_lock_contention_global_and_system_fail_closed() {
+        use crate::storage::config_store::{
+            ConfigScopeLock, open_config_scope_read_write_with_deadline,
+        };
+
+        for (role, label) in [
+            (DatabaseRole::GlobalConfig, "global"),
+            (DatabaseRole::SystemConfig, "system"),
+        ] {
+            // Sqlite runtime command contention (`AC1` Global, `AC3` System)
+            {
+                let dir = tempdir().expect("rb11w sqlite tempdir");
+                let scope_dir = dir.path().join(label);
+                seed_sqlite_config_scope_fixture(&scope_dir, role, label).await;
+
+                let _mig_lock =
+                    ConfigScopeLock::try_lock_exclusive_bounded(&scope_dir, role, Duration::ZERO)
+                        .expect("migration acquires LOCK_EX");
+                let err =
+                    open_config_scope_read_write_with_deadline(&scope_dir, role, Duration::ZERO)
+                        .await
+                        .expect_err(
+                            "concurrent Sqlite config command must fail closed during LOCK_EX",
+                        );
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert!(matches!(err, StorageBackendError::WriteLockBusy { .. }));
+            }
+
+            // Redb runtime command contention (`AC2` Global, `AC4` System)
+            {
+                let dir = tempdir().expect("rb11w redb tempdir");
+                let scope_dir = dir.path().join(label);
+                seed_sqlite_config_scope_fixture(&scope_dir, role, label).await;
+                let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                    .await
+                    .expect("prepare Redb config scope");
+
+                let _mig_lock =
+                    ConfigScopeLock::try_lock_exclusive_bounded(&scope_dir, role, Duration::ZERO)
+                        .expect("migration acquires LOCK_EX");
+                let err =
+                    open_config_scope_read_write_with_deadline(&scope_dir, role, Duration::ZERO)
+                        .await
+                        .expect_err(
+                            "concurrent Redb config command must fail closed during LOCK_EX",
+                        );
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert!(matches!(err, StorageBackendError::WriteLockBusy { .. }));
+            }
+        }
+    }
+
+    /// `RB-11f` AC1 & AC2: for BOTH `GlobalConfig` and `SystemConfig`, inject a
+    /// real mid-fence SQLite hot rollback journal (`config.db-journal`) AND tear
+    /// the entire first 512-byte physical sector of Page 1 in `config.db`;
+    /// resume triggers SQLite hot rollback recovery and converges cleanly to
+    /// `finalized = true, legacy_sqlite_tombstone = true` (`0600`/`0400` Global,
+    /// `0644`/`0444` System) with zero data loss.
+    #[tokio::test]
+    async fn config_forward_crash_hot_journal_torn_sector_global_and_system() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+            open_config_scope_for_read,
+        };
+
+        // Isolated OS child mode: spill a genuine SQLite hot rollback journal
+        // (`config.db-journal`) containing original Page 1 during mid-fence
+        // transaction and hard-exit via `_exit(0)` without closing SQLite!
+        if std::env::var_os("LIBRA_RB11F_CHILD_MODE").is_some() {
+            let target = PathBuf::from(
+                std::env::var_os("LIBRA_RB11F_TARGET_PATH").expect("LIBRA_RB11F_TARGET_PATH"),
+            );
+            let mut conn =
+                open_reverse_sqlite_tmp_conn_async(&target, DatabaseRole::GlobalConfig, false)
+                    .await
+                    .expect("child open config.db");
+            for pragma in [
+                "PRAGMA journal_mode = DELETE;",
+                "PRAGMA synchronous = FULL;",
+                "PRAGMA locking_mode = EXCLUSIVE;",
+                "PRAGMA cache_size = 1;",
+                "PRAGMA cache_spill = 1;",
+            ] {
+                sea_orm::sqlx::query(pragma)
+                    .persistent(false)
+                    .execute(&mut conn)
+                    .await
+                    .expect("set pragma");
+            }
+            let sv_before: i64 = sea_orm::sqlx::query_scalar("PRAGMA schema_version;")
+                .persistent(false)
+                .fetch_one(&mut conn)
+                .await
+                .expect("read sv");
+            sea_orm::sqlx::query("BEGIN EXCLUSIVE;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await
+                .expect("begin exclusive");
+            sea_orm::sqlx::query(AssertSqlSafe(format!(
+                "CREATE TABLE {SQLITE_MIGRATED_FENCE_TABLE} (x INTEGER);"
+            )))
+            .persistent(false)
+            .execute(&mut conn)
+            .await
+            .expect("create fence table");
+            sea_orm::sqlx::query("PRAGMA writable_schema = ON;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await
+                .expect("writable_schema on");
+            sea_orm::sqlx::query(AssertSqlSafe(format!(
+                "UPDATE sqlite_master SET sql = '{SQLITE_MIGRATED_FENCE_SQL}' \
+                 WHERE type = 'table' AND name = '{SQLITE_MIGRATED_FENCE_TABLE}';"
+            )))
+            .persistent(false)
+            .execute(&mut conn)
+            .await
+            .expect("update fence sql");
+            sea_orm::sqlx::query(AssertSqlSafe(format!(
+                "PRAGMA schema_version = {};",
+                (sv_before as i32).wrapping_add(2)
+            )))
+            .persistent(false)
+            .execute(&mut conn)
+            .await
+            .expect("bump sv");
+            // Dirty >25 pages of `config` while `writable_schema = ON` so `pagerStress()`
+            // flushes the hot `-journal` (preserving original Page 1) and spills dirty Page 1!
+            sea_orm::sqlx::query("UPDATE config SET value = value || '!'")
+                .persistent(false)
+                .execute(&mut conn)
+                .await
+                .expect("dirty pages to force hot journal spill");
+            sea_orm::sqlx::query("PRAGMA writable_schema = OFF;")
+                .persistent(false)
+                .execute(&mut conn)
+                .await
+                .expect("writable_schema off");
+
+            let journal_path = sqlite_sidecar_path(&target, "-journal");
+            let j_bytes = fs::read(&journal_path).expect("hot config.db-journal must exist");
+            assert!(
+                j_bytes.len() >= 512 + 4096 && j_bytes[..8] == SQLITE_HOT_ROLLBACK_JOURNAL_MAGIC,
+                "hot config.db-journal must carry valid SQLite hot journal header"
+            );
+            println!("RB11F_POWERLOSS_OK");
+            let _ = std::io::stdout().flush();
+            #[cfg(unix)]
+            unsafe {
+                libc::_exit(0);
+            }
+            #[cfg(not(unix))]
+            std::process::exit(0);
+        }
+
+        for (role, tag, expected_redb_mode, expected_tomb_mode) in [
+            (DatabaseRole::GlobalConfig, "global-hot", 0o600u32, 0o400u32),
+            (DatabaseRole::SystemConfig, "system-hot", 0o644u32, 0o444u32),
+        ] {
+            let dir = tempdir().expect("rb11f hot tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            {
+                let mut pad_conn = open_reverse_sqlite_tmp_conn_async(
+                    &config_sqlite_path_in_scope_dir(&scope_dir),
+                    role,
+                    false,
+                )
+                .await
+                .expect("open config.db for padding");
+                let pad_val = "x".repeat(120);
+                sea_orm::sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut pad_conn)
+                    .await
+                    .expect("begin padding tx");
+                for idx in 0..800u32 {
+                    sea_orm::sqlx::query(
+                        "INSERT INTO config (configuration, name, \"key\", value) VALUES ('pad', NULL, ?1, ?2)",
+                    )
+                    .bind(format!("pad.key.{idx:04}"))
+                    .bind(&pad_val)
+                    .execute(&mut pad_conn)
+                    .await
+                    .expect("insert padding config row");
+                }
+                sea_orm::sqlx::query("COMMIT")
+                    .execute(&mut pad_conn)
+                    .await
+                    .expect("commit padding tx");
+                pad_conn.close().await.expect("close padding conn");
+            }
+
+            // Crash right after Step 2.1 (`config-format.json(finalized=false, source_db_state=pending)`).
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardPendingManifest,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash at Step 2.1");
+
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            let journal_path = sqlite_sidecar_path(&sqlite_path, "-journal");
+
+            let exe = std::env::current_exe().expect("locate current test exe");
+            let child_out = Command::new(&exe)
+                .arg("--exact")
+                .arg("storage::migrate::tests::config_forward_crash_hot_journal_torn_sector_global_and_system")
+                .arg("--nocapture")
+                .env("LIBRA_RB11F_CHILD_MODE", "1")
+                .env("LIBRA_RB11F_TARGET_PATH", &sqlite_path)
+                .env("LIBRA_TEST", "1")
+                .output()
+                .expect("spawn powerloss child for config.db");
+            assert!(
+                child_out.status.success()
+                    && String::from_utf8_lossy(&child_out.stdout).contains("RB11F_POWERLOSS_OK"),
+                "powerloss child failed: {}",
+                String::from_utf8_lossy(&child_out.stderr)
+            );
+            assert!(journal_path.is_file(), "hot config.db-journal must exist");
+
+            // Tear the ENTIRE first 512-byte physical sector of Page 1 in `config.db`!
+            {
+                let mut f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&sqlite_path)
+                    .expect("open config.db to tear 512-byte sector");
+                let mut torn = [0u8; 512];
+                for (i, b) in torn.iter_mut().enumerate() {
+                    *b = if i % 2 == 0 { 0xA5 } else { 0x5A };
+                }
+                f.write_all(&torn).expect("write torn sector");
+                f.sync_all().expect("fsync torn config.db");
+            }
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("hot-journal torn-sector resume must succeed");
+            assert!(resumed.resumed_from_unfinalized);
+            assert!(resumed.hot_journal_recovered);
+            assert!(resumed.manifest.finalized);
+            assert!(resumed.manifest.legacy_sqlite_tombstone);
+            assert_eq!(resumed.manifest.backend, StorageBackendKind::Redb);
+
+            let redb_path = config_redb_path_in_scope_dir(&scope_dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&redb_path).unwrap().permissions().mode() & 0o777,
+                    expected_redb_mode
+                );
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_tomb_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = (expected_redb_mode, expected_tomb_mode);
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Redb)
+                .await
+                .expect("open recovered config store");
+            assert_eq!(
+                store.get("user.email").await.unwrap().unwrap().value,
+                format!("{tag}@example.test")
+            );
+        }
+    }
+
+    /// `RB-11f` AC3 & AC4: for BOTH `GlobalConfig` and `SystemConfig`, crash
+    /// AFTER `rename(config.redb.tmp, config.redb)` and BEFORE `finalized = true`;
+    /// resume detects the already-published `config.redb`, NEVER overwrites it,
+    /// verifies the fenced `config.db` tombstone, and publishes `finalized = true`.
+    #[tokio::test]
+    async fn config_forward_crash_staged_rename_preserves_redb_global_and_system() {
+        use crate::storage::{
+            config_store::{
+                ConfigStore as _, config_redb_path_in_scope_dir, open_config_scope_for_read,
+            },
+            redb::config_store::RedbConfigStore,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-staged", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-staged", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11f staged tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardRenamedBeforeFinalize,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after rename(config.redb.tmp, config.redb) before finalize");
+
+            let redb_path = config_redb_path_in_scope_dir(&scope_dir);
+            assert!(redb_path.is_file());
+
+            // Write a brand-new post-rename key directly into already-published `config.redb`
+            // AND plant a stale `config.redb.tmp` to prove resume NEVER overwrites `config.redb`!
+            let rw = RedbConfigStore::open_read_write(&redb_path, role)
+                .expect("open published config.redb");
+            rw.set("post.rename.canary", "MUST_SURVIVE", false)
+                .await
+                .expect("write post-rename canary");
+            drop(rw);
+            fs::write(
+                config_redb_tmp_path_in_scope(&scope_dir),
+                b"STALE_TMP_MUST_BE_DELETED",
+            )
+            .expect("plant stale tmp");
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("staged-rename resume must preserve config.redb");
+            assert!(resumed.manifest.finalized);
+            assert!(resumed.manifest.legacy_sqlite_tombstone);
+            assert!(!config_redb_tmp_path_in_scope(&scope_dir).exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&redb_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Redb)
+                .await
+                .expect("open preserved config.redb");
+            assert_eq!(
+                store
+                    .get("post.rename.canary")
+                    .await
+                    .unwrap()
+                    .expect("canary must NOT be overwritten")
+                    .value,
+                "MUST_SURVIVE"
+            );
+        }
+    }
+
+    /// `RB-11n` AC1–AC4: forward config recovery rejects (1) `GlobalConfig`
+    /// `pending` missing `config.db`, (2) `SystemConfig` `pending` missing
+    /// `config.db`, (3) fenced state missing `sqlite-backup`, and (4) fenced
+    /// state `sqlite-backup` `backup_sha256` mismatch — all fail-closed `LBR-IO-001`.
+    #[tokio::test]
+    async fn config_forward_crash_pending_missing_and_backup_fault_reject() {
+        use crate::storage::config_store::config_sqlite_path_in_scope_dir;
+
+        // AC1 & AC2: `pending` missing `config.db` for BOTH GlobalConfig and SystemConfig
+        for (role, tag) in [
+            (DatabaseRole::GlobalConfig, "global-miss"),
+            (DatabaseRole::SystemConfig, "system-miss"),
+        ] {
+            let dir = tempdir().expect("rb11n ac12 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardPendingManifest,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash at Step 2.1");
+
+            fs::remove_file(config_sqlite_path_in_scope_dir(&scope_dir))
+                .expect("delete pending config.db");
+            let err = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect_err("missing pending config.db must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        }
+
+        // AC3 & AC4: fenced state missing `sqlite-backup` and tampered `backup_sha256`
+        {
+            let dir = tempdir().expect("rb11n ac34 tempdir");
+            let scope_dir = dir.path().join("global-bak-fault");
+            seed_sqlite_config_scope_fixture(&scope_dir, DatabaseRole::GlobalConfig, "bak").await;
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardFencedBeforeStaged,
+            };
+            let _ = migrate_config_scope_inner(
+                DatabaseRole::GlobalConfig,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after fence before staged");
+
+            let bak = config_sqlite_backup_path_in_scope(&scope_dir, 1);
+            let orig = fs::read(&bak).expect("read backup");
+
+            // AC4: Tampered backup SHA-256 mismatch -> fail-closed `LBR-IO-001`.
+            let mut bad = orig.clone();
+            bad[0] ^= 0xFF;
+            fs::write(&bak, &bad).expect("tamper sqlite-backup");
+            let err_sha = resume_config_scope_migration(DatabaseRole::GlobalConfig, &scope_dir)
+                .await
+                .expect_err("AC4: tampered backup_sha256 must fail closed");
+            assert_eq!(err_sha.stable_code_str(), "LBR-IO-001");
+
+            // AC3: Missing backup -> fail-closed `LBR-IO-001`.
+            fs::remove_file(&bak).expect("remove sqlite-backup");
+            let err_miss = resume_config_scope_migration(DatabaseRole::GlobalConfig, &scope_dir)
+                .await
+                .expect_err("AC3: missing sqlite-backup must fail closed");
+            assert_eq!(err_miss.stable_code_str(), "LBR-IO-001");
+        }
+    }
+
+    /// `RB-11n` AC5 & AC6: after a crash releases `config-migration.lock` while
+    /// leaving `config-format.json(finalized = false)`, BOTH `Sqlite` and `Redb`
+    /// runtime config commands fail closed with `LBR-IO-001` (`ManifestNotFinalized`).
+    #[tokio::test]
+    async fn config_forward_pending_manifest_rejects_sqlite_and_redb_commands() {
+        use crate::storage::config_store::{
+            inspect_config_scope_authority, open_config_scope_for_read_with_deadline,
+            open_config_scope_read_write_with_deadline,
+        };
+
+        for (role, tag) in [
+            (DatabaseRole::GlobalConfig, "global-pend"),
+            (DatabaseRole::SystemConfig, "system-pend"),
+        ] {
+            let dir = tempdir().expect("rb11n ac56 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+
+            // Unfinalized forward manifest (`backend="redb", finalized=false`)
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterForwardPendingManifest,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Redb,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash leaving finalized=false");
+
+            let auth_err = inspect_config_scope_authority(&scope_dir, role)
+                .expect_err("inspect authority must reject finalized=false");
+            assert!(matches!(
+                auth_err,
+                StorageBackendError::ManifestNotFinalized { .. }
+            ));
+            assert_eq!(auth_err.stable_code_str(), "LBR-IO-001");
+
+            let rw_err =
+                open_config_scope_read_write_with_deadline(&scope_dir, role, Duration::ZERO)
+                    .await
+                    .expect_err("AC5/AC6: write command must fail closed on finalized=false");
+            assert!(matches!(
+                rw_err,
+                StorageBackendError::ManifestNotFinalized { .. }
+            ));
+            assert_eq!(rw_err.stable_code_str(), "LBR-IO-001");
+
+            for runtime_backend in [StorageBackendKind::Sqlite, StorageBackendKind::Redb] {
+                let ro_err = open_config_scope_for_read_with_deadline(
+                    &scope_dir,
+                    role,
+                    runtime_backend,
+                    Duration::ZERO,
+                )
+                .await
+                .expect_err("AC5/AC6: read command must fail closed on finalized=false");
+                assert!(matches!(
+                    ro_err,
+                    StorageBackendError::ManifestNotFinalized { .. }
+                ));
+                assert_eq!(ro_err.stable_code_str(), "LBR-IO-001");
+            }
+        }
+    }
+
+    /// `RB-11g` AC1 & AC2: for BOTH `GlobalConfig` (`0600`) and `SystemConfig`
+    /// (`0644`), crash IMMEDIATELY after `unlink(config.redb) + fsync_dir`
+    /// (`source_db_state == FencedReadyToUnlink` while `config.redb` is already
+    /// unlinked); resume verifies real `redb-backup` SHA-256 and converges
+    /// cleanly to `finalized = true, legacy_sqlite_tombstone = false`.
+    #[tokio::test]
+    async fn config_reverse_crash_after_config_redb_unlink_global_and_system() {
+        use crate::storage::config_store::{
+            config_redb_path_in_scope_dir, config_sqlite_path_in_scope_dir,
+            open_config_scope_for_read,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-rev-unlink", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-rev-unlink", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11g ac12 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("prepare Redb config scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReverseRedbFencedBeforeUnlink,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after fenced_ready_to_unlink");
+
+            // Simulate crash IMMEDIATELY AFTER `unlink(config.redb) + fsync_dir`!
+            let redb_path = config_redb_path_in_scope_dir(&scope_dir);
+            fs::remove_file(&redb_path).expect("unlink config.redb");
+            fsync_dir_best_effort(&scope_dir).expect("fsync scope dir");
+            // Also remove `config.db.tmp` to force full verified re-export from `redb-backup`!
+            let _ = fs::remove_file(config_sqlite_tmp_path_in_scope(&scope_dir));
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("post-unlink reverse config resume must verify redb-backup and converge");
+            assert!(resumed.resumed_from_unfinalized);
+            assert!(resumed.manifest.finalized);
+            assert!(!resumed.manifest.legacy_sqlite_tombstone);
+            assert_eq!(resumed.manifest.backend, StorageBackendKind::Sqlite);
+
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            assert!(sqlite_path.is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Sqlite)
+                .await
+                .expect("open restored sqlite config");
+            assert_eq!(store.backend(), StorageBackendKind::Sqlite);
+            assert_eq!(
+                store.get("user.email").await.unwrap().unwrap().value,
+                format!("{tag}@example.test")
+            );
+        }
+    }
+
+    /// `RB-11g` AC3–AC6: reverse config recovery rejects (AC3) `GlobalConfig`
+    /// `pending` missing `config.redb`, (AC4) `SystemConfig` `pending` missing
+    /// `config.redb`, (AC5) unlinked state missing `redb-backup`, and (AC6)
+    /// unlinked state tampered `redb-backup` SHA-256 — all fail-closed `LBR-IO-001`.
+    #[tokio::test]
+    async fn config_reverse_crash_pending_missing_and_corrupt_backup_reject() {
+        use crate::storage::config_store::config_redb_path_in_scope_dir;
+
+        // AC3 & AC4: `pending` missing `config.redb` for Global and System
+        for (role, tag) in [
+            (DatabaseRole::GlobalConfig, "global-rev-miss"),
+            (DatabaseRole::SystemConfig, "system-rev-miss"),
+        ] {
+            let dir = tempdir().expect("rb11g ac34 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("prepare Redb scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReversePendingManifest,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash at reverse Step 2.1");
+
+            fs::remove_file(config_redb_path_in_scope_dir(&scope_dir))
+                .expect("delete pending config.redb");
+            let err = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect_err("missing pending config.redb must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        }
+
+        // AC5 & AC6: legally unlinked state missing/tampered `redb-backup`
+        {
+            let dir = tempdir().expect("rb11g ac56 tempdir");
+            let scope_dir = dir.path().join("global-rev-bak-fault");
+            seed_sqlite_config_scope_fixture(&scope_dir, DatabaseRole::GlobalConfig, "revbak")
+                .await;
+            let _ = migrate_config_scope(
+                DatabaseRole::GlobalConfig,
+                &scope_dir,
+                StorageBackendKind::Redb,
+            )
+            .await
+            .expect("prepare Redb scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReverseRedbUnlinkedBeforeStaged,
+            };
+            let _ = migrate_config_scope_inner(
+                DatabaseRole::GlobalConfig,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after unlink(config.redb)");
+
+            // Generation is 2 (forward was 1, reverse is 2).
+            let bak = config_redb_backup_path_in_scope(&scope_dir, 2);
+            let orig = fs::read(&bak).expect("read redb-backup");
+
+            // AC6: Tampered SHA-256 -> fail-closed `LBR-IO-001`.
+            let mut bad = orig.clone();
+            bad[0] ^= 0xFF;
+            fs::write(&bak, &bad).expect("tamper redb-backup");
+            let err_sha = resume_config_scope_migration(DatabaseRole::GlobalConfig, &scope_dir)
+                .await
+                .expect_err("AC6: tampered redb-backup SHA-256 must fail closed");
+            assert_eq!(err_sha.stable_code_str(), "LBR-IO-001");
+
+            // AC5: Missing backup -> fail-closed `LBR-IO-001`.
+            fs::remove_file(&bak).expect("remove redb-backup");
+            let err_miss = resume_config_scope_migration(DatabaseRole::GlobalConfig, &scope_dir)
+                .await
+                .expect_err("AC5: missing redb-backup must fail closed");
+            assert_eq!(err_miss.stable_code_str(), "LBR-IO-001");
+        }
+    }
+
+    /// `RB-11o` AC1 & AC2: for BOTH `GlobalConfig` and `SystemConfig`, crash
+    /// AFTER `rename(config.db.tmp, config.db)` and BEFORE `finalized = true`
+    /// while an old binary writes a brand-new key into live `config.db`; resume
+    /// detects the valid unfenced `config.db`, NEVER overwrites it, cleans `.tmp`,
+    /// publishes `finalized = true, legacy_sqlite_tombstone = false`, and
+    /// preserves 100% of the old binary's write.
+    #[tokio::test]
+    async fn config_reverse_staged_rename_preserves_old_binary_writes_global_and_system() {
+        use crate::storage::config_store::{
+            config_sqlite_path_in_scope_dir, open_config_scope_for_read,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-post-ren", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-post-ren", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11o ac12 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("prepare Redb scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReverseRenamedBeforeFinalize,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after rename(config.db.tmp, config.db) before finalize");
+
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            // Old binary writes a new key directly into live `config.db` during crash window!
+            let mut conn = open_reverse_sqlite_tmp_conn_async(&sqlite_path, role, false)
+                .await
+                .expect("old binary opens live config.db");
+            sea_orm::sqlx::query(
+                "INSERT INTO config_kv (\"key\", value, encrypted) VALUES ('old.binary.key', 'PRESERVED_VALUE', 0)",
+            )
+            .execute(&mut conn)
+            .await
+            .expect("old binary writes new key");
+            conn.close().await.expect("close old binary conn");
+
+            // Also plant a stale `config.db.tmp` to prove resume cleans `.tmp` without overwriting!
+            fs::write(
+                config_sqlite_tmp_path_in_scope(&scope_dir),
+                b"STALE_SQLITE_TMP",
+            )
+            .expect("plant stale config.db.tmp");
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("post-rename reverse resume must preserve old binary write");
+            assert!(resumed.manifest.finalized);
+            assert!(!resumed.manifest.legacy_sqlite_tombstone);
+            assert!(!config_sqlite_tmp_path_in_scope(&scope_dir).exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Sqlite)
+                .await
+                .expect("open finalized sqlite config");
+            assert_eq!(
+                store
+                    .get("old.binary.key")
+                    .await
+                    .unwrap()
+                    .expect("old binary write MUST survive")
+                    .value,
+                "PRESERVED_VALUE"
+            );
+        }
+    }
+
+    /// `RB-11o` AC3 & AC4: for BOTH `GlobalConfig` (`0400 -> 0600`) and
+    /// `SystemConfig` (`0444 -> 0644`), crash AFTER `targets_staged_for_rename = true`
+    /// and BEFORE `rename(config.db.tmp, config.db)` while `config.db` is still a
+    /// read-only tombstone; resume atomically replaces the tombstone and publishes
+    /// `finalized = true, legacy_sqlite_tombstone = false`.
+    #[tokio::test]
+    async fn config_reverse_staged_rename_before_rename_replaces_tombstone_global_and_system() {
+        use crate::storage::config_store::{
+            config_sqlite_path_in_scope_dir, is_config_sqlite_fenced_tombstone,
+            open_config_scope_for_read,
+        };
+
+        for (role, tag, expected_mode) in [
+            (DatabaseRole::GlobalConfig, "global-pre-ren", 0o600u32),
+            (DatabaseRole::SystemConfig, "system-pre-ren", 0o644u32),
+        ] {
+            let dir = tempdir().expect("rb11o ac34 tempdir");
+            let scope_dir = dir.path().join(tag);
+            seed_sqlite_config_scope_fixture(&scope_dir, role, tag).await;
+            let _ = migrate_config_scope(role, &scope_dir, StorageBackendKind::Redb)
+                .await
+                .expect("prepare Redb scope");
+
+            let mut crash = CrashAtConfigStageObserver {
+                target: ConfigMigrationTestStage::AfterReverseStagedBeforeRename,
+            };
+            let _ = migrate_config_scope_inner(
+                role,
+                &scope_dir,
+                StorageBackendKind::Sqlite,
+                Some(&mut crash),
+            )
+            .await
+            .expect_err("crash after targets_staged_for_rename=true before rename");
+
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            assert!(
+                is_config_sqlite_fenced_tombstone(&sqlite_path).unwrap(),
+                "config.db must still be a fenced tombstone before resume"
+            );
+
+            let resumed = resume_config_scope_migration(role, &scope_dir)
+                .await
+                .expect("pre-rename reverse resume must replace tombstone");
+            assert!(resumed.manifest.finalized);
+            assert!(!resumed.manifest.legacy_sqlite_tombstone);
+            assert_eq!(resumed.manifest.backend, StorageBackendKind::Sqlite);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&sqlite_path).unwrap().permissions().mode() & 0o777,
+                    expected_mode
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = expected_mode;
+
+            let store = open_config_scope_for_read(&scope_dir, role, StorageBackendKind::Sqlite)
+                .await
+                .expect("open replaced sqlite config");
+            assert_eq!(store.backend(), StorageBackendKind::Sqlite);
+            assert_eq!(
+                store.get("user.email").await.unwrap().unwrap().value,
+                format!("{tag}@example.test")
+            );
+        }
     }
 }
