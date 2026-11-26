@@ -38,7 +38,7 @@
 ### Task FIX-LTR-11: bare 仓库快照排除元数据目录
 
 **Task type:** `implementation`  
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成，本地 signed+DCO 子提交 `dfed4cbca17624daf7a9b9a2a42e15514cdc780f` 已核 VALIDSIG；家族最终 C/D 待。  
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：A/B 与本地 signed+DCO 子提交 `dfed4cb` 的 VALIDSIG 证据保留，本轮按用户授权收口 family child，D 组继承 REL-QUAL-11；不 bump。）
 **Description:** 已用同一 0.30.153 二进制在 16 个独立 bare 仓库实测：操作快照的 untracked manifest 收入 `libra.db`、`objects/` 和内部锁路径。bare 无工作树，扫描不得把仓库元数据当作工作区内容。按请求固定的仓库身份判定 bare，空工作区扫描仍保留已有 HEAD、引用、原始 index/facet 和操作日志流程。  
 **Out of scope:** 不改 worker wire 错误编码、不吞 I/O 错误、不放宽时间/并发、不改普通工作区 ignore/layer/gitlink/稀疏规则；原 full 的具体出错文件和时序仍 unknown。  
 **Acceptance criteria:**
