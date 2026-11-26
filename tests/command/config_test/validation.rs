@@ -387,3 +387,51 @@ fn test_cf_36_predicates() {
     assert_eq!(parsed["error_code"], "LBR-CLI-002");
     assert_eq!(parsed["exit_code"], 1);
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_57_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    let missing = temp.path().join("missing-system.db");
+    let out = run_libra_command_with_env(
+        &["config", "--system", "--list"],
+        &repo,
+        &[("LIBRA_CONFIG_SYSTEM_DB", missing.to_str().unwrap())],
+    );
+    assert_eq!(out.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unable to read config file"), "{stderr}");
+    assert!(stderr.contains("LBR-IO-001"), "{stderr}");
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_58_predicates() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    let unreadable = temp.path().join("unreadable.db");
+    fs::write(&unreadable, b"placeholder").unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = run_libra_command_with_env(
+        &["config", "--system", "--get", "x.y"],
+        &repo,
+        &[("LIBRA_CONFIG_SYSTEM_DB", unreadable.to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("unable to access"), "{stderr}");
+    let list = run_libra_command_with_env(
+        &["config", "--system", "--list"],
+        &repo,
+        &[("LIBRA_CONFIG_SYSTEM_DB", unreadable.to_str().unwrap())],
+    );
+    assert_eq!(list.status.code(), Some(128), "unreadable list");
+    assert!(String::from_utf8_lossy(&list.stderr).contains("LBR-IO-001"));
+    let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+}

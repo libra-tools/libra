@@ -950,3 +950,5 @@ fixed-value get matches the whole value.
 encrypted get stays redacted.
 
 explicit scope list prints one scope.
+
+missing system list exits 128.
