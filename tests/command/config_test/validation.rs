@@ -205,3 +205,24 @@ fn test_explicit_scope_missing_or_unreadable_store() {
         "expected LBR-IO-001: {stderr_global_list}"
     );
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_104_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "x.path", "/tmp/example"], repo.path()),
+        "set path",
+    );
+    let path = run_libra_command(&["config", "--get", "--path", "x.path"], repo.path());
+    assert_cli_success(&path, "--path");
+    assert_eq!(String::from_utf8_lossy(&path.stdout).trim(), "/tmp/example");
+
+    let default = run_libra_command(
+        &["config", "--get", "--default", "fallback", "x.missing"],
+        repo.path(),
+    );
+    assert_cli_success(&default, "--default");
+    assert_eq!(String::from_utf8_lossy(&default.stdout).trim(), "fallback");
+}

@@ -1051,3 +1051,5 @@ conflicting type switches exit 129.
 config --file - reads stdin.
 
 section subcommands match the legacy flags.
+
+path and default stay compatible.
