@@ -137,7 +137,7 @@
 ### Task FIX-LTR-09: 隔离 rebase exec 回归测试的嵌套签名
 
 **Task type:** `implementation`  
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（两次定向 RED 保留，修复后单例 1/1、同 target 32/32；FIX-LTR-09 签名+DCO 提交 `6819631a1d23b6110b250f8a0a1f347b2525f997` 已合入当前上游；A9 最终来源树本地六阶段 exit0，当前树 main D 成功。终态文档自身提交及其 D、原工作区受控整合仍待，不提前记 complete）。
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：本地六阶段与 main D 证据保留；签名+DCO 子提交 `6819631` 已在当前上游，本轮按用户授权收口 family child，D 组继承 REL-QUAL-11；不 bump。）
 **Current evidence:** 两个未修改源码的单例失败收据 `f60ebeda31b53bab26e62c5c35d6f2e97e67f8ce7423971d577d0ea9fbecdcb2` / `25fee5d188c7272724d7b44cacbe92585a967168d46b995d7e9bc05501b29895`；修复后单例 1/1 `864bf8b0925a69968abb001b2f9c2bace3296acf6a7edd82d4dc67e24a35da88`、完整 target 32/32 `27313e43b0aae0c74f16c409539d0cd90ce5ef15796a1de691ff5356d506b522`；测试文件 SHA256 `8a1978974f8b60514aca6790e21d0094a245d3bf645b6cf020aa684828143e68`。仅测试命令增加 `--no-gpg-sign`，未改断言或沙箱。  
 **Description:** 在 `rebase_exec_failure_stops_and_continue_retries_the_command` 的测试命令中对嵌套测试提交显式传 `--no-gpg-sign`，使该 rebase 重试/引用更新用例不依赖沙箱禁止读取的 vault 私钥；保持 DCO、全部断言和沙箱凭据保护不变。  
 **Out of scope:** 产品源码、沙箱策略、真实用户默认签名、其它测试及既有结果。  
