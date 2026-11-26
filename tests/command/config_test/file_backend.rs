@@ -300,3 +300,69 @@ fn test_cf_82_predicates() {
         String::from_utf8_lossy(&list.stderr)
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_92_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    let cfg = repo.path().join("upstream.cfg");
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "upstream.cfg", "core.editor", "vim"],
+            repo.path(),
+        ),
+        "create",
+    );
+    assert_eq!(
+        fs::read_to_string(&cfg).unwrap(),
+        "[core]\n\teditor = vim\n"
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "upstream.cfg", "core.editor", "nano"],
+            repo.path(),
+        ),
+        "update",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "--file",
+                "upstream.cfg",
+                "remote.origin.url",
+                "git://h/r",
+            ],
+            repo.path(),
+        ),
+        "subsection",
+    );
+    assert_eq!(
+        fs::read_to_string(&cfg).unwrap(),
+        "[core]\n\teditor = nano\n\n[remote \"origin\"]\n\turl = git://h/r\n"
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "upstream.cfg", "core.note", "a;b"],
+            repo.path(),
+        ),
+        "quote",
+    );
+    assert!(
+        fs::read_to_string(&cfg)
+            .unwrap()
+            .contains("\tnote = \"a;b\"\n")
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "upstream.cfg", "--unset", "core.note"],
+            repo.path(),
+        ),
+        "unset",
+    );
+    assert!(!fs::read_to_string(&cfg).unwrap().contains("note"));
+}
