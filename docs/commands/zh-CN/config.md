@@ -397,9 +397,9 @@ libra config path --global
 # Output: /home/user/.config/libra/config.db
 ```
 
-#### `edit`
+#### `edit` / `-e` / `--edit`
 
-不支持。Libra 使用 SQLite 存储，无法安全地通过文本编辑器 round-trip。详情见[设计动机](#设计动机为何不同于-gitjj)。
+在编辑器中打开所选作用域。Libra 将作用域导出为 `0600` 的 Git 配置格式临时文件，校验编辑后的文本，并在解析成功后只写回发生变化的条目。加密条目显示为 `<REDACTED>` 且只读。语法错误不会写入任何内容，并在错误信息中保留临时文件路径。
 
 #### `generate-ssh-key --remote <name>`
 
@@ -749,9 +749,9 @@ Git 将配置存储在明文 INI 文件中，用来保存 API keys、access toke
 
 它有意**不**支持的是 vault：在系统作用域存储加密密钥（`vault.*` 键或 `--encrypt` 值）会以用法错误被拒绝。在多用户 OS 环境中，root 拥有的 `/etc/libra` 下的系统级 unseal key 要么对普通用户不可读（破坏解密），要么全局可读（破坏加密）。系统范围的*密钥*应在 OS/环境层处理；Libra 把 vault 限定在 `--global`（用户级）与 `--local`（仓库）作用域。
 
-### 为什么没有 `config edit`？
+### `config edit` 如何在 SQLite 上保持安全？
 
-Libra 使用 SQLite 数据库（`config_kv` 表），而不是明文文件。将数据库行导出到文本编辑器，再把 unified diff 解析回 SQL `UPDATE`/`DELETE` 语句是危险的。具体而言，对于多值 key（如 `remote.origin.fetch`），明文表示缺少行级主键。重新排序、部分修改或删除行会阻止 Libra 准确地将文本更改映射回数据库行，最终不可避免地导致数据丢失或损坏。为保证数据一致性，必须使用稳健的 `set`、`--add`、`unset` 和 `list` 命令。
+Libra 将作用域导出为私有 `0600` 的 Git 配置格式临时文件，并在触碰数据库前解析编辑后的文本。只有值列表确实变化的 key 会被重写，未变化的 key 保持不动，加密条目显示为只读的 `<REDACTED>` 占位符。解析失败不会写入任何内容，并报告保留的临时文件路径。脚本化修改仍应使用精确的 `set`、`--add`、`unset` 和 `list` 接口。
 
 ### 为什么内置 SSH/GPG 密钥管理？
 
@@ -773,7 +773,7 @@ Git 在 key 未找到时以代码 1 退出，这在脚本中与其他错误难�
 | 子命令风格 | 无 | 有（`set/get/list/edit/path`） | 有（`set/get/list/unset/import/path`） |
 | 获取值 | `git config key` | `jj config get key` | `libra config get key` |
 | 列表 | `git config -l` | `jj config list` | `libra config list` |
-| 在编辑器中编辑 | `git config -e` | `jj config edit` | 不支持（SQLite 存储） |
+| 在编辑器中编辑 | `git config -e` | `jj config edit` | `libra config edit` / `-e` / `--edit`（`--file` 直接编辑文件） |
 | 正则搜索 | `git config --get-regexp` | 无 | `libra config get --regexp` |
 | 显示来源 | `git config --show-origin` | 无 | `libra config list --show-origin` |
 | 类型转换 | `--type=bool\|int\|path` | 无（TOML 类型） | `--type=bool\|int\|path` + `--bool`/`--int`/`--path`（读取与设置时均规范化） |
@@ -807,7 +807,6 @@ Git 在 key 未找到时以代码 1 退出，这在脚本中与其他错误难�
 | `LBR-REPO-001` | 不在 libra 仓库内（local scope） | 使用 `libra init` 初始化，或使用 `--global` |
 | `LBR-CLI-002` | 在 `--system` 作用域使用 vault 加密密钥（`vault.*`/`--encrypt`） | vault 密钥改用 `--global` 或 `--local` |
 | `LBR-CLI-003` | key 未找到且未提供 `--default` | 用 `libra config list` 检查 key 名称 |
-| `LBR-CLI-002` | 使用了 `edit` 子命令（不支持） | 使用 `set`、`get`、`unset`、`list` 子命令 |
 | `LBR-IO-001` | 读取配置数据库失败 | 检查 `.libra/libra.db` 的文件权限 |
 | `LBR-IO-001` | 显式作用域的配置存储缺失或不可读（`--system --list`、`--global --list`） | 检查配置数据库是否存在及其文件权限 |
 | `LBR-IO-002` | 写入配置数据库失败 | 检查文件权限和磁盘空间 |
@@ -815,7 +814,7 @@ Git 在 key 未找到时以代码 1 退出，这在脚本中与其他错误难�
 ## 兼容性说明
 
 - `libra vault` 已移除。请改用 `libra config generate-ssh-key`、`libra config generate-gpg-key` 和 `libra config get vault.*`。
-- 不支持 `libra config edit`（见上方设计动机）。
+- `libra config edit` / `-e` / `--edit` 将作用域导出为 Git 配置格式临时文件，校验后只写回变化条目。
 - 旧仓库可能仍包含遗留的 `vault.gpg_pubkey` 条目；新写入使用 `vault.gpg.pubkey`。
 
 ## SSH 认证与捕获诊断

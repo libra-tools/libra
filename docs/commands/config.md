@@ -486,9 +486,9 @@ libra config path --global
 # Output: /home/user/.config/libra/config.db
 ```
 
-#### `edit`
+#### `edit` / `-e` / `--edit`
 
-Not supported. Libra uses SQLite storage, which cannot be safely round-tripped through a text editor. See [Design Rationale](#design-rationale-why-different-from-gitjj) for details.
+Open the selected scope in your editor. Libra exports the scope to a `0600` temporary file in Git config format, validates the edited text, and writes back only changed entries after a successful parse. Encrypted entries appear as `<REDACTED>` and are read-only. A syntax error writes nothing and keeps the temporary file path in the error message.
 
 #### `generate-ssh-key --remote <name>`
 
@@ -881,9 +881,9 @@ Git stores configurations in plaintext INI files, which is inherently insecure f
 
 What it deliberately does **not** support is the vault: storing encrypted secrets (`vault.*` keys or `--encrypt` values) in the system scope is rejected with a usage error. In a multi-user OS environment, a system-level unseal key under root-owned `/etc/libra` would either be unreadable to regular users (breaking decryption) or world-readable (defeating the encryption). System-wide *secrets* should be handled at the OS/environment level; Libra keeps the vault to `--global` (user-level) and `--local` (repository) scopes.
 
-### Why no `config edit`?
+### How does `config edit` stay safe on SQLite?
 
-Libra uses a SQLite database (`config_kv` table) instead of plaintext files. Exporting database rows to a text editor and parsing the unified diff back into SQL `UPDATE`/`DELETE` statements is dangerous. Specifically, for multi-value keys (e.g., `remote.origin.fetch`), the plaintext representation lacks row-level primary keys. Reordered, partially modified, or deleted lines would prevent Libra from accurately mapping text changes to database rows, inevitably leading to data loss or corruption. To guarantee data consistency, you must use the robust `set`, `--add`, `unset`, and `list` commands.
+Libra exports the scope to a private `0600` Git-format temporary file and parses the edited text before touching the database. Only keys whose value list actually changed are rewritten; unchanged keys are left alone, and encrypted entries are shown as `<REDACTED>` read-only placeholders. A parse failure writes nothing and reports the kept temporary path. For scripted changes, `set`, `--add`, `unset`, and `list` remain the precise interface.
 
 ### Why built-in SSH/GPG key management?
 
@@ -905,7 +905,7 @@ Git exits with code 1 when a key is not found, which is indistinguishable from o
 | Subcommand style | No | Yes (`set/get/list/edit/path`) | Yes (`set/get/list/unset/import/path`) |
 | Get value | `git config key` | `jj config get key` | `libra config get key` |
 | List | `git config -l` | `jj config list` | `libra config list` |
-| Edit in editor | `git config -e` | `jj config edit` | Not supported (SQLite storage) |
+| Edit in editor | `git config -e` | `jj config edit` | `libra config edit` / `-e` / `--edit` (`--file` edits the file directly) |
 | Regex search | `git config --get-regexp` | No | `libra config get --regexp` |
 | Show origin | `git config --show-origin` | No | `libra config list --show-origin` |
 | Type coercion | `--type=bool\|int\|path` | No (TOML types) | `--type=bool\|int\|path` + `--bool`/`--int`/`--path` (canonicalize on both read and set) |
@@ -939,7 +939,6 @@ Git exits with code 1 when a key is not found, which is indistinguishable from o
 | `LBR-REPO-001` | Not inside a libra repository (for local scope) | Initialize with `libra init` or use `--global` |
 | `LBR-CLI-002` | Vault-encrypted secret (`vault.*`/`--encrypt`) in `--system` scope | Use `--global` or `--local` for vault secrets |
 | `LBR-CLI-003` | Key not found and no `--default` provided | Check key name with `libra config list` |
-| `LBR-CLI-002` | `edit` subcommand used (not supported) | Use `set`, `get`, `unset`, `list` subcommands |
 | `LBR-IO-001` | Failed to read config database | Check file permissions on `.libra/libra.db` |
 | `LBR-IO-001` | Explicit scope config store missing or unreadable (`--system --list`, `--global --list`) | Check file existence and permissions on configuration database |
 | `LBR-IO-002` | Failed to write config database | Check file permissions and disk space |
@@ -948,7 +947,7 @@ Git exits with code 1 when a key is not found, which is indistinguishable from o
 
 - `libra vault` has been removed. Use `libra config generate-ssh-key`,
   `libra config generate-gpg-key`, and `libra config get vault.*` instead.
-- `libra config edit` is not supported (see Design Rationale above).
+- `libra config edit` / `-e` / `--edit` exports the scope to a Git-format temporary file, validates it, and writes back changed entries only.
 - Old repositories may still contain legacy `vault.gpg_pubkey` entries; new writes use
   `vault.gpg.pubkey`.
 

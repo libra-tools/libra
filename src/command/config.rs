@@ -604,6 +604,9 @@ pub struct ConfigArgs {
     /// Import from Git config
     #[clap(long, hide = true)]
     pub import: bool,
+    /// Open config in an editor (`git config --edit`)
+    #[clap(long, short = 'e', hide = true)]
+    pub edit: bool,
     /// Get entries matching a regex
     #[clap(long("get-regexp"), hide = true)]
     pub get_regexp: bool,
@@ -1156,9 +1159,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
         }
         ResolvedCommand::Import => handle_import(scope, output).await,
         ResolvedCommand::Path => handle_path(scope, output).await,
-        ResolvedCommand::Edit => Err(CliError::from_legacy_string(
-            "error: config edit is not supported (SQLite storage does not support text-based editing)\n\nhint: use libra config set/unset/list to manage configuration\nhint: use libra config list --name-only to see all keys",
-        )),
+        ResolvedCommand::Edit => handle_edit(scope, output).await,
         ResolvedCommand::GenerateSshKey { remote } => {
             handle_generate_ssh_key(&remote, scope, output).await
         }
@@ -2045,8 +2046,8 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
         return Ok(ResolvedCommand::Import);
     }
 
-    // Check for "edit" positional
-    if args.key.as_deref() == Some("edit") {
+    // `--edit`/`-e` and the `edit` positional both open the editor.
+    if args.edit || args.key.as_deref() == Some("edit") {
         return Ok(ResolvedCommand::Edit);
     }
     // Check for "path" positional
@@ -4590,6 +4591,236 @@ async fn handle_import(scope: ConfigScope, output: &OutputConfig) -> CliResult<(
         print_import_summary(&summary);
     }
     Ok(())
+}
+
+/// Render, edit, validate, and apply a scope's config through `$GIT_EDITOR`
+/// (falling back to `core.editor`, `$VISUAL`, `$EDITOR`, then `vi`).
+async fn handle_edit(scope: ConfigScope, _output: &OutputConfig) -> CliResult<()> {
+    use std::{io::Write as _, process::Command};
+
+    let entries = match ScopedConfig::list_all(scope).await {
+        Ok(entries) => entries,
+        // Git treats an absent global config file as empty for `--edit`.
+        Err(error) if error.contains("NOT_FOUND") || error.contains("No such file") => Vec::new(),
+        Err(error) => return Err(CliError::from_legacy_string(error)),
+    };
+    let original_text = render_edit_text(&entries);
+
+    let mut temp = tempfile::Builder::new()
+        .prefix("libra-config-edit-")
+        .suffix(".cfg")
+        .tempfile()
+        .map_err(|error| {
+            CliError::fatal(format!("failed to create temporary config file: {error}"))
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to set temporary config file permissions: {error}"
+                ))
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+            })?;
+    }
+    temp.write_all(original_text.as_bytes()).map_err(|error| {
+        CliError::fatal(format!("failed to write temporary config file: {error}"))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+    })?;
+    temp.flush().map_err(|error| {
+        CliError::fatal(format!("failed to write temporary config file: {error}"))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+    })?;
+
+    let path = temp.path().to_path_buf();
+    let editor = ScopedConfig::get(scope, "core.editor")
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| entry.value)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("GIT_EDITOR").ok().filter(|v| !v.is_empty()))
+        .or_else(|| std::env::var("VISUAL").ok().filter(|v| !v.is_empty()))
+        .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| "vi".to_string());
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{} {}",
+            editor,
+            shell_quote(&path.to_string_lossy())
+        ))
+        .status()
+        .map_err(|error| {
+            CliError::fatal(format!("failed to launch editor '{editor}': {error}"))
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
+    if !status.success() {
+        return Err(
+            CliError::fatal(format!("editor '{editor}' exited with status {status}"))
+                .with_stable_code(StableErrorCode::IoWriteFailed),
+        );
+    }
+
+    let edited = std::fs::read_to_string(&path).map_err(|error| {
+        CliError::fatal(format!("failed to read edited config: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    let parsed = match parse_strict_git_config_text(&edited) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            // Keep the temp file so the user's edits are not lost.
+            let (_file, kept_path) = temp.keep().map_err(|keep_error| {
+                CliError::fatal(format!(
+                    "failed to preserve temporary config file: {}",
+                    keep_error.error
+                ))
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+            })?;
+            return Err(CliError::failure(format!(
+                "failed to parse edited config: {error}; edits kept at {}",
+                kept_path.display()
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_exit_code(1));
+        }
+    };
+
+    apply_edited_config(scope, &entries, &parsed).await?;
+    drop(temp);
+    Ok(())
+}
+
+fn render_edit_text(entries: &[ConfigKvEntry]) -> String {
+    use crate::internal::config_file::write::quote_value;
+    let mut out = String::new();
+    let mut current_section: Option<String> = None;
+    for entry in entries {
+        let (section, variable) = match entry.key.rsplit_once('.') {
+            Some((section, variable)) => (section, variable),
+            None => (entry.key.as_str(), entry.key.as_str()),
+        };
+        if current_section.as_deref() != Some(section) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            match section.split_once('.') {
+                Some((head, sub)) => out.push_str(&format!("[{head} \"{sub}\"]\n")),
+                None => out.push_str(&format!("[{section}]\n")),
+            }
+            current_section = Some(section.to_string());
+        }
+        let value = if entry.encrypted {
+            "<REDACTED>".to_string()
+        } else {
+            quote_value(&entry.value)
+        };
+        out.push_str(&format!("\t{variable} = {value}\n"));
+    }
+    out
+}
+
+fn parse_strict_git_config_text(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::new();
+    let mut section = String::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let Some(inner) = rest.split_once(']').map(|(inner, _)| inner) else {
+                return Err(format!("line {}: unterminated section header", index + 1));
+            };
+            if inner.trim().is_empty() {
+                return Err(format!("line {}: empty section header", index + 1));
+            }
+            section = parse_ini_section(inner);
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            return Err(format!("line {}: expected 'key = value'", index + 1));
+        };
+        if section.is_empty() {
+            return Err(format!(
+                "line {}: key outside a section: {}",
+                index + 1,
+                name.trim()
+            ));
+        }
+        if name.trim().is_empty() {
+            return Err(format!("line {}: empty key", index + 1));
+        }
+        entries.push((
+            format!("{}.{}", section, name.trim().to_ascii_lowercase()),
+            unquote_ini_value(value.trim()),
+        ));
+    }
+    Ok(entries)
+}
+
+async fn apply_edited_config(
+    scope: ConfigScope,
+    original: &[ConfigKvEntry],
+    edited: &[(String, String)],
+) -> CliResult<()> {
+    use std::collections::BTreeMap;
+
+    let mut old_values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut old_encrypted: BTreeMap<String, bool> = BTreeMap::new();
+    for entry in original {
+        old_values
+            .entry(entry.key.clone())
+            .or_default()
+            .push(entry.value.clone());
+        old_encrypted.insert(entry.key.clone(), entry.encrypted);
+    }
+    let mut new_values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, value) in edited {
+        new_values
+            .entry(key.clone())
+            .or_default()
+            .push(value.clone());
+    }
+    for key in old_values.keys() {
+        if !new_values.contains_key(key) {
+            ScopedConfig::unset_all(scope, key)
+                .await
+                .map_err(CliError::from_legacy_string)?;
+        }
+    }
+    for (key, values) in new_values {
+        if old_values.get(&key) == Some(&values) {
+            continue;
+        }
+        if old_encrypted.get(&key) == Some(&true) {
+            if values.len() == old_values.get(&key).map_or(0, Vec::len)
+                && values.iter().all(|value| value == "<REDACTED>")
+            {
+                continue;
+            }
+            return Err(CliError::command_usage(format!(
+                "encrypted config entry '{key}' is read-only in config edit"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+        ScopedConfig::unset_all(scope, &key)
+            .await
+            .map_err(CliError::from_legacy_string)?;
+        for value in values {
+            ScopedConfig::add(scope, &key, &value, false)
+                .await
+                .map_err(CliError::from_legacy_string)?;
+        }
+    }
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn handle_path(scope: ConfigScope, output: &OutputConfig) -> CliResult<()> {
