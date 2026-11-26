@@ -47,12 +47,12 @@ const WIDTH_OR_THREAD_LOCAL_ALLOWLIST: &[(&str, &str, &str)] = &[
         "application-layer digest; not a repository OID (GC-B3-02 allowlist)",
     ),
     (
-        "src/utils/media/mod.rs",
+        "crates/libra-core/src/utils/media/mod.rs",
         "digest_width_check",
         "LFS media_oid is always SHA-256; not a repository OID (GC-B3-02)",
     ),
     (
-        "src/internal/upgrade/manifest.rs",
+        "crates/libra-core/src/internal/upgrade/manifest.rs",
         "digest_width_check",
         "application-layer digest; not a repository OID (GC-B3-02 allowlist)",
     ),
@@ -62,7 +62,7 @@ const WIDTH_OR_THREAD_LOCAL_ALLOWLIST: &[(&str, &str, &str)] = &[
         "application-layer digest; not a repository OID (GC-B3-02 allowlist)",
     ),
     (
-        "src/utils/storage_ext.rs",
+        "crates/libra-core/src/utils/storage_ext.rs",
         "from_type_and_data",
         "single-repo thread-local object write; explicit-kind follow-up OK",
     ),

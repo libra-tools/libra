@@ -1,0 +1,2126 @@
+//! Repo-root fd / no-follow / beneath directory traversal (plan-20260715 WIO-02).
+//!
+//! Status probe and worktree scans must not follow a directory that is
+//! swapped for an escaping symlink between `symlink_metadata` and `read_dir`.
+//! Every listing, marker probe, and lstat is derived from a repo-root
+//! directory fd/handle:
+//!
+//! - Linux: `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
+//! - other Unix: component-wise `openat(O_NOFOLLOW | O_DIRECTORY)`
+//! - Windows: `FILE_FLAG_OPEN_REPARSE_POINT` + fail closed on a reparse point
+//!
+//! A path that escapes the root, or any symlink component during directory
+//! descent, is returned as an I/O error (mapped to `IoBlocked` by callers).
+//! There is no fallback to a naked path open after a beneath failure.
+
+use std::{
+    cell::RefCell,
+    fs, io,
+    path::{Component, Path, PathBuf},
+};
+
+mod entry_identity;
+pub use entry_identity::{
+    EntryIdentity, EntryIdentityKey, EntryKind, entry_identity_beneath, identity_for_file,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RootIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    volume: u32,
+    #[cfg(windows)]
+    index: u64,
+}
+
+thread_local! {
+    static CACHED_ROOT: RefCell<Option<(PathBuf, RootIdentity, fs::File)>> =
+        const { RefCell::new(None) };
+}
+
+/// Open the repository working tree as a directory fd/handle.
+///
+/// The beneath boundary is the root directory itself, so `root`'s own final
+/// component is pinned no-follow: a symlinked root is rejected. Components
+/// *above* the root are outside the boundary and resolve normally — they are
+/// routinely symlinks on real systems (macOS ships `/var -> private/var` and
+/// `/tmp -> private/tmp`, so every `TMPDIR` path crosses one), and the callers
+/// hand in a path that ordinary repository discovery already resolved.
+/// Requiring them to be symlink-free would fail closed on legitimate trees
+/// without adding a guarantee: once the root fd is held, descent never
+/// re-traverses an ancestor, and `root_cache_still_valid` re-pins the
+/// directory identity (which `symlink_metadata` also resolves through
+/// ancestors) before any cached fd is reused.
+///
+/// The opened descriptor is cached per thread for the current root path, but
+/// only reused when the path still names the same directory identity (so a
+/// rename+recreate at the same pathname cannot keep status on a stale tree).
+pub fn open_root(root: &Path) -> io::Result<fs::File> {
+    let abs = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(root)
+    };
+    let abs = lexical_normalize(&abs);
+    // A cached descriptor into a live FUSE workspace pins the mount, making
+    // `worktree remove` fail with EBUSY even after callers drop their handles.
+    // Keep these roots transient; the common metadata root is still cached.
+    #[cfg(unix)]
+    if inside_managed_fuse_workspace(&abs) {
+        return open_root_uncached(&abs);
+    }
+    CACHED_ROOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((cached, identity, file)) = slot.as_ref()
+            && cached == &abs
+            && root_cache_still_valid(file, identity, &abs)
+        {
+            return dup_file(file);
+        }
+        let opened = open_root_uncached(&abs)?;
+        let identity = file_identity(&opened)?;
+        let dup = dup_file(&opened)?;
+        *slot = Some((abs, identity, opened));
+        Ok(dup)
+    })
+}
+
+#[cfg(unix)]
+fn inside_managed_fuse_workspace(path: &Path) -> bool {
+    path.ancestors().any(|ancestor| {
+        ancestor.file_name().is_some_and(|name| name == "workspace")
+            && ancestor
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|fuse| fuse.file_name().is_some_and(|name| name == "fuse"))
+            && ancestor
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .is_some_and(|worktree| worktree.file_name().is_some_and(|name| name == "worktree"))
+            && ancestor
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .is_some_and(|common| common.file_name().is_some_and(|name| name == ".libra"))
+    })
+}
+
+fn root_cache_still_valid(file: &fs::File, cached: &RootIdentity, path: &Path) -> bool {
+    let Ok(fd_id) = file_identity(file) else {
+        return false;
+    };
+    if &fd_id != cached {
+        return false;
+    }
+    let Ok(path_id) = path_identity_nofollow(path) else {
+        return false;
+    };
+    &path_id == cached
+}
+
+#[cfg(unix)]
+fn file_identity(file: &fs::File) -> io::Result<RootIdentity> {
+    identity_from_metadata(&file.metadata()?)
+}
+
+#[cfg(windows)]
+fn file_identity(file: &fs::File) -> io::Result<RootIdentity> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+    };
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok(RootIdentity {
+        volume: info.dwVolumeSerialNumber,
+        index,
+    })
+}
+
+#[cfg(unix)]
+fn path_identity_nofollow(path: &Path) -> io::Result<RootIdentity> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::other("beneath root is a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "status beneath root is not a directory",
+        ));
+    }
+    identity_from_metadata(&meta)
+}
+
+#[cfg(windows)]
+fn path_identity_nofollow(path: &Path) -> io::Result<RootIdentity> {
+    let file = open_windows_dir_nofollow(path)?;
+    file_identity(&file)
+}
+
+#[cfg(unix)]
+fn identity_from_metadata(meta: &fs::Metadata) -> io::Result<RootIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(RootIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+fn open_root_uncached(abs: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let rel = abs.strip_prefix("/").unwrap_or(abs);
+        if is_root_rel(rel) {
+            return fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open("/");
+        }
+        // Resolve the root's ancestors normally (see `open_root`: they sit
+        // above the beneath boundary and are symlinks on stock macOS), then
+        // pin the root component itself through `openat(O_NOFOLLOW)` so a
+        // symlinked root is still rejected.
+        let (parent, name) = match (abs.parent(), abs.file_name()) {
+            (Some(parent), Some(name)) => (parent, name),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "beneath root must be an absolute path with a final component",
+                ));
+            }
+        };
+        let parent_dir = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(parent)?;
+        open_beneath_openat_walk(&parent_dir, Path::new(name))
+    }
+    #[cfg(windows)]
+    {
+        // Same contract as the Unix arm: `FILE_FLAG_OPEN_REPARSE_POINT`
+        // applies to the final component, so a reparse-point root fails
+        // closed while junctions above the root resolve normally.
+        open_windows_dir_nofollow(abs)
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            Component::Normal(name) => out.push(name),
+        }
+    }
+    out
+}
+
+/// Open `rel` beneath `root` without following any symlink component.
+///
+/// `rel` is worktree-relative. Empty / `.` returns a duplicate of `root`.
+/// Absolute `rel` is rejected. Escape or symlink-in-descent is an error.
+pub fn open_beneath(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    if rel.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath path must be worktree-relative",
+        ));
+    }
+    if is_root_rel(rel) {
+        return dup_file(root);
+    }
+    reject_dotdot(rel)?;
+    if test_force_beneath_escape(rel) {
+        return Err(io::Error::other("beneath open escaped the repository root"));
+    }
+    open_beneath_platform(root, rel)
+}
+
+/// Whether `left` and `right` are the same directory entry, without following
+/// a symlink at either path. Ancestor symlinks are not followed: the walk uses
+/// the no-follow beneath open.
+pub fn same_nofollow_entry(root: &fs::File, left: &Path, right: &Path) -> io::Result<bool> {
+    let left = nofollow_identity(root, left)?;
+    let right = nofollow_identity(root, right)?;
+    Ok(left == right)
+}
+
+/// `lstat` of `rel` beneath `root` (final component may be a symlink leaf).
+pub fn lstat_beneath(root: &fs::File, rel: &Path) -> io::Result<RawLstat> {
+    if rel.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath path must be worktree-relative",
+        ));
+    }
+    if is_root_rel(rel) {
+        return RawLstat::from_metadata(&root.metadata()?);
+    }
+    reject_dotdot(rel)?;
+    lstat_beneath_platform(root, rel)
+}
+
+/// Open a regular file beneath an already-pinned root without following any
+/// symlink. The returned descriptor, rather than the pathname, is the source
+/// for all subsequent reads so a rename/replacement cannot redirect them.
+pub fn open_file_beneath(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    open_file_beneath_with_nonblocking(root, rel, false)
+}
+
+/// Open a regular file without blocking on a special-file replacement.
+pub fn open_file_beneath_nonblocking(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    open_file_beneath_with_nonblocking(root, rel, true)
+}
+
+fn open_file_beneath_with_nonblocking(
+    root: &fs::File,
+    rel: &Path,
+    nonblocking: bool,
+) -> io::Result<fs::File> {
+    if rel.is_absolute() || is_root_rel(rel) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path must be a non-empty relative path",
+        ));
+    }
+    reject_dotdot(rel)?;
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path has no final component",
+        )
+    })?;
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent)?,
+        None => dup_file(root)?,
+    };
+    open_file_in_dir(&directory, name, root, nonblocking)
+}
+
+/// Read a regular file beneath an already-pinned root. This is used for
+/// attributes and other metadata inputs that must not be re-discovered by
+/// pathname after the root has been pinned.
+pub fn read_file_beneath(root: &fs::File, rel: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_file_beneath(root, rel)?;
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Replace a regular file beneath an already-pinned root without following a
+/// symlink at any path component.
+///
+/// The parent directory is held by descriptor while the leaf is opened. The
+/// leaf is verified to be regular before it is truncated, so a concurrent
+/// replacement cannot redirect the write through a symlink or special file.
+/// When `create` is true, a missing regular leaf is created with owner-only
+/// permissions on Unix.
+pub fn write_regular_file_beneath(
+    root: &fs::File,
+    rel: &Path,
+    bytes: &[u8],
+    create: bool,
+) -> io::Result<()> {
+    if rel.is_absolute() || is_root_rel(rel) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path must be a non-empty relative path",
+        ));
+    }
+    reject_dotdot(rel)?;
+    write_regular_file_beneath_platform(root, rel, bytes, create)
+}
+
+/// Read a symlink's target bytes relative to a pinned root and parent
+/// descriptor. This never follows the symlink or reopens it by pathname.
+pub fn read_symlink_beneath(root: &fs::File, rel: &Path) -> io::Result<Vec<u8>> {
+    if rel.is_absolute() || is_root_rel(rel) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath symlink path must be a non-empty relative path",
+        ));
+    }
+    reject_dotdot(rel)?;
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath symlink path has no final component",
+        )
+    })?;
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent)?,
+        None => dup_file(root)?,
+    };
+    read_symlink_in_dir(&directory, name, root)
+}
+
+/// Read one symlink target and report the bytes every read attempt returned.
+///
+/// The caller uses this to charge a shared byte budget for the real work a
+/// retried read performs.
+pub fn read_symlink_beneath_counted(root: &fs::File, rel: &Path) -> (io::Result<Vec<u8>>, u64) {
+    if rel.is_absolute() || is_root_rel(rel) {
+        return (
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "beneath symlink path must be a non-empty relative path",
+            )),
+            0,
+        );
+    }
+    if let Err(error) = reject_dotdot(rel) {
+        return (Err(error), 0);
+    }
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let Some(name) = rel.file_name() else {
+        return (
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "beneath symlink path has no final component",
+            )),
+            0,
+        );
+    };
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent),
+        None => dup_file(root),
+    };
+    match directory {
+        Ok(directory) => read_symlink_in_dir_counted(&directory, name, root),
+        Err(error) => (Err(error), 0),
+    }
+}
+
+fn open_file_in_dir(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    root: &fs::File,
+    nonblocking: bool,
+) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let _ = root;
+        let c_name = component_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | if nonblocking { libc::O_NONBLOCK } else { 0 },
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "beneath file path is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::HANDLE;
+
+        let _ = nonblocking;
+        let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
+        let directory_path = final_path_name(directory.as_raw_handle() as HANDLE)?;
+        let file = open_windows_nofollow(&directory_path.join(name), false, false, true)?;
+        assert_handle_beneath(&file, &root_path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "beneath file path is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (directory, name, root, nonblocking);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "beneath file open unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn write_regular_file_beneath_platform(
+    root: &fs::File,
+    rel: &Path,
+    bytes: &[u8],
+    create: bool,
+) -> io::Result<()> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path has no final component",
+        )
+    })?;
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent)?,
+        None => dup_file(root)?,
+    };
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path contains an interior NUL",
+        )
+    })?;
+    let flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let flags = if create { flags | libc::O_CREAT } else { flags };
+    // SAFETY: `directory` and the NUL-terminated leaf name remain live for
+    // the syscall. O_NOFOLLOW protects the final component while the parent
+    // descriptor, opened through `open_beneath`, pins every ancestor.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a newly owned descriptor above.
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path is not a regular file",
+        ));
+    }
+    file.set_len(0)?;
+    io::Write::write_all(&mut file, bytes)?;
+    io::Write::flush(&mut file)
+}
+
+fn read_symlink_in_dir(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    root: &fs::File,
+) -> io::Result<Vec<u8>> {
+    let (target, _read) = read_symlink_in_dir_counted(directory, name, root);
+    target
+}
+
+/// Read one symlink target and report the bytes every attempt returned.
+///
+/// A target longer than the initial buffer takes more than one `readlinkat`
+/// call; the caller's budget must charge the whole work, not only the final
+/// target length.
+/// Test seam: make the second `readlinkat` attempt of a long target fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FAIL_READLINK_RETRY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: make the second `readlinkat` attempt of a long target fail.
+///
+/// Only the bridge fault-injection tests use it, so the dead-code lint is
+/// expected in a library build that enables the feature without those tests.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[allow(dead_code)]
+pub fn set_fail_readlink_retry_for_test(enabled: bool) {
+    FAIL_READLINK_RETRY.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn read_symlink_in_dir_counted(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    root: &fs::File,
+) -> (io::Result<Vec<u8>>, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        let _ = root;
+        let c_name = match component_cstring(name) {
+            Ok(name) => name,
+            Err(error) => return (Err(error), 0),
+        };
+        let mut target = vec![0u8; 256];
+        let mut read = 0u64;
+        loop {
+            let size = unsafe {
+                libc::readlinkat(
+                    directory.as_raw_fd(),
+                    c_name.as_ptr(),
+                    target.as_mut_ptr().cast(),
+                    target.len(),
+                )
+            };
+            if size < 0 {
+                return (Err(io::Error::last_os_error()), read);
+            }
+            let size = size as usize;
+            read = read.saturating_add(size as u64);
+            if size < target.len() {
+                target.truncate(size);
+                return (Ok(target), read);
+            }
+            // The retried attempt fails after the first attempt returned
+            // bytes; the caller still charges them.
+            #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+            if FAIL_READLINK_RETRY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return (
+                    Err(io::Error::other("injected readlink retry failure")),
+                    read,
+                );
+            }
+            let next = target.len().saturating_mul(2);
+            if next <= target.len() || next > 16 * 1024 * 1024 {
+                return (
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "beneath symlink target is too large",
+                    )),
+                    read,
+                );
+            }
+            target.resize(next, 0);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::HANDLE;
+
+        let root_path = match final_path_name(root.as_raw_handle() as HANDLE) {
+            Ok(path) => path,
+            Err(error) => return (Err(error), 0),
+        };
+        let directory_path = match final_path_name(directory.as_raw_handle() as HANDLE) {
+            Ok(path) => path,
+            Err(error) => return (Err(error), 0),
+        };
+        let file = match open_windows_nofollow(&directory_path.join(name), true, false, false) {
+            Ok(file) => file,
+            Err(error) => return (Err(error), 0),
+        };
+        if let Err(error) = assert_handle_beneath(&file, &root_path) {
+            return (Err(error), 0);
+        }
+        let target = read_windows_symlink_target(&file);
+        let read = target
+            .as_ref()
+            .map(|target| target.len() as u64)
+            .unwrap_or(0);
+        (target, read)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (directory, name, root);
+        (
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "beneath symlink read unsupported on this platform",
+            )),
+            0,
+        )
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "DeviceIoControl"]
+    fn beneath_device_io_control(
+        device: windows_sys::Win32::Foundation::HANDLE,
+        control_code: u32,
+        input_buffer: *const core::ffi::c_void,
+        input_size: u32,
+        output_buffer: *mut core::ffi::c_void,
+        output_size: u32,
+        bytes_returned: *mut u32,
+        overlapped: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+/// Read a Windows symlink or junction target from its already-open reparse
+/// handle.  The target is metadata, not a pathname to follow; the caller
+/// hashes these bytes as Git's symlink blob content.
+#[cfg(windows)]
+fn read_windows_symlink_target(file: &fs::File) -> io::Result<Vec<u8>> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    const FSCTL_GET_REPARSE_POINT: u32 = 589_992;
+    const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa000_0003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xa000_000c;
+    let mut buffer = vec![0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    let mut bytes_returned = 0u32;
+    let succeeded = unsafe {
+        beneath_device_io_control(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let returned = usize::try_from(bytes_returned).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record length overflow",
+        )
+    })?;
+    let record = buffer.get(..returned).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record is larger than the receive buffer",
+        )
+    })?;
+    let read_u16 = |offset: usize| -> io::Result<usize> {
+        let end = offset.checked_add(2).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Windows reparse field overflow")
+        })?;
+        let bytes = record.get(offset..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows reparse record is truncated",
+            )
+        })?;
+        Ok(usize::from(u16::from_le_bytes([bytes[0], bytes[1]])))
+    };
+    let tag_end = 4usize;
+    let tag_bytes = record.get(..tag_end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record is truncated",
+        )
+    })?;
+    let tag = u32::from_le_bytes([tag_bytes[0], tag_bytes[1], tag_bytes[2], tag_bytes[3]]);
+    let data_len = read_u16(4)?;
+    let record_len = 8usize.checked_add(data_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record length overflow",
+        )
+    })?;
+    let record = record.get(..record_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse record data is truncated",
+        )
+    })?;
+    let path_buffer_offset = match tag {
+        IO_REPARSE_TAG_SYMLINK if data_len >= 12 => 20usize,
+        IO_REPARSE_TAG_MOUNT_POINT if data_len >= 8 => 16usize,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported Windows reparse tag",
+            ));
+        }
+    };
+    let substitute_offset = read_u16(8)?;
+    let substitute_len = read_u16(10)?;
+    let print_offset = read_u16(12)?;
+    let print_len = read_u16(14)?;
+    if substitute_offset % 2 != 0
+        || substitute_len % 2 != 0
+        || print_offset % 2 != 0
+        || print_len % 2 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse target has an unaligned UTF-16 range",
+        ));
+    }
+    let range = |offset: usize, len: usize| -> io::Result<&[u8]> {
+        let start = path_buffer_offset.checked_add(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows reparse target overflow",
+            )
+        })?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows reparse target overflow",
+            )
+        })?;
+        record.get(start..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows reparse target is outside the record",
+            )
+        })
+    };
+    let target_bytes = if print_len != 0 {
+        range(print_offset, print_len)?
+    } else {
+        range(substitute_offset, substitute_len)?
+    };
+    let mut wide = Vec::with_capacity(target_bytes.len() / 2);
+    for chunk in target_bytes.as_chunks::<2>().0 {
+        wide.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    if target_bytes.len() % 2 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows reparse target has an odd UTF-16 byte length",
+        ));
+    }
+    Ok(std::ffi::OsString::from_wide(&wide)
+        .to_string_lossy()
+        .as_bytes()
+        .to_vec())
+}
+
+/// Marker presence (`.libra` / `.git`) via no-follow lookup under `rel`.
+pub fn marker_present_beneath(root: &fs::File, rel: &Path) -> io::Result<bool> {
+    let dir = open_beneath(root, rel)?;
+    for marker in [crate::utils::util::ROOT_DIR, crate::utils::util::GIT_DIR] {
+        match fstatat_nofollow(&dir, std::ffi::OsStr::new(marker)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+/// Read a regular file `name` under `dir_rel` without following symlinks.
+///
+/// Used for `.gitignore` / `.libraignore` so ignore resolution cannot follow
+/// a post-listing directory→symlink swap. Missing files are `NotFound`.
+pub fn read_regular_file_beneath(
+    worktree_root: &Path,
+    dir_rel: &Path,
+    name: &std::ffi::OsStr,
+) -> io::Result<Vec<u8>> {
+    let root = open_root(worktree_root)?;
+    let dir = if is_root_rel(dir_rel) {
+        dup_file(&root)?
+    } else {
+        open_beneath(&root, dir_rel)?
+    };
+    read_regular_file_in_dir(&dir, name)
+}
+
+fn read_regular_file_in_dir(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let c_name = component_cstring(name)?;
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        let meta = file.metadata()?;
+        if meta.file_type().is_symlink() || meta.is_dir() {
+            return Err(io::Error::other(
+                "beneath ignore source is not a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(file), &mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::HANDLE;
+        let dir_path = final_path_name(dir.as_raw_handle() as HANDLE)?;
+        let file = open_windows_nofollow(&dir_path.join(name), false, false, true)?;
+        let root_path = final_path_name(dir.as_raw_handle() as HANDLE)?;
+        assert_handle_beneath(&file, &strip_nt_prefix_path(&root_path))?;
+        let meta = file.metadata()?;
+        if meta.is_dir() {
+            return Err(io::Error::other(
+                "beneath ignore source is not a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(file), &mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (dir, name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "beneath ignore read unsupported on this platform",
+        ))
+    }
+}
+
+/// `read_dir` via the directory fd already opened beneath the root.
+pub fn read_dir_fd(dir: fs::File) -> io::Result<FdReadDir> {
+    FdReadDir::new(dir)
+}
+
+/// Portable lstat snapshot (Metadata cannot be built from `libc::stat`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawLstat {
+    pub is_symlink: bool,
+    pub is_dir: bool,
+    pub is_file: bool,
+    pub len: u64,
+    pub mode: u32,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+}
+
+impl RawLstat {
+    pub fn from_metadata(meta: &fs::Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ft = meta.file_type();
+            Ok(Self {
+                is_symlink: ft.is_symlink(),
+                is_dir: meta.is_dir(),
+                is_file: meta.is_file() && !ft.is_symlink(),
+                len: meta.len(),
+                mode: meta.mode(),
+                ctime_sec: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
+                mtime_sec: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let ft = meta.file_type();
+            let mtime = meta.modified().ok();
+            let ctime = meta.created().ok().or(mtime);
+            let (ctime_sec, ctime_nsec) = system_time_parts(ctime);
+            let (mtime_sec, mtime_nsec) = system_time_parts(mtime);
+            Ok(Self {
+                is_symlink: ft.is_symlink(),
+                is_dir: meta.is_dir(),
+                is_file: meta.is_file() && !ft.is_symlink(),
+                len: meta.len(),
+                mode: 0,
+                ctime_sec,
+                ctime_nsec,
+                mtime_sec,
+                mtime_nsec,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_libc_stat(stat: &libc::stat) -> Self {
+        let mode = stat.st_mode;
+        let is_symlink = (mode & libc::S_IFMT) == libc::S_IFLNK;
+        let is_dir = (mode & libc::S_IFMT) == libc::S_IFDIR;
+        let is_file = (mode & libc::S_IFMT) == libc::S_IFREG;
+        Self {
+            is_symlink,
+            is_dir,
+            is_file: is_file && !is_symlink,
+            len: stat.st_size as u64,
+            mode: {
+                #[cfg(target_os = "linux")]
+                {
+                    mode
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    mode as u32
+                }
+            },
+            ctime_sec: stat.st_ctime,
+            ctime_nsec: ctime_nsec(stat),
+            mtime_sec: stat.st_mtime,
+            mtime_nsec: mtime_nsec(stat),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn ctime_nsec(stat: &libc::stat) -> i64 {
+    // The Rust `libc` crate flattens Darwin's `st_ctimespec` into
+    // `st_ctime`/`st_ctime_nsec` (same names as Linux); `st_ctimespec`
+    // does not exist on `libc::stat` there — the aarch64-apple-darwin
+    // release build of v0.20.0 was the first cross-target compile since
+    // WIO-02 landed and failed on exactly this field (W5-09).
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+    {
+        stat.st_ctime_nsec
+    }
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        stat.st_ctim.tv_nsec
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        let _ = stat;
+        0
+    }
+}
+
+#[cfg(unix)]
+fn mtime_nsec(stat: &libc::stat) -> i64 {
+    // See `ctime_nsec`: libc flattens Darwin's timespec pair to
+    // `st_mtime`/`st_mtime_nsec`.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+    {
+        stat.st_mtime_nsec
+    }
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        stat.st_mtim.tv_nsec
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        let _ = stat;
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn system_time_parts(time: Option<std::time::SystemTime>) -> (i64, i64) {
+    use std::time::UNIX_EPOCH;
+    let Some(time) = time else {
+        return (0, 0);
+    };
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (
+            duration.as_secs() as i64,
+            i64::from(duration.subsec_nanos()),
+        ),
+        Err(_) => (0, 0),
+    }
+}
+
+/// Handle-bound Windows directory stream (`GetFileInformationByHandleEx`).
+#[cfg(not(unix))]
+struct WindowsDirStream {
+    _file: fs::File,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    buffer: Vec<u8>,
+    pos: usize,
+    restart: bool,
+    done: bool,
+}
+
+/// Streaming directory iterator over an already-opened directory fd.
+pub struct FdReadDir {
+    #[cfg(unix)]
+    dir: *mut libc::DIR,
+    #[cfg(not(unix))]
+    win: WindowsDirStream,
+}
+
+// SAFETY: `DIR*` is used from a single worker thread; the iterator is not shared.
+#[cfg(unix)]
+unsafe impl Send for FdReadDir {}
+
+impl FdReadDir {
+    fn new(dir: fs::File) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, IntoRawFd};
+            // `open_root` returns `dup` of a thread-local cached directory fd.
+            // On Unix, `dup` shares the open-file offset with the cache, so a
+            // prior `fdopendir`/`readdir` that drained the description would
+            // make the next listing look empty (WIO-02 probe regression).
+            // Rewind before handing the fd to `fdopendir`.
+            if unsafe { libc::lseek(dir.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let fd = dir.into_raw_fd();
+            let ptr = unsafe { libc::fdopendir(fd) };
+            if ptr.is_null() {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(error);
+            }
+            Ok(Self { dir: ptr })
+        }
+        #[cfg(not(unix))]
+        {
+            use std::os::windows::io::AsRawHandle;
+
+            use windows_sys::Win32::Foundation::HANDLE;
+            let handle = dir.as_raw_handle() as HANDLE;
+            let buffer = vec![0u8; 16 * 1024];
+            let pos = buffer.len();
+            Ok(Self {
+                win: WindowsDirStream {
+                    _file: dir,
+                    handle,
+                    buffer,
+                    pos,
+                    restart: true,
+                    done: false,
+                },
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FdReadDir {
+    fn drop(&mut self) {
+        if !self.dir.is_null() {
+            unsafe {
+                libc::closedir(self.dir);
+            }
+            self.dir = std::ptr::null_mut();
+        }
+    }
+}
+
+/// One `readdir` record with `d_type` when the filesystem provides it.
+#[derive(Debug)]
+pub struct FdDirent {
+    pub name: std::ffi::OsString,
+    pub d_type: u8,
+}
+
+#[cfg(not(unix))]
+impl WindowsDirStream {
+    fn next(&mut self) -> Option<io::Result<FdDirent>> {
+        loop {
+            if self.done {
+                return None;
+            }
+            if self.pos >= self.buffer.len() {
+                if let Err(error) = self.refill() {
+                    return Some(Err(error));
+                }
+                if self.done {
+                    return None;
+                }
+            }
+            match self.parse_one() {
+                Ok(Some(entry)) => {
+                    if entry.name == "." || entry.name == ".." {
+                        continue;
+                    }
+                    return Some(Ok(entry));
+                }
+                Ok(None) => continue,
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+
+    fn refill(&mut self) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+        const FILE_FULL_DIRECTORY_INFO: i32 = 14;
+        const FILE_FULL_DIRECTORY_RESTART_INFO: i32 = 15;
+        let class = if self.restart {
+            FILE_FULL_DIRECTORY_RESTART_INFO
+        } else {
+            FILE_FULL_DIRECTORY_INFO
+        };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                self.handle,
+                class,
+                self.buffer.as_mut_ptr().cast(),
+                self.buffer.len() as u32,
+            )
+        };
+        if ok == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(18) {
+                self.done = true;
+                return Ok(());
+            }
+            return Err(error);
+        }
+        self.restart = false;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn parse_one(&mut self) -> io::Result<Option<FdDirent>> {
+        const HEADER: usize = 68;
+        if self.pos + HEADER > self.buffer.len() {
+            self.pos = self.buffer.len();
+            return Ok(None);
+        }
+        let next_offset = u32::from_le_bytes(
+            self.buffer[self.pos..self.pos + 4]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "dir info offset"))?,
+        ) as usize;
+        let attrs = u32::from_le_bytes(
+            self.buffer[self.pos + 56..self.pos + 60]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "dir info attrs"))?,
+        );
+        let name_len = u32::from_le_bytes(
+            self.buffer[self.pos + 60..self.pos + 64]
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "dir info name len"))?,
+        ) as usize;
+        let name_off = self.pos + HEADER;
+        if name_off + name_len > self.buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated directory info name",
+            ));
+        }
+        let mut wide = Vec::with_capacity(name_len / 2);
+        let mut index = 0;
+        while index + 1 < name_len {
+            wide.push(u16::from_le_bytes([
+                self.buffer[name_off + index],
+                self.buffer[name_off + index + 1],
+            ]));
+            index += 2;
+        }
+        use std::os::windows::ffi::OsStringExt;
+        let name = std::ffi::OsString::from_wide(&wide);
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let d_type = if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            10
+        } else if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            4
+        } else {
+            8
+        };
+        if next_offset == 0 {
+            self.pos = self.buffer.len();
+        } else {
+            self.pos += next_offset;
+        }
+        Ok(Some(FdDirent { name, d_type }))
+    }
+}
+
+impl Iterator for FdReadDir {
+    type Item = io::Result<FdDirent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(unix)]
+        {
+            use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+            loop {
+                clear_errno();
+                let entry = unsafe { libc::readdir(self.dir) };
+                if entry.is_null() {
+                    let err = last_errno();
+                    if err == 0 {
+                        return None;
+                    }
+                    return Some(Err(io::Error::from_raw_os_error(err)));
+                }
+                let c_name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+                let bytes = c_name.to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                let d_type = unsafe { (*entry).d_type };
+                return Some(Ok(FdDirent {
+                    name: OsStr::from_bytes(bytes).to_os_string(),
+                    d_type,
+                }));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.win.next()
+        }
+    }
+}
+
+fn is_root_rel(rel: &Path) -> bool {
+    rel.as_os_str().is_empty()
+        || rel == Path::new(".")
+        || rel
+            .components()
+            .all(|component| matches!(component, Component::CurDir))
+}
+
+fn reject_dotdot(rel: &Path) -> io::Result<()> {
+    for component in rel.components() {
+        match component {
+            Component::CurDir | Component::Normal(_) => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "beneath path must not contain '..' or a prefix",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rel_cstring(rel: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(rel.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath path contains interior NUL",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn component_cstring(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath component contains interior NUL",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn clear_errno() {
+    unsafe {
+        *errno_location() = 0;
+    }
+}
+
+#[cfg(unix)]
+fn errno_location() -> *mut libc::c_int {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "fuchsia",
+        target_os = "redox",
+    ))]
+    {
+        unsafe { libc::__errno_location() }
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))]
+    {
+        unsafe { libc::__error() }
+    }
+    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+    {
+        unsafe { libc::___errno() }
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "emscripten",
+            target_os = "hurd",
+            target_os = "fuchsia",
+            target_os = "redox",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "solaris",
+            target_os = "illumos",
+        ))
+    ))]
+    {
+        // Remaining Unix targets (e.g. Haiku) still need a zeroed errno
+        // before readdir so EOF is not misread as an I/O error.
+        unsafe extern "C" {
+            fn __errno() -> *mut libc::c_int;
+        }
+        unsafe { __errno() }
+    }
+}
+
+#[cfg(unix)]
+fn last_errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn dup_file(file: &fs::File) -> io::Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe { libc::dup(file.as_raw_fd()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn dup_file(file: &fs::File) -> io::Result<fs::File> {
+    file.try_clone()
+}
+
+#[cfg(unix)]
+fn open_beneath_openat_walk(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut current = dup_file(root)?;
+    for component in rel.components() {
+        let name = match component {
+            Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "beneath path must not contain '..' or a prefix",
+                ));
+            }
+        };
+        let c_name = component_cstring(name)?;
+        let next = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if next < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        current = unsafe { fs::File::from_raw_fd(next) };
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+fn open_beneath_platform(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let c_rel = rel_cstring(rel)?;
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let mut how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            c_rel.as_ptr(),
+            &mut how as *mut OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) | Some(libc::EPERM)
+        ) {
+            return open_beneath_openat_walk(root, rel);
+        }
+        return Err(error);
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd as i32) })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_beneath_platform(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    open_beneath_openat_walk(root, rel)
+}
+
+#[cfg(windows)]
+fn open_windows_dir_nofollow(path: &Path) -> io::Result<fs::File> {
+    open_windows_nofollow(path, false, true, false)
+}
+
+/// Open `path` with `FILE_FLAG_OPEN_REPARSE_POINT` (final component only).
+/// Intermediate reparse points are not followed when callers walk one
+/// component at a time. `allow_reparse_leaf` keeps a final symlink/junction
+/// as the opened object; `require_dir` rejects non-directories.
+#[cfg(windows)]
+fn open_windows_nofollow(
+    path: &Path,
+    allow_reparse_leaf: bool,
+    require_dir: bool,
+    read_data: bool,
+) -> io::Result<fs::File> {
+    use std::{
+        os::windows::io::{AsRawHandle, FromRawHandle},
+        ptr,
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING, SYNCHRONIZE,
+        },
+    };
+
+    let wide = wide_path(path)?;
+    let desired_access = if require_dir {
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    } else if read_data {
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    } else {
+        // Leaf lstat must not demand FILE_READ_DATA (aliased with
+        // FILE_LIST_DIRECTORY) — attribute-only ACLs previously worked via
+        // symlink_metadata and must keep working under beneath.
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    };
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) };
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let ok = unsafe { GetFileInformationByHandle(owned.as_raw_handle() as HANDLE, &mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if !allow_reparse_leaf && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::other("beneath open hit a reparse point"));
+    }
+    if require_dir && info.dwFileAttributes & 0x10 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "status beneath path is not a directory",
+        ));
+    }
+    Ok(fs::File::from(owned))
+}
+
+#[cfg(windows)]
+fn write_regular_file_beneath_platform(
+    root: &fs::File,
+    rel: &Path,
+    bytes: &[u8],
+    create: bool,
+) -> io::Result<()> {
+    use std::{
+        os::windows::io::{AsRawHandle, FromRawHandle},
+        ptr,
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
+            GetFileInformationByHandle, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
+        },
+    };
+
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path has no final component",
+        )
+    })?;
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent)?,
+        None => dup_file(root)?,
+    };
+    let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
+    let directory_path = final_path_name(directory.as_raw_handle() as HANDLE)?;
+    let wide = wide_path(&directory_path.join(name))?;
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            if create { OPEN_ALWAYS } else { OPEN_EXISTING },
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let owned = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) };
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let ok = unsafe { GetFileInformationByHandle(owned.as_raw_handle() as HANDLE, &mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || info.dwFileAttributes & 0x10 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath file path is not a regular file",
+        ));
+    }
+    let mut file = fs::File::from(owned);
+    assert_handle_beneath(&file, &root_path)?;
+    file.set_len(0)?;
+    io::Write::write_all(&mut file, bytes)?;
+    io::Write::flush(&mut file)
+}
+
+#[cfg(windows)]
+fn open_beneath_platform(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
+    let mut expected = root_path.clone();
+    let mut last: Option<fs::File> = None;
+    for component in rel.components() {
+        let name = match component {
+            Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "beneath path must not contain '..' or a prefix",
+                ));
+            }
+        };
+        expected = expected.join(name);
+        let file = open_windows_dir_nofollow(&expected)?;
+        assert_final_path_matches(&file, &expected)?;
+        if !path_is_beneath(
+            &final_path_name(file.as_raw_handle() as HANDLE)?,
+            &root_path,
+        ) {
+            return Err(io::Error::other("beneath open escaped the repository root"));
+        }
+        last = Some(file);
+    }
+    last.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "beneath path had no component"))
+}
+
+#[cfg(windows)]
+fn final_path_name(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe {
+        GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, VOLUME_NAME_DOS)
+    };
+    if len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (len as usize) >= buf.len() {
+        buf.resize(len as usize + 1, 0);
+        let len = unsafe {
+            GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, VOLUME_NAME_DOS)
+        };
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buf.truncate(len as usize);
+    } else {
+        buf.truncate(len as usize);
+    }
+    use std::os::windows::ffi::OsStringExt;
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)))
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath path contains interior NUL",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn path_is_beneath(candidate: &Path, root: &Path) -> bool {
+    let candidate = strip_nt_prefix_path(candidate);
+    let root = strip_nt_prefix_path(root);
+    paths_equal_windows(&candidate, &root) || path_starts_with_windows(&candidate, &root)
+}
+
+#[cfg(windows)]
+fn assert_handle_beneath(child: &fs::File, root_path: &Path) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    let child_path = final_path_name(child.as_raw_handle() as HANDLE)?;
+    if !path_is_beneath(&child_path, root_path) {
+        return Err(io::Error::other("beneath open escaped the repository root"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn assert_final_path_matches(file: &fs::File, expected: &Path) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    let opened = final_path_name(file.as_raw_handle() as HANDLE)?;
+    if !paths_equal_windows(
+        &strip_nt_prefix_path(&opened),
+        &strip_nt_prefix_path(expected),
+    ) {
+        return Err(io::Error::other(
+            "beneath open resolved to a different path than requested",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn strip_nt_prefix_path(path: &Path) -> PathBuf {
+    let rendered = path.to_string_lossy();
+    if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(windows)]
+fn paths_equal_windows(left: &Path, right: &Path) -> bool {
+    left.as_os_str().eq_ignore_ascii_case(right.as_os_str())
+}
+
+#[cfg(windows)]
+fn path_starts_with_windows(candidate: &Path, root: &Path) -> bool {
+    let candidate = candidate.to_string_lossy();
+    let root = root.to_string_lossy();
+    if candidate.len() <= root.len() {
+        return false;
+    }
+    if !candidate
+        .as_bytes()
+        .get(..root.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(root.as_bytes()))
+    {
+        return false;
+    }
+    candidate.as_bytes().get(root.len()) == Some(&b'\\')
+        || candidate.as_bytes().get(root.len()) == Some(&b'/')
+}
+
+fn nofollow_identity(root: &fs::File, rel: &Path) -> io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        let stat = stat_nofollow(root, rel)?;
+        Ok((stat.st_dev as u64, stat.st_ino as u64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, rel);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "nofollow identity is unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn stat_nofollow(root: &fs::File, rel: &Path) -> io::Result<libc::stat> {
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath lstat missing file name",
+        )
+    })?;
+    let dir = match parent {
+        Some(parent) => open_beneath_platform(root, parent)?,
+        None => dup_file(root)?,
+    };
+    fstatat_value(&dir, name)
+}
+
+#[cfg(unix)]
+fn lstat_beneath_platform(root: &fs::File, rel: &Path) -> io::Result<RawLstat> {
+    let parent = rel.parent().filter(|p| !is_root_rel(p));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath lstat missing file name",
+        )
+    })?;
+    let dir = match parent {
+        Some(parent) => open_beneath_platform(root, parent)?,
+        None => dup_file(root)?,
+    };
+    fstatat_raw(&dir, name)
+}
+
+#[cfg(windows)]
+fn lstat_beneath_platform(root: &fs::File, rel: &Path) -> io::Result<RawLstat> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    let parent = rel.parent().filter(|p| !is_root_rel(p));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath lstat missing file name",
+        )
+    })?;
+    let dir = match parent {
+        Some(parent) => open_beneath_platform(root, parent)?,
+        None => dup_file(root)?,
+    };
+    let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
+    let dir_path = final_path_name(dir.as_raw_handle() as HANDLE)?;
+    let file = open_windows_nofollow(&dir_path.join(name), true, false, false)?;
+    assert_handle_beneath(&file, &root_path)?;
+    drop(dir);
+    RawLstat::from_metadata(&file.metadata()?)
+}
+
+fn fstatat_nofollow(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<RawLstat> {
+    #[cfg(unix)]
+    {
+        fstatat_raw(dir, name)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::HANDLE;
+        let dir_path = final_path_name(dir.as_raw_handle() as HANDLE)?;
+        let file = open_windows_nofollow(&dir_path.join(name), true, false, false)?;
+        assert_handle_beneath(&file, &dir_path)?;
+        RawLstat::from_metadata(&file.metadata()?)
+    }
+}
+
+#[cfg(unix)]
+fn fstatat_raw(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<RawLstat> {
+    fstatat_value(dir, name).map(|stat| RawLstat::from_libc_stat(&stat))
+}
+
+#[cfg(unix)]
+fn fstatat_value(dir: &fs::File, name: &std::ffi::OsStr) -> io::Result<libc::stat> {
+    use std::os::fd::AsRawFd;
+    let c_name = component_cstring(name)?;
+    // SAFETY: libc::stat contains only integer fields on the supported Unix
+    // targets; zero initialization produces a valid writable output buffer.
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: the borrowed directory descriptor and NUL-terminated name remain
+    // live during the call; stat is an aligned, exclusively borrowed buffer.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat)
+}
+
+/// Test harness seam: when `LIBRA_TEST=1` and the swap env vars are set,
+/// force the matching relative open to fail closed with the same error the
+/// real beneath path returns on escape. This is intentionally **non-mutating**
+/// (no `remove_dir_all` / symlink injection in the shipped binary); real
+/// check→open races are covered by unit tests that mutate only their tempdirs.
+fn test_force_beneath_escape(rel: &Path) -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_none() {
+        return false;
+    }
+    let Ok(target) = std::env::var("LIBRA_TEST_BENEATH_TOCTOU_SWAP") else {
+        return false;
+    };
+    if rel != Path::new(&target) && !rel.ends_with(&target) {
+        return false;
+    }
+    // OUTSIDE must be set so callers cannot arm the seam by accident with a
+    // single env var; the path itself is unused because the seam is
+    // non-mutating.
+    std::env::var_os("LIBRA_TEST_BENEATH_TOCTOU_OUTSIDE").is_some()
+}
+
+#[cfg(all(test, windows))]
+fn create_windows_test_reparse(link: &Path, target: &Path) -> io::Result<()> {
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_fuse_workspace_roots_do_not_enter_the_thread_cache() {
+        let workspace = Path::new("/repo/.libra/worktree/fuse/topic/workspace");
+        assert!(inside_managed_fuse_workspace(workspace));
+        assert!(inside_managed_fuse_workspace(&workspace.join("subdir")));
+        assert!(!inside_managed_fuse_workspace(Path::new(
+            "/repo/.libra/worktree/fuse/topic/upper"
+        )));
+        assert!(!inside_managed_fuse_workspace(Path::new(
+            "/repo/.libra/worktree/linked/topic"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_root_rejects_symlink() {
+        let real = tempfile::tempdir().expect("real");
+        let link_dir = tempfile::tempdir().expect("link parent");
+        let link = link_dir.path().join("rootlink");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let error = open_root(&link).expect_err("symlinked root");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_root_invalidates_stale_cache_after_root_replace() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root_path = tmp.path().join("wt");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("old.txt"), b"old\n").unwrap();
+        let first = open_root(&root_path).expect("first open");
+        let first_names: Vec<_> = read_dir_fd(first)
+            .expect("list first")
+            .map(|entry| entry.expect("dirent").name)
+            .collect();
+        assert!(first_names.iter().any(|n| n == "old.txt"));
+
+        let retired = tmp.path().join("retired");
+        fs::rename(&root_path, &retired).unwrap();
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("new.txt"), b"new\n").unwrap();
+
+        let second = open_root(&root_path).expect("reopen after replace");
+        let second_names: Vec<_> = read_dir_fd(second)
+            .expect("list second")
+            .map(|entry| entry.expect("dirent").name)
+            .collect();
+        assert!(second_names.iter().any(|n| n == "new.txt"));
+        assert!(!second_names.iter().any(|n| n == "old.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_beneath_rejects_escaping_symlink() {
+        let root_dir = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("decoy.txt"), b"secret\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root_dir.path().join("link")).unwrap();
+        let root = open_root(root_dir.path()).expect("open root");
+        let error = open_beneath(&root, Path::new("link")).expect_err("symlink must fail");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_beneath_accepts_real_subdirectory() {
+        let root_dir = tempfile::tempdir().expect("root");
+        fs::create_dir(root_dir.path().join("inner")).unwrap();
+        fs::write(root_dir.path().join("inner/a.txt"), b"ok\n").unwrap();
+        let root = open_root(root_dir.path()).expect("open root");
+        let dir = open_beneath(&root, Path::new("inner")).expect("real dir");
+        let listing = read_dir_fd(dir).expect("fdopendir");
+        let names: Vec<_> = listing.map(|entry| entry.expect("dirent").name).collect();
+        assert!(names.iter().any(|n| n == "a.txt"));
+    }
+
+    /// Cached `open_root` returns `dup` of one open-file description. A first
+    /// `read_dir_fd` that drains the directory must not make the next listing
+    /// through the same cache appear empty.
+    #[cfg(unix)]
+    #[test]
+    fn read_dir_fd_rewinds_shared_cached_root_offset() {
+        let root_dir = tempfile::tempdir().expect("root");
+        fs::write(root_dir.path().join("visible.txt"), b"ok\n").unwrap();
+        let first = open_beneath(&open_root(root_dir.path()).expect("root"), Path::new(""))
+            .and_then(read_dir_fd)
+            .expect("first listing");
+        let first_names: Vec<_> = first.map(|entry| entry.expect("dirent").name).collect();
+        assert!(
+            first_names.iter().any(|n| n == "visible.txt"),
+            "first listing sees the file: {first_names:?}"
+        );
+        let second = open_beneath(&open_root(root_dir.path()).expect("root"), Path::new(""))
+            .and_then(read_dir_fd)
+            .expect("second listing");
+        let second_names: Vec<_> = second.map(|entry| entry.expect("dirent").name).collect();
+        assert!(
+            second_names.iter().any(|n| n == "visible.txt"),
+            "second listing must rewind the shared cached offset: {second_names:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_beneath_rejects_directory_swapped_for_escape() {
+        let root_dir = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("decoy.txt"), b"secret\n").unwrap();
+        fs::create_dir(root_dir.path().join("swapme")).unwrap();
+        fs::write(root_dir.path().join("swapme/inside.txt"), b"ok\n").unwrap();
+        let root = open_root(root_dir.path()).expect("open root");
+        open_beneath(&root, Path::new("swapme")).expect("pre-swap dir");
+        fs::remove_dir_all(root_dir.path().join("swapme")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root_dir.path().join("swapme")).unwrap();
+        let error = open_beneath(&root, Path::new("swapme")).expect_err("swapped symlink");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lstat_beneath_sees_symlink_leaf_without_following() {
+        let root_dir = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("decoy.txt"), b"secret\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("decoy.txt"),
+            root_dir.path().join("leaf"),
+        )
+        .unwrap();
+        let root = open_root(root_dir.path()).expect("open root");
+        let stat = lstat_beneath(&root, Path::new("leaf")).expect("lstat leaf");
+        assert!(stat.is_symlink);
+        assert!(!stat.is_dir);
+        assert!(!stat.is_file);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_beneath_rejects_directory_junction() {
+        let root_dir = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("decoy.txt"), b"secret\n").unwrap();
+        let link = root_dir.path().join("link");
+        create_windows_test_reparse(&link, outside.path()).expect("junction");
+        let root = open_root(root_dir.path()).expect("open root");
+        let error = open_beneath(&root, Path::new("link")).expect_err("junction must fail");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_beneath_rejects_directory_swapped_for_junction() {
+        let root_dir = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("decoy.txt"), b"secret\n").unwrap();
+        fs::create_dir(root_dir.path().join("swapme")).unwrap();
+        fs::write(root_dir.path().join("swapme/inside.txt"), b"ok\n").unwrap();
+        let root = open_root(root_dir.path()).expect("open root");
+        open_beneath(&root, Path::new("swapme")).expect("pre-swap dir");
+        fs::remove_dir_all(root_dir.path().join("swapme")).unwrap();
+        create_windows_test_reparse(&root_dir.path().join("swapme"), outside.path())
+            .expect("junction");
+        let error = open_beneath(&root, Path::new("swapme")).expect_err("swapped junction");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+    }
+}

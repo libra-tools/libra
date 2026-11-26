@@ -52,6 +52,17 @@ use git_internal::{
         tree::{Tree, TreeItem, TreeItemMode},
     },
 };
+/// Default Git reference for the AI history orphan branch.
+///
+/// All AI process objects (Intent, Task, Run, Plan, PatchSet, Evidence,
+/// ToolInvocation, Provenance, Decision) live on this single branch,
+/// running in parallel with the normal code branch (`refs/heads/*`).
+///
+/// By keeping AI objects reachable from this ref, they are protected
+/// from `git gc` — the branch acts as a GC root.
+///
+/// In the database, this is stored with kind='Branch' and name='libra/intent'.
+pub use libra_core::internal::metadata_types::AI_REF;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr,
     EntityTrait, QueryFilter, QueryResult, Set, SqlErr, Statement, TransactionTrait, Value,
@@ -92,18 +103,6 @@ use crate::{
         storage::Storage,
     },
 };
-
-/// Default Git reference for the AI history orphan branch.
-///
-/// All AI process objects (Intent, Task, Run, Plan, PatchSet, Evidence,
-/// ToolInvocation, Provenance, Decision) live on this single branch,
-/// running in parallel with the normal code branch (`refs/heads/*`).
-///
-/// By keeping AI objects reachable from this ref, they are protected
-/// from `git gc` — the branch acts as a GC root.
-///
-/// In the database, this is stored with kind='Branch' and name='libra/intent'.
-pub const AI_REF: &str = "libra/intent";
 /// Maximum attempts to retry a SQLite operation that returns a transient
 /// "database is locked" error before propagating the failure.
 const SQLITE_BUSY_MAX_RETRIES: usize = 15;

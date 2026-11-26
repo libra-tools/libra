@@ -871,8 +871,9 @@ libra 0.18.84\n";
     #[test]
     fn rejects_unsupported_content_types_and_header_injection() {
         assert!(validate_content_type("text/plain; charset=UTF-8").is_ok());
+        assert!(validate_content_type("text/plain; charset=iso-8859-1").is_ok());
         assert!(validate_content_type("multipart/mixed; boundary=x").is_err());
-        assert!(validate_content_type("text/plain; charset=iso-8859-1").is_err());
+        assert!(validate_content_type("text/plain; charset=shift_jis").is_err());
 
         let decoded = decode_encoded_words("=?UTF-8?B?QWxpY2UK?= <alice@example.com>")
             .expect("decode injected header");

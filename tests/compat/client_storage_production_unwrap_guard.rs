@@ -15,7 +15,7 @@
 
 use std::{fs, path::PathBuf};
 
-const TARGET_FILE: &str = "src/utils/client_storage.rs";
+const TARGET_FILE: &str = "crates/libra-core/src/utils/client_storage.rs";
 
 #[test]
 fn client_storage_production_has_no_bare_unwrap_calls() {

@@ -291,18 +291,6 @@ impl BisectState {
         Ok(())
     }
 
-    /// Read the single bisect-state row, decoding the JSON-encoded
-    /// `good`/`skipped` vectors and re-parsing each `ObjectHash`. Returns
-    /// `Ok(None)` when no row exists.
-    /// The row of an EXPLICITLY resolved scope (§C.4.2) — the `ORIG_HEAD`
-    /// projection of §C.5 reads it for the scope its caller resolved.
-    pub(crate) async fn load_for_scope(
-        scope: &crate::internal::worktree_scope::WorktreeScope,
-    ) -> Result<Option<BisectState>, String> {
-        let db = crate::internal::sequencer::request_db_checked().await?;
-        Self::load_from_db_in_scope(&db, scope.storage_key()).await
-    }
-
     async fn load_from_db<C: ConnectionTrait>(db: &C) -> Result<Option<BisectState>, String> {
         Self::load_from_db_in_scope(db, &Self::scope_key()).await
     }
@@ -2476,16 +2464,6 @@ async fn count_commits_to_test(state: &BisectState) -> Result<usize, String> {
     let testable =
         get_testable_commits(&bad, &state.good, &state.skipped, state.first_parent).await?;
     Ok(testable.len())
-}
-
-/// `ORIG_HEAD` for an explicitly resolved scope — the §C.5 projection. `None`
-/// when that worktree has no bisect session; an unreadable row is an ERROR.
-pub(crate) async fn orig_head_for_scope(
-    scope: &crate::internal::worktree_scope::WorktreeScope,
-) -> Result<Option<String>, String> {
-    Ok(BisectState::load_for_scope(scope)
-        .await?
-        .map(|state| state.orig_head.to_string()))
 }
 
 #[cfg(test)]

@@ -251,19 +251,8 @@ pub fn load_object<T>(hash: &ObjectHash) -> Result<T, GitError>
 where
     T: ObjectTrait,
 {
-    // Apply any `refs/replace/<oid>` substitution before reading, so `log`,
-    // `show`, `rev-parse` peeling, etc. transparently see the replacement.
-    // Cheap no-op when no replacements exist.
-    let hash = replace::resolve(*hash);
-    let storage = util::try_objects_storage().map_err(GitError::IOError)?;
-    let data = match storage.get(&hash) {
-        Ok(data) => data,
-        Err(error) => match lazy_fetch_missing_object(&hash) {
-            Some(data) => data,
-            None => return Err(error),
-        },
-    };
-    T::from_bytes(&data.to_vec(), hash)
+    crate::ensure_runtime_hooks();
+    libra_core::internal::object_io::load_object(hash)
 }
 
 /// Promisor lazy fetch: when `extensions.partialClone` names a remote and the
@@ -1078,9 +1067,8 @@ fn stream_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {
 pub async fn get_target_commit(
     branch_or_commit: &str,
 ) -> Result<ObjectHash, Box<dyn std::error::Error>> {
-    util::get_commit_base(branch_or_commit)
-        .await
-        .map_err(|e| e.into())
+    crate::ensure_runtime_hooks();
+    libra_core::internal::object_io::get_target_commit(branch_or_commit).await
 }
 
 #[cfg(test)]

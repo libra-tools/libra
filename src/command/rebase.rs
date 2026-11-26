@@ -6123,28 +6123,6 @@ async fn collect_commits_to_replay(
     Ok(commits)
 }
 
-/// `ORIG_HEAD` for an explicitly resolved scope — the pseudo-ref projection
-/// (§C.5). `None` when that worktree has no rebase in progress; an unreadable
-/// row is an ERROR, never "nothing in progress".
-pub(crate) async fn orig_head_for_scope(
-    scope: &crate::internal::worktree_scope::WorktreeScope,
-) -> Result<Option<String>, String> {
-    Ok(RebaseState::load_for_scope(scope)
-        .await?
-        .map(|state| state.orig_head.to_string()))
-}
-
-/// `REBASE_HEAD` for an explicitly resolved scope: the commit a STOPPED rebase
-/// is sitting on. A rebase in progress that has not stopped defines no
-/// `REBASE_HEAD`, which is why the column is nullable.
-pub(crate) async fn stopped_sha_for_scope(
-    scope: &crate::internal::worktree_scope::WorktreeScope,
-) -> Result<Option<String>, String> {
-    Ok(RebaseState::load_for_scope(scope)
-        .await?
-        .and_then(|state| state.stopped_sha.map(|sha| sha.to_string())))
-}
-
 /// Reset the working directory to match the new index state without overwriting untracked files.
 fn reset_workdir_tracked_only(
     current_index: &git_internal::internal::index::Index,

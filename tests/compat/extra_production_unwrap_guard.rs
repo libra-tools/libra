@@ -23,15 +23,15 @@ use std::{fs, path::PathBuf};
 
 /// (production file path, introducing patch version)
 const TARGET_FILES: &[(&str, &str)] = &[
-    ("src/utils/lfs.rs", "v0.17.240"),
-    ("src/utils/object.rs", "v0.17.240"),
-    ("src/utils/storage/local.rs", "v0.17.244"),
-    ("src/utils/storage/tiered.rs", "v0.17.245"),
-    ("src/utils/path_ext.rs", "v0.17.252"),
+    ("crates/libra-core/src/utils/lfs.rs", "v0.17.240"),
+    ("crates/libra-core/src/utils/object.rs", "v0.17.240"),
+    ("crates/libra-core/src/utils/storage/local.rs", "v0.17.244"),
+    ("crates/libra-core/src/utils/storage/tiered.rs", "v0.17.245"),
+    ("crates/libra-core/src/utils/path_ext.rs", "v0.17.252"),
     ("src/git_protocol.rs", "v0.17.242"),
     ("src/lfs_structs.rs", "v0.17.242"),
     ("src/command/reflog.rs", "v0.17.251"),
-    ("src/internal/reflog.rs", "v0.17.1391"),
+    ("crates/libra-core/src/internal/reflog.rs", "v0.17.1391"),
 ];
 
 #[test]

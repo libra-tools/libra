@@ -19,7 +19,7 @@ use std::{fs, path::PathBuf};
 /// The single file this guard protects. If the file moves, update this
 /// constant alongside the move so the guard keeps surfacing regressions
 /// at compile-time.
-const TARGET_FILE: &str = "src/internal/config.rs";
+const TARGET_FILE: &str = "crates/libra-core/src/internal/config.rs";
 
 #[test]
 fn config_production_has_no_bare_unwrap_calls() {

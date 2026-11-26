@@ -994,6 +994,7 @@ pub enum Bisect {
 /// - Returns `CliError::fatal` if the runtime itself cannot be constructed (extremely
 ///   unlikely outside of OOM scenarios).
 pub fn parse(args: Option<&[&str]>) -> CliResult<()> {
+    crate::ensure_runtime_hooks();
     let argv: Vec<std::ffi::OsString> = match args {
         Some(args) => args.iter().map(std::ffi::OsString::from).collect(),
         None => env::args_os().collect(),
@@ -3603,6 +3604,7 @@ fn run_auto_upgrade_check_hook() {
 ///   function returns a `CliError::failure` with stable code `WarningEmitted` even
 ///   though the underlying command succeeded.
 pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
+    crate::ensure_runtime_hooks();
     // `args_os`, not `args`: `env::args()` PANICS on an argument that is not
     // valid UTF-8, and a pathspec naming a file whose name is not UTF-8 is an
     // ordinary thing to type on Unix. The argv pipeline therefore carries

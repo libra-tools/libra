@@ -1,0 +1,5899 @@
+//! Core utility toolbox for repo detection, path conversion, ignore checking, storage access, hashing helpers, and miscellaneous formatting/time utilities.
+
+use std::{
+    collections::{BinaryHeap, HashMap, HashSet},
+    env,
+    ffi::OsStr,
+    fs, io,
+    io::Write,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
+
+use git_internal::{
+    errors::GitError,
+    hash::ObjectHash,
+    internal::{
+        index::Index,
+        object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
+    },
+};
+use ignore::{
+    Match,
+    gitignore::{Gitignore, GitignoreBuilder},
+};
+use indicatif::{ProgressBar, ProgressStyle};
+use once_cell::sync::Lazy;
+use path_absolutize::*;
+use regex::RegexBuilder;
+
+use crate::{
+    internal::{
+        branch::{Branch, BranchStoreError},
+        config::ConfigKv,
+        db::get_db_conn_instance,
+        head::Head,
+        object_io::load_object,
+        reflog::Reflog,
+        tag,
+    },
+    utils::{
+        client_storage::ClientStorage,
+        error::{CliError, StableErrorCode},
+        path,
+        path_ext::PathExt,
+        text::SHORT_HASH_LEN,
+    },
+};
+
+// SAFETY: The unwrap() and expect() calls in this module are documented with safety
+// justifications where used. These are intentional panics for unrecoverable errors
+// or cases where invariants are guaranteed by the code structure.
+
+pub const ROOT_DIR: &str = ".libra";
+/// The Git metadata directory. Like Git, Libra always force-ignores any `.git`
+/// directory in the worktree so a nested Git repository is never surfaced as
+/// untracked or staged, and it cannot be un-ignored via `.libraignore`.
+pub const GIT_DIR: &str = ".git";
+const LIBRAIGNORE_FILE: &str = ".libraignore";
+const GITIGNORE_FILE: &str = ".gitignore";
+const CORE_EXCLUDES_FILE_KEY: &str = "core.excludesFile";
+pub const DATABASE: &str = "libra.db";
+pub const ATTRIBUTES: &str = ".libra_attributes";
+
+static OBJECTS_STORAGE_CACHE: Lazy<Mutex<HashMap<PathBuf, ClientStorage>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static LIBRAIGNORE_CACHE: Lazy<Mutex<HashMap<IgnoreCacheKey, CachedGitignore>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+/// Per-invocation ignore-walk registry. Concurrent status/probe walks each
+/// own an epoch; timed-out workers can only latch failure onto still-active
+/// epochs, so one walk cannot clear or poison another.
+struct SecureIgnoreWalkRegistry {
+    next_epoch: u64,
+    active: HashSet<u64>,
+    failed: HashSet<u64>,
+    /// Per-walk beneath ignore loads (`path` → `Some(matcher)` or `None` for
+    /// NotFound). Avoids re-reading the same `.gitignore` for every entry
+    /// while keeping cache lifetime tied to the walk epoch.
+    matchers: HashMap<u64, HashMap<PathBuf, Option<Arc<Gitignore>>>>,
+}
+
+static SECURE_IGNORE_WALK: Lazy<Mutex<SecureIgnoreWalkRegistry>> = Lazy::new(|| {
+    Mutex::new(SecureIgnoreWalkRegistry {
+        next_epoch: 0,
+        active: HashSet::new(),
+        failed: HashSet::new(),
+        matchers: HashMap::new(),
+    })
+});
+
+thread_local! {
+    /// Epoch of the ignore walk started on this thread (supports nesting).
+    static CURRENT_WALK_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Epoch bound for the duration of a single ignore lookup (worker thread).
+    static IGNORE_OP_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Restore a pooled worker's previous epoch even if matching unwinds.
+struct IgnoreOpEpochGuard(u64);
+
+impl Drop for IgnoreOpEpochGuard {
+    fn drop(&mut self) {
+        IGNORE_OP_EPOCH.with(|cell| cell.set(self.0));
+    }
+}
+
+fn lock_secure_ignore_walk() -> std::sync::MutexGuard<'static, SecureIgnoreWalkRegistry> {
+    match SECURE_IGNORE_WALK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+static CONFIG_PATH_CACHE: Lazy<Mutex<HashMap<ConfigPathCacheKey, Option<PathBuf>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IgnoreCacheKey {
+    source: PathBuf,
+    base: PathBuf,
+}
+
+struct CachedGitignore {
+    len: u64,
+    modified: SystemTime,
+    matcher: Arc<Gitignore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConfigPathCacheKey {
+    workdir: PathBuf,
+    key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRepositoryLocation {
+    pub root: PathBuf,
+    pub is_bare: bool,
+}
+
+/// Returns the current working directory as a `PathBuf`.
+///
+/// This function wraps the `std::env::current_dir()` function and provides
+/// robust fallback behavior when the current directory is not available.
+///
+/// # Returns
+///
+/// A `PathBuf` representing the current working directory. If the current
+/// directory cannot be determined, this function uses the following fallbacks:
+/// 1. The `PWD` environment variable (if set and points to a valid directory)
+/// 2. The parent directory of the current executable (if available)
+/// 3. The root directory `/` as a last resort
+pub fn cur_dir() -> PathBuf {
+    match env::current_dir() {
+        Ok(dir) => dir,
+        Err(_) => {
+            // Fallback 1: use PWD if present and valid
+            if let Ok(pwd) = env::var("PWD") {
+                let p = PathBuf::from(&pwd);
+                if p.exists() && p.is_dir() {
+                    return p;
+                }
+            }
+
+            // Fallback 2: directory of the current executable if available
+            if let Ok(exec) = env::current_exe()
+                && let Some(parent) = exec.parent()
+                && parent.exists()
+                && parent.is_dir()
+            {
+                return parent.to_path_buf();
+            }
+
+            // Fallback 3: root directory to ensure a stable, existing path
+            PathBuf::from("/")
+        }
+    }
+}
+
+/// Whether `path` is reserved for per-user state rather than repository storage.
+/// The upgrade home and global config directories can differ when overridden;
+/// neither may be adopted because of a stray `libra.db`. Resolve existing
+/// ancestors too, so a not-yet-created home behind a symlink is still reserved.
+///
+/// The reserved set covers the Libra home, the XDG-based global config
+/// directory and the legacy `<home>/.libra` config directory (ADR-GCX-01).
+/// Two strengths apply:
+/// - the **config directories** are reserved recursively, so `libra init`
+///   refuses a storage root inside the user's configuration directory;
+/// - the **Libra home** (`LIBRA_HOME`, or the parent of an explicit
+///   `LIBRA_CONFIG_GLOBAL_DB` override) is reserved only as itself, because
+///   isolated test/sandbox setups legitimately keep repositories beneath that
+///   directory (the override is an isolation hook, not a storage policy).
+pub fn is_global_libra_home(path: &Path) -> bool {
+    let path = canonicalize_deepest_existing(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = |home: PathBuf| canonicalize_deepest_existing(&home).unwrap_or(home);
+    let home = crate::internal::upgrade::home::resolve_libra_home()
+        .ok()
+        .map(canonical);
+    if home.as_deref() == Some(path.as_path()) {
+        return true;
+    }
+    [
+        crate::internal::config::global_config_dir(),
+        crate::internal::config::legacy_global_config_path()
+            .and_then(|db| db.parent().map(Path::to_path_buf)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(canonical)
+    .any(|config_dir| path == config_dir || path.starts_with(&config_dir))
+}
+
+fn is_valid_storage_dir(path: &Path) -> bool {
+    // The Libra home must be refused before the `libra.db` check: adopting it
+    // made repository discovery read global-side files as repo-local config,
+    // failing commands with `no such table: config` on home DBs that lack the
+    // legacy `config` table.
+    if is_global_libra_home(path) {
+        return false;
+    }
+    if path.join(DATABASE).exists() {
+        return true;
+    }
+    // lore.md 2.1: a linked worktree's `.libra` holds only `commondir` +
+    // `worktree_id` + `index` (db/objects live in the common storage), so
+    // recognize it by its commondir pointer. A detached-from-registry
+    // marker also counts (W3-s1b): even if the commondir file was deleted,
+    // the walk must STOP here and fail closed on the marker — climbing to
+    // an ancestor repository would silently run commands in the WRONG
+    // scope.
+    // `symlink_metadata`, not `exists()`, and inspection ERRORS count as
+    // marker-present too: a dangling symlink (or an EPERM/EIO on the
+    // marker) still MARKS this directory as a linked gitdir — reporting it
+    // absent would let repository discovery climb past a (corrupt) linked
+    // worktree into the main worktree's scope. The walk STOPS here and the
+    // resolution layer produces the actionable refusal.
+    let marker_blocks = |name: &str| {
+        !matches!(
+            fs::symlink_metadata(path.join(name)),
+            Err(ref err) if err.kind() == io::ErrorKind::NotFound
+        )
+    };
+    // `worktree_id` counts too: a linked gitdir whose `commondir` was
+    // DELETED still carries its identity, and the walk must stop here so
+    // the resolver can refuse. Climbing past it would resolve commands in
+    // an ancestor repository's scope (or answer "no repository" and let a
+    // caller trust the local `.libra` contents).
+    if marker_blocks("commondir")
+        || marker_blocks("detached_from_registry")
+        || marker_blocks("worktree_id")
+    {
+        return true;
+    }
+
+    ["objects", "info/exclude", "hooks"]
+        .iter()
+        .filter(|marker| path.join(marker).exists())
+        .count()
+        >= 2
+}
+
+fn read_gitdir_file(path: &Path, worktree: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(path).ok()?;
+    let line = contents.lines().next()?.trim();
+    let raw = line.strip_prefix("gitdir:")?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let git_dir = Path::new(raw);
+    Some(if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        worktree.join(git_dir)
+    })
+}
+
+/// Resolve a `gitdir:` pointer stored in the worktree's `.libra` entry (the
+/// layout `libra clone --separate-git-dir <DIR>` creates). A `.libra`
+/// directory, or a missing/unreadable entry, yields `None`; a relative target
+/// resolves against the worktree.
+pub fn resolve_dot_libra_pointer(worktree: &Path) -> Option<PathBuf> {
+    let pointer = worktree.join(ROOT_DIR);
+    if fs::symlink_metadata(&pointer).ok()?.file_type().is_dir() {
+        return None;
+    }
+    let target = read_gitdir_file(&pointer, worktree)?;
+    // A `.libra` pointer resolving to another `.libra` directory is the removed
+    // legacy relocation layout; only `clone --separate-git-dir <DIR>` pointers
+    // (metadata in its own directory) are honoured.
+    if target.file_name().is_some_and(|name| name == ROOT_DIR) {
+        return None;
+    }
+    Some(target)
+}
+
+fn resolve_dot_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    let metadata = fs::metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return Some(dot_git);
+    }
+    if metadata.is_file() {
+        return read_gitdir_file(&dot_git, worktree);
+    }
+    None
+}
+
+/// Resolve the CURRENT worktree's `info/<name>` candidates (W0 §C.4.1.1,
+/// plan line 2262): `<local_gitdir>/info/<name>`, never through the
+/// common-storage pointer.
+///
+/// `info/exclude` and `info/attributes` are part of the WORKTREE VIEW in
+/// Libra — each worktree carries its own, and repository-wide sharing is
+/// expressed by root `.libraignore`/`.gitignore`/attributes files instead.
+/// (Intentionally different from Git, which routes `info/*` through
+/// `commondir`; recorded in `COMPATIBILITY.md`.) BOTH local layouts are
+/// consulted when present, `.libra` first:
+///
+/// - `.libra` (primary): the worktree's own local gitdir — main's equals the
+///   common storage, a linked worktree's is its private `.libra`. Before W0
+///   this candidate DID NOT EXIST: only a literal `.git` marker was
+///   recognized, so the `.libra/info/exclude` that `libra init` itself
+///   creates was never read at all.
+/// - Git-compat: a literal `.git` directory or gitdir-file. Kept alongside
+///   the `.libra` candidate so dual-layout repositories (converted from Git
+///   with `.git` left in place) do not silently lose their existing
+///   `.git/info/*` rules. The gitdir-file target is used as-is (the LOCAL
+///   gitdir); its `commondir` is not followed.
+///
+/// Returns an empty vec when the worktree has no recognizable metadata
+/// directory.
+pub fn worktree_info_file_paths(worktree: &Path, name: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let libra_gitdir = worktree.join(ROOT_DIR);
+    if libra_gitdir.is_dir() && is_valid_storage_dir(&libra_gitdir) {
+        candidates.push(libra_gitdir.join("info").join(name));
+    } else if let Some(git_dir) = resolve_dot_libra_pointer(worktree)
+        && is_valid_storage_dir(&git_dir)
+    {
+        candidates.push(git_dir.join("info").join(name));
+    }
+    if let Some(git_dir) = resolve_dot_git_dir(worktree) {
+        candidates.push(git_dir.join("info").join(name));
+    }
+    candidates
+}
+
+/// The `commondir` target of a Git-layout gitdir. Used ONLY for gitdir
+/// validity probing (`config`/`objects` markers may live in either place) —
+/// info-file resolution deliberately does NOT follow it (see
+/// [`worktree_info_file_path`]).
+fn git_common_dir(git_dir: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let raw = contents.lines().next()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let common_dir = Path::new(raw);
+    let path = if common_dir.is_absolute() {
+        common_dir.to_path_buf()
+    } else {
+        git_dir.join(common_dir)
+    };
+    Some(normalize_lexical_path(&path))
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Path::new(component.as_os_str())),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    out.push("..");
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+fn git_dir_marker_exists(git_dir: &Path, common_dir: Option<&Path>, marker: &str) -> bool {
+    git_dir.join(marker).exists() || common_dir.is_some_and(|dir| dir.join(marker).exists())
+}
+
+fn is_valid_git_storage_dir(git_dir: &Path) -> bool {
+    let common_dir = git_common_dir(git_dir);
+    git_dir.join("HEAD").exists()
+        && git_dir_marker_exists(git_dir, common_dir.as_deref(), "config")
+        && git_dir_marker_exists(git_dir, common_dir.as_deref(), "objects")
+}
+
+fn git_config_declares_bare(git_dir: &Path) -> bool {
+    fs::read_to_string(git_dir.join("config")).is_ok_and(|config| {
+        config.lines().any(|line| {
+            line.trim().split_once('=').is_some_and(|(key, value)| {
+                key.trim() == "bare" && value.trim().eq_ignore_ascii_case("true")
+            })
+        })
+    })
+}
+
+fn worktree_root_for_dot_git_storage(candidate: &Path) -> Option<PathBuf> {
+    if candidate.file_name() != Some(OsStr::new(".git"))
+        || !is_valid_git_storage_dir(candidate)
+        || git_config_declares_bare(candidate)
+    {
+        return None;
+    }
+    let parent = candidate.parent()?;
+    Some(fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()))
+}
+
+pub fn find_git_repository(path: Option<&Path>) -> Option<GitRepositoryLocation> {
+    let mut candidate = path.map(Path::to_path_buf).unwrap_or_else(cur_dir);
+    if candidate.is_file() {
+        candidate.pop();
+    }
+
+    loop {
+        if let Some(git_dir) = resolve_dot_git_dir(&candidate)
+            && is_valid_git_storage_dir(&git_dir)
+        {
+            return Some(GitRepositoryLocation {
+                root: fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone()),
+                is_bare: false,
+            });
+        }
+
+        if let Some(root) = worktree_root_for_dot_git_storage(&candidate) {
+            return Some(GitRepositoryLocation {
+                root,
+                is_bare: false,
+            });
+        }
+
+        if is_valid_git_storage_dir(&candidate) {
+            return Some(GitRepositoryLocation {
+                root: fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone()),
+                is_bare: true,
+            });
+        }
+
+        if !candidate.pop() {
+            return None;
+        }
+    }
+}
+
+/// The shared/common storage for a worktree gitdir (lore.md 2.1): follow a
+/// `commondir` pointer if present (a linked worktree borrows the main repo's
+/// db/objects/hooks), else the gitdir itself (the main worktree). The
+/// per-worktree `index` and `worktree_id` always live in the local gitdir.
+///
+/// FAIL-CLOSED (Part C §C.4.1): a linked worktree is identified by the presence
+/// of a `commondir` file. When that file exists but is unreadable or has an
+/// empty first line, the pointer is CORRUPT — we must NOT silently fall back to
+/// treating the library-less local gitdir as common storage, which would route
+/// every db/objects lookup at a phantom repository. Return an error so mutation
+/// paths refuse and point the user at `libra worktree repair --confirm`. Only a genuinely
+/// absent `commondir` (a main worktree) resolves to the gitdir itself.
+/// Terminal COMMON-storage validity — stricter than [`is_valid_storage_dir`],
+/// which also accepts linked LOCAL gitdirs by their `commondir` /
+/// `detached_from_registry` markers. The target of a commondir pointer must
+/// itself BE the shared storage: it holds the repository database (or the
+/// git-import marker set) and carries no `commondir` pointer of its own.
+/// A pointer chain — including a self-pointer or a pointer at another
+/// linked worktree's gitdir — is corruption to refuse, not indirection to
+/// follow: following it would route db/objects/policy lookups into a
+/// database-less local gitdir where "not found" masquerades as "no
+/// configuration".
+fn is_terminal_common_storage(path: &Path) -> bool {
+    if is_global_libra_home(path) {
+        return false;
+    }
+    // `symlink_metadata`, not `exists()`: a DANGLING `commondir` symlink is
+    // still a commondir marker — `exists()` follows the link and reports the
+    // marker absent, which would bless a non-terminal (corrupt) target. And
+    // fail CLOSED on inspection errors: only a definitive NotFound counts
+    // as "no marker" — an uninspectable target must be refused, not
+    // accepted as terminal.
+    if !matches!(
+        fs::symlink_metadata(path.join("commondir")),
+        Err(ref err) if err.kind() == io::ErrorKind::NotFound
+    ) {
+        return false;
+    }
+    if path.join(DATABASE).exists() {
+        return true;
+    }
+    ["objects", "info/exclude", "hooks"]
+        .iter()
+        .filter(|marker| path.join(marker).exists())
+        .count()
+        >= 2
+}
+
+pub fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
+    let commondir_file = gitdir.join("commondir");
+    // W3-s1b (§C.7): a worktree removed from the registry with its directory
+    // kept carries a `detached_from_registry` marker — every command run
+    // inside it fails closed (its scoped state is preserved but frozen)
+    // until it is re-added or deleted. Checked only for LINKED worktrees
+    // (marker next to an existing commondir).
+    // W3-s3 (§C.6.2): a mid-migration worktree (journal-stamped
+    // `migrate-marker` still present) is FROZEN for every other process —
+    // work created there could be overwritten by the recovery re-seed. The
+    // migrating/repairing process itself holds a process-local bypass.
+    // Lifecycle markers are judged WITHOUT following symlinks (a dangling
+    // symlink still marks the state) and WITHOUT treating inspection
+    // failures as absence: only a definitive NotFound clears a marker —
+    // an EPERM/EIO on the marker must freeze, not silently unfreeze.
+    let marker_present = |name: &str| -> io::Result<bool> {
+        match fs::symlink_metadata(gitdir.join(name)) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot inspect worktree lifecycle marker '{}/{name}': {err}; treat the \
+                     worktree as frozen — run `libra worktree repair --confirm --path \
+                     <worktree-path>` from the main worktree",
+                    gitdir.display()
+                ),
+            )),
+        }
+    };
+    if marker_present("migrate-marker")? && !migration_gate_bypassed() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "this worktree has an unfinished layout migration; run `libra worktree \
+                 repair --migrate-layout --confirm` from the main worktree ('{}')",
+                gitdir.display()
+            ),
+        ));
+    }
+    if marker_present("detached_from_registry")? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "this worktree was removed from the registry (detached); from the main \
+                 worktree run `libra worktree add <name> --path \"{}\"` to re-attach it, or \
+                 `libra worktree remove --delete-dir --path \"{}\"` to delete it; if another \
+                 registered worktree shares its identity, preserve both directories for manual \
+                 recovery because re-attachment or deletion may be refused",
+                gitdir.parent().unwrap_or(gitdir).display(),
+                gitdir.parent().unwrap_or(gitdir).display()
+            ),
+        ));
+    }
+    // The marker's EXISTENCE is judged without following symlinks: a
+    // dangling `commondir` symlink is a present-but-unreadable marker
+    // (corruption to refuse), NOT an absent one — `read_to_string` alone
+    // would report NotFound and silently treat this linked worktree as
+    // MAIN. A marker that exists but is not a regular file is equally
+    // corrupt.
+    match fs::symlink_metadata(&commondir_file) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // No pointer. That spells MAIN — unless this gitdir still
+            // carries a `worktree_id`, which only a LINKED worktree has: a
+            // linked worktree that lost its pointer is corrupt, and
+            // answering "main" here would route its db/objects lookups at
+            // its own pointer-less gitdir (a phantom repository) and let
+            // callers trust its local configuration as the repository's.
+            if marker_present("worktree_id")? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "worktree gitdir '{}' carries a `worktree_id` but no `commondir` \
+                         pointer; the linked worktree is corrupt — run `libra worktree \
+                         repair --confirm --path <worktree-path>` from the main worktree",
+                        gitdir.display()
+                    ),
+                ));
+            }
+            return Ok(gitdir.to_path_buf());
+        }
+        Err(err) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot inspect worktree commondir marker at '{}': {err}; the linked \
+                     worktree is corrupt — run `libra worktree repair --confirm --path \
+                     <worktree-path>` from the main worktree",
+                    commondir_file.display()
+                ),
+            ));
+        }
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "worktree commondir marker at '{}' is not a regular file; the linked \
+                     worktree is corrupt — run `libra worktree repair --confirm --path \
+                     <worktree-path>` from the main worktree",
+                    commondir_file.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+    }
+    match super::worktree_layout::read_regular_metadata(gitdir, Path::new("commondir"), 65_536)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }) {
+        Ok(contents) => {
+            let raw = contents
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(raw) = raw else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "worktree commondir pointer at '{}' is empty; the linked worktree is \
+                         corrupt — run `libra worktree repair --confirm --path <worktree-path>` from the main \
+                         worktree",
+                        commondir_file.display()
+                    ),
+                ));
+            };
+            let common = Path::new(raw);
+            let resolved = if common.is_absolute() {
+                common.to_path_buf()
+            } else {
+                gitdir.join(common)
+            };
+            // FAIL-CLOSED on the TARGET too (W0 codex finding): a pointer
+            // whose target is missing, unreadable, or not a storage
+            // directory is just as corrupt as an empty pointer — silently
+            // returning the dangling path routes every downstream lookup
+            // (db, objects, sandbox policy, publish manifest) at a location
+            // where "file not found" masquerades as "no configuration".
+            let canonical = fs::canonicalize(&resolved).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "worktree commondir pointer at '{}' targets '{}', which cannot be \
+                         resolved: {err}; the linked worktree is corrupt — run `libra worktree \
+                         repair --confirm --path <worktree-path>` from the main worktree",
+                        commondir_file.display(),
+                        resolved.display()
+                    ),
+                )
+            })?;
+            if !is_terminal_common_storage(&canonical) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "worktree commondir pointer at '{}' targets '{}', which is not the \
+                         repository's TERMINAL common storage (it is missing the repository \
+                         database, or carries a commondir pointer of its own — chains, \
+                         self-pointers, and pointers at another worktree's gitdir are \
+                         corruption, not indirection); run `libra worktree repair --confirm --path \
+                         <worktree-path>` from the main worktree",
+                        commondir_file.display(),
+                        canonical.display()
+                    ),
+                ));
+            }
+            Ok(canonical)
+        }
+        // The marker VANISHED between the no-follow existence check above
+        // and this read: something is mutating this gitdir underneath us —
+        // that is corruption to refuse, not a license to reclassify the
+        // worktree as main mid-observation.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "worktree commondir marker at '{}' disappeared while being read; the \
+                 linked worktree is corrupt or being mutated — run `libra worktree \
+                 repair --confirm --path <worktree-path>` from the main worktree",
+                commondir_file.display()
+            ),
+        )),
+        // The marker exists but cannot be read → linked-worktree corruption.
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cannot read worktree commondir pointer at '{}': {err}; the linked worktree \
+                 is corrupt — run `libra worktree repair --confirm --path <worktree-path>` from the main \
+                 worktree",
+                commondir_file.display()
+            ),
+        )),
+    }
+}
+
+/// Preserve why discovery skipped user storage while retaining NotFound semantics.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{workdir:?} is not a libra repository; '{}' is the global Libra home, \
+     reserved for per-user state rather than repository storage; \
+     use a dedicated project directory (e.g. 'libra init <project>')",
+    home.display()
+)]
+pub struct GlobalHomeNotRepository {
+    workdir: PathBuf,
+    home: PathBuf,
+}
+
+/// Resolve `(common_storage, workdir, worktree_gitdir)` for a path.
+/// - `worktree_gitdir`: the LOCAL `.libra` for this working tree (holds the
+///   private `index` and `worktree_id`).
+/// - `common_storage`: the SHARED `.libra` (db / objects / hooks). Equals the
+///   gitdir for the main worktree; the `commondir` target for a linked one.
+fn try_get_paths_full(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
+    try_get_paths_full_with_storage_lookup(path, false)
+}
+
+/// Only the storage-only API permits an explicitly supplied metadata root.
+/// Discovery for commands must not climb out of an internal workspace into
+/// common storage and accidentally bind to the main worktree.
+fn try_get_paths_full_with_storage_lookup(
+    path: Option<PathBuf>,
+    explicit_storage_lookup: bool,
+) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
+    let mut path = path.unwrap_or_else(cur_dir);
+    if !path.is_absolute() {
+        path = env::current_dir()?.join(path);
+    }
+    // Preserve ordinary workdir spellings, but inspect metadata aliases by
+    // their physical path. Otherwise `main/alias -> .libra/worktree/linked`
+    // would let a damaged alias/topic climb to main instead of meeting the
+    // managed-container fence below.
+    let physical = canonicalize_deepest_existing(&path)?;
+    if physical.ancestors().any(|ancestor| {
+        (ancestor.file_name() == Some(OsStr::new(ROOT_DIR)) && !is_global_libra_home(ancestor))
+            || managed_common_ancestor(ancestor).is_some()
+    }) {
+        path = physical;
+    }
+    let orig = path.clone();
+    let mut skipped_home = None;
+
+    loop {
+        let metadata_boundary = path.file_name() == Some(OsStr::new(ROOT_DIR))
+            && !is_global_libra_home(&path)
+            && (is_valid_storage_dir(&path)
+                || path != orig && !is_valid_storage_dir(&path.join(ROOT_DIR)))
+            || path != orig && is_terminal_common_storage(&path);
+        let managed_boundary = path.file_name() == Some(OsStr::new("worktree"))
+            && path.parent().is_some_and(|parent| {
+                (parent.file_name() == Some(OsStr::new(ROOT_DIR)) && !is_global_libra_home(parent))
+                    || is_terminal_common_storage(parent)
+            });
+        if metadata_boundary || managed_boundary {
+            if metadata_boundary
+                && path != orig
+                && path.file_name() != Some(OsStr::new(ROOT_DIR))
+                && is_terminal_common_storage(&path)
+            {
+                // A bare repository's own hooks/objects directories are
+                // legitimate command cwd values. A normal `.libra` metadata
+                // child still cannot climb to the enclosing main worktree.
+                resolve_managed_workspace_common(&path, &path, &path)?;
+                return Ok((path.clone(), path.clone(), path.clone()));
+            }
+            // The exact metadata root is a legitimate storage cwd (including
+            // a bare repository named `.libra` and a linked gitdir). Never
+            // climb into it from a child path. Managed task workspaces still
+            // pass the local-identity check in the resolver below.
+            if metadata_boundary
+                && path == orig
+                && path.file_name() == Some(OsStr::new(ROOT_DIR))
+                && is_valid_storage_dir(&path)
+            {
+                let gitdir = fs::canonicalize(&path)?;
+                let common = worktree_common_storage(&gitdir)?;
+                if let Some(workdir) = path.parent() {
+                    let common = resolve_managed_workspace_common(workdir, &gitdir, &common)?;
+                    return Ok((common, workdir.to_path_buf(), gitdir));
+                }
+            }
+            if metadata_boundary
+                && explicit_storage_lookup
+                && path == orig
+                && is_valid_storage_dir(&path)
+            {
+                let gitdir = fs::canonicalize(&path)?;
+                let common = worktree_common_storage(&gitdir)?;
+                let common = if let Some(workdir) = path.parent() {
+                    resolve_managed_workspace_common(workdir, &gitdir, &common)?
+                } else {
+                    common
+                };
+                return Ok((common, path.clone(), gitdir));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot discover a worktree from '{}' across repository metadata '{}'; \
+                     the local .libra workspace identity is missing or invalid — run \
+                     `libra worktree repair --confirm --path <worktree-path>` from the \
+                     main worktree, or recreate an isolated task workspace",
+                    orig.display(),
+                    path.display()
+                ),
+            ));
+        }
+        let standard_repo = path.join(ROOT_DIR);
+        if standard_repo.join(DATABASE).exists() && is_global_libra_home(&standard_repo) {
+            skipped_home = Some(standard_repo.clone());
+        } else if path.join(DATABASE).exists() && is_global_libra_home(&path) {
+            skipped_home = Some(path.clone());
+        }
+        if standard_repo.is_dir() && is_valid_storage_dir(&standard_repo) {
+            // unwrap_or is safe here: if canonicalize fails, we use the original path
+            let gitdir = fs::canonicalize(&standard_repo).unwrap_or(standard_repo);
+            let common = worktree_common_storage(&gitdir)?;
+            let common = resolve_managed_workspace_common(&path, &gitdir, &common)?;
+            return Ok((common, path.clone(), gitdir));
+        }
+
+        // `clone --separate-git-dir`: `.libra` is a file holding a `gitdir:`
+        // pointer to the real metadata directory.
+        if let Some(pointer_gitdir) = resolve_dot_libra_pointer(&path)
+            && is_valid_storage_dir(&pointer_gitdir)
+        {
+            let gitdir = fs::canonicalize(&pointer_gitdir).unwrap_or(pointer_gitdir);
+            let common = worktree_common_storage(&gitdir)?;
+            let common = resolve_managed_workspace_common(&path, &gitdir, &common)?;
+            return Ok((common, path.clone(), gitdir));
+        }
+
+        if path.join(DATABASE).exists()
+            && path.join("objects").exists()
+            && !is_global_libra_home(&path)
+        {
+            resolve_managed_workspace_common(&path, &path, &path)?;
+            return Ok((path.clone(), path.clone(), path.clone()));
+        }
+
+        if !path.pop() {
+            return Err(match skipped_home {
+                Some(home) => io::Error::new(
+                    io::ErrorKind::NotFound,
+                    GlobalHomeNotRepository {
+                        workdir: orig,
+                        home,
+                    },
+                ),
+                None => io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{orig:?} is not a libra repository"),
+                ),
+            });
+        }
+    }
+}
+
+fn managed_common_ancestor(workdir: &Path) -> Option<&Path> {
+    workdir.ancestors().find_map(|ancestor| {
+        if ancestor.file_name() != Some(OsStr::new("worktree")) {
+            return None;
+        }
+        ancestor.parent().filter(|parent| {
+            (parent.file_name() == Some(OsStr::new(ROOT_DIR)) && !is_global_libra_home(parent))
+                || is_terminal_common_storage(parent)
+        })
+    })
+}
+
+/// An internal workspace may resolve only its enclosing common storage and a
+/// real local identity. A copied main gitdir or a linked gitdir pointing at a
+/// different repository must not bypass the managed-container discovery fence.
+fn resolve_managed_workspace_common(
+    workdir: &Path,
+    gitdir: &Path,
+    resolved_common: &Path,
+) -> io::Result<PathBuf> {
+    if let Some(enclosing) = managed_common_ancestor(workdir) {
+        let expected_common = fs::canonicalize(enclosing)?;
+        super::worktree_layout::validate_managed_path(enclosing, workdir)?;
+        if resolved_common == gitdir
+            && is_nested_repository_in_managed_workspace(enclosing, workdir)
+        {
+            // A repository initialized inside a managed worktree has its own
+            // local common storage. The enclosing worktree's identity does
+            // not apply to that independent child repository. Missing local
+            // metadata still meets the managed-container fence above.
+            return Ok(resolved_common.to_path_buf());
+        }
+        if workdir.starts_with(enclosing.join("worktree/fuse")) {
+            verify_registered_fuse_source(workdir, gitdir, &expected_common)?;
+            return Ok(expected_common);
+        }
+        let local = workdir.join(ROOT_DIR);
+        let identity_is_nonempty = super::worktree_layout::read_regular_metadata(
+            workdir,
+            &Path::new(ROOT_DIR).join("worktree_id"),
+            4096,
+        )
+        .is_ok_and(|bytes| {
+            std::str::from_utf8(&bytes).is_ok_and(|identity| !identity.trim().is_empty())
+        });
+        let local_is_directory =
+            fs::symlink_metadata(&local).is_ok_and(|metadata| metadata.file_type().is_dir());
+        if resolved_common != expected_common
+            || !local_is_directory
+            || !identity_is_nonempty
+            || gitdir == resolved_common
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "managed worktree '{}' has no valid local identity for common storage \
+                     '{}'; run `libra worktree repair --confirm --path <worktree-path>` \
+                     from the main worktree or recreate the task workspace",
+                    workdir.display(),
+                    expected_common.display()
+                ),
+            ));
+        }
+    }
+    Ok(resolved_common.to_path_buf())
+}
+
+fn is_nested_repository_in_managed_workspace(enclosing: &Path, workdir: &Path) -> bool {
+    let Ok(relative) = workdir.strip_prefix(enclosing.join("worktree")) else {
+        return false;
+    };
+    let parts: Vec<_> = relative.components().map(|part| part.as_os_str()).collect();
+    match parts.as_slice() {
+        [kind, _, _, ..] if *kind == OsStr::new("linked") => true,
+        [kind, _, workspace, _, ..]
+            if *kind == OsStr::new("fuse") && *workspace == OsStr::new("workspace") =>
+        {
+            true
+        }
+        [kind, _, _, workspace, _, ..]
+            if *kind == OsStr::new("tasks")
+                && (*workspace == OsStr::new("workspace")
+                    || *workspace == OsStr::new("checkpoint-input")) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// FUSE retains its source's metadata identity. Bind that exception to the
+/// persisted mount and source, rather than accepting a copied main gitdir.
+fn verify_registered_fuse_source(
+    workdir: &Path,
+    gitdir: &Path,
+    common: &Path,
+) -> io::Result<PathBuf> {
+    let invalid = |detail: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cannot resolve managed FUSE worktree '{}': {detail}; restore its registry/source metadata or recreate the mount",
+                workdir.display()
+            ),
+        )
+    };
+    let binding = crate::internal::worktree_registry::registered_fuse_worktree_at(common, workdir)
+        .map_err(|error| invalid(&format!("cannot validate its registry binding: {error}")))?
+        .ok_or_else(|| invalid("the mount has no registered FUSE binding"))?;
+    let name = binding
+        .name
+        .as_deref()
+        .ok_or_else(|| invalid("the managed mount has no stable name"))?;
+    let expected_path = super::worktree_layout::fuse_workspace(common, name)?;
+    let expected_upper = super::worktree_layout::fuse_upper(common, name)?;
+    let managed = workdir.starts_with(common.join("worktree/fuse"));
+    if (managed && binding.path != expected_path)
+        || binding.path != workdir
+        || binding.upper_dir != expected_upper
+        || binding.lower_dirs.len() != 1
+    {
+        return Err(invalid(
+            "its path, upper directory, or source list does not match the managed layout",
+        ));
+    }
+    let mount_id = binding
+        .mount_id
+        .as_deref()
+        .ok_or_else(|| invalid("the managed mount has no persisted mount identity"))?;
+    uuid::Uuid::parse_str(mount_id).map_err(|_| invalid("the mount identity is not a UUID"))?;
+    super::worktree_layout::open_managed_directory(common, &binding.upper_dir)?;
+    // The overlay must expose real local metadata, including the opacity
+    // container that prevents the source from exposing this mount recursively.
+    let workspace = if managed {
+        super::worktree_layout::open_managed_directory(common, workdir)?
+    } else {
+        super::beneath::open_root(workdir)?
+    };
+    let local = super::beneath::open_beneath(&workspace, Path::new(ROOT_DIR))?;
+    super::beneath::open_beneath(&local, Path::new("worktree"))?;
+    for root in [&binding.upper_dir, workdir] {
+        let marker = super::worktree_layout::read_regular_metadata(
+            root,
+            Path::new(".libra/worktree-mount-id"),
+            128,
+        )?;
+        if std::str::from_utf8(&marker).map(str::trim).ok() != Some(mount_id) {
+            return Err(invalid(
+                "the mounted filesystem does not expose the registered upper-directory identity",
+            ));
+        }
+    }
+    let source = &binding.lower_dirs[0];
+    let source_gitdir = source.join(ROOT_DIR);
+    let source_common = worktree_common_storage(&source_gitdir)?;
+    if fs::canonicalize(&source_common)? != common || !is_terminal_common_storage(common) {
+        return Err(invalid(
+            "its original source belongs to a different or invalid common storage",
+        ));
+    }
+    let read_identity = |local_gitdir: &Path| -> io::Result<Option<Vec<u8>>> {
+        match super::worktree_layout::read_regular_metadata(
+            local_gitdir,
+            Path::new("worktree_id"),
+            4096,
+        ) {
+            Ok(bytes) if bytes.iter().any(|byte| !byte.is_ascii_whitespace()) => Ok(Some(bytes)),
+            Ok(_) => Err(invalid("the source or overlay worktree identity is empty")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    };
+    let source_gitdir = fs::canonicalize(source_gitdir)?;
+    let source_identity = read_identity(&source_gitdir)?;
+    if source_common != source_gitdir && source_identity.is_none() {
+        return Err(invalid(
+            "the linked source is missing its worktree identity",
+        ));
+    }
+    if read_identity(gitdir)? != source_identity {
+        return Err(invalid(
+            "its overlay identity no longer matches the registered source",
+        ));
+    }
+    let overlay_common = worktree_common_storage(gitdir)?;
+    if overlay_common != gitdir && overlay_common != common {
+        return Err(invalid(
+            "its overlay common-storage pointer targets another repository",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = workdir
+            .parent()
+            .ok_or_else(|| invalid("the mountpoint has no parent"))?;
+        // A FUSE filesystem has a distinct device identity. Unlike invoking
+        // `mount`, this check adds no process creation to repository discovery.
+        if workspace.metadata()?.dev() == fs::metadata(parent)?.dev() {
+            return Err(invalid("the registered workspace is not mounted"));
+        }
+    }
+    #[cfg(not(unix))]
+    return Err(invalid("FUSE worktrees require a supported Unix mount"));
+    #[cfg(unix)]
+    Ok(source.to_path_buf())
+}
+
+/// A FUSE mount borrowing a linked source's scope is registered against that
+/// source identity. Only this complete provenance proof permits the alias.
+pub fn verified_fuse_source(common: &Path, workdir: &Path) -> io::Result<Option<PathBuf>> {
+    if !workdir.starts_with(common.join("worktree/fuse")) {
+        if workdir.starts_with(common) {
+            return Ok(None);
+        }
+        let binding =
+            crate::internal::worktree_registry::registered_fuse_worktree_at(common, workdir)
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("cannot inspect FUSE source identity: {error}"),
+                    )
+                })?;
+        match binding {
+            None => return Ok(None),
+            Some(binding) if binding.name.is_none() && binding.mount_id.is_none() => {
+                // Legacy external FUSE registrations predate managed names and
+                // mount identity. They never qualify as a linked-source alias,
+                // but they must remain a definite non-match for old layouts.
+                return Ok(None);
+            }
+            Some(_) => {}
+        }
+    }
+    let gitdir = fs::canonicalize(workdir.join(ROOT_DIR))?;
+    verify_registered_fuse_source(workdir, &gitdir, common).map(Some)
+}
+
+/// `(common_storage, workdir)` — db/objects/hooks storage + the working dir.
+fn try_get_paths(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf), io::Error> {
+    let (common, workdir, _gitdir) = try_get_paths_full(path)?;
+    Ok((common, workdir))
+}
+
+/// `(common_storage, worktree_root, gitdir)` from ONE walk — what a request
+/// pin resolves at entry so its three paths cannot later disagree (§C.4.2).
+pub fn try_get_request_paths(
+    path: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
+    try_get_paths_full(path)
+}
+
+/// The LOCAL `.libra` gitdir for this working tree (lore.md 2.1): where the
+/// per-worktree `index` + `worktree_id` live. Equals the common storage for the
+/// main worktree; the linked worktree's own `.libra` otherwise.
+pub fn try_get_worktree_gitdir(path: Option<PathBuf>) -> Result<PathBuf, io::Error> {
+    let (_common, _workdir, gitdir) = try_get_paths_full(path)?;
+    Ok(gitdir)
+}
+
+/// The current worktree's gitdir (panics outside a repo — mirrors `storage_path`).
+pub fn worktree_gitdir() -> PathBuf {
+    try_get_worktree_gitdir(None).expect("worktree_gitdir() called outside a libra repository")
+}
+
+/// The gitdir of the worktree THIS INVOCATION is acting on (§C.4.2
+/// resolve-once).
+///
+/// Worktree-local files — `FETCH_HEAD`, `rebase-aux.json`, `CHERRY_PICK_MSG` —
+/// must land in the same worktree whose database rows the command is reading.
+/// [`worktree_gitdir`] resolves from the process cwd, so a `set_current_dir`
+/// between the row read and the file write would pair scope A's state with
+/// scope B's sidecar. When dispatch pinned a request workdir, resolve from
+/// THAT; otherwise resolve from the cwd, which is what an unpinned in-process
+/// caller means. A pinned workdir that cannot be resolved is an error rather
+/// than a fallback.
+pub fn request_worktree_gitdir() -> Result<PathBuf, io::Error> {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        // The gitdir RESOLVED at pin time, so a later discovery failure cannot
+        // produce a different worktree's path — or a path that is not a gitdir
+        // at all, which is what deriving `<workdir>/.libra` from a
+        // subdirectory-invoked command would do. A pin only exists when all of
+        // its paths resolved, so there is no half-resolved case to report.
+        Some(pinned) => Ok(pinned.gitdir.clone()),
+        None => try_get_worktree_gitdir(None),
+    }
+}
+
+/// [`request_worktree_gitdir`] for callers whose path helper cannot fail.
+///
+/// Uses the gitdir resolved AT PIN TIME. It never re-resolves the cwd (the
+/// accident the pin exists to prevent) and never derives a path from the
+/// workdir (which is wrong whenever the command was invoked from a
+/// subdirectory). If the pin has no resolved gitdir the repository was
+/// unreadable when the command started, and there is nothing to be strict
+/// about — the same panic-on-missing-repo contract as [`worktree_gitdir`]
+/// applies, which is what every caller here already assumed.
+pub fn request_worktree_gitdir_strict() -> PathBuf {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.gitdir.clone(),
+        None => worktree_gitdir(),
+    }
+}
+
+/// The COMMON storage of the repository THIS INVOCATION is acting on (§C.4.2).
+///
+/// [`storage_path`] re-reads the cwd, so a command that steps into another
+/// repository mid-flight — or one whose library caller moved the cwd — would
+/// resolve a DIFFERENT repository's storage than the one whose rows it has
+/// been reading. The legacy sequencer sidecars (`rebase-merge`,
+/// `rebase-apply`) live there, so the pair has to hold: state read from
+/// repository A's database must never be finished against repository B's
+/// sidecar directory.
+///
+/// Unpinned callers resolve from the cwd, which is what they mean.
+pub fn request_storage_path() -> PathBuf {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.storage.clone(),
+        None => storage_path(),
+    }
+}
+
+/// [`request_storage_path`] for callers that can report a missing repository.
+///
+/// A pinned request uses the storage resolved at pin time. An unpinned caller
+/// keeps the existing cwd discovery and returns the same error
+/// [`try_get_storage_path`] already returns outside a repository.
+pub fn try_request_storage_path() -> io::Result<PathBuf> {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => Ok(pinned.storage.clone()),
+        None => try_get_storage_path(None),
+    }
+}
+
+/// The working-tree ROOT this invocation is acting on (§C.4.2).
+///
+/// [`working_dir`] re-reads the cwd; a rebase that resolved its plan against
+/// worktree A must not then reset worktree B's files because something moved
+/// the process cwd in between.
+pub fn request_working_dir() -> PathBuf {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.worktree_root.clone(),
+        None => working_dir(),
+    }
+}
+
+/// The current worktree's stable instance id (lore.md 2.1), read ambiently from
+/// `<gitdir>/worktree_id`. `None` = the MAIN worktree (HEAD/index/reflog rows
+/// with `worktree_id IS NULL`). Resolved from the process cwd exactly like
+/// `path::index()`; a single process operates in one worktree, so this is
+/// stable for its lifetime.
+/// Whether the current process runs in a LINKED worktree (lore.md 2.1). Used
+/// by the transition guards for stores that are still repository-global —
+/// `rebase` (its `rebase_state` + sidecars), the stash stack, layer/sparse/
+/// dirty tables, and the composite `pull`. The other sequencer ops
+/// (merge/cherry-pick/am/revert/bisect) are worktree-scoped and run here
+/// freely (Part C W1).
+pub fn is_linked_worktree() -> bool {
+    current_worktree_id().is_some()
+}
+
+pub fn current_worktree_id() -> Option<String> {
+    worktree_id_for_base(None)
+}
+
+/// [`current_worktree_id`] resolved from an EXPLICIT base directory instead
+/// of the process cwd (W1 §C.4.1.1 scope↔workdir binding): a command that
+/// captured its working directory once can derive the matching scope from
+/// that same value, immune to a concurrent cwd switch in the process.
+pub fn worktree_id_for_base(base: Option<PathBuf>) -> Option<String> {
+    let gitdir = try_get_worktree_gitdir(base).ok()?;
+    worktree_id_for_gitdir(&gitdir)
+}
+
+/// [`worktree_id_for_base`] for a caller that has ALREADY resolved the gitdir.
+///
+/// §C.4.2: a pin derives its scope from the same walk that produced its paths.
+/// Resolving the scope from the cwd and the paths from a workdir is two
+/// observations, and a `set_current_dir` between them yields worktree A's
+/// scope key paired with worktree B's gitdir — the exact mismatch the pin
+/// exists to prevent.
+pub fn worktree_id_for_gitdir(gitdir: &Path) -> Option<String> {
+    if let Ok(id) =
+        super::worktree_layout::read_regular_metadata(gitdir, Path::new("worktree_id"), 4096)
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            })
+    {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    // FAIL-CLOSED (Codex P1): a LINKED worktree is identified by its
+    // `commondir` pointer. If its `worktree_id` file is missing/empty/unreadable
+    // (corruption), we must NEVER return `None` — that aliases to the MAIN
+    // worktree and would graft the main HEAD. Synthesize a stable id from the
+    // canonical workdir (matching creation's derivation) so a recovered
+    // worktree stays isolated from main and keeps its rows.
+    if gitdir.join("commondir").exists() {
+        let workdir = gitdir.parent().unwrap_or(gitdir);
+        let canonical = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+        return Some(worktree_instance_id(&canonical));
+    }
+    None
+}
+
+/// A stable, unique instance id for a worktree (lore.md 2.1), derived from its
+/// canonical path so it is deterministic across invocations. FNV-1a keeps it
+/// dependency-free and filesystem-safe. Shared by worktree creation and the
+/// fail-closed fallback in [`current_worktree_id`].
+pub fn worktree_instance_id(canonical_path: &Path) -> String {
+    let bytes = canonical_path.to_string_lossy();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let base = canonical_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wt".to_string());
+    let sanitized: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("{sanitized}-{hash:016x}")
+}
+
+/// Try to get the storage path of the repository, which is the path of the `.libra` directory
+/// - if the current directory or given path is not a repository, return an error
+pub fn try_get_storage_path(path: Option<PathBuf>) -> Result<PathBuf, io::Error> {
+    let explicit_storage_lookup = path.is_some();
+    let (storage, _, _) = try_get_paths_full_with_storage_lookup(path, explicit_storage_lookup)?;
+    Ok(storage)
+}
+
+/// Load the storage path with optional given repository
+pub fn storage_path() -> PathBuf {
+    // INVARIANT: this function is documented to panic when called outside a
+    // repository. Callers that handle the missing-repo case should use
+    // `try_get_storage_path` directly.
+    try_get_storage_path(None).expect("storage_path() called outside a libra repository")
+}
+
+/// Return an error instead of printing when the current directory is not a repository.
+/// RAII guard for the repository-wide BRANCH-ATTACH lock (W3-s2 §C.7).
+///
+/// `switch`/`checkout` and `worktree add <branch>` all publish "branch X is
+/// checked out in scope Y" state, but only worktree mutators hold the
+/// registry lock — so the checked-out-elsewhere check and the HEAD
+/// publication must share THIS lock or two processes can attach the same
+/// branch in two scopes. (The full writer inventory joins in the dedicated
+/// shared-helper slice; see plan-20260714 W-branch item.)
+/// Deterministic fault injection for cold recovery/guard paths (R0-8
+/// style): active only when `LIBRA_TEST_FAULT` names the site. Never set in
+/// production.
+/// W3-s3 (§C.6.1): true when the CURRENT worktree uses the pre-isolation
+/// LEGACY layout — its `.libra` is a symlink straight at the common storage,
+/// so HEAD/index are shared with main. Read-only commands may proceed (no
+/// regression), but worktree-state mutations must refuse and direct at
+/// `repair --migrate-layout` (committing here would silently move MAIN's
+/// HEAD).
+pub fn is_legacy_symlink_worktree() -> bool {
+    let Ok((_, workdir, _gitdir)) = try_get_paths_full(None) else {
+        return false;
+    };
+    fs::symlink_metadata(workdir.join(ROOT_DIR))
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+static MIGRATION_GATE_BYPASS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII bypass for the mid-migration freeze: held ONLY by the migration
+/// engine / repair recovery in this process (single migration at a time
+/// under the registry lock), so its own seeding/verification can resolve
+/// storage while every other process stays frozen out.
+pub struct MigrationGateBypass;
+
+impl Drop for MigrationGateBypass {
+    fn drop(&mut self) {
+        MIGRATION_GATE_BYPASS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn bypass_migration_gate() -> MigrationGateBypass {
+    MIGRATION_GATE_BYPASS.store(true, std::sync::atomic::Ordering::SeqCst);
+    MigrationGateBypass
+}
+
+fn migration_gate_bypassed() -> bool {
+    MIGRATION_GATE_BYPASS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn fault_injected(site: &str) -> bool {
+    std::env::var("LIBRA_TEST_FAULT").is_ok_and(|value| value == site)
+}
+
+/// Test-only rendezvous seam: when `LIBRA_TEST_RENDEZVOUS` is set to
+/// `<site>=<path>`, append one line to `<path>` on reaching `site`.
+///
+/// It changes NO behaviour — it exists so a test can start a timing window
+/// at the moment the SERVER reaches a point. A client-side barrier can only
+/// observe when a request was SENT; a concurrency test that starts its
+/// window there proves nothing when the handler arrives late, because the
+/// wall-clock assertion is then satisfied by the handler's own slowness
+/// instead of by contention.
+pub fn test_rendezvous(site: &str) {
+    use std::io::Write as _;
+
+    let Ok(value) = std::env::var("LIBRA_TEST_RENDEZVOUS") else {
+        return;
+    };
+    let Some((configured, path)) = value.split_once('=') else {
+        return;
+    };
+    if configured != site {
+        return;
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{site}");
+    }
+}
+
+pub struct BranchAttachLockGuard {
+    file: fs::File,
+}
+
+impl Drop for BranchAttachLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Acquire the branch-attach lock (blocking). The lock file lives in the
+/// COMMON storage, so every worktree of the repository serializes on it.
+pub fn acquire_branch_attach_lock() -> io::Result<BranchAttachLockGuard> {
+    let path = storage_path().join("branch-attach.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    file.lock()?;
+    Ok(BranchAttachLockGuard { file })
+}
+
+pub fn require_repo() -> io::Result<()> {
+    try_get_storage_path(None).map(|_| ())
+}
+
+/// Get `ClientStorage` for the `objects` directory
+pub fn objects_storage() -> io::Result<ClientStorage> {
+    cached_objects_storage(path::objects())
+}
+
+/// Get `ClientStorage` for the `objects` directory, returning a Result.
+///
+/// The objects directory comes from [`path::try_objects`], so a pinned request
+/// reuses its storage instead of rediscovering the repository from the cwd.
+/// Only the unpinned fallback records an ambient discovery.
+pub fn try_objects_storage() -> io::Result<ClientStorage> {
+    let objects = path::try_objects()?;
+    if crate::internal::worktree_scope::WorktreeScope::request_scope().is_none() {
+        record_objects_storage_ambient_discovery();
+    }
+    cached_objects_storage(objects)
+}
+
+/// Append one line when object storage falls back to cwd discovery.
+///
+/// Active only in debug builds while `LIBRA_TEST` is set and
+/// `LIBRA_TEST_STORAGE_DISCOVERY_LOG` names a file. Release builds and
+/// ordinary runs do not write. The probe does not count repository discovery
+/// that is unrelated to object storage.
+fn record_objects_storage_ambient_discovery() {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_none() {
+            return;
+        }
+        let Some(path) = std::env::var_os("LIBRA_TEST_STORAGE_DISCOVERY_LOG") else {
+            return;
+        };
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "ambient");
+        }
+    }
+}
+
+/// Resolve object storage for a caller that can handle configuration failure.
+///
+/// This does not read or write `OBJECTS_STORAGE_CACHE`. [`try_objects_storage`]
+/// remains the cached entry. A rejected configuration is not inserted.
+pub fn resolve_configured_objects_storage()
+-> Result<ClientStorage, crate::utils::client_storage::StorageConfigFailure> {
+    crate::utils::client_storage::ClientStorage::resolve_configured_storage(path::objects())
+}
+
+fn cached_objects_storage(base_path: PathBuf) -> io::Result<ClientStorage> {
+    let mut cache = OBJECTS_STORAGE_CACHE
+        .lock()
+        .expect("objects storage cache mutex poisoned"); // panic is intentional: if poisoned, we cannot recover
+    if let Some(storage) = cache.get(&base_path) {
+        return Ok(storage.clone());
+    }
+
+    let storage = ClientStorage::try_init(base_path.clone())?;
+    if storage.configuration_variable().is_some() {
+        return Ok(storage);
+    }
+    cache.insert(base_path, storage.clone());
+    Ok(storage)
+}
+
+#[cfg(test)]
+pub fn objects_storage_cache_contains(base_path: &Path) -> bool {
+    OBJECTS_STORAGE_CACHE
+        .lock()
+        .expect("objects storage cache mutex poisoned")
+        .contains_key(base_path)
+}
+
+pub fn reset_objects_storage_cache_for_path(base_path: &Path) {
+    if let Ok(mut cache) = OBJECTS_STORAGE_CACHE.lock() {
+        cache.remove(base_path);
+    }
+}
+
+/// Get the working directory of the repository
+/// - panics if the current directory is not a repository
+pub fn working_dir() -> PathBuf {
+    // INVARIANT: this function is documented to panic when called outside a
+    // repository. Callers that handle the missing-repo case should use
+    // `try_working_dir` directly.
+    let (_, workdir) =
+        try_get_paths(None).expect("working_dir() called outside a libra repository");
+    workdir
+}
+
+/// Get the working directory of the repository.
+pub fn try_working_dir() -> io::Result<PathBuf> {
+    let (_, workdir) = try_get_paths(None)?;
+    Ok(workdir)
+}
+
+/// Read a path-valued config key from local-then-global config and expand it
+/// relative to `workdir`. This is best-effort for optional Git compatibility
+/// sources such as `core.excludesFile`: unreadable or absent config is treated
+/// as no configured path so hot-path commands do not fail because an optional
+/// global config DB is unavailable.
+/// Git's per-user config file under the XDG config home: an absolute non-empty
+/// `XDG_CONFIG_HOME` wins (`$XDG_CONFIG_HOME/git/<file>`), otherwise
+/// `$HOME/.config/git/<file>`; with neither set there is no global file.
+pub fn xdg_config_home(file: &str) -> Option<PathBuf> {
+    match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(value) if !value.is_empty() => Some(PathBuf::from(value).join("git").join(file)),
+        _ => dirs::home_dir().map(|home| home.join(".config").join("git").join(file)),
+    }
+}
+
+pub fn optional_cascaded_config_path(key: &str, workdir: &Path) -> Option<PathBuf> {
+    let cache_key = ConfigPathCacheKey {
+        workdir: workdir.to_path_buf(),
+        key: key.to_string(),
+    };
+    if let Ok(cache) = CONFIG_PATH_CACHE.lock()
+        && let Some(cached) = cache.get(&cache_key)
+    {
+        return cached.clone();
+    }
+
+    let value = read_cascaded_config_value_sync(key).map(|raw| expand_config_path(&raw, workdir));
+    if let Ok(mut cache) = CONFIG_PATH_CACHE.lock() {
+        cache.insert(cache_key, value.clone());
+    }
+    value
+}
+
+fn read_cascaded_config_value_sync(key: &str) -> Option<String> {
+    let key = key.to_string();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        // Fresh-connection reader, NOT the cached-pool cascade: this thread
+        // blocks the caller (`join()` below), and when the caller is itself
+        // a runtime thread, the cached pool for the repo/global DB can have
+        // its connection-return task stranded on that frozen runtime — the
+        // acquire here then burns sqlx's full 30 s timeout per lookup (two
+        // ~28.7 s stalls per `add` on the single-threaded test harness,
+        // W5-09). See `read_cascaded_config_value_fresh_conn`.
+        runtime.block_on(crate::internal::config::read_cascaded_config_value_fresh_conn(&key))
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+fn expand_config_path(raw: &str, workdir: &Path) -> PathBuf {
+    let expanded = if raw == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw))
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(raw))
+    } else {
+        PathBuf::from(raw)
+    };
+
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        workdir.join(expanded)
+    }
+}
+
+/// Get the working directory of the repository as a string, panics if the path is not valid utf-8
+pub fn working_dir_string() -> String {
+    // INVARIANT: this function is documented to panic on non-UTF-8 paths.
+    // Callers that handle non-UTF-8 paths should use `try_working_dir_string`.
+    working_dir()
+        .to_str()
+        .expect("working_dir_string() called with non-UTF-8 working directory path")
+        .to_string()
+}
+
+/// Get the working directory of the repository as UTF-8.
+pub fn try_working_dir_string() -> io::Result<String> {
+    let workdir = try_working_dir()?;
+    workdir.to_str().map(str::to_string).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("path '{}' is not valid UTF-8", workdir.display()),
+        )
+    })
+}
+
+/// Turn a path to a relative path to the working directory
+/// - not check existence
+pub fn to_workdir_path(path: impl AsRef<Path>) -> PathBuf {
+    to_relative(path, working_dir())
+}
+
+/// Turn a workdir path to absolute path
+pub fn workdir_to_absolute(path: impl AsRef<Path>) -> PathBuf {
+    working_dir().join(path.as_ref())
+}
+
+/// Turn a workdir path to absolute path.
+pub fn try_workdir_to_absolute(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    Ok(try_working_dir()?.join(path.as_ref()))
+}
+
+/// Collapse `.` / `..` components lexically, without touching the filesystem.
+///
+/// `..` never escapes above the filesystem root or a Windows prefix, so the
+/// result stays inside the same volume. Symlinks are NOT resolved — pair this
+/// with [`canonicalize_deepest_existing`] when two spellings of the same
+/// directory must compare equal.
+pub fn normalize_abs_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Path::new(comp.as_os_str())),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Never allow `..` to escape above filesystem root/prefix.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+/// Canonical, absolute spelling of `path` for the worktree registry
+/// (plan-20260714 Part C §C.7). Path aliases (`a/../b`, a symlinked parent, a
+/// trailing slash) must collapse onto one string, or the registry would treat
+/// one directory as two entries.
+///
+/// Relative inputs resolve against the process cwd. An EXISTING path goes
+/// through [`fs::canonicalize`], so symlinks and `..` are applied in the
+/// kernel's order; only for a path that does not exist yet does it fall back to
+/// canonicalizing the deepest existing ancestor and appending the remaining
+/// lexical components, keeping a persisted path stable across the directory's
+/// creation.
+///
+/// The workspace/lease store (§C.8) needs the same answer but cannot accept the
+/// lexical fallback — a not-yet-created leaf behind a dangling symlink has no
+/// provable identity — so it uses its own stricter resolver. The two agree
+/// exactly for every path that exists, which is what keeps a registered
+/// worktree and its workspace record pointing at one directory.
+pub fn canonicalize_deepest_existing(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref();
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cur_dir().join(path)
+    };
+    // Ask the KERNEL first, and keep asking it about shorter and shorter
+    // prefixes of the ORIGINAL path — never a lexically collapsed copy.
+    // Collapsing `..` before resolution is wrong wherever a symlink precedes
+    // it: with `/r/a/link -> /r/b/sub`, `/r/a/link/../new` really lives at
+    // `/r/b/new`, but popping `link` lexically yields `/r/a/new` — a different
+    // directory that a `worktree add` would then create.
+    let mut current = joined.as_path();
+    let mut remainder = PathBuf::new();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(current) {
+            let mut resolved = canonical;
+            if !remainder.as_os_str().is_empty() {
+                resolved.push(&remainder);
+            }
+            return Ok(resolved);
+        }
+
+        // `file_name()` is None for a component that is `..` or a bare root:
+        // there is nothing to peel off, so no true resolution exists.
+        let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
+            break;
+        };
+        remainder = if remainder.as_os_str().is_empty() {
+            PathBuf::from(name)
+        } else {
+            PathBuf::from(name).join(remainder)
+        };
+        current = parent;
+    }
+
+    // Nothing along the path resolves (a fully missing tree, or a `..` at the
+    // boundary). Fall back to the lexical reading — the best available answer
+    // when the filesystem has no opinion.
+    Ok(normalize_abs_path(&joined))
+}
+
+/// Judge if the path is a sub path of the parent path
+/// - Not check existence
+/// - `true` if path == parent
+pub fn is_sub_path<P, B>(path: P, parent: B) -> bool
+where
+    P: AsRef<Path>,
+    B: AsRef<Path>,
+{
+    // Avoid panics and avoid depending on a valid current directory when inputs are absolute.
+    let path_abs = if path.as_ref().is_absolute() {
+        normalize_abs_path(path.as_ref())
+    } else {
+        match path.as_ref().absolutize() {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => return false,
+        }
+    };
+
+    let parent_abs = if parent.as_ref().is_absolute() {
+        normalize_abs_path(parent.as_ref())
+    } else {
+        match parent.as_ref().absolutize() {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => return false,
+        }
+    };
+
+    path_abs.starts_with(parent_abs)
+}
+
+/// Judge if the `path` is sub-path of `paths`(include sub-dirs)
+/// - absolute path or relative path to the current dir
+/// - Not check existence
+pub fn is_sub_of_paths<P, U>(path: impl AsRef<Path>, paths: U) -> bool
+where
+    P: AsRef<Path>,
+    U: IntoIterator<Item = P>,
+{
+    for p in paths {
+        if is_sub_path(path.as_ref(), p.as_ref()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Filter paths to fit the given paths, include sub-dirs
+/// - return the paths that are sub-path of the fit paths
+/// - `paths`: to workdir
+/// - `fit_paths`: abs or rel
+/// - Not check existence
+pub fn filter_to_fit_paths<P>(paths: &[P], fit_paths: &Vec<P>) -> Vec<P>
+where
+    P: AsRef<Path> + Clone,
+{
+    paths
+        .iter()
+        .filter(|p| {
+            let p = workdir_to_absolute(p.as_ref());
+            is_sub_of_paths(p, fit_paths)
+        })
+        .cloned()
+        .collect()
+}
+
+/// `path` & `base` must be absolute or relative (to current dir)
+/// <br> return "." if `path` == `base`
+pub fn to_relative<P, B>(path: P, base: B) -> PathBuf
+where
+    P: AsRef<Path>,
+    B: AsRef<Path>,
+{
+    // Snapshot the current directory once so both inputs resolve against the same base
+    // even if another test or thread changes the process cwd concurrently.
+    let cwd = cur_dir();
+    let path_abs = match path.as_ref().absolutize_from(&cwd) {
+        Ok(p) => p.into_owned(),
+        Err(_) => cwd.join(path.as_ref()),
+    };
+    let base_abs = match base.as_ref().absolutize_from(&cwd) {
+        Ok(b) => b.into_owned(),
+        Err(_) => cwd.join(base.as_ref()),
+    };
+
+    if let Some(rel_path) = pathdiff::diff_paths(path_abs, base_abs) {
+        if rel_path.to_string_lossy() == "" {
+            PathBuf::from(".")
+        } else {
+            rel_path
+        }
+    } else {
+        // panic is intentional: this indicates a bug in path resolution logic
+        panic!(
+            "fatal: path {:?} cannot convert to relative based on {:?}",
+            path.as_ref(),
+            base.as_ref()
+        );
+    }
+}
+
+/// Convert a workdir path to relative path
+/// - `base` must be absolute or relative (to current dir)
+pub fn workdir_to_relative<P, B>(path: P, base: B) -> PathBuf
+where
+    P: AsRef<Path>,
+    B: AsRef<Path>,
+{
+    let path_abs = workdir_to_absolute(path);
+    to_relative(path_abs, base)
+}
+
+/// Convert a workdir path to relative path to the current directory
+pub fn workdir_to_current<P>(path: P) -> PathBuf
+where
+    P: AsRef<Path>,
+{
+    workdir_to_relative(path, cur_dir())
+}
+
+/// List all files in the given dir and its sub_dir, except `.libra`
+/// - input `path`: absolute path or relative path to the current dir
+/// - output: to workdir path
+pub fn list_files(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if path.is_dir() {
+        // unwrap_or_default is safe: returns empty string which won't match ROOT_DIR/GIT_DIR
+        let name = path.file_name().unwrap_or_default();
+        if name == OsStr::new(ROOT_DIR) || name == OsStr::new(GIT_DIR) {
+            // ignore `.libra` (Libra metadata) and `.git` (always, like Git)
+            return Ok(files);
+        }
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(list_files(&path)?);
+            } else {
+                files.push(to_workdir_path(&path));
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// list all non-ignored files in the working dir(include sub_dir)
+/// - output: to workdir path
+pub fn list_workdir_files() -> io::Result<Vec<PathBuf>> {
+    list_files_respecting_libraignore(&working_dir())
+}
+
+/// list all files in the working dir(include sub_dir), including ignored files
+/// - output: to workdir path
+pub fn list_workdir_files_unfiltered() -> io::Result<Vec<PathBuf>> {
+    list_files(&working_dir())
+}
+
+fn list_files_respecting_libraignore(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let name = path.file_name().unwrap_or_default();
+    if !path.is_dir() || name == OsStr::new(ROOT_DIR) || name == OsStr::new(GIT_DIR) {
+        return Ok(files);
+    }
+
+    fn visit(workdir: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let file_name = entry.file_name();
+            if file_name == OsStr::new(ROOT_DIR) || file_name == OsStr::new(GIT_DIR) {
+                continue;
+            }
+
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                if !check_gitignore(workdir, &entry_path) {
+                    visit(workdir, &entry_path, files)?;
+                }
+            } else if (file_type.is_file() || file_type.is_symlink())
+                && !check_gitignore(workdir, &entry_path)
+            {
+                files.push(to_workdir_path(&entry_path));
+            }
+        }
+        Ok(())
+    }
+
+    visit(path, path, &mut files)?;
+
+    Ok(files)
+}
+
+/// Integrate the input paths (relative, absolute, file, dir) to workdir paths.
+/// Only existing files are expanded; directory traversal failures are surfaced
+/// to the caller so command code can report them instead of panicking.
+pub fn integrate_pathspec(paths: &[PathBuf]) -> io::Result<HashSet<PathBuf>> {
+    let mut workdir_paths = HashSet::new();
+    for path in paths {
+        if path.is_dir() {
+            let files = list_files(path)?;
+            workdir_paths.extend(files);
+        } else {
+            workdir_paths.insert(path.to_workdir());
+        }
+    }
+    Ok(workdir_paths)
+}
+
+/// write content to file
+/// - create parent directory if not exist
+pub fn write_file(content: &[u8], file: &PathBuf) -> io::Result<()> {
+    let mut parent = file.clone();
+    parent.pop();
+    fs::create_dir_all(parent)?;
+    let mut file = fs::File::create(file)?;
+    file.write_all(content)
+}
+
+/// Removing the empty directories in cascade until meet the root of workdir or the current dir
+pub fn clear_empty_dir(dir: &Path) {
+    let mut dir = if dir.is_dir() {
+        dir.to_path_buf()
+    } else {
+        let Some(parent) = dir.parent() else {
+            return;
+        };
+        parent.to_path_buf()
+    };
+
+    let repo = storage_path();
+    // CAN NOT remove .libra & current dir
+    while !is_sub_path(&repo, &dir) && !is_cur_dir(&dir) {
+        if is_empty_dir(&dir) {
+            if fs::remove_dir(&dir).is_err() {
+                break;
+            }
+        } else {
+            break; // once meet a non-empty dir, stop
+        }
+        dir.pop();
+    }
+}
+
+pub fn is_empty_dir(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    match fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => false,
+    }
+}
+
+pub fn is_cur_dir(dir: &Path) -> bool {
+    let Ok(dir) = dir.absolutize() else {
+        return false;
+    };
+    let current_dir = cur_dir();
+    let Ok(current) = current_dir.absolutize() else {
+        return false;
+    };
+    dir == current
+}
+
+/// Transform a path to a string.
+///
+/// This function uses `to_string_lossy()` which converts the path to a string,
+/// replacing any invalid UTF-8 sequences with the Unicode replacement character (U+FFFD).
+/// This is preferred over `into_os_string().into_string().unwrap()` which would panic
+/// on non-UTF-8 paths. The path separators are preserved as-is by the underlying OS
+/// path representation; this function does not perform separator normalization.
+pub fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+/// A single object matched by an ambiguous short object-name prefix, resolved
+/// to its Git object type and shortest unique abbreviation (≥ [`SHORT_HASH_LEN`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousCandidate {
+    /// Full object id.
+    pub oid: ObjectHash,
+    /// Git object type (`blob` / `tree` / `commit` / `tag`).
+    pub object_type: ObjectType,
+    /// Shortest prefix (≥ 7 hex chars) that uniquely identifies this object.
+    pub abbrev: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommitBaseError {
+    #[error("HEAD does not point to a commit")]
+    HeadUnborn,
+    #[error("{0}")]
+    InvalidReference(String),
+    /// A short object-name prefix matched multiple DISTINCT objects.
+    #[error("short object ID {name} is ambiguous")]
+    Ambiguous {
+        name: String,
+        candidates: Vec<AmbiguousCandidate>,
+    },
+    #[error("{0}")]
+    ReadFailure(String),
+    #[error("{0}")]
+    CorruptReference(String),
+}
+
+impl From<io::Error> for CommitBaseError {
+    fn from(error: io::Error) -> Self {
+        CommitBaseError::ReadFailure(error.to_string())
+    }
+}
+
+impl CommitBaseError {
+    fn from_branch_store_error(context: String, error: BranchStoreError) -> Self {
+        let message = format!("{context}: {error}");
+        match error {
+            BranchStoreError::Query(_) | BranchStoreError::Delete { .. } => {
+                Self::ReadFailure(message)
+            }
+            BranchStoreError::AlreadyExists(_) => Self::InvalidReference(message),
+            BranchStoreError::Corrupt { .. } => Self::CorruptReference(message),
+            BranchStoreError::NotFound(_) => Self::InvalidReference(message),
+            // §C.4.4's checkout-collision refusal is raised only by the WRITE
+            // seams (`Head::update_result_with_conn`,
+            // `Branch::delete_branch_result_with_conn`); the read functions
+            // this classifier wraps cannot produce it. Classified as an
+            // unusable reference rather than corruption so that if a future
+            // refactor ever routes a write error through here, the user is
+            // told the ref cannot be used — not that their repository is
+            // damaged.
+            BranchStoreError::CheckedOutElsewhere { .. } => Self::InvalidReference(message),
+        }
+    }
+
+    fn classify_storage_failure(message: String) -> Self {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("database is locked")
+            || lower.contains("database schema is locked")
+            || lower.contains("permission denied")
+            || lower.contains("input/output error")
+            || lower.contains("failed to read")
+            || lower.contains("could not read")
+            || lower.contains("failed to query")
+        {
+            Self::ReadFailure(message)
+        } else {
+            Self::CorruptReference(message)
+        }
+    }
+}
+
+/// Build the shared Git-style [`CliError`] for a short object-name prefix that
+/// matched multiple DISTINCT objects: `error: short object ID <p> is
+/// ambiguous`, a `The candidates are:` hint listing `<abbrev> <type>` lines,
+/// and `details.candidates` (full OID + type + unique abbreviation) for
+/// `--json`. Every revision consumer maps [`CommitBaseError::Ambiguous`]
+/// through this so the diagnostic family is identical across commands.
+pub fn ambiguous_short_oid_error(name: &str, candidates: &[AmbiguousCandidate]) -> CliError {
+    CliError::failure(format!("short object ID {name} is ambiguous"))
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
+        .with_hint(ambiguity_hint_text(candidates))
+        .with_detail("candidates", ambiguity_details_value(candidates))
+}
+
+/// `The candidates are:` plus one `  <abbrev> <type>` line per candidate,
+/// matching Git's `show_ambiguous_object` ordering (by full OID).
+fn ambiguity_hint_text(candidates: &[AmbiguousCandidate]) -> String {
+    let mut lines = Vec::with_capacity(candidates.len() + 1);
+    lines.push("The candidates are:".to_string());
+    for candidate in candidates {
+        lines.push(format!("  {} {}", candidate.abbrev, candidate.object_type));
+    }
+    lines.join("\n")
+}
+
+/// JSON array of `{ "oid", "type", "abbrev" }` objects for `details.candidates`.
+fn ambiguity_details_value(candidates: &[AmbiguousCandidate]) -> serde_json::Value {
+    serde_json::Value::Array(
+        candidates
+            .iter()
+            .map(|candidate| {
+                serde_json::json!({
+                    "oid": candidate.oid.to_string(),
+                    "type": candidate.object_type.to_string(),
+                    "abbrev": candidate.abbrev,
+                })
+            })
+            .collect(),
+    )
+}
+
+async fn resolve_branch_commit_typed(
+    branch_name: &str,
+    remote: Option<&str>,
+    display_name: &str,
+) -> Result<Option<ObjectHash>, CommitBaseError> {
+    let context = match remote {
+        Some(remote_name) => {
+            format!("failed to resolve branch '{display_name}' on remote '{remote_name}'")
+        }
+        None => format!("failed to resolve branch '{display_name}'"),
+    };
+
+    match Branch::find_branch_result(branch_name, remote).await {
+        Ok(Some(branch)) => Ok(Some(branch.commit)),
+        Ok(None) => match Branch::exists_result(branch_name, remote).await {
+            Ok(true) => Err(CommitBaseError::InvalidReference(format!(
+                "branch '{display_name}' does not point to a commit"
+            ))),
+            Ok(false) => Ok(None),
+            Err(error) => Err(CommitBaseError::from_branch_store_error(context, error)),
+        },
+        Err(error) => Err(CommitBaseError::from_branch_store_error(context, error)),
+    }
+}
+
+pub fn remote_tracking_candidates(name: &str) -> impl Iterator<Item = (&str, &str)> + '_ {
+    name.char_indices().filter_map(|(index, ch)| {
+        if ch != '/' {
+            return None;
+        }
+
+        let remote = &name[..index];
+        let branch_name = &name[index + 1..];
+        (!remote.is_empty() && !branch_name.is_empty()).then_some((remote, branch_name))
+    })
+}
+
+#[derive(Debug)]
+struct ResolvedAtom {
+    object_id: ObjectHash,
+    reflog_ref: Option<String>,
+}
+
+fn invalid_reference(name: &str) -> CommitBaseError {
+    CommitBaseError::InvalidReference(format!("invalid reference: {name}"))
+}
+
+fn ensure_hash_kind(
+    object_id: ObjectHash,
+    display_name: &str,
+    stored_reference: bool,
+) -> Result<ObjectHash, CommitBaseError> {
+    let expected = git_internal::hash::get_hash_kind();
+    if object_id.kind() == expected {
+        return Ok(object_id);
+    }
+
+    let message = format!(
+        "object id for '{display_name}' uses {}, but this repository uses {expected}",
+        object_id.kind()
+    );
+    if stored_reference {
+        Err(CommitBaseError::CorruptReference(message))
+    } else {
+        Err(CommitBaseError::InvalidReference(message))
+    }
+}
+
+fn object_type_typed(
+    storage: &ClientStorage,
+    object_id: &ObjectHash,
+    display_name: &str,
+) -> Result<ObjectType, CommitBaseError> {
+    storage
+        .get_object_type(object_id)
+        .map_err(|error| match error {
+            GitError::ObjectNotFound(_) => CommitBaseError::InvalidReference(format!(
+                "object {object_id} does not exist while resolving '{display_name}'"
+            )),
+            other => CommitBaseError::classify_storage_failure(format!(
+                "could not read object {object_id} while resolving '{display_name}': {other}"
+            )),
+        })
+}
+
+fn validate_referenced_object(
+    storage: &ClientStorage,
+    object_id: ObjectHash,
+    display_name: &str,
+    expected_type: Option<ObjectType>,
+) -> Result<ObjectHash, CommitBaseError> {
+    let object_id = ensure_hash_kind(object_id, display_name, true)?;
+    let actual_type = storage
+        .get_object_type(&object_id)
+        .or_else(|error| {
+            // Promisor clones fetch a missing object on demand.
+            if matches!(error, GitError::ObjectNotFound(_)) {
+                match crate::internal::lazy_fetch::try_lazy_fetch_object(&object_id) {
+                    Ok(true) => storage.get_object_type(&object_id),
+                    Ok(false) => Err(error),
+                    Err(unregistered) => Err(GitError::CustomError(unregistered.to_string())),
+                }
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| {
+            CommitBaseError::classify_storage_failure(format!(
+                "reference '{display_name}' points to unreadable object {object_id}: {error}"
+            ))
+        })?;
+    if let Some(expected_type) = expected_type
+        && actual_type != expected_type
+    {
+        return Err(CommitBaseError::CorruptReference(format!(
+            "reference '{display_name}' points to {actual_type}, expected {expected_type}"
+        )));
+    }
+    Ok(object_id)
+}
+
+/// Require that a resolved object id exists in the current repository.
+///
+/// This is the additional contract used by `rev-parse --verify`/`--short`:
+/// plain rev parsing may echo a syntactically complete object id, while these
+/// modes must prove that the object is readable.
+pub fn require_object_exists_typed(
+    object_id: ObjectHash,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    object_type_typed(&objects_storage()?, &object_id, display_name)?;
+    Ok(object_id)
+}
+
+async fn resolve_tag_atom_typed(
+    name: &str,
+    display_name: &str,
+) -> Result<Option<ResolvedAtom>, CommitBaseError> {
+    let tag_name = name.strip_prefix("refs/tags/").unwrap_or(name);
+    let tag_ref = tag::find_tag_ref(tag_name).await.map_err(|error| {
+        CommitBaseError::ReadFailure(format!("failed to resolve tag '{display_name}': {error}"))
+    })?;
+    let Some(tag_ref) = tag_ref else {
+        return Ok(None);
+    };
+    let target = tag_ref.target.ok_or_else(|| {
+        CommitBaseError::CorruptReference(format!(
+            "tag reference 'refs/tags/{tag_name}' has no object id"
+        ))
+    })?;
+    let object_id = crate::internal::object_format::parse_repo_oid(&target).map_err(|error| {
+        CommitBaseError::CorruptReference(format!(
+            "tag reference 'refs/tags/{tag_name}' has invalid object id '{target}': {error}"
+        ))
+    })?;
+    let storage = objects_storage()?;
+    let object_id = validate_referenced_object(&storage, object_id, display_name, None)?;
+    Ok(Some(ResolvedAtom {
+        object_id,
+        reflog_ref: Some(format!("refs/tags/{tag_name}")),
+    }))
+}
+
+async fn resolve_local_branch_atom_typed(
+    name: &str,
+    display_name: &str,
+) -> Result<Option<ResolvedAtom>, CommitBaseError> {
+    let short_name = name.strip_prefix("refs/heads/").unwrap_or(name);
+    let commit = match resolve_branch_commit_typed(short_name, None, display_name).await? {
+        Some(commit) => Some(commit),
+        None if short_name != name => resolve_branch_commit_typed(name, None, display_name).await?,
+        None => None,
+    };
+    let Some(commit) = commit else {
+        return Ok(None);
+    };
+    let storage = objects_storage()?;
+    let object_id =
+        validate_referenced_object(&storage, commit, display_name, Some(ObjectType::Commit))?;
+    Ok(Some(ResolvedAtom {
+        object_id,
+        reflog_ref: Some(format!("refs/heads/{short_name}")),
+    }))
+}
+
+async fn resolve_remote_branch_atom_typed(
+    name: &str,
+    display_name: &str,
+) -> Result<Option<ResolvedAtom>, CommitBaseError> {
+    let short_name = name.strip_prefix("refs/remotes/").unwrap_or(name);
+
+    // Git's short-ref DWIM also resolves `refs/remotes/<remote>` and
+    // `refs/remotes/<remote>/HEAD` through the cached remote HEAD. A bare
+    // remote name never contains '/', and an explicit `.../HEAD` is stored as
+    // a `Head` row (not a `Branch` row), so both need this dedicated probe
+    // before the slash-split loop.
+    let remote_head = if let Some(remote) = short_name.strip_suffix("/HEAD") {
+        Some(remote)
+    } else if short_name.contains('/') {
+        None
+    } else {
+        Some(short_name)
+    };
+    if let Some(remote) = remote_head.filter(|remote| !remote.is_empty())
+        && let Some(atom) = resolve_remote_head_atom_typed(remote, display_name).await?
+    {
+        return Ok(Some(atom));
+    }
+
+    for (remote, branch_name) in remote_tracking_candidates(short_name) {
+        let full_ref = format!("refs/remotes/{remote}/{branch_name}");
+        let candidates = [
+            (full_ref.as_str(), Some(remote)),
+            (branch_name, Some(remote)),
+        ];
+        for (candidate, candidate_remote) in candidates {
+            if let Some(commit) =
+                resolve_branch_commit_typed(candidate, candidate_remote, display_name).await?
+            {
+                let storage = objects_storage()?;
+                let object_id = validate_referenced_object(
+                    &storage,
+                    commit,
+                    display_name,
+                    Some(ObjectType::Commit),
+                )?;
+                return Ok(Some(ResolvedAtom {
+                    object_id,
+                    reflog_ref: Some(full_ref.clone()),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve the cached default branch of `remote`
+/// (`refs/remotes/<remote>/HEAD`) to the commit it points at.
+///
+/// Mirrors Git's `refs/remotes/<name>/HEAD` DWIM fallback: a symbolic row
+/// resolves through the mapped tracking branch (full name first, then the
+/// legacy short shape), a detached row uses its OID directly.
+async fn resolve_remote_head_atom_typed(
+    remote: &str,
+    display_name: &str,
+) -> Result<Option<ResolvedAtom>, CommitBaseError> {
+    let db = get_db_conn_instance().await;
+    let head = Head::remote_current_result_with_conn(&db, remote)
+        .await
+        .map_err(|error| {
+            CommitBaseError::from_branch_store_error(
+                format!("failed to resolve remote HEAD for '{display_name}' on remote '{remote}'"),
+                error,
+            )
+        })?;
+    let (object_id, reflog_ref) = match head {
+        Some(Head::Branch(branch_name)) => {
+            let full_ref = format!("refs/remotes/{remote}/{branch_name}");
+            let mut commit =
+                resolve_branch_commit_typed(&full_ref, Some(remote), display_name).await?;
+            if commit.is_none() {
+                commit =
+                    resolve_branch_commit_typed(&branch_name, Some(remote), display_name).await?;
+            }
+            match commit {
+                Some(commit) => (commit, full_ref),
+                None => return Ok(None),
+            }
+        }
+        Some(Head::Detached(commit)) => (commit, format!("refs/remotes/{remote}/HEAD")),
+        None => return Ok(None),
+    };
+    let storage = objects_storage()?;
+    let object_id =
+        validate_referenced_object(&storage, object_id, display_name, Some(ObjectType::Commit))?;
+    Ok(Some(ResolvedAtom {
+        object_id,
+        reflog_ref: Some(reflog_ref),
+    }))
+}
+
+async fn resolve_hash_atom_typed(name: &str) -> Result<ResolvedAtom, CommitBaseError> {
+    let hash_kind = git_internal::hash::get_hash_kind();
+    let expected_len = hash_kind.hex_len();
+    if name.len() == expected_len && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let object_id = crate::internal::object_format::parse_repo_oid(name)
+            .map_err(|_| invalid_reference(name))?;
+        return Ok(ResolvedAtom {
+            object_id: ensure_hash_kind(object_id, name, false)?,
+            reflog_ref: None,
+        });
+    }
+
+    if !(4..expected_len).contains(&name.len())
+        || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(invalid_reference(name));
+    }
+
+    let storage = objects_storage()?;
+    let matches = storage.search_result(name).await.map_err(|error| {
+        CommitBaseError::classify_storage_failure(format!(
+            "failed to search objects while resolving '{name}': {error}"
+        ))
+    })?;
+    let mut matches = matches
+        .into_iter()
+        .filter(|object_id| object_id.kind() == hash_kind)
+        .collect::<Vec<_>>();
+    // Defensive dedup: storage layers already collapse identical OIDs, but a
+    // duplicate must never surface as a false `ambiguous argument` error.
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.as_slice() {
+        [object_id] => Ok(ResolvedAtom {
+            object_id: *object_id,
+            reflog_ref: None,
+        }),
+        [] => Err(invalid_reference(name)),
+        ambiguous => {
+            // Genuine ambiguity: resolve each DISTINCT candidate's type and
+            // unique abbreviation so the shared diagnostic can list them
+            // (Git's `show_ambiguous_object`). Types are only read here — on
+            // the rare ambiguous path — per the MX-02 performance budget.
+            let mut candidates = Vec::with_capacity(ambiguous.len());
+            for object_id in ambiguous {
+                let object_type = object_type_typed(&storage, object_id, name)?;
+                let abbrev = find_unique_abbrev_typed(&storage, object_id, expected_len).await?;
+                candidates.push(AmbiguousCandidate {
+                    oid: *object_id,
+                    object_type,
+                    abbrev,
+                });
+            }
+            Err(CommitBaseError::Ambiguous {
+                name: name.to_string(),
+                candidates,
+            })
+        }
+    }
+}
+
+/// Compute the shortest unique abbreviation (≥ [`SHORT_HASH_LEN`]) for
+/// `object_id` by probing the object store with progressively longer prefixes,
+/// mirroring Git's `find_unique_abbrev`. Called only while reporting an
+/// ambiguity, so the per-candidate probing cost is paid on the rare path.
+async fn find_unique_abbrev_typed(
+    storage: &ClientStorage,
+    object_id: &ObjectHash,
+    expected_len: usize,
+) -> Result<String, CommitBaseError> {
+    let full = object_id.to_string();
+    for len in SHORT_HASH_LEN.max(1)..=expected_len.min(full.len()) {
+        let prefix = &full[..len];
+        let matches = storage.search_result(prefix).await.map_err(|error| {
+            CommitBaseError::classify_storage_failure(format!(
+                "failed to search objects while disambiguating '{prefix}': {error}"
+            ))
+        })?;
+        if matches.len() == 1 && matches[0] == *object_id {
+            return Ok(prefix.to_string());
+        }
+    }
+    Ok(full)
+}
+
+async fn resolve_object_atom_typed(name: &str) -> Result<ResolvedAtom, CommitBaseError> {
+    if let Some(pattern) = name.strip_prefix(":/") {
+        // Git's `get_oid_oneline` skips empty patterns, so `:/` resolves
+        // nothing; only `<rev>^{/}` (empty pattern, explicit start) is a match.
+        if pattern.is_empty() {
+            return Err(invalid_reference(name));
+        }
+        let object_id = resolve_message_search_typed(None, pattern, name).await?;
+        return Ok(ResolvedAtom {
+            object_id,
+            reflog_ref: None,
+        });
+    }
+
+    if name == "HEAD" || name == "@" {
+        let object_id = match Head::current_commit_result().await {
+            Ok(Some(commit_id)) => commit_id,
+            Ok(None) => return Err(CommitBaseError::HeadUnborn),
+            Err(error) => {
+                return Err(CommitBaseError::from_branch_store_error(
+                    "failed to resolve HEAD".to_string(),
+                    error,
+                ));
+            }
+        };
+        let storage = objects_storage()?;
+        let object_id =
+            validate_referenced_object(&storage, object_id, "HEAD", Some(ObjectType::Commit))?;
+        return Ok(ResolvedAtom {
+            object_id,
+            reflog_ref: Some("HEAD".to_string()),
+        });
+    }
+
+    if name.starts_with("refs/tags/") || name.starts_with("tags/") {
+        let canonical = name.strip_prefix("tags/").unwrap_or(name);
+        if let Some(tag) = resolve_tag_atom_typed(canonical, name).await? {
+            return Ok(tag);
+        }
+        // Git resolves the complete name against the other namespaces before it
+        // treats the name as a describe suffix (`ref_rev_parse_rules`).
+        if let Some(branch) = resolve_local_branch_atom_typed(name, name).await? {
+            return Ok(branch);
+        }
+        if let Some(branch) = resolve_remote_branch_atom_typed(name, name).await? {
+            return Ok(branch);
+        }
+        if let Some((_base, _count, hash)) = split_describe_name(canonical) {
+            return resolve_describe_hash_typed(&hash, name).await;
+        }
+        return Err(invalid_reference(name));
+    }
+    if name.starts_with("refs/heads/") || name.starts_with("heads/") {
+        let canonical = name.strip_prefix("heads/").unwrap_or(name);
+        if let Some(branch) = resolve_local_branch_atom_typed(canonical, name).await? {
+            return Ok(branch);
+        }
+        // Complete-name lookups across the other namespaces before the name is
+        // treated as a describe suffix (Git's `ref_rev_parse_rules`).
+        if let Some(tag) = resolve_tag_atom_typed(name, name).await? {
+            return Ok(tag);
+        }
+        if let Some(branch) = resolve_remote_branch_atom_typed(name, name).await? {
+            return Ok(branch);
+        }
+        if let Some((_base, _count, hash)) = split_describe_name(canonical) {
+            return resolve_describe_hash_typed(&hash, name).await;
+        }
+        return Err(invalid_reference(name));
+    }
+    if name.starts_with("refs/remotes/") || name.starts_with("remotes/") {
+        let canonical = name.strip_prefix("remotes/").unwrap_or(name);
+        if let Some(branch) = resolve_remote_branch_atom_typed(canonical, name).await? {
+            return Ok(branch);
+        }
+        // Complete-name lookups across the other namespaces before the name is
+        // treated as a describe suffix (Git's `ref_rev_parse_rules`).
+        if let Some(tag) = resolve_tag_atom_typed(name, name).await? {
+            return Ok(tag);
+        }
+        if let Some(branch) = resolve_local_branch_atom_typed(name, name).await? {
+            return Ok(branch);
+        }
+        if let Some((_base, _count, hash)) = split_describe_name(canonical) {
+            return resolve_describe_hash_typed(&hash, name).await;
+        }
+        return Err(invalid_reference(name));
+    }
+
+    // Git's short-ref precedence checks tags before local and remote branches.
+    if let Some(tag) = resolve_tag_atom_typed(name, name).await? {
+        return Ok(tag);
+    }
+    if let Some(branch) = resolve_local_branch_atom_typed(name, name).await? {
+        return Ok(branch);
+    }
+    if let Some(branch) = resolve_remote_branch_atom_typed(name, name).await? {
+        return Ok(branch);
+    }
+
+    // Git's describe suffix (`<ref>-<count>-g<hex>`): the literal lookups above
+    // win, then the trailing object id names the commit (ADR-DESC-03).
+    if let Some((_base, _count, hash)) = split_describe_name(name) {
+        return resolve_describe_hash_typed(&hash, name).await;
+    }
+
+    resolve_hash_atom_typed(name).await
+}
+
+/// Resolve the trailing object id of a describe name.
+///
+/// Git looks it up with `GET_OID_QUIETLY | GET_OID_COMMIT`: an abbreviated id
+/// must be unambiguous UNLESS exactly one candidate is a commit (that commit
+/// wins), a full-length id must actually exist, and nothing produces an
+/// ambiguity listing — every failure is a plain invalid reference.
+async fn resolve_describe_hash_typed(
+    hash: &str,
+    display_name: &str,
+) -> Result<ResolvedAtom, CommitBaseError> {
+    let hash_kind = git_internal::hash::get_hash_kind();
+    let expected_len = hash_kind.hex_len();
+    if hash.len() < 4
+        || hash.len() > expected_len
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(invalid_reference(display_name));
+    }
+
+    let storage = objects_storage()?;
+    let mut matches = if hash.len() == expected_len {
+        // A full id is NOT trusted blindly on this path: it must exist.
+        let object_id = crate::internal::object_format::parse_repo_oid(hash)
+            .map_err(|_| invalid_reference(display_name))?;
+        if storage.get_object_type(&object_id).is_err() {
+            return Err(invalid_reference(display_name));
+        }
+        vec![object_id]
+    } else {
+        storage.search_result(hash).await.map_err(|error| {
+            CommitBaseError::classify_storage_failure(format!(
+                "failed to search objects while resolving '{display_name}': {error}"
+            ))
+        })?
+    };
+    matches.retain(|object_id| object_id.kind() == hash_kind);
+    matches.sort_unstable();
+    matches.dedup();
+
+    if matches.is_empty() {
+        return Err(invalid_reference(display_name));
+    }
+    let mut typed = Vec::with_capacity(matches.len());
+    for object_id in matches {
+        typed.push((
+            object_id,
+            object_type_typed(&storage, &object_id, display_name)?,
+        ));
+    }
+    pick_describe_candidate(&typed)
+        .map(|object_id| ResolvedAtom {
+            object_id,
+            reflog_ref: None,
+        })
+        .ok_or_else(|| invalid_reference(display_name))
+}
+
+/// Git's `GET_OID_COMMIT` disambiguation for a describe suffix.
+///
+/// A single candidate always wins; with several, exactly one commit resolves
+/// and anything else fails (no ambiguity listing on this path).
+fn pick_describe_candidate(candidates: &[(ObjectHash, ObjectType)]) -> Option<ObjectHash> {
+    match candidates {
+        [(object_id, _)] => Some(*object_id),
+        _ => {
+            let commits = candidates
+                .iter()
+                .filter(|(_, object_type)| *object_type == ObjectType::Commit)
+                .collect::<Vec<_>>();
+            match commits.as_slice() {
+                [(object_id, _)] => Some(*object_id),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Split a Git describe name `<ref>-<count>-g<hex>` into its parts.
+///
+/// `<count>` is one or more hex digits, `<ref>` must be a valid ref name and
+/// cannot be `@`. The rightmost valid split wins, mirroring Git's
+/// `get_describe_name`.
+fn split_describe_name(name: &str) -> Option<(String, String, String)> {
+    let bytes = name.as_bytes();
+    let mut search_end = bytes.len();
+    while let Some(offset) = name[..search_end].rfind("-g") {
+        let hash = &name[offset + 2..];
+        if !hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            let prefix = &name[..offset];
+            if let Some(dash) = prefix.rfind('-') {
+                let base = &prefix[..dash];
+                let count = &prefix[dash + 1..];
+                if !base.is_empty()
+                    && base != "@"
+                    && !count.is_empty()
+                    && count.chars().all(|c| c.is_ascii_hexdigit())
+                    && is_valid_refname(&format!("refs/{base}"))
+                {
+                    return Some((base.to_string(), count.to_string(), hash.to_string()));
+                }
+            }
+        }
+        search_end = offset;
+        if search_end == 0 {
+            break;
+        }
+    }
+    None
+}
+
+fn peel_tag_target_typed(
+    storage: &ClientStorage,
+    object_id: ObjectHash,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let tag_object: GitTag = load_object(&object_id).map_err(|error| {
+        CommitBaseError::classify_storage_failure(format!(
+            "failed to load tag object {object_id} while resolving '{display_name}': {error}"
+        ))
+    })?;
+    validate_referenced_object(storage, tag_object.object_hash, display_name, None)
+}
+
+fn peel_object_to_type_typed(
+    object_id: ObjectHash,
+    expected: Option<ObjectType>,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let storage = objects_storage()?;
+    let mut current = ensure_hash_kind(object_id, display_name, false)?;
+    let mut seen = HashSet::new();
+    // Whether the peel walked through at least one annotated tag: a type
+    // mismatch is then the TAG's fault, and the error names it so users see
+    // which object to fix (e.g. `rev-list <tag>` where the tag targets a
+    // tree).
+    let mut peeled_through_tag = false;
+
+    loop {
+        if !seen.insert(current) {
+            return Err(CommitBaseError::CorruptReference(format!(
+                "tag cycle detected while resolving '{display_name}'"
+            )));
+        }
+        let current_type = object_type_typed(&storage, &current, display_name)?;
+        match expected {
+            Some(ObjectType::Commit) if current_type == ObjectType::Commit => return Ok(current),
+            Some(ObjectType::Tree) if current_type == ObjectType::Tree => return Ok(current),
+            Some(ObjectType::Blob) if current_type == ObjectType::Blob => return Ok(current),
+            Some(ObjectType::Tag) if current_type == ObjectType::Tag => return Ok(current),
+            Some(expected_type) if expected_type == current_type => return Ok(current),
+            None if current_type != ObjectType::Tag => return Ok(current),
+            Some(ObjectType::Tree) if current_type == ObjectType::Commit => {
+                let commit: Commit = load_object(&current).map_err(|error| {
+                    CommitBaseError::classify_storage_failure(format!(
+                        "failed to load commit {current} while resolving '{display_name}': {error}"
+                    ))
+                })?;
+                return validate_referenced_object(
+                    &storage,
+                    commit.tree_id,
+                    display_name,
+                    Some(ObjectType::Tree),
+                );
+            }
+            _ if current_type == ObjectType::Tag => {
+                peeled_through_tag = true;
+                current = peel_tag_target_typed(&storage, current, display_name)?;
+            }
+            Some(expected_type) => {
+                let tag_detail = if peeled_through_tag {
+                    format!(" (tag points to {current_type})")
+                } else {
+                    String::new()
+                };
+                return Err(CommitBaseError::InvalidReference(format!(
+                    "reference '{display_name}' cannot be peeled from {current_type} to \
+                     {expected_type}{tag_detail}"
+                )));
+            }
+            None => return Ok(current),
+        }
+    }
+}
+
+fn nth_parent_commit_typed(
+    commit_id: ObjectHash,
+    n: usize,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let commit_id = peel_object_to_type_typed(commit_id, Some(ObjectType::Commit), display_name)?;
+    if n == 0 {
+        return Ok(commit_id);
+    }
+    let commit: Commit = load_object(&commit_id).map_err(|error| {
+        CommitBaseError::classify_storage_failure(format!(
+            "failed to load commit {commit_id} while resolving '{display_name}': {error}"
+        ))
+    })?;
+    let parent = commit
+        .parent_commit_ids
+        .get(n - 1)
+        .copied()
+        .ok_or_else(|| invalid_reference(display_name))?;
+    validate_referenced_object(
+        &objects_storage()?,
+        parent,
+        display_name,
+        Some(ObjectType::Commit),
+    )
+}
+
+async fn current_branch_reflog_ref(display_name: &str) -> Result<String, CommitBaseError> {
+    match Head::current_result().await {
+        Ok(Head::Branch(name)) => Ok(format!("refs/heads/{name}")),
+        Ok(Head::Detached(_)) => Err(CommitBaseError::InvalidReference(format!(
+            "'{display_name}' requires a current branch reflog, but HEAD is detached"
+        ))),
+        Err(error) => Err(CommitBaseError::from_branch_store_error(
+            "failed to resolve current branch for reflog selector".to_string(),
+            error,
+        )),
+    }
+}
+
+async fn resolve_reflog_selector_typed(
+    ref_name: &str,
+    index: usize,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let db = get_db_conn_instance().await;
+    let entries = Reflog::find_all(&db, ref_name).await.map_err(|error| {
+        CommitBaseError::ReadFailure(format!(
+            "failed to read reflog '{ref_name}' while resolving '{display_name}': {error}"
+        ))
+    })?;
+    let entry = entries.get(index).ok_or_else(|| {
+        CommitBaseError::InvalidReference(format!(
+            "reflog entry '{ref_name}@{{{index}}}' does not exist"
+        ))
+    })?;
+    let object_id =
+        crate::internal::object_format::parse_repo_oid(&entry.new_oid).map_err(|error| {
+            CommitBaseError::CorruptReference(format!(
+                "reflog entry '{ref_name}@{{{index}}}' has invalid object id '{}': {error}",
+                entry.new_oid
+            ))
+        })?;
+    validate_referenced_object(&objects_storage()?, object_id, display_name, None)
+}
+
+fn first_revision_operator(spec: &str) -> Option<usize> {
+    spec.char_indices().find_map(|(index, ch)| {
+        (ch == '^' || ch == '~' || (ch == '@' && spec[index..].starts_with("@{"))).then_some(index)
+    })
+}
+
+fn parse_decimal_prefix(
+    value: &str,
+    default: usize,
+    display_name: &str,
+) -> Result<(usize, usize), CommitBaseError> {
+    let digit_len = value
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digit_len == 0 {
+        return Ok((default, 0));
+    }
+    let parsed = value[..digit_len]
+        .parse::<usize>()
+        .map_err(|_| invalid_reference(display_name))?;
+    Ok((parsed, digit_len))
+}
+
+async fn resolve_revision_expression_typed(spec: &str) -> Result<ObjectHash, CommitBaseError> {
+    if spec.is_empty() {
+        return Err(invalid_reference(spec));
+    }
+    let operator_index = first_revision_operator(spec).unwrap_or(spec.len());
+    let atom_text = &spec[..operator_index];
+    let mut rest = &spec[operator_index..];
+    let mut atom = if atom_text.is_empty() {
+        None
+    } else {
+        Some(resolve_object_atom_typed(atom_text).await?)
+    };
+
+    while !rest.is_empty() {
+        if let Some(selector) = rest.strip_prefix("@{") {
+            let close = selector.find('}').ok_or_else(|| invalid_reference(spec))?;
+            let index_text = &selector[..close];
+            if index_text.is_empty() || !index_text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(CommitBaseError::InvalidReference(format!(
+                    "unsupported reflog selector in '{spec}'; use a non-negative numeric index"
+                )));
+            }
+            let index = index_text
+                .parse::<usize>()
+                .map_err(|_| invalid_reference(spec))?;
+            let ref_name = match atom
+                .as_ref()
+                .and_then(|resolved| resolved.reflog_ref.clone())
+            {
+                Some(ref_name) => ref_name,
+                None if atom_text.is_empty() => current_branch_reflog_ref(spec).await?,
+                None => return Err(invalid_reference(spec)),
+            };
+            let object_id = resolve_reflog_selector_typed(&ref_name, index, spec).await?;
+            atom = Some(ResolvedAtom {
+                object_id,
+                reflog_ref: Some(ref_name),
+            });
+            rest = &selector[close + 1..];
+            continue;
+        }
+
+        let current = atom
+            .as_ref()
+            .map(|resolved| resolved.object_id)
+            .ok_or_else(|| invalid_reference(spec))?;
+        if let Some(peel) = rest.strip_prefix("^{") {
+            let close = peel.find('}').ok_or_else(|| invalid_reference(spec))?;
+            // `<rev>^{/<pattern>}` commit-message search (RV-02).
+            if let Some(pattern) = peel[..close].strip_prefix('/') {
+                let object_id = resolve_message_search_typed(Some(current), pattern, spec).await?;
+                atom = Some(ResolvedAtom {
+                    object_id,
+                    reflog_ref: None,
+                });
+                rest = &peel[close + 1..];
+                continue;
+            }
+            let expected = match &peel[..close] {
+                "" => None,
+                "object" => Some(object_type_typed(&objects_storage()?, &current, spec)?),
+                "commit" => Some(ObjectType::Commit),
+                "tree" => Some(ObjectType::Tree),
+                "blob" => Some(ObjectType::Blob),
+                "tag" => Some(ObjectType::Tag),
+                _ => return Err(invalid_reference(spec)),
+            };
+            let object_id = peel_object_to_type_typed(current, expected, spec)?;
+            atom = Some(ResolvedAtom {
+                object_id,
+                reflog_ref: None,
+            });
+            rest = &peel[close + 1..];
+            continue;
+        }
+        if let Some(parent) = rest.strip_prefix('^') {
+            let (parent_number, consumed) = parse_decimal_prefix(parent, 1, spec)?;
+            let object_id = nth_parent_commit_typed(current, parent_number, spec)?;
+            atom = Some(ResolvedAtom {
+                object_id,
+                reflog_ref: None,
+            });
+            rest = &parent[consumed..];
+            continue;
+        }
+        if let Some(ancestor) = rest.strip_prefix('~') {
+            let (generations, consumed) = parse_decimal_prefix(ancestor, 1, spec)?;
+            let mut object_id = peel_object_to_type_typed(current, Some(ObjectType::Commit), spec)?;
+            for _ in 0..generations {
+                object_id = nth_parent_commit_typed(object_id, 1, spec)?;
+            }
+            atom = Some(ResolvedAtom {
+                object_id,
+                reflog_ref: None,
+            });
+            rest = &ancestor[consumed..];
+            continue;
+        }
+        return Err(invalid_reference(spec));
+    }
+
+    atom.map(|resolved| resolved.object_id)
+        .ok_or_else(|| invalid_reference(spec))
+}
+
+fn resolve_tree_path_typed(
+    root: ObjectHash,
+    path_spec: &str,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let mut current = peel_object_to_type_typed(root, Some(ObjectType::Tree), display_name)?;
+    if path_spec.is_empty() {
+        return Ok(current);
+    }
+
+    let components = path_spec.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || *component == "." || *component == "..")
+    {
+        return Err(CommitBaseError::InvalidReference(format!(
+            "invalid tree path in '{display_name}'"
+        )));
+    }
+
+    for (index, component) in components.iter().enumerate() {
+        let tree: Tree = load_object(&current).map_err(|error| {
+            CommitBaseError::classify_storage_failure(format!(
+                "failed to load tree {current} while resolving '{display_name}': {error}"
+            ))
+        })?;
+        let item = tree
+            .tree_items
+            .iter()
+            .find(|item| item.name == *component)
+            .ok_or_else(|| {
+                CommitBaseError::InvalidReference(format!(
+                    "path '{path_spec}' does not exist in '{display_name}'"
+                ))
+            })?;
+        current = validate_referenced_object(
+            &objects_storage()?,
+            item.id,
+            display_name,
+            if index + 1 < components.len() {
+                Some(ObjectType::Tree)
+            } else {
+                None
+            },
+        )?;
+    }
+    Ok(current)
+}
+
+/// Parse a `:<path>` / `:<n>:<path>` index-path spec into `(stage, path)`.
+///
+/// `rest` is the input after the leading `:` (so the spec's second character is
+/// `rest[0]`). A leading `[0-3]:` selects that merge stage; any other shape
+/// selects stage 0 with the whole remainder as the path (`:0:p` ≡ `:p`).
+fn parse_index_path_spec(rest: &str) -> (u8, &str) {
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_digit() && bytes[0] <= b'3' && bytes[1] == b':' {
+        (bytes[0] - b'0', &rest[2..])
+    } else {
+        (0, rest)
+    }
+}
+
+/// Resolve a `:<path>` / `:<n>:<path>` object spec against the current worktree
+/// index (ADR-PL-03). `name` is the full spec including the leading `:`.
+///
+/// `./` / `../` prefixes are resolved relative to the current directory; every
+/// other path is already repository-relative (Git's `resolve_relative_path`).
+async fn resolve_index_path_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
+    let rest = &name[1..];
+    let (stage, path_spec) = parse_index_path_spec(rest);
+
+    let repo_relative = if path_spec.starts_with("./") || path_spec.starts_with("../") {
+        let worktree = working_dir();
+        let absolute = normalize_abs_path(&cur_dir().join(path_spec));
+        // Git's `resolve_relative_path` contract: `./` / `../` specs that
+        // escape the worktree are rejected, never resolved against the index.
+        if !is_sub_path(&absolute, &worktree) {
+            return Err(CommitBaseError::InvalidReference(format!(
+                "'{path_spec}' is outside repository at '{}'",
+                worktree.display()
+            )));
+        }
+        to_relative(absolute, worktree)
+    } else {
+        PathBuf::from(path_spec)
+    };
+    let path_name = repo_relative.to_string_lossy().into_owned();
+
+    let index_file = path::index();
+    let hash_kind = git_internal::hash::get_hash_kind();
+    let index = Index::load_with_hash_kind(hash_kind, &index_file).map_err(|error| {
+        CommitBaseError::classify_storage_failure(format!(
+            "failed to read the index while resolving '{name}': {error}"
+        ))
+    })?;
+
+    if let Some(object_id) = index.get_hash(&path_name, stage) {
+        return Ok(object_id);
+    }
+    // Git reports `path '<p>' is in the index, but not at stage <n>` when the
+    // requested stage is absent but any other stage of the path exists.
+    if (0u8..=3).any(|other| other != stage && index.get_hash(&path_name, other).is_some()) {
+        return Err(CommitBaseError::InvalidReference(format!(
+            "path '{path_name}' is in the index, but not at stage {stage}"
+        )));
+    }
+    Err(CommitBaseError::InvalidReference(format!(
+        "path '{path_name}' is not in the index"
+    )))
+}
+
+/// Parse a `:/<pattern>` / `^{/<pattern>}` message-search pattern prefix.
+///
+/// Returns `(negated, regex_text)`: `!-` negates the match, `!!` keeps a
+/// literal leading `!` in the regex, and any other leading `!` is an error
+/// (matching Git's `get_oid_oneline`).
+fn parse_message_search_pattern<'a>(
+    pattern: &'a str,
+    display_name: &str,
+) -> Result<(bool, &'a str), CommitBaseError> {
+    match pattern.strip_prefix('!') {
+        None => Ok((false, pattern)),
+        Some(rest) => {
+            if let Some(negated) = rest.strip_prefix('-') {
+                Ok((true, negated))
+            } else if rest.starts_with('!') {
+                // `!!` is a literal `!`: the first `!` is the escape marker and
+                // the second stays in the regex (where `!` is a literal byte).
+                Ok((false, rest))
+            } else {
+                Err(CommitBaseError::InvalidReference(format!(
+                    "invalid message-search pattern in '{display_name}': a leading '!' must be followed by '-' or '!'"
+                )))
+            }
+        }
+    }
+}
+
+/// Upper bound on the compiled regex size (a linear-time, backtracking-free
+/// engine, so a size cap is the memory guard; ADR-PL-04).
+const MESSAGE_SEARCH_REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+
+fn compile_message_search_regex(
+    pattern: &str,
+    display_name: &str,
+) -> Result<regex::Regex, CommitBaseError> {
+    RegexBuilder::new(pattern)
+        .size_limit(MESSAGE_SEARCH_REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|error| {
+            CommitBaseError::InvalidReference(format!(
+                "invalid message-search pattern in '{display_name}': {error}"
+            ))
+        })
+}
+
+/// A commit queued for the message-search walk, ordered newest-first by
+/// committer timestamp (ties broken by object id for determinism).
+#[derive(Eq, PartialEq)]
+struct PendingCommit {
+    timestamp: usize,
+    object_id: ObjectHash,
+}
+
+impl Ord for PendingCommit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| self.object_id.to_string().cmp(&other.object_id.to_string()))
+    }
+}
+
+impl PartialOrd for PendingCommit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Load `object_id` and enqueue it once (deduplicated by object id).
+fn push_pending_commit(
+    pending: &mut BinaryHeap<PendingCommit>,
+    seen: &mut HashSet<ObjectHash>,
+    object_id: ObjectHash,
+    display_name: &str,
+) -> Result<(), CommitBaseError> {
+    if !seen.insert(object_id) {
+        return Ok(());
+    }
+    let commit: Commit = load_object(&object_id).map_err(|error| {
+        CommitBaseError::classify_storage_failure(format!(
+            "failed to load commit {object_id} while resolving '{display_name}': {error}"
+        ))
+    })?;
+    pending.push(PendingCommit {
+        timestamp: commit.committer.timestamp,
+        object_id,
+    });
+    Ok(())
+}
+
+/// The start points for a `:/<pattern>` search: HEAD plus every local branch
+/// and tag (peeled to a commit). Non-commit tags are skipped.
+async fn message_search_start_points(
+    display_name: &str,
+) -> Result<Vec<ObjectHash>, CommitBaseError> {
+    let mut tips = Vec::new();
+
+    match Head::current_commit_result().await {
+        Ok(Some(commit)) => tips.push(commit),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(CommitBaseError::from_branch_store_error(
+                format!("failed to resolve HEAD while resolving '{display_name}'"),
+                error,
+            ));
+        }
+    }
+
+    let branches = Branch::list_branches_result(None).await.map_err(|error| {
+        CommitBaseError::from_branch_store_error(
+            format!("failed to list local branches while resolving '{display_name}'"),
+            error,
+        )
+    })?;
+    tips.extend(branches.into_iter().map(|branch| branch.commit));
+
+    // Git's `for_each_ref` start set includes `refs/remotes/*`, so a commit
+    // reachable only from a remote-tracking branch is findable too.
+    let remotes = ConfigKv::all_remote_configs().await.map_err(|error| {
+        CommitBaseError::ReadFailure(format!(
+            "failed to list remotes while resolving '{display_name}': {error}"
+        ))
+    })?;
+    for remote in remotes {
+        let remote_branches = Branch::list_branches_result(Some(&remote.name))
+            .await
+            .map_err(|error| {
+                CommitBaseError::from_branch_store_error(
+                    format!(
+                        "failed to list remote-tracking branches for '{}' while resolving \
+                         '{display_name}'",
+                        remote.name
+                    ),
+                    error,
+                )
+            })?;
+        tips.extend(remote_branches.into_iter().map(|branch| branch.commit));
+    }
+
+    let tags = tag::list().await.map_err(|error| {
+        CommitBaseError::ReadFailure(format!(
+            "failed to list tags while resolving '{display_name}': {error}"
+        ))
+    })?;
+    for entry in tags {
+        let target = match entry.object {
+            tag::TagObject::Commit(commit) => commit.id,
+            tag::TagObject::Tag(tag_object) => tag_object.object_hash,
+            // Tree/Blob tags are not commit tips.
+            tag::TagObject::Tree(_) | tag::TagObject::Blob(_) => continue,
+        };
+        match peel_object_to_type_typed(target, Some(ObjectType::Commit), &entry.name) {
+            Ok(commit) => tips.push(commit),
+            // A tag that does not peel to a commit is not a start point.
+            Err(_) => continue,
+        }
+    }
+
+    Ok(tips)
+}
+
+/// Resolve a commit-message search (ADR-PL-04): `:/<pattern>` (start from all
+/// local refs + HEAD) or `<rev>^{/<pattern>}` (start from `start`).
+///
+/// Traverses ancestors newest-first by committer timestamp and returns the
+/// first commit whose message matches (or, with `!-`, does not match). Only
+/// commit objects are read — trees and blobs are never loaded. Invalid regex,
+/// size-limit overflow, and no-match all report `invalid_reference`.
+async fn resolve_message_search_typed(
+    start: Option<ObjectHash>,
+    pattern: &str,
+    display_name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let (negated, regex_text) = parse_message_search_pattern(pattern, display_name)?;
+    let regex = compile_message_search_regex(regex_text, display_name)?;
+
+    let starts = match start {
+        Some(object_id) => vec![object_id],
+        None => message_search_start_points(display_name).await?,
+    };
+
+    let mut pending = BinaryHeap::new();
+    let mut seen = HashSet::new();
+    for object_id in starts {
+        push_pending_commit(&mut pending, &mut seen, object_id, display_name)?;
+    }
+
+    while let Some(PendingCommit { object_id, .. }) = pending.pop() {
+        let commit: Commit = load_object(&object_id).map_err(|error| {
+            CommitBaseError::classify_storage_failure(format!(
+                "failed to load commit {object_id} while resolving '{display_name}': {error}"
+            ))
+        })?;
+        // Git matches against the whole message block (everything after the
+        // blank line that ends the commit header), which is exactly
+        // `Commit::message` here.
+        if regex.is_match(&commit.message) != negated {
+            return Ok(object_id);
+        }
+        for parent in commit.parent_commit_ids {
+            push_pending_commit(&mut pending, &mut seen, parent, display_name)?;
+        }
+    }
+
+    Err(invalid_reference(display_name))
+}
+
+/// Resolve one strict Git object specification to its concrete object id.
+///
+/// Supported forms include refs, unique object-id prefixes, `@`, numeric reflog
+/// selectors, parent/ancestor navigation, typed or recursive peel suffixes, and
+/// `<tree-ish>:<path>`. Parsing consumes the entire input; trailing garbage is
+/// never ignored.
+pub async fn resolve_object_spec_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
+    // `:<path>` / `:<n>:<path>` (RV-01): the second character is not `/`.
+    if let Some(rest) = name.strip_prefix(':')
+        && !rest.starts_with('/')
+    {
+        return resolve_index_path_typed(name).await;
+    }
+    // `:/<pattern>` (RV-02) has no `<rev>:` part — it is a revision atom.
+    if name.starts_with(":/") {
+        return resolve_revision_expression_typed(name).await;
+    }
+    if let Some((revision, tree_path)) = name.split_once(':') {
+        if revision.is_empty() {
+            return Err(invalid_reference(name));
+        }
+        let root = resolve_revision_expression_typed(revision).await?;
+        return resolve_tree_path_typed(root, tree_path, name);
+    }
+    resolve_revision_expression_typed(name).await
+}
+
+/// Resolve the sole public pseudo-ref that is deliberately opt-in. Keeping
+/// this separate from [`resolve_object_spec_typed`] preserves the rejection
+/// contract for every other consumer, including `update-ref` CAS arguments.
+pub async fn resolve_object_spec_with_auto_merge_typed(
+    name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let auto_merge = crate::internal::pseudo_ref::PseudoRef::AutoMerge.name();
+    let suffix = name.strip_prefix(auto_merge);
+    if let Some(suffix) = suffix.filter(|suffix| {
+        suffix.is_empty() || matches!(suffix.as_bytes().first(), Some(b'^' | b'~' | b':'))
+    }) {
+        let refs = crate::internal::pseudo_ref::WorktreePseudoRefs::for_request();
+        return match refs
+            .resolve(crate::internal::pseudo_ref::PseudoRef::AutoMerge)
+            .await
+        {
+            Ok(Some(value)) => {
+                let projected_spec = format!("{}{suffix}", value.oid);
+                resolve_object_spec_typed(&projected_spec).await
+            }
+            Ok(None) => Err(invalid_reference(name)),
+            Err(detail) => Err(CommitBaseError::ReadFailure(format!(
+                "failed to resolve {name}: {detail}"
+            ))),
+        };
+    }
+    resolve_object_spec_typed(name).await
+}
+
+/// Resolve a tree-ish expression and peel commits or annotated tags to a tree.
+pub async fn resolve_tree_ish_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
+    let object_id = resolve_object_spec_typed(name).await?;
+    peel_object_to_type_typed(object_id, Some(ObjectType::Tree), name)
+}
+
+/// Tree-ish counterpart for consumers that explicitly support `AUTO_MERGE`.
+pub async fn resolve_tree_ish_with_auto_merge_typed(
+    name: &str,
+) -> Result<ObjectHash, CommitBaseError> {
+    let object_id = resolve_object_spec_with_auto_merge_typed(name).await?;
+    peel_object_to_type_typed(object_id, Some(ObjectType::Tree), name)
+}
+
+pub async fn get_commit_base_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
+    let object_id = resolve_object_spec_typed(name).await?;
+    peel_object_to_type_typed(object_id, Some(ObjectType::Commit), name)
+}
+
+/// Peel `object_id` through any chain of annotated tags to the first non-tag
+/// object and report that object's type.
+///
+/// Delegates to the shared peel loop (including its cycle detection), so a
+/// nested tag — a tag of a tag of a commit — peels exactly like
+/// `rev-parse <tag>^{}`. A non-tag object is returned unchanged. A missing
+/// intermediate object or a tag cycle is reported as
+/// [`CommitBaseError::CorruptReference`]; an unreadable object store as
+/// [`CommitBaseError::ReadFailure`].
+pub fn peel_to_non_tag_typed(
+    object_id: ObjectHash,
+    display_name: &str,
+) -> Result<(ObjectHash, ObjectType), CommitBaseError> {
+    let end = peel_object_to_type_typed(object_id, None, display_name)?;
+    let end_type = object_type_typed(&objects_storage()?, &end, display_name)?;
+    Ok((end, end_type))
+}
+
+/// Resolve a string to a commit [`ObjectHash`].
+/// The string can be a local branch name, a remote-tracking branch name
+/// (such as `origin/main`), a tag name, or a commit hash prefix.
+/// Order of resolution:
+/// 1. HEAD
+/// 2. Tag
+/// 3. Local branch
+/// 4. Remote-tracking branch (e.g. `origin/main`)
+/// 5. Commit hash prefix
+pub async fn get_commit_base(name: &str) -> Result<ObjectHash, String> {
+    get_commit_base_typed(name)
+        .await
+        .map_err(|error| format!("fatal: {error}"))
+}
+
+/// Get the repository name from the url
+/// - e.g. `https://github.com/libra-tools/mega.git/` -> mega
+/// - e.g. `https://github.com/libra-tools/mega.git` -> mega
+pub fn get_repo_name_from_url(mut url: &str) -> Option<&str> {
+    if url.ends_with('/') {
+        url = &url[..url.len() - 1];
+    }
+
+    let repo_start = url.rfind('/')? + 1;
+    let repo = &url[repo_start..];
+    if repo.is_empty() {
+        return None;
+    }
+
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if repo.is_empty() { None } else { Some(repo) }
+}
+
+/// Find the appropriate unit and value for Bytes.
+/// ### Examples
+/// - 1024 bytes -> 1 KiB
+/// - 1024 * 1024 bytes -> 1 MiB
+pub fn auto_unit_bytes(bytes: u64) -> byte_unit::AdjustedByte {
+    let bytes = byte_unit::Byte::from(bytes);
+    bytes.get_appropriate_unit(byte_unit::UnitType::Binary)
+}
+/// Create a default style progress bar
+pub fn default_progress_bar(len: u64) -> ProgressBar {
+    let progress_bar = ProgressBar::new(len);
+    progress_bar.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.magenta} [{elapsed_precise}] [{bar:40.green/white}] {bytes}/{total_bytes} ({eta}) {bytes_per_sec}")
+            // INVARIANT: the template string is a compile-time literal whose
+            // placeholders are validated by indicatif at parse time; this is
+            // covered by every command that uses default_progress_bar().
+            .expect("default progress bar template is a valid indicatif format string")
+            .progress_chars("=> "),
+    );
+    progress_bar
+}
+
+/// Returns `true` when any component of `target_file`, taken relative to
+/// `work_dir`, is a literal `.git` entry (see [`GIT_DIR`]). Only the portion
+/// below `work_dir` is inspected, so a repository that merely lives under an
+/// ancestor path containing `.git` is unaffected.
+fn path_has_git_dir_component(work_dir: &Path, target_file: &Path) -> bool {
+    let relative = target_file.strip_prefix(work_dir).unwrap_or(target_file);
+    relative
+        .components()
+        .any(|component| component.as_os_str() == OsStr::new(GIT_DIR))
+}
+
+/// Check each directory level from `work_dir` to `target_file` to see if an
+/// ignore source matches `target_file`.
+///
+/// `.git` is always treated as ignored (like Git) regardless of any ignore
+/// rule.
+///
+/// Low-level helper historically used by status/add flows. Prefer the higher-level wrappers in
+/// `crate::utils::ignore::{should_ignore, filter_workdir_paths}` so that ignore policies and index
+/// awareness stay consistent. Call this directly only when you explicitly need raw ignore-source
+/// parsing.
+///
+/// Assume `target_file` is in `work_dir`.
+/// [`check_gitignore`] under the status I/O deadline.
+///
+/// Ignore resolution reads `.gitignore` / `.libraignore` files, so on a hung
+/// mount it can block like any other filesystem read. `None` means the
+/// lookup was reclaimed: callers treat that as "cannot decide" and report
+/// the path blocked rather than silently choosing an answer.
+pub fn check_gitignore_bounded(workdir: &Path, path: &Path) -> Option<bool> {
+    prewarm_ignore_config(workdir);
+    let workdir_owned = workdir.to_path_buf();
+    let path_owned = path.to_path_buf();
+    let walk_epoch = secure_ignore_walk_epoch();
+    let answer = crate::utils::io_deadline::with_io_deadline(move || {
+        let is_dir = fs::symlink_metadata(&path_owned)
+            .map(|meta| meta.file_type().is_dir())
+            .unwrap_or(false);
+        check_gitignore_as_dir_for_walk(&workdir_owned, &path_owned, is_dir, walk_epoch)
+    })
+    .ok()?;
+    if ignore_read_failed() {
+        return None;
+    }
+    Some(answer)
+}
+
+/// [`check_gitignore_bounded`] with an explicit no-follow directory flag.
+pub fn check_gitignore_bounded_as_dir(workdir: &Path, path: &Path, is_dir: bool) -> Option<bool> {
+    prewarm_ignore_config(workdir);
+    let workdir_owned = workdir.to_path_buf();
+    let path_owned = path.to_path_buf();
+    let walk_epoch = secure_ignore_walk_epoch();
+    let answer = crate::utils::io_deadline::with_io_deadline(move || {
+        check_gitignore_as_dir_for_walk(&workdir_owned, &path_owned, is_dir, walk_epoch)
+    })
+    .ok()?;
+    if ignore_read_failed() {
+        return None;
+    }
+    Some(answer)
+}
+
+/// Immutable ignore rules for the immediate children of one entered directory.
+/// Construction performs all filesystem I/O under the status deadline; matching
+/// afterwards uses only the captured rules and layer snapshot.
+pub struct DirectoryIgnoreContext {
+    workdir: PathBuf,
+    matchers: Vec<Arc<Gitignore>>,
+    layers: crate::internal::layer::ExclusionSnapshot,
+}
+
+impl DirectoryIgnoreContext {
+    /// Match an absolute, lexically contained path against the captured rules.
+    /// Callers must not substitute a relative path or a path outside `workdir`.
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        debug_assert!(path.is_absolute() && path.starts_with(&self.workdir));
+        if path_has_git_dir_component(&self.workdir, path) {
+            return true;
+        }
+        if !self.layers.is_empty()
+            && let Ok(relative) = path.strip_prefix(&self.workdir)
+            && let Some(key) = crate::internal::layer::normalize_key(relative)
+            && self.layers.is_owned(&key)
+        {
+            return true;
+        }
+        self.matchers
+            .iter()
+            .find_map(|matcher| ignore_verdict_as_dir(matcher, &self.workdir, path, is_dir))
+            .unwrap_or(false)
+    }
+}
+
+/// Load every applicable source, including `dir`'s own ignore files, even if all
+/// children are tracked. The existing walk epoch keeps beneath reads scoped to
+/// this invocation and prevents late workers from poisoning another walk.
+pub fn directory_ignore_context_bounded(
+    workdir: &Path,
+    dir: &Path,
+) -> io::Result<DirectoryIgnoreContext> {
+    prewarm_ignore_config(workdir);
+    let workdir = workdir.to_path_buf();
+    let target = dir.join(".libra-ignore-context");
+    let epoch = secure_ignore_walk_epoch();
+    let layers = crate::internal::layer::ExclusionSnapshot::for_request();
+    let context = crate::utils::io_deadline::with_io_deadline(move || {
+        let _guard = IgnoreOpEpochGuard(IGNORE_OP_EPOCH.with(|cell| cell.replace(epoch)));
+        let matchers = ignore_sources_for_target(&workdir, &target)
+            .into_iter()
+            .map(|source| {
+                source
+                    .preloaded
+                    .unwrap_or_else(|| cached_ignore_file(&source.path, &source.base))
+            })
+            .collect();
+        DirectoryIgnoreContext {
+            workdir,
+            matchers,
+            layers,
+        }
+    })
+    .map_err(|()| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "directory ignore sources exceeded the status I/O deadline",
+        )
+    })?;
+    if ignore_read_failed_for_walk(epoch) {
+        return Err(io::Error::other("directory ignore source unreadable"));
+    }
+    Ok(context)
+}
+
+/// Resolve the DATABASE-backed part of the ignore configuration on the
+/// CALLING thread.
+///
+/// `check_gitignore` consults `core.excludesFile`, which is a SQLite read of
+/// the repository config — not a filesystem operation. Running it on a
+/// pooled I/O worker means contention on the repository database is charged
+/// against the worktree I/O deadline and surfaces as a bogus `io_timeout`
+/// for a path that was perfectly readable. Callers that are about to hand
+/// `check_gitignore` to the status I/O worker warm the process-wide config
+/// cache here first, so the worker only ever touches the filesystem.
+pub fn prewarm_ignore_config(workdir: &Path) {
+    let _ = optional_cascaded_config_path(CORE_EXCLUDES_FILE_KEY, workdir);
+}
+
+pub fn check_gitignore(work_dir: &Path, target_file: &Path) -> bool {
+    check_gitignore_with_layers(
+        work_dir,
+        target_file,
+        &crate::internal::layer::ExclusionSnapshot::for_request(),
+    )
+}
+
+/// Like [`check_gitignore`], but uses a caller-supplied directory flag instead
+/// of `Path::is_dir()` (which follows symlinks). Status walks must pass the
+/// no-follow dirent kind so a post-listing swap cannot redirect ignore I/O.
+pub fn check_gitignore_as_dir(work_dir: &Path, target_file: &Path, is_dir: bool) -> bool {
+    check_gitignore_with_layers_as_dir(
+        work_dir,
+        target_file,
+        &crate::internal::layer::ExclusionSnapshot::for_request(),
+        is_dir,
+    )
+}
+
+/// [`check_gitignore`] against an ALREADY-CAPTURED layer snapshot, for a walk
+/// that captured once and must not re-read process-global state per path.
+pub fn check_gitignore_with_layers(
+    work_dir: &Path,
+    target_file: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+) -> bool {
+    check_gitignore_with_layers_as_dir(work_dir, target_file, layers, target_file.is_dir())
+}
+
+/// [`check_gitignore_with_layers`] with an explicit directory flag (no-follow).
+pub fn check_gitignore_with_layers_as_dir(
+    work_dir: &Path,
+    target_file: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+    is_dir: bool,
+) -> bool {
+    assert!(target_file.starts_with(work_dir));
+
+    // Git hardcodes ignoring `.git`. Mirror that here, before consulting any
+    // `.libraignore` file, so a nested Git repository's metadata is always
+    // treated as ignored and can never be un-ignored by a `.libraignore`
+    // whitelist rule (e.g. `!.git`).
+    if path_has_git_dir_component(work_dir, target_file) {
+        return true;
+    }
+
+    // lore.md 2.4: a materialized layer-overlay path is UN-NEGATABLY excluded
+    // (above every `.libraignore` rule) so a purely-local overlay is never
+    // swept into `status`/`add`. Zero overhead with no layers (empty
+    // snapshot). The `add` staging guard is the airtight backstop for
+    // `--force` (which extends ignored files back into the staged set).
+    //
+    // The snapshot is a PARAMETER (§C.4.1.1): a walk captures once and threads
+    // it down, so a concurrent re-pin cannot change which worktree's exclusions
+    // the walk is applying halfway through. `check_gitignore` captures for
+    // callers that have no walk.
+    if !layers.is_empty()
+        && let Ok(relative) = target_file.strip_prefix(work_dir)
+        && let Some(key) = crate::internal::layer::normalize_key(relative)
+        && layers.is_owned(&key)
+    {
+        return true;
+    }
+
+    for source in ignore_sources_for_target(work_dir, target_file) {
+        let ignore = match &source.preloaded {
+            Some(matcher) => Arc::clone(matcher),
+            None => cached_ignore_file(&source.path, &source.base),
+        };
+        if let Some(verdict) = ignore_verdict_as_dir(&ignore, work_dir, target_file, is_dir) {
+            return verdict;
+        }
+    }
+
+    false
+}
+
+/// The deciding ignore pattern for a path, produced by
+/// [`check_gitignore_match`] for `check-ignore -v` output.
+pub struct IgnoreMatchInfo {
+    /// The ignore file that supplied the deciding pattern. `None` for
+    /// the built-in `.git` rule.
+    pub source: Option<PathBuf>,
+    /// 1-based line number of the pattern within `source`, recovered by scanning
+    /// the file (the matcher engine does not expose it). `None` when it cannot
+    /// be located or for the built-in rule.
+    pub line: Option<usize>,
+    /// The deciding pattern exactly as written in the source (e.g. `*.tmp` or
+    /// `!keep`). Empty for the built-in `.git` rule.
+    pub pattern: String,
+    /// `true` when the deciding pattern ignores the path; `false` for a
+    /// whitelist (`!`) override.
+    pub ignored: bool,
+}
+
+/// Like [`check_gitignore`] but returns the deciding pattern's source file,
+/// line, and text — the detail `check-ignore -v` reports. Returns `Some(info)`
+/// when an ignore pattern (or the built-in `.git` rule) decides the
+/// path's status (`info.ignored` distinguishes an ignore match from a whitelist
+/// override) and `None` when no pattern applies. The walk order matches
+/// [`check_gitignore`] exactly (nearest per-directory ignore source first, last
+/// matching pattern within a file wins), so the two never disagree on the verdict.
+pub fn check_gitignore_match(work_dir: &Path, target_file: &Path) -> Option<IgnoreMatchInfo> {
+    assert!(target_file.starts_with(work_dir));
+
+    if path_has_git_dir_component(work_dir, target_file) {
+        return Some(IgnoreMatchInfo {
+            source: None,
+            line: None,
+            pattern: String::new(),
+            ignored: true,
+        });
+    }
+
+    for source in ignore_sources_for_target(work_dir, target_file) {
+        let ignore = match &source.preloaded {
+            Some(matcher) => Arc::clone(matcher),
+            None => cached_ignore_file(&source.path, &source.base),
+        };
+        if let Some(info) = ignore_match_info(&ignore, work_dir, target_file) {
+            return Some(info);
+        }
+    }
+
+    None
+}
+
+struct IgnoreSource {
+    path: PathBuf,
+    base: PathBuf,
+    /// When set, the matcher was loaded via fd/beneath and must not be
+    /// re-read through a pathname (which could follow a swap).
+    preloaded: Option<Arc<Gitignore>>,
+}
+
+fn ignore_sources_for_target(work_dir: &Path, target_file: &Path) -> Vec<IgnoreSource> {
+    let mut sources = Vec::new();
+    let mut dir = target_file.to_path_buf();
+    dir.pop();
+
+    while dir.starts_with(work_dir) {
+        let rel = dir.strip_prefix(work_dir).unwrap_or(Path::new(""));
+        push_ignore_source_beneath(&mut sources, work_dir, rel, &dir, LIBRAIGNORE_FILE);
+        push_ignore_source_beneath(&mut sources, work_dir, rel, &dir, GITIGNORE_FILE);
+        if dir == work_dir {
+            break;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    for info_exclude in worktree_info_file_paths(work_dir, "exclude") {
+        push_ignore_source(&mut sources, info_exclude, work_dir.to_path_buf());
+    }
+    if let Some(configured) = optional_cascaded_config_path(CORE_EXCLUDES_FILE_KEY, work_dir) {
+        push_ignore_source(&mut sources, configured, work_dir.to_path_buf());
+    } else if let Some(xdg) = xdg_config_home("ignore") {
+        // `core.excludesFile` absent: Git reads `$XDG_CONFIG_HOME/git/ignore`.
+        push_ignore_source(&mut sources, xdg, work_dir.to_path_buf());
+    }
+    sources
+}
+
+/// Current ignore-walk epoch for scheduling deadline workers.
+///
+/// Returns the epoch of the walk begun on this thread via
+/// [`begin_secure_ignore_walk`], or `0` when none is active.
+pub fn secure_ignore_walk_epoch() -> u64 {
+    CURRENT_WALK_EPOCH.with(|cell| cell.get())
+}
+
+/// RAII end for [`begin_secure_ignore_walk`].
+pub struct SecureIgnoreWalkGuard {
+    epoch: u64,
+    prev_epoch: u64,
+}
+
+impl Drop for SecureIgnoreWalkGuard {
+    fn drop(&mut self) {
+        {
+            let mut registry = lock_secure_ignore_walk();
+            registry.active.remove(&self.epoch);
+            registry.failed.remove(&self.epoch);
+            registry.matchers.remove(&self.epoch);
+        }
+        CURRENT_WALK_EPOCH.with(|cell| {
+            if cell.get() == self.epoch {
+                cell.set(self.prev_epoch);
+            }
+        });
+    }
+}
+
+/// Call at the start of a status/probe walk; drops to end the walk.
+///
+/// Each invocation allocates its own epoch so concurrent in-process status
+/// runs cannot clear each other's failure latch. Ignore matchers are read via
+/// beneath into a walk-scoped cache so timed-out deadline workers cannot
+/// contaminate a later scan, while repeated lookups within one walk reuse the
+/// first beneath read.
+pub fn begin_secure_ignore_walk() -> SecureIgnoreWalkGuard {
+    let epoch = {
+        let mut registry = lock_secure_ignore_walk();
+        registry.next_epoch = registry.next_epoch.saturating_add(1).max(1);
+        let epoch = registry.next_epoch;
+        registry.active.insert(epoch);
+        registry.matchers.insert(epoch, HashMap::new());
+        epoch
+    };
+    let prev_epoch = CURRENT_WALK_EPOCH.with(|cell| cell.replace(epoch));
+    SecureIgnoreWalkGuard { epoch, prev_epoch }
+}
+
+/// Like [`check_gitignore_as_dir`], but binds `walk_epoch` for the duration of
+/// the lookup so a timed-out worker from another scan cannot latch failure.
+pub fn check_gitignore_as_dir_for_walk(
+    work_dir: &Path,
+    target_file: &Path,
+    is_dir: bool,
+    walk_epoch: u64,
+) -> bool {
+    check_gitignore_with_layers_as_dir_for_walk(
+        work_dir,
+        target_file,
+        &crate::internal::layer::ExclusionSnapshot::for_request(),
+        is_dir,
+        walk_epoch,
+    )
+}
+
+/// Match within an explicit epoch without recapturing the caller's layer scope.
+pub fn check_gitignore_with_layers_as_dir_for_walk(
+    work_dir: &Path,
+    target_file: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+    is_dir: bool,
+    walk_epoch: u64,
+) -> bool {
+    let previous = IGNORE_OP_EPOCH.with(|cell| cell.replace(walk_epoch));
+    let answer = check_gitignore_with_layers_as_dir(work_dir, target_file, layers, is_dir);
+    IGNORE_OP_EPOCH.with(|cell| cell.set(previous));
+    answer
+}
+
+fn ignore_walk_op_epoch() -> u64 {
+    let op_epoch = IGNORE_OP_EPOCH.with(|cell| cell.get());
+    if op_epoch != 0 {
+        op_epoch
+    } else {
+        CURRENT_WALK_EPOCH.with(|cell| cell.get())
+    }
+}
+
+fn lookup_walk_ignore_matcher(epoch: u64, path: &Path) -> Option<Option<Arc<Gitignore>>> {
+    if epoch == 0 {
+        return None;
+    }
+    let registry = lock_secure_ignore_walk();
+    registry
+        .matchers
+        .get(&epoch)
+        .and_then(|map| map.get(path).cloned())
+}
+
+fn store_walk_ignore_matcher(epoch: u64, path: PathBuf, value: Option<Arc<Gitignore>>) {
+    if epoch == 0 {
+        return;
+    }
+    let mut registry = lock_secure_ignore_walk();
+    if registry.active.contains(&epoch)
+        && let Some(map) = registry.matchers.get_mut(&epoch)
+    {
+        map.insert(path, value);
+    }
+}
+
+fn push_ignore_source_beneath(
+    sources: &mut Vec<IgnoreSource>,
+    work_dir: &Path,
+    dir_rel: &Path,
+    dir_abs: &Path,
+    file_name: &str,
+) {
+    let path = dir_abs.join(file_name);
+    let epoch = ignore_walk_op_epoch();
+    if let Some(cached) = lookup_walk_ignore_matcher(epoch, &path) {
+        if let Some(matcher) = cached {
+            sources.push(IgnoreSource {
+                path,
+                base: dir_abs.to_path_buf(),
+                preloaded: Some(matcher),
+            });
+        }
+        return;
+    }
+    match crate::utils::beneath::read_regular_file_beneath(
+        work_dir,
+        dir_rel,
+        std::ffi::OsStr::new(file_name),
+    ) {
+        Ok(bytes) => {
+            let matcher = cached_ignore_file_from_bytes(&path, dir_abs, &bytes);
+            store_walk_ignore_matcher(epoch, path.clone(), Some(Arc::clone(&matcher)));
+            sources.push(IgnoreSource {
+                path,
+                base: dir_abs.to_path_buf(),
+                preloaded: Some(matcher),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            store_walk_ignore_matcher(epoch, path, None);
+        }
+        Err(_) => {
+            latch_ignore_read_failed();
+        }
+    }
+}
+
+fn push_ignore_source(sources: &mut Vec<IgnoreSource>, path: PathBuf, base: PathBuf) {
+    if path.exists() {
+        sources.push(IgnoreSource {
+            path,
+            base,
+            preloaded: None,
+        });
+    }
+}
+
+fn ignore_verdict_as_dir(
+    ignore: &Gitignore,
+    work_dir: &Path,
+    target_file: &Path,
+    is_dir: bool,
+) -> Option<bool> {
+    // Boolean checks must not recover verbose pattern line numbers: that path
+    // reopens the source by pathname and performs I/O after the beneath read.
+    let verdict = |matched| match matched {
+        Match::Ignore(_) => Some(true),
+        Match::Whitelist(_) => Some(false),
+        Match::None => None,
+    };
+    if let Some(answer) = verdict(ignore.matched(target_file, is_dir)) {
+        return Some(answer);
+    }
+    // The target itself was already checked above, including is_dir=true.
+    let mut parent = target_file.parent().unwrap_or(work_dir);
+    while parent.starts_with(work_dir) {
+        if let Some(answer) = verdict(ignore.matched(parent, true)) {
+            return Some(answer);
+        }
+        let Some(next) = parent.parent() else {
+            break;
+        };
+        parent = next;
+    }
+    None
+}
+
+fn ignore_match_info(
+    ignore: &Gitignore,
+    work_dir: &Path,
+    target_file: &Path,
+) -> Option<IgnoreMatchInfo> {
+    ignore_match_info_as_dir(ignore, work_dir, target_file, target_file.is_dir())
+}
+
+fn ignore_match_info_as_dir(
+    ignore: &Gitignore,
+    work_dir: &Path,
+    target_file: &Path,
+    is_dir: bool,
+) -> Option<IgnoreMatchInfo> {
+    if let Some(info) = glob_match_info(ignore.matched(target_file, is_dir)) {
+        return Some(info);
+    }
+
+    let mut parent_dir = if is_dir {
+        target_file.to_path_buf()
+    } else {
+        target_file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| work_dir.to_path_buf())
+    };
+    while parent_dir.starts_with(work_dir) {
+        if let Some(info) = glob_match_info(ignore.matched(&parent_dir, true)) {
+            return Some(info);
+        }
+        parent_dir.pop();
+    }
+
+    None
+}
+
+/// Convert an `ignore` crate match into [`IgnoreMatchInfo`], recovering the
+/// source/line/pattern of the deciding glob. `Match::None` yields `None`.
+fn glob_match_info(m: Match<&ignore::gitignore::Glob>) -> Option<IgnoreMatchInfo> {
+    let (glob, ignored) = match m {
+        Match::Ignore(glob) => (glob, true),
+        Match::Whitelist(glob) => (glob, false),
+        Match::None => return None,
+    };
+    let source = glob.from().map(Path::to_path_buf);
+    let pattern = glob.original().to_string();
+    let line = source
+        .as_deref()
+        .and_then(|path| find_pattern_line(path, &pattern));
+    Some(IgnoreMatchInfo {
+        source,
+        line,
+        pattern,
+        ignored,
+    })
+}
+
+/// Best-effort recovery of a pattern's 1-based line number in an ignore
+/// file: the first non-blank, non-comment line whose trimmed content equals
+/// `pattern`. The matcher engine does not expose line numbers, so `check-ignore
+/// -v` reconstructs them here. Returns `None` if the file cannot be read or the
+/// pattern is not found verbatim.
+fn find_pattern_line(source: &Path, pattern: &str) -> Option<usize> {
+    let contents = fs::read_to_string(source).ok()?;
+    // Return the LAST matching line: within one `.libraignore`, the last pattern
+    // that matches a path is the deciding one, so on duplicate identical
+    // patterns the later line is the rule the matcher actually applied.
+    contents
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#') && trimmed == pattern
+        })
+        .last()
+        .map(|(idx, _)| idx + 1)
+}
+
+fn cached_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
+    let Ok(metadata) = fs::metadata(ignore_path) else {
+        return load_ignore_file(ignore_path, base)
+            .unwrap_or_else(|()| Arc::new(Gitignore::empty()));
+    };
+    let Ok(modified) = metadata.modified() else {
+        return load_ignore_file(ignore_path, base)
+            .unwrap_or_else(|()| Arc::new(Gitignore::empty()));
+    };
+    let len = metadata.len();
+    let key = IgnoreCacheKey {
+        source: ignore_path.to_path_buf(),
+        base: base.to_path_buf(),
+    };
+
+    {
+        let cache = match LIBRAIGNORE_CACHE.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cached) = cache.get(&key)
+            && cached.len == len
+            && cached.modified == modified
+        {
+            return Arc::clone(&cached.matcher);
+        }
+    }
+
+    // A blocked source must not hold the process-wide cache lock.
+    let Ok(matcher) = load_ignore_file(ignore_path, base) else {
+        // Failed reads must relatch in later walks, including after epoch-zero warmup.
+        return Arc::new(Gitignore::empty());
+    };
+    let mut cache = match LIBRAIGNORE_CACHE.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.insert(
+        key,
+        CachedGitignore {
+            len,
+            modified,
+            matcher: Arc::clone(&matcher),
+        },
+    );
+    matcher
+}
+
+fn cached_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) -> Arc<Gitignore> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let content_tag = hasher.finish();
+    let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(content_tag);
+    let len = bytes.len() as u64;
+    let key = IgnoreCacheKey {
+        source: ignore_path.to_path_buf(),
+        base: base.to_path_buf(),
+    };
+    {
+        let cache = match LIBRAIGNORE_CACHE.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cached) = cache.get(&key)
+            && cached.len == len
+            && cached.modified == modified
+        {
+            return Arc::clone(&cached.matcher);
+        }
+    }
+    // Parsing and warning emission do not serialize unrelated cache users.
+    let Ok(matcher) = load_ignore_file_from_bytes(ignore_path, base, bytes) else {
+        return Arc::new(Gitignore::empty());
+    };
+    let mut cache = match LIBRAIGNORE_CACHE.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.insert(
+        key,
+        CachedGitignore {
+            len,
+            modified,
+            matcher: Arc::clone(&matcher),
+        },
+    );
+    matcher
+}
+
+/// Build an in-memory gitignore matcher from explicit exclude patterns supplied
+/// on the command line (e.g. `ls-files -x <pattern>` / `-X <file>`), rooted at
+/// `work_dir`. Returns `None` when there are no patterns, so callers can skip the
+/// match entirely. Pattern syntax matches Git ignore files (the same engine).
+pub fn build_exclude_matcher(
+    work_dir: &Path,
+    patterns: &[String],
+) -> Result<Option<Gitignore>, String> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GitignoreBuilder::new(work_dir);
+    for pattern in patterns {
+        builder
+            .add_line(None, pattern)
+            .map_err(|error| format!("invalid exclude pattern '{pattern}': {error}"))?;
+    }
+    builder
+        .build()
+        .map(Some)
+        .map_err(|error| format!("failed to compile exclude patterns: {error}"))
+}
+
+/// Three-state verdict of an explicit-exclude matcher built by
+/// [`build_exclude_matcher`] for `abs_path` (under `work_dir`). `Some(true)`
+/// means excluded; `Some(false)` means explicitly re-included by a negation (a
+/// higher-precedence source — the caller should let this override lower-priority
+/// standard excludes); `None` means no explicit pattern matched
+/// (defer to the standard excludes).
+///
+/// Honors Git's parent-directory dominance: once an ancestor directory is
+/// excluded, the path is excluded regardless of a child negation (e.g. the pair
+/// `build/` and `!build/keep.txt` still excludes `build/keep.txt`). Ancestors
+/// are walked top-down; the first ancestor whose last-matching rule is `Ignore`
+/// excludes everything beneath it.
+pub fn exclude_matcher_verdict(
+    matcher: &Gitignore,
+    work_dir: &Path,
+    abs_path: &Path,
+    is_dir: bool,
+) -> Option<bool> {
+    if let Ok(rel) = abs_path.strip_prefix(work_dir) {
+        let comps: Vec<_> = rel.components().collect();
+        let mut cur = work_dir.to_path_buf();
+        for comp in comps.iter().take(comps.len().saturating_sub(1)) {
+            cur.push(comp.as_os_str());
+            if matches!(matcher.matched(&cur, true), Match::Ignore(_)) {
+                return Some(true);
+            }
+        }
+    }
+    match matcher.matched(abs_path, is_dir) {
+        Match::Ignore(_) => Some(true),
+        Match::Whitelist(_) => Some(false),
+        Match::None => None,
+    }
+}
+
+/// Whether any ignore file failed to read during this thread's active
+/// status/probe walk.
+pub fn ignore_read_failed() -> bool {
+    let epoch = CURRENT_WALK_EPOCH.with(|cell| cell.get());
+    ignore_read_failed_for_walk(epoch)
+}
+
+pub fn ignore_read_failed_for_walk(epoch: u64) -> bool {
+    if epoch == 0 {
+        return false;
+    }
+    let registry = lock_secure_ignore_walk();
+    registry.active.contains(&epoch) && registry.failed.contains(&epoch)
+}
+
+fn latch_ignore_read_failed() {
+    let epoch = ignore_walk_op_epoch();
+    if epoch == 0 {
+        return;
+    }
+    let mut registry = lock_secure_ignore_walk();
+    // Only latch onto still-active walks so a timed-out worker from a
+    // finished scan cannot poison a concurrent or later walk.
+    if registry.active.contains(&epoch) {
+        registry.failed.insert(epoch);
+    }
+}
+
+/// Does this ignore file contribute at least one pattern the ENGINE would
+/// actually apply? Parser-backed on purpose (W0 §C.4.1.1 origin inventory):
+/// a hand-rolled "non-comment line" heuristic disagrees with gitignore
+/// semantics — an INDENTED `#…` line is a real pattern, and a line the
+/// builder rejects contributes nothing.
+pub fn ignore_file_defines_any_pattern(ignore_path: &Path, base: &Path) -> bool {
+    let mut builder = GitignoreBuilder::new(base);
+    let Ok(contents) = fs::read_to_string(ignore_path) else {
+        return false;
+    };
+    let mut added = false;
+    for line in contents.lines() {
+        if builder
+            .add_line(Some(ignore_path.to_path_buf()), line)
+            .is_ok()
+        {
+            added = true;
+        }
+    }
+    if !added {
+        return false;
+    }
+    builder.build().map(|set| !set.is_empty()).unwrap_or(false)
+}
+
+fn load_ignore_file(ignore_path: &Path, base: &Path) -> Result<Arc<Gitignore>, ()> {
+    match fs::read(ignore_path) {
+        Ok(bytes) => load_ignore_file_from_bytes(ignore_path, base, &bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            load_ignore_file_from_bytes(ignore_path, base, b"")
+        }
+        Err(error) => {
+            latch_ignore_read_failed();
+            crate::utils::error::emit_warning(format!(
+                "failed to read ignore file {}: {error}",
+                ignore_path.display()
+            ));
+            Err(())
+        }
+    }
+}
+
+fn load_ignore_file_from_bytes(
+    ignore_path: &Path,
+    base: &Path,
+    bytes: &[u8],
+) -> Result<Arc<Gitignore>, ()> {
+    let contents = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            latch_ignore_read_failed();
+            crate::utils::error::emit_warning(format!(
+                "ignore file {} is not valid UTF-8: {error}",
+                ignore_path.display()
+            ));
+            return Err(());
+        }
+    };
+    let mut builder = GitignoreBuilder::new(base);
+    for line in contents.lines() {
+        if let Err(error) = builder.add_line(Some(ignore_path.to_path_buf()), line) {
+            eprintln!(
+                "warning: invalid ignore pattern in {}: {error}",
+                ignore_path.display()
+            );
+        }
+    }
+    match builder.build() {
+        Ok(ignore) => Ok(Arc::new(ignore)),
+        Err(error) => {
+            eprintln!(
+                "warning: failed to compile ignore file {}: {error}",
+                ignore_path.display()
+            );
+            Ok(Arc::new(Gitignore::empty()))
+        }
+    }
+}
+
+use git_internal::internal::object::signature::{Signature, SignatureType};
+
+pub async fn create_signatures() -> (Signature, Signature) {
+    let user_name = ConfigKv::get("user.name")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value)
+        .unwrap_or_else(|| "Stasher".to_string());
+    let user_email = ConfigKv::get("user.email")
+        .await
+        .ok()
+        .flatten()
+        .map(|e| e.value)
+        .unwrap_or_else(|| "stasher@example.com".to_string());
+
+    let author = Signature::new(SignatureType::Author, user_name.clone(), user_email.clone());
+    let committer = Signature::new(SignatureType::Committer, user_name, user_email);
+    (author, committer)
+}
+
+/// Compute the minimum prefix length at which all commit IDs are uniquely identifiable.
+///
+/// This function inspects the textual object IDs of all `commits` and searches for the
+/// smallest prefix length `len` such that the first `len` characters of every commit ID
+/// are pairwise distinct. The search range is from `7` (inclusive) up to the maximum
+/// hash string length present in `commits` (inclusive).
+///
+/// Return value semantics:
+/// - If `commits` is empty or contains only a single commit, this returns `7`. In these
+///   cases, there is no ambiguity, and the conventional minimal prefix length is used.
+/// - Otherwise, it returns the smallest `len >= 7` for which all commit ID prefixes of
+///   length `len` are unique.
+/// - If no such `len` exists before the end of the hash strings, the full hash length
+///   (i.e., the maximum ID length observed) is returned.
+///
+/// This is useful for producing short, Git-style abbreviated IDs that remain unambiguous
+/// across the given set of reachable commits.
+pub fn get_min_unique_hash_length(commits: &[Commit]) -> usize {
+    // Get all commit IDs.
+    let hashes: Vec<String> = commits.iter().map(|commit| commit.id.to_string()).collect();
+    // If there is no commit or only one commit, return 7.
+    if hashes.is_empty() || hashes.len() == 1 {
+        7
+    } else {
+        // Get the maximum length of all commit IDs.
+        let max_length = hashes.iter().map(|h| h.len()).max().unwrap_or(0);
+        (7..=max_length)
+            .find(|&len| {
+                let mut prefixes = HashSet::new();
+                hashes
+                    .iter()
+                    // unwrap_or is safe: returns the full hash if slice fails
+                    .all(|hash| prefixes.insert(hash.get(0..len).unwrap_or(hash)))
+            })
+            .unwrap_or(max_length) // Worst case: use full hash length
+    }
+}
+
+/// Compare two ref names with "version" ordering (`--sort=version:refname`):
+/// runs of digits compare numerically (so `v1.9` sorts before `v1.10`) while
+/// other runs compare lexically. Shared by `ls-remote` and `for-each-ref`.
+pub fn version_refname_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut left_chars = left.chars().peekable();
+    let mut right_chars = right.chars().peekable();
+
+    while left_chars.peek().is_some() && right_chars.peek().is_some() {
+        let left_is_digit = left_chars.peek().is_some_and(|ch| ch.is_ascii_digit());
+        let right_is_digit = right_chars.peek().is_some_and(|ch| ch.is_ascii_digit());
+        let left_run = take_char_run(&mut left_chars, left_is_digit);
+        let right_run = take_char_run(&mut right_chars, right_is_digit);
+        let ordering = if left_is_digit && right_is_digit {
+            numeric_run_cmp(&left_run, &right_run)
+        } else {
+            left_run.cmp(&right_run)
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    left_chars
+        .peek()
+        .is_some()
+        .cmp(&right_chars.peek().is_some())
+}
+
+fn take_char_run<I>(chars: &mut std::iter::Peekable<I>, want_digit: bool) -> String
+where
+    I: Iterator<Item = char>,
+{
+    let mut run = String::new();
+    while chars
+        .peek()
+        .is_some_and(|ch| ch.is_ascii_digit() == want_digit)
+    {
+        if let Some(ch) = chars.next() {
+            run.push(ch);
+        }
+    }
+    run
+}
+
+fn numeric_run_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_trimmed = left.trim_start_matches('0');
+    let right_trimmed = right.trim_start_matches('0');
+    let left_norm = if left_trimmed.is_empty() {
+        "0"
+    } else {
+        left_trimmed
+    };
+    let right_norm = if right_trimmed.is_empty() {
+        "0"
+    } else {
+        right_trimmed
+    };
+
+    left_norm
+        .len()
+        .cmp(&right_norm.len())
+        .then_with(|| left_norm.cmp(right_norm))
+        .then_with(|| left.len().cmp(&right.len()))
+}
+
+/// Validate a full reference name against Git's `check-ref-format` rules.
+///
+/// Accepts `HEAD` and any `refs/<...>` name; rejects names that Git would
+/// reject: an empty/leading-slash/trailing-slash body, a trailing `.`, a
+/// `.lock` suffix, `//`, `..`, `@{`, any path component that is empty / starts
+/// with `.` / ends with `.lock`, and ASCII control bytes, the ASCII space, or
+/// any of `: \ ~ ^ ? * [`. Bytes above ASCII (incl. Unicode whitespace) are
+/// accepted, matching Git. Used wherever a user supplies a ref name (e.g.
+/// `show-ref --exclude-existing`, `format-patch --notes=<ref>`).
+pub fn is_valid_refname(refname: &str) -> bool {
+    if refname == "HEAD" {
+        return true;
+    }
+
+    let Some(short) = refname.strip_prefix("refs/") else {
+        return false;
+    };
+    if short.is_empty()
+        || short.starts_with('/')
+        || short.ends_with('/')
+        || short.ends_with('.')
+        || short.ends_with(".lock")
+        || short.contains("//")
+        || short.contains("..")
+        || short.contains("@{")
+    {
+        return false;
+    }
+    if short.split('/').any(|component| {
+        component.is_empty() || component.starts_with('.') || component.ends_with(".lock")
+    }) {
+        return false;
+    }
+
+    // Git's `check-ref-format` forbids ASCII control bytes and the ASCII space,
+    // plus the punctuation below — but it accepts bytes above ASCII, so Unicode
+    // whitespace (NBSP, EM SPACE, …) is allowed. Use an ASCII-only space test
+    // rather than `char::is_whitespace`, which would over-reject those.
+    !short.chars().any(|c| {
+        c.is_ascii_control() || c == ' ' || matches!(c, ':' | '\\' | '~' | '^' | '?' | '*' | '[')
+    })
+}
+
+#[cfg(test)]
+mod test {
+    use std::{env, fs, path::PathBuf};
+
+    #[test]
+    fn pick_describe_candidate_obeys_git_disambiguation() {
+        use git_internal::{
+            hash::{HashKind, set_hash_kind},
+            internal::object::types::ObjectType,
+        };
+
+        set_hash_kind(HashKind::Sha1);
+        let commit = |digit: char| {
+            git_internal::hash::ObjectHash::from_bytes(&[digit.to_digit(16).unwrap_or(0) as u8; 20])
+                .expect("hash")
+        };
+        let a = commit('a');
+        let b = commit('b');
+        let c = commit('c');
+
+        // AC3: one commit among a commit+blob pair resolves to the commit.
+        assert_eq!(
+            pick_describe_candidate(&[(a, ObjectType::Commit), (b, ObjectType::Blob)]),
+            Some(a)
+        );
+        // AC4: two commits are ambiguous.
+        assert_eq!(
+            pick_describe_candidate(&[(a, ObjectType::Commit), (b, ObjectType::Commit)]),
+            None
+        );
+        // AC5: two blobs are ambiguous.
+        assert_eq!(
+            pick_describe_candidate(&[(a, ObjectType::Blob), (b, ObjectType::Blob)]),
+            None
+        );
+        // A single candidate of any type resolves.
+        assert_eq!(pick_describe_candidate(&[(c, ObjectType::Blob)]), Some(c));
+    }
+
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::utils::test;
+
+    /// `..` after a symlink must be resolved by the kernel, for an existing
+    /// path AND for a leaf that does not exist yet: with `a/link -> b/sub`,
+    /// `a/link/../new` is `b/new`, not `a/new`. Getting this wrong makes
+    /// `worktree add` create a directory somewhere the user never named.
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_resolves_parent_traversal_through_symlinks() {
+        let dir = tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        std::fs::create_dir_all(root.join("a")).expect("mkdir a");
+        std::fs::create_dir_all(root.join("b").join("sub")).expect("mkdir b/sub");
+        std::fs::create_dir(root.join("b").join("existing")).expect("mkdir b/existing");
+        std::os::unix::fs::symlink(root.join("b").join("sub"), root.join("a").join("link"))
+            .expect("symlink");
+
+        // Existing target.
+        assert_eq!(
+            canonicalize_deepest_existing(root.join("a/link/../existing")).expect("canonical"),
+            root.join("b").join("existing")
+        );
+        // Leaf that does not exist yet — the parent still resolves.
+        assert_eq!(
+            canonicalize_deepest_existing(root.join("a/link/../new")).expect("canonical"),
+            root.join("b").join("new")
+        );
+        // Two levels of missing leaf below the resolvable parent.
+        assert_eq!(
+            canonicalize_deepest_existing(root.join("a/link/../new/deeper")).expect("canonical"),
+            root.join("b").join("new").join("deeper")
+        );
+    }
+
+    #[test]
+    fn is_valid_refname_matches_git_check_ref_format() {
+        // Accepted.
+        assert!(is_valid_refname("HEAD"));
+        assert!(is_valid_refname("refs/heads/main"));
+        assert!(is_valid_refname("refs/notes/commits"));
+        assert!(is_valid_refname("refs/notes/team/review"));
+        assert!(is_valid_refname("refs/notes/my-notes"));
+        // Git accepts bytes above ASCII, including Unicode whitespace.
+        assert!(is_valid_refname("refs/notes/foo\u{a0}bar"));
+        assert!(is_valid_refname("refs/notes/foo\u{2003}bar"));
+
+        // Rejected: not under refs/, structural, and forbidden punctuation.
+        assert!(!is_valid_refname("main"));
+        assert!(!is_valid_refname("refs/"));
+        assert!(!is_valid_refname("refs/notes/"));
+        assert!(!is_valid_refname("refs/heads/bad name")); // ASCII space
+        assert!(!is_valid_refname("refs/notes/bad..ref"));
+        assert!(!is_valid_refname("refs/notes/bad~ref"));
+        assert!(!is_valid_refname("refs/notes/.hidden"));
+        assert!(!is_valid_refname("refs/notes/foo.lock"));
+        assert!(!is_valid_refname("refs/notes/bad@{ref"));
+        assert!(!is_valid_refname("refs/notes/foo/"));
+        assert!(!is_valid_refname("refs/notes/foo."));
+    }
+
+    #[test]
+    #[serial_test::serial(cwd)]
+    ///Test get current directory success.
+    fn cur_dir_returns_current_directory() {
+        let _cwd_lock = test::cwd_lock_guard();
+        match env::current_dir() {
+            Ok(expected) => {
+                let actual = cur_dir();
+                assert_eq!(actual, expected);
+            }
+            Err(_) => {
+                // On some Linux/CI environments, current_dir can fail if the working
+                // directory was removed. In that case, ensure cur_dir still returns
+                // a stable, existing directory via its fallback logic.
+                let actual = cur_dir();
+                assert!(actual.exists(), "cur_dir should return an existing path");
+                assert!(actual.is_dir(), "cur_dir should point to a directory");
+            }
+        }
+    }
+
+    #[test]
+    #[serial(cwd)]
+    ///Test the function of is_sub_path.
+    fn test_is_sub_path() {
+        let _guard = test::ChangeDirGuard::new(Path::new(env!("LIBRA_WORKSPACE_ROOT")));
+
+        assert!(is_sub_path("src/main.rs", "src"));
+        assert!(is_sub_path("src/main.rs", "src/"));
+        assert!(is_sub_path("src/main.rs", "src/main.rs"));
+        assert!(is_sub_path("src/main.rs", "."));
+    }
+
+    /// Containment is **component-wise**, never a byte prefix: a sibling
+    /// whose name merely starts with the parent's name (`srcfoo` vs
+    /// `src`) must NOT be treated as inside the parent, and an unrelated
+    /// sibling is likewise rejected. If `is_sub_path` ever regressed to
+    /// a string `starts_with`, `srcfoo/x` would falsely read as inside
+    /// `src` — a scope-escape. Pin the rejection.
+    #[test]
+    #[serial(cwd)]
+    fn test_is_sub_path_rejects_byte_prefix_sibling_and_unrelated_paths() {
+        let _guard = test::ChangeDirGuard::new(Path::new(env!("LIBRA_WORKSPACE_ROOT")));
+
+        // Positive control: a genuine child IS inside, so a regression
+        // that returned `false` for everything can't make the negative
+        // assertions below pass vacuously.
+        assert!(is_sub_path("src/main.rs", "src"), "genuine child is inside");
+
+        assert!(
+            !is_sub_path("srcfoo/x.rs", "src"),
+            "a byte-prefix sibling must not be inside the parent",
+        );
+        assert!(
+            !is_sub_path("srcfoo", "src"),
+            "the byte-prefix sibling dir itself must not be inside the parent",
+        );
+        assert!(
+            !is_sub_path("lib/x.rs", "src"),
+            "an unrelated sibling must not be inside the parent",
+        );
+    }
+
+    /// Interior `..` is resolved before the containment check: a
+    /// `..` that stays within the parent keeps the path in scope, while
+    /// a `..` that climbs out to a sibling escapes it. Pins that the
+    /// normalization happens before `starts_with`, not after.
+    ///
+    /// Covers both input branches: relative inputs (resolved by
+    /// `.absolutize()`) and absolute inputs (resolved by the internal
+    /// `normalize_abs_path`), so the absolute branch — exercised
+    /// otherwise only by the root-escape test — is pinned for the
+    /// in-scope / sibling-escape cases too.
+    #[test]
+    #[serial(cwd)]
+    fn test_is_sub_path_resolves_interior_parent_dir() {
+        let _guard = test::ChangeDirGuard::new(Path::new(env!("LIBRA_WORKSPACE_ROOT")));
+
+        // Relative inputs (the `.absolutize()` branch):
+        // src/sub/../main.rs -> src/main.rs, still under src.
+        assert!(is_sub_path("src/sub/../main.rs", "src"));
+        // src/../lib/x.rs -> lib/x.rs, NOT under src.
+        assert!(!is_sub_path("src/../lib/x.rs", "src"));
+
+        // Absolute inputs (the `normalize_abs_path` branch): same
+        // interior-`..` semantics, independent of the current dir.
+        assert!(is_sub_path("/repo/src/sub/../main.rs", "/repo/src"));
+        assert!(!is_sub_path("/repo/src/../lib/x.rs", "/repo/src"));
+    }
+
+    #[test]
+    fn test_is_sub_path_parent_dir_cannot_escape_root() {
+        assert!(!is_sub_path("/../../etc/passwd", "/tmp"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_is_sub_path_preserves_windows_prefix() {
+        assert!(is_sub_path(r"C:\repo\sub\..\file.txt", r"C:\repo"));
+        assert!(!is_sub_path(r"C:\repo\..\Windows\System32", r"C:\repo"));
+    }
+
+    #[test]
+    ///Test the function of to_relative.
+    fn test_to_relative() {
+        assert_eq!(to_relative("src/main.rs", "src"), PathBuf::from("main.rs"));
+        assert_eq!(to_relative(".", "src"), PathBuf::from(".."));
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn list_workdir_files_prunes_libraignored_directories() {
+        let repo = tempdir().unwrap();
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+
+        fs::write(".libraignore", "target/\n").unwrap();
+        fs::create_dir_all("target/debug/deps").unwrap();
+        fs::write("target/debug/deps/ignored.rlib", "ignored").unwrap();
+        fs::write("visible.txt", "visible").unwrap();
+
+        let files = list_workdir_files().unwrap();
+
+        assert!(files.contains(&PathBuf::from(".libraignore")));
+        assert!(files.contains(&PathBuf::from("visible.txt")));
+        assert!(!files.contains(&PathBuf::from("target/debug/deps/ignored.rlib")));
+    }
+
+    #[test]
+    fn is_empty_dir_returns_false_for_missing_directory() {
+        let temp = tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        assert!(!is_empty_dir(&missing));
+    }
+
+    #[test]
+    fn clear_empty_dir_ignores_parentless_paths() {
+        clear_empty_dir(Path::new(""));
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn get_commit_base_typed_head_navigation_reports_unborn_head() {
+        let repo = tempdir().unwrap();
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+
+        let error = get_commit_base_typed("HEAD~1")
+            .await
+            .expect_err("unborn HEAD navigation must not panic");
+        assert!(matches!(error, CommitBaseError::HeadUnborn));
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    ///Test the function of to_workdir_path.
+    async fn test_to_workdir_path() {
+        let temp_path = tempdir().unwrap();
+        test::setup_with_new_libra_in(temp_path.path()).await;
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        assert_eq!(
+            to_workdir_path("./src/abc/../main.rs"),
+            PathBuf::from("src/main.rs")
+        );
+        assert_eq!(to_workdir_path("."), PathBuf::from("."));
+        assert_eq!(to_workdir_path("./"), PathBuf::from("."));
+        assert_eq!(to_workdir_path(""), PathBuf::from("."));
+    }
+
+    #[test]
+    #[serial(cwd)]
+    /// Tests that files matching patterns in .libraignore are correctly identified as ignored.
+    fn test_check_gitignore_ignore_files() {
+        let temp_path = tempdir().unwrap();
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        let mut gitignore_file = fs::File::create(".libraignore").unwrap();
+        gitignore_file.write_all(b"*.bar").unwrap();
+
+        let target = temp_path.path().join("tmp/foo.bar");
+        assert!(check_gitignore(&temp_path.keep(), &target));
+    }
+
+    #[test]
+    #[serial(cwd)]
+    /// Tests that directories matching patterns in .libraignore are correctly identified as ignored.
+    fn test_check_gitignore_ignore_directory() {
+        let temp_path = tempdir().unwrap();
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        let mut gitignore_file = fs::File::create(".libraignore").unwrap();
+        gitignore_file.write_all(b"foo/").unwrap();
+
+        let target = temp_path.path().join("foo/bar");
+        assert!(check_gitignore(&temp_path.keep(), &target));
+    }
+
+    #[test]
+    #[serial(cwd)]
+    /// Tests ignore pattern matching in subdirectories with .libraignore files at different directory levels.
+    fn test_check_gitignore_ignore_subdirectory_files() {
+        let temp_path = tempdir().unwrap();
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        fs::create_dir_all("tmp").unwrap();
+        fs::create_dir_all("tmp/tmp1").unwrap();
+        fs::create_dir_all("tmp/tmp1/tmp2").unwrap();
+        let mut gitignore_file1 = fs::File::create("tmp/.libraignore").unwrap();
+        gitignore_file1.write_all(b"*.bar").unwrap();
+        let workdir = env::current_dir().unwrap();
+        let target = workdir.join("tmp/tmp1/tmp2/foo.bar");
+        assert!(check_gitignore(&workdir, &target));
+        fs::remove_dir_all(workdir.join("tmp")).unwrap();
+    }
+
+    #[test]
+    #[serial(cwd)]
+    /// Tests that files not matching patterns in .libraignore are correctly identified as not ignored.
+    fn test_check_gitignore_not_ignore() {
+        let temp_path = tempdir().unwrap();
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        let mut gitignore_file = fs::File::create(".libraignore").unwrap();
+        gitignore_file.write_all(b"*.bar").unwrap();
+        let workdir = env::current_dir().unwrap();
+        let target = workdir.join("tmp/bar.foo");
+        assert!(!check_gitignore(&workdir, &target));
+        fs::remove_file(workdir.join(".libraignore")).unwrap();
+    }
+
+    #[test]
+    #[serial(cwd)]
+    /// Tests that files not matching subdirectory-specific patterns in .libraignore are correctly identified as not ignored.
+    fn test_check_gitignore_not_ignore_subdirectory_files() {
+        let temp_path = tempdir().unwrap();
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        fs::create_dir_all("tmp").unwrap();
+        fs::create_dir_all("tmp/tmp1").unwrap();
+        fs::create_dir_all("tmp/tmp1/tmp2").unwrap();
+        let mut gitignore_file1 = fs::File::create("tmp/.libraignore").unwrap();
+        gitignore_file1.write_all(b"tmp/tmp1/tmp2/*.bar").unwrap();
+        let workdir = env::current_dir().unwrap();
+        let target = workdir.join("tmp/tmp1/tmp2/foo.bar");
+        assert!(!check_gitignore(&workdir, &target));
+        fs::remove_dir_all(workdir.join("tmp")).unwrap();
+    }
+
+    /// `.git` must always be treated as ignored, like Git, even when a
+    /// `.libraignore` whitelist rule (`!.git`) tries to un-ignore it. A nested
+    /// `.git` at any depth is covered, while a normal file is left untouched.
+    #[test]
+    fn test_check_gitignore_force_ignores_git_dir_even_with_whitelist() {
+        let temp_path = tempdir().unwrap();
+        let workdir = temp_path.path().to_path_buf();
+        // A whitelist that tries to un-ignore `.git` must not win.
+        fs::write(workdir.join(".libraignore"), "!.git\n!.git/**\n").unwrap();
+
+        assert!(check_gitignore(&workdir, &workdir.join(".git")));
+        assert!(check_gitignore(
+            &workdir,
+            &workdir.join(".git").join("config")
+        ));
+        // Nested git repository (e.g. a submodule checkout) is covered too.
+        assert!(check_gitignore(
+            &workdir,
+            &workdir.join("sub").join(".git").join("HEAD")
+        ));
+        // A normal file is still not ignored.
+        assert!(!check_gitignore(
+            &workdir,
+            &workdir.join("src").join("main.rs")
+        ));
+    }
+
+    #[test]
+    fn test_get_repo_name_from_url_with_git_suffix() {
+        assert_eq!(
+            get_repo_name_from_url("https://example.com/owner/repo.git"),
+            Some("repo")
+        );
+    }
+
+    #[test]
+    fn test_get_repo_name_from_url_without_suffix() {
+        assert_eq!(
+            get_repo_name_from_url("https://example.com/owner/repo"),
+            Some("repo")
+        );
+    }
+
+    #[test]
+    fn test_get_repo_name_from_file_url_without_suffix() {
+        assert_eq!(
+            get_repo_name_from_url("file:///home/user/projects/repo"),
+            Some("repo")
+        );
+    }
+
+    #[test]
+    #[serial(cwd)]
+    fn test_try_get_storage_path_ignores_global_libra_dir_without_repo_markers() {
+        let temp = tempdir().unwrap();
+        let home_like = temp.path();
+        let global_libra = home_like.join(".libra");
+        fs::create_dir_all(global_libra.join("vault-keys")).unwrap();
+        fs::write(global_libra.join("config.db"), b"not a repo db").unwrap();
+
+        let workdir = home_like.join("workspace").join("project");
+        fs::create_dir_all(&workdir).unwrap();
+
+        let _guard = test::ChangeDirGuard::new(&workdir);
+        let result = try_get_storage_path(None);
+
+        assert!(
+            result.is_err(),
+            "global ~/.libra directory without repo markers must not be treated as a repository"
+        );
+    }
+    #[test]
+    #[serial(cwd)]
+    fn test_try_get_storage_path_accepts_valid_repo_under_ancestor_with_global_libra_dir() {
+        let temp = tempdir().unwrap();
+        let home_like = temp.path();
+        let global_libra = home_like.join(".libra");
+        fs::create_dir_all(global_libra.join("vault-keys")).unwrap();
+        fs::write(global_libra.join("config.db"), b"not a repo db").unwrap();
+
+        let repo = home_like.join("workspace").join("repo");
+        let storage = repo.join(ROOT_DIR);
+        fs::create_dir_all(storage.join("objects")).unwrap();
+        fs::create_dir_all(storage.join("hooks")).unwrap();
+        fs::create_dir_all(storage.join("info")).unwrap();
+        fs::write(storage.join(DATABASE), b"repo db").unwrap();
+        fs::write(storage.join("info").join("exclude"), b"").unwrap();
+
+        let nested = repo.join("src");
+        fs::create_dir_all(&nested).unwrap();
+
+        let _guard = test::ChangeDirGuard::new(&nested);
+        let resolved = try_get_storage_path(None).unwrap();
+
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            storage.canonicalize().unwrap()
+        );
+    }
+    #[test]
+    #[serial(cwd)]
+    fn test_try_get_storage_path_rejects_libra_dir_with_only_hooks() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("project");
+        fs::create_dir_all(&repo).unwrap();
+
+        let libra = repo.join(".libra");
+        fs::create_dir_all(libra.join("hooks")).unwrap();
+
+        let _guard = test::ChangeDirGuard::new(&repo);
+        let result = try_get_storage_path(None);
+
+        assert!(
+            result.is_err(),
+            ".libra with only hooks/ should not be treated as a valid repository"
+        );
+    }
+    #[test]
+    #[serial(cwd)]
+    fn test_try_get_storage_path_rejects_libra_dir_with_only_objects() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("project");
+        fs::create_dir_all(&repo).unwrap();
+
+        let libra = repo.join(".libra");
+        fs::create_dir_all(libra.join("objects")).unwrap();
+
+        let _guard = test::ChangeDirGuard::new(&repo);
+        let result = try_get_storage_path(None);
+
+        assert!(
+            result.is_err(),
+            ".libra with only objects/ should not be treated as a valid repository"
+        );
+    }
+
+    fn managed_discovery_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempdir().unwrap();
+        let main = temp.path().join("main");
+        let common = main.join(ROOT_DIR);
+        fs::create_dir_all(common.join("objects")).unwrap();
+        fs::write(common.join(DATABASE), b"fixture").unwrap();
+        (temp, main, common)
+    }
+
+    #[test]
+    fn managed_discovery_rejects_missing_or_damaged_workspace_identity() {
+        let (_temp, _main, common) = managed_discovery_fixture();
+        for suffix in [
+            "linked/topic",
+            "tasks/run/attempt/workspace",
+            "tasks/run/attempt/checkpoint-input",
+        ] {
+            let root = common.join("worktree").join(suffix);
+            let nested = root.join("src/nested");
+            fs::create_dir_all(&nested).unwrap();
+            for damaged in [false, true] {
+                if damaged {
+                    fs::create_dir_all(root.join(ROOT_DIR)).unwrap();
+                    fs::write(root.join(ROOT_DIR).join("commondir"), b"").unwrap();
+                }
+                let error = try_get_storage_path(Some(nested.clone())).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData,
+                    "{suffix}: {error}"
+                );
+                assert!(error.to_string().contains("worktree repair"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn managed_discovery_accepts_local_identity_and_common_storage() {
+        let (_temp, main, common) = managed_discovery_fixture();
+        let root = common.join("worktree/linked/topic");
+        let gitdir = root.join(ROOT_DIR);
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(
+            gitdir.join("commondir"),
+            common.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        fs::write(gitdir.join("worktree_id"), b"topic-identity\n").unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        let (storage, workdir, local) = try_get_paths_full(Some(root.join("src"))).unwrap();
+        assert_eq!(storage, common.canonicalize().unwrap());
+        assert_eq!(workdir, root.canonicalize().unwrap());
+        assert_eq!(local, gitdir.canonicalize().unwrap());
+        assert_eq!(try_get_paths_full(Some(main.clone())).unwrap().1, main);
+        assert_eq!(
+            try_get_storage_path(Some(common.clone())).unwrap(),
+            common.canonicalize().unwrap()
+        );
+        assert_eq!(
+            try_get_storage_path(Some(gitdir)).unwrap(),
+            common.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn managed_discovery_accepts_nested_independent_repositories() {
+        let (_temp, _main, common) = managed_discovery_fixture();
+        for suffix in [
+            "linked/topic/vendor",
+            "tasks/run/attempt/workspace/vendor",
+            "fuse/topic/workspace/vendor",
+        ] {
+            let nested = common.join("worktree").join(suffix);
+            let local = nested.join(ROOT_DIR);
+            fs::create_dir_all(local.join("objects")).unwrap();
+            fs::write(local.join(DATABASE), b"independent repository").unwrap();
+            let (storage, workdir, gitdir) = try_get_paths_full(Some(nested.join("src"))).unwrap();
+            assert_eq!(storage, local.canonicalize().unwrap(), "{suffix}");
+            assert_eq!(workdir, nested.canonicalize().unwrap(), "{suffix}");
+            assert_eq!(gitdir, local.canonicalize().unwrap(), "{suffix}");
+        }
+    }
+
+    #[test]
+    fn bare_repository_children_remain_discoverable_outside_managed_storage() {
+        let temp = tempdir().unwrap();
+        let bare = temp.path().join("bare");
+        fs::create_dir_all(bare.join("objects")).unwrap();
+        fs::create_dir_all(bare.join("hooks")).unwrap();
+        fs::write(bare.join(DATABASE), b"fixture").unwrap();
+        for child in ["objects", "hooks"] {
+            let (storage, workdir, gitdir) = try_get_paths_full(Some(bare.join(child))).unwrap();
+            assert_eq!(storage, bare);
+            assert_eq!(workdir, bare);
+            assert_eq!(gitdir, bare);
+        }
+    }
+
+    #[test]
+    fn legacy_external_fuse_binding_is_a_definite_non_alias() {
+        let (temp, _main, common) = managed_discovery_fixture();
+        let mount = temp.path().join("legacy-mount");
+        let upper = temp.path().join("legacy-upper");
+        let document = serde_json::json!({"worktrees": [{
+            "path": mount.to_string_lossy(),
+            "branch": "main",
+            "upper_dir": upper.to_string_lossy(),
+            "lower_dirs": [temp.path().join("main").to_string_lossy()],
+            "locked": false
+        }]});
+        fs::write(
+            common.join("worktrees-fuse.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        assert!(verified_fuse_source(&common, &mount).unwrap().is_none());
+    }
+
+    #[test]
+    fn managed_discovery_refuses_copied_main_or_wrong_common_identity() {
+        let (temp, _main, common) = managed_discovery_fixture();
+        let root = common.join("worktree/linked/topic");
+        let local = root.join(ROOT_DIR);
+        fs::create_dir_all(&local).unwrap();
+        fs::write(local.join(DATABASE), b"copied main database").unwrap();
+        assert!(try_get_paths_full(Some(root.clone())).is_err());
+        fs::remove_file(local.join(DATABASE)).unwrap();
+        let other = temp.path().join("other/.libra");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(DATABASE), b"other database").unwrap();
+        fs::write(local.join("worktree_id"), b"topic-identity\n").unwrap();
+        fs::write(local.join("commondir"), other.to_string_lossy().as_bytes()).unwrap();
+        assert!(try_get_paths_full(Some(root.clone())).is_err());
+        assert!(try_get_storage_path(Some(local.clone())).is_err());
+        fs::write(local.join("commondir"), common.to_string_lossy().as_bytes()).unwrap();
+        fs::remove_file(local.join("worktree_id")).unwrap();
+        assert!(try_get_paths_full(Some(root)).is_err());
+    }
+
+    #[test]
+    fn managed_discovery_accepts_exact_storage_root_but_not_metadata_children() {
+        let (temp, _main, common) = managed_discovery_fixture();
+        assert_eq!(
+            try_get_paths_full(Some(common.clone())).unwrap().0,
+            fs::canonicalize(&common).unwrap()
+        );
+        assert!(try_get_storage_path(Some(common.join("objects"))).is_err());
+        assert!(try_get_paths_full(Some(common.join("worktree"))).is_err());
+        let bare = temp.path().join("bare-repository");
+        fs::create_dir_all(bare.join("objects")).unwrap();
+        fs::write(bare.join(DATABASE), b"bare database").unwrap();
+        assert_eq!(try_get_paths_full(Some(bare.clone())).unwrap().0, bare);
+    }
+
+    #[test]
+    fn managed_discovery_nonstandard_common_and_fake_bare_remain_isolated() {
+        let temp = tempdir().unwrap();
+        let common = temp.path().join("bare.git");
+        fs::create_dir_all(common.join("objects")).unwrap();
+        fs::write(common.join(DATABASE), b"common database").unwrap();
+        let root = common.join("worktree/linked/topic");
+        fs::create_dir_all(&root).unwrap();
+        assert!(try_get_storage_path(Some(root.clone())).is_err());
+        fs::create_dir(root.join("objects")).unwrap();
+        fs::write(root.join(DATABASE), b"fake bare database").unwrap();
+        assert!(try_get_storage_path(Some(root)).is_err());
+        assert_eq!(try_get_storage_path(Some(common.clone())).unwrap(), common);
+    }
+
+    #[test]
+    fn managed_discovery_fuse_requires_registration_and_a_live_mount() {
+        let (_temp, main, common) = managed_discovery_fixture();
+        let common = common.canonicalize().unwrap();
+        let main = main.canonicalize().unwrap();
+        let workspace = common.join("worktree/fuse/topic/workspace");
+        let upper = common.join("worktree/fuse/topic/upper");
+        fs::create_dir_all(workspace.join(".libra/worktree")).unwrap();
+        fs::create_dir_all(upper.join(".libra/worktree")).unwrap();
+        fs::write(workspace.join(".libra").join(DATABASE), b"overlay database").unwrap();
+        let unknown = try_get_storage_path(Some(workspace.clone())).unwrap_err();
+        assert!(
+            unknown.to_string().contains("no registered FUSE binding"),
+            "{unknown}"
+        );
+        fs::write(common.join("worktrees-fuse.json"), b"{broken").unwrap();
+        let corrupt = try_get_storage_path(Some(workspace.clone())).unwrap_err();
+        assert!(
+            corrupt.to_string().contains("registry binding"),
+            "{corrupt}"
+        );
+        let mount_id = uuid::Uuid::new_v4().to_string();
+        fs::write(
+            upper.join(".libra/worktree-mount-id"),
+            format!("{mount_id}\n"),
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(".libra/worktree-mount-id"),
+            format!("{}\n", uuid::Uuid::new_v4()),
+        )
+        .unwrap();
+        fs::write(common.join("worktrees-fuse.json"), serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,"entries":[{
+                "name":"topic","path":workspace,"upper_dir":upper,"lower_dirs":[main],"mount_id":mount_id,
+                "branch":"main","locked":false,"lock_reason":null,"privileged":false,"allow_other":false
+            }]
+        })).unwrap()).unwrap();
+        let wrong_mount = try_get_storage_path(Some(workspace.clone())).unwrap_err();
+        assert!(
+            wrong_mount
+                .to_string()
+                .contains("registered upper-directory identity"),
+            "{wrong_mount}"
+        );
+        fs::write(
+            workspace.join(".libra/worktree-mount-id"),
+            format!("{mount_id}\n"),
+        )
+        .unwrap();
+        let stale = try_get_storage_path(Some(workspace.clone())).unwrap_err();
+        assert!(
+            stale.to_string().contains("not mounted")
+                || stale.to_string().contains("supported Unix"),
+            "{stale}"
+        );
+        fs::remove_file(workspace.join(".libra").join(DATABASE)).unwrap();
+        assert!(try_get_storage_path(Some(workspace)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_discovery_rejects_symlinked_local_gitdir() {
+        let (_temp, _main, common) = managed_discovery_fixture();
+        let root = common.join("worktree/linked/topic");
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&common, root.join(ROOT_DIR)).unwrap();
+        assert!(try_get_storage_path(Some(root)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_discovery_rejects_fifo_identity_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let (_temp, _main, common) = managed_discovery_fixture();
+        let root = common.join("worktree/linked/topic");
+        let local = root.join(ROOT_DIR);
+        fs::create_dir_all(&local).unwrap();
+        fs::write(local.join("commondir"), common.to_string_lossy().as_bytes()).unwrap();
+        let fifo = CString::new(local.join("worktree_id").as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is a valid NUL-terminated fixture path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(try_get_storage_path(Some(root)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_discovery_alias_cannot_escape_to_main() {
+        let (_temp, main, common) = managed_discovery_fixture();
+        let linked = common.join("worktree/linked");
+        fs::create_dir_all(linked.join("damaged/src")).unwrap();
+        let alias = main.join("alias");
+        std::os::unix::fs::symlink(&linked, &alias).unwrap();
+        assert!(try_get_paths_full(Some(alias.join("damaged/src"))).is_err());
+        let metadata_alias = main.join("metadata-alias");
+        std::os::unix::fs::symlink(&common, &metadata_alias).unwrap();
+        assert!(try_get_paths_full(Some(metadata_alias.join("objects"))).is_err());
+        assert_eq!(
+            try_get_storage_path(Some(metadata_alias)).unwrap(),
+            common.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_discovery_symlinked_common_storage_preserves_boundary() {
+        let temp = tempdir().unwrap();
+        let main = temp.path().join("main");
+        let common = temp.path().join("shared-storage");
+        fs::create_dir(&main).unwrap();
+        fs::create_dir_all(common.join("objects")).unwrap();
+        fs::write(common.join(DATABASE), b"shared database").unwrap();
+        std::os::unix::fs::symlink(&common, main.join(ROOT_DIR)).unwrap();
+        let root = common.join("worktree/linked/topic");
+        fs::create_dir_all(&root).unwrap();
+        let alias_root = main.join(".libra/worktree/linked/topic");
+        assert!(try_get_paths_full(Some(alias_root.clone())).is_err());
+        fs::create_dir(root.join(ROOT_DIR)).unwrap();
+        fs::write(
+            root.join(ROOT_DIR).join("commondir"),
+            common.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        fs::write(root.join(ROOT_DIR).join("worktree_id"), b"linked-id\n").unwrap();
+        assert_eq!(
+            try_get_storage_path(Some(alias_root)).unwrap(),
+            common.canonicalize().unwrap()
+        );
+        assert_eq!(
+            try_get_storage_path(Some(main)).unwrap(),
+            common.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_find_git_repository_detects_worktree_ancestor() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("project");
+        let git = repo.join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("config"),
+            b"[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        let nested = repo.join("src").join("lib");
+        fs::create_dir_all(&nested).unwrap();
+
+        let location = find_git_repository(Some(&nested)).expect("should detect Git repository");
+
+        assert_eq!(location.root, repo.canonicalize().unwrap());
+        assert!(!location.is_bare);
+    }
+
+    #[test]
+    fn test_find_git_repository_detects_gitdir_file_worktree() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("linked-worktree");
+        let common = temp.path().join("main.git");
+        let worktree_git = common.join("worktrees").join("linked-worktree");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(common.join("objects")).unwrap();
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(
+            repo.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        fs::write(
+            common.join("config"),
+            b"[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        fs::write(worktree_git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(worktree_git.join("commondir"), b"../..\n").unwrap();
+
+        let location = find_git_repository(Some(&repo)).expect("should detect Git worktree");
+
+        assert_eq!(location.root, repo.canonicalize().unwrap());
+        assert!(!location.is_bare);
+    }
+
+    /// W0 §C.4.1.1 (plan line 2262): info files belong to the WORKTREE VIEW.
+    /// A Git-layout linked worktree resolves its OWN gitdir's `info/<name>`,
+    /// not the commondir target's — the pre-W0 behavior (follow `commondir`)
+    /// gave a linked worktree main's exclude view while its own file was
+    /// silently ignored.
+    #[test]
+    fn test_worktree_info_file_path_is_local_for_git_layout_linked_worktree() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("linked-worktree");
+        let common = temp.path().join("main.git");
+        let worktree_git = common.join("worktrees").join("linked-worktree");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(common.join("info")).unwrap();
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(
+            repo.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        fs::write(worktree_git.join("commondir"), b"../..\n").unwrap();
+
+        let info_paths = worktree_info_file_paths(&repo, "exclude");
+
+        assert_eq!(
+            info_paths,
+            vec![worktree_git.join("info").join("exclude")],
+            "the LOCAL gitdir's info file, not the commondir target's"
+        );
+    }
+
+    /// The `.libra` layout — the primary product — must resolve at all: the
+    /// `.libra/info/exclude` that `libra init` creates was dead code before
+    /// W0 (only a literal `.git` marker was recognized). A dual-layout tree
+    /// (converted from Git, `.git` kept beside `.libra`) keeps BOTH local
+    /// candidates so existing `.git/info/*` rules do not silently vanish.
+    #[test]
+    fn test_worktree_info_file_paths_resolve_dot_libra_layouts() {
+        let temp = tempdir().unwrap();
+
+        // Main worktree: local gitdir == common storage.
+        let main_root = temp.path().join("main");
+        let main_gitdir = main_root.join(ROOT_DIR);
+        fs::create_dir_all(&main_gitdir).unwrap();
+        fs::write(main_gitdir.join(DATABASE), b"").unwrap();
+        assert_eq!(
+            worktree_info_file_paths(&main_root, "exclude"),
+            vec![main_gitdir.join("info").join("exclude")],
+        );
+
+        // Linked worktree: its OWN `.libra`, never the commondir target.
+        let linked_root = temp.path().join("wt");
+        let linked_gitdir = linked_root.join(ROOT_DIR);
+        fs::create_dir_all(&linked_gitdir).unwrap();
+        fs::write(
+            linked_gitdir.join("commondir"),
+            main_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            worktree_info_file_paths(&linked_root, "attributes"),
+            vec![linked_gitdir.join("info").join("attributes")],
+            "linked worktrees carry their own info view (plan line 2262)"
+        );
+
+        // Dual layout: a literal `.git` beside `.libra` contributes its own
+        // LOCAL info candidate after the `.libra` one.
+        let dual_git = main_root.join(".git");
+        fs::create_dir_all(&dual_git).unwrap();
+        assert_eq!(
+            worktree_info_file_paths(&main_root, "exclude"),
+            vec![
+                main_gitdir.join("info").join("exclude"),
+                dual_git.join("info").join("exclude"),
+            ],
+            "a converted repo keeps its .git/info rules alongside .libra's"
+        );
+    }
+
+    /// §C.4.1 fail-closed covers the pointer's TARGET too: a `commondir`
+    /// whose target is missing or is not a storage directory must refuse —
+    /// returning the dangling path would route every db/objects/policy
+    /// lookup at a location where "not found" masquerades as "no
+    /// configuration".
+    #[test]
+    fn test_commondir_pointer_with_bad_target_fails_closed() {
+        let temp = tempdir().unwrap();
+
+        // Dangling target.
+        let dangling_root = temp.path().join("wt-dangling");
+        let dangling_gitdir = dangling_root.join(ROOT_DIR);
+        fs::create_dir_all(&dangling_gitdir).unwrap();
+        fs::write(
+            dangling_gitdir.join("commondir"),
+            temp.path().join("no-such-dir").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(dangling_root)).expect_err("dangling target refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("worktree repair"),
+            "the refusal must point at the remedy: {err}"
+        );
+
+        // Existing target that is NOT a storage directory.
+        let bogus_target = temp.path().join("plain-dir");
+        fs::create_dir_all(&bogus_target).unwrap();
+        let bogus_root = temp.path().join("wt-bogus");
+        let bogus_gitdir = bogus_root.join(ROOT_DIR);
+        fs::create_dir_all(&bogus_gitdir).unwrap();
+        fs::write(
+            bogus_gitdir.join("commondir"),
+            bogus_target.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(bogus_root)).expect_err("non-storage target refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("TERMINAL common storage"),
+            "the refusal must say WHY the target is rejected: {err}"
+        );
+
+        // A SELF-pointer (the gitdir's commondir names itself): the target
+        // carries a commondir marker, so it is not terminal — refused, not
+        // followed into a database-less local gitdir.
+        let selfish_root = temp.path().join("wt-self");
+        let selfish_gitdir = selfish_root.join(ROOT_DIR);
+        fs::create_dir_all(&selfish_gitdir).unwrap();
+        fs::write(
+            selfish_gitdir.join("commondir"),
+            selfish_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(selfish_root)).expect_err("self-pointer refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // A pointer at ANOTHER linked worktree's gitdir (a chain): equally
+        // refused — chains are corruption, not indirection.
+        let main_gitdir = temp.path().join("main").join(ROOT_DIR);
+        fs::create_dir_all(&main_gitdir).unwrap();
+        fs::write(main_gitdir.join(DATABASE), b"").unwrap();
+        let hop_gitdir = temp.path().join("wt-hop").join(ROOT_DIR);
+        fs::create_dir_all(&hop_gitdir).unwrap();
+        fs::write(
+            hop_gitdir.join("commondir"),
+            main_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let chain_root = temp.path().join("wt-chain");
+        let chain_gitdir = chain_root.join(ROOT_DIR);
+        fs::create_dir_all(&chain_gitdir).unwrap();
+        fs::write(
+            chain_gitdir.join("commondir"),
+            hop_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(chain_root)).expect_err("pointer chain refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A gitdir carrying a `worktree_id` but NO `commondir` is a linked
+    /// worktree that LOST its pointer — corruption to refuse. Answering
+    /// "main" (the pre-fix behavior) would route its db/objects lookups at
+    /// its own pointer-less gitdir, a phantom repository, and let callers
+    /// trust its local configuration as the repository's. Discovery must
+    /// also STOP there rather than climbing into an ancestor repository.
+    #[test]
+    #[serial_test::serial(env)]
+    fn test_pointerless_linked_gitdir_fails_closed() {
+        let temp = tempdir().unwrap();
+        // An ancestor repository the walk must NOT climb into.
+        let ancestor_gitdir = temp.path().join(ROOT_DIR);
+        fs::create_dir_all(&ancestor_gitdir).unwrap();
+        fs::write(ancestor_gitdir.join(DATABASE), b"").unwrap();
+
+        let root = temp.path().join("nested-wt");
+        let gitdir = root.join(ROOT_DIR);
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("worktree_id"), b"wt-orphan-1234\n").unwrap();
+
+        assert!(
+            is_valid_storage_dir(&gitdir),
+            "a worktree_id marks a linked gitdir even with no commondir, so \
+             discovery STOPS here instead of climbing to the ancestor repo"
+        );
+        let err = try_get_storage_path(Some(root)).expect_err("pointer-less linked gitdir refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("worktree repair"),
+            "the refusal must point at the remedy: {err}"
+        );
+        assert!(
+            !err.to_string().contains("not a libra repository"),
+            "it must be a CORRUPTION refusal, not a 'no repository' answer: {err}"
+        );
+    }
+
+    /// The global Libra home is NEVER repository storage: a stray `libra.db`
+    /// in `$LIBRA_HOME` (the artifact of a command once run from `$HOME`) must
+    /// not let discovery adopt the home as a repository. Adopting it routed
+    /// the config cascade's LOCAL scope at `~/.libra/libra.db`, so `libra init`
+    /// failed with `no such table: config` on home DBs lacking the legacy
+    /// `config` table — and the printed `libra config --global` hint could
+    /// never fix it (global config lives in `~/.libra/config.db`).
+    #[test]
+    #[serial(cwd, env)]
+    fn test_global_libra_home_is_never_repository_storage() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join(ROOT_DIR);
+        fs::create_dir_all(&home).unwrap();
+        // Artifact: the home carries a database, exactly like a storage dir.
+        fs::write(home.join(DATABASE), b"").unwrap();
+
+        let _env = test::ScopedEnvVar::set("LIBRA_HOME", &home);
+        assert!(
+            is_global_libra_home(&home),
+            "the resolved LIBRA_HOME itself must be recognized"
+        );
+        assert!(
+            !is_valid_storage_dir(&home),
+            "the Libra home is never a valid storage dir, even with a libra.db in it"
+        );
+        let err = try_get_storage_path(Some(temp.path().to_path_buf()))
+            .expect_err("discovery must not adopt the Libra home as a repository");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "the walk must climb PAST the home and answer 'no repository', not resolve it: {err}"
+        );
+
+        // Control: a real repository next to the home still resolves normally.
+        let repo_root = temp.path().join("repo");
+        let repo_gitdir = repo_root.join(ROOT_DIR);
+        fs::create_dir_all(&repo_gitdir).unwrap();
+        fs::write(repo_gitdir.join(DATABASE), b"").unwrap();
+        assert!(is_valid_storage_dir(&repo_gitdir));
+        // Discovery canonicalizes the accepted gitdir (tmpdir paths may sit
+        // behind a symlink), so compare against the canonical form too.
+        let expected_gitdir = fs::canonicalize(&repo_gitdir).unwrap_or(repo_gitdir.clone());
+        let (storage, workdir) = try_get_paths(Some(repo_root.clone())).unwrap();
+        assert_eq!(storage, expected_gitdir);
+        assert_eq!(workdir, repo_root);
+    }
+
+    #[test]
+    fn global_home_not_repository_display_is_actionable() {
+        let error = GlobalHomeNotRepository {
+            workdir: PathBuf::from("outside"),
+            home: PathBuf::from(".libra"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "\"outside\" is not a libra repository; '.libra' is the global Libra home, \
+             reserved for per-user state rather than repository storage; \
+             use a dedicated project directory (e.g. 'libra init <project>')"
+        );
+    }
+
+    /// A DANGLING `commondir` symlink is a present-but-corrupt marker, not
+    /// an absent one: `exists()` follows the link and would silently treat
+    /// the linked worktree as MAIN (routing every write at the wrong scope),
+    /// and would bless a pointer target that still carries a (dangling)
+    /// commondir marker as terminal.
+    #[cfg(unix)]
+    #[test]
+    fn test_dangling_commondir_symlink_fails_closed() {
+        let temp = tempdir().unwrap();
+
+        // Linked gitdir whose commondir marker is a dangling symlink.
+        let root = temp.path().join("wt");
+        let gitdir = root.join(ROOT_DIR);
+        fs::create_dir_all(&gitdir).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("gone"), gitdir.join("commondir")).unwrap();
+        // The gitdir must still be RECOGNIZED as a linked gitdir...
+        assert!(
+            is_valid_storage_dir(&gitdir),
+            "a dangling commondir symlink still marks a linked gitdir"
+        );
+        // ...and resolution must refuse, never silently answer "main".
+        let err = try_get_storage_path(Some(root)).expect_err("dangling marker refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("worktree repair"),
+            "the refusal must point at the remedy: {err}"
+        );
+
+        // A pointer TARGET carrying a dangling commondir symlink is not
+        // terminal either.
+        let target = temp.path().join("bad-target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join(DATABASE), b"").unwrap();
+        std::os::unix::fs::symlink(temp.path().join("gone2"), target.join("commondir")).unwrap();
+        assert!(
+            !is_terminal_common_storage(&target),
+            "a database-bearing dir with a dangling commondir marker is not terminal"
+        );
+
+        // A DANGLING detached_from_registry symlink still freezes the
+        // worktree — `exists()` would follow it and silently unfreeze.
+        let detached_main_gitdir = temp.path().join("detached-main").join(ROOT_DIR);
+        fs::create_dir_all(&detached_main_gitdir).unwrap();
+        fs::write(detached_main_gitdir.join(DATABASE), b"").unwrap();
+        let detached_root = temp.path().join("wt-detached");
+        let detached_gitdir = detached_root.join(ROOT_DIR);
+        fs::create_dir_all(&detached_gitdir).unwrap();
+        fs::write(
+            detached_gitdir.join("commondir"),
+            detached_main_gitdir.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            temp.path().join("gone3"),
+            detached_gitdir.join("detached_from_registry"),
+        )
+        .unwrap();
+        let err = try_get_storage_path(Some(detached_root)).expect_err("dangling detached refuses");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// An UNINSPECTABLE marker (EPERM on lstat) is treated as present, not
+    /// absent: discovery still stops at the gitdir and resolution refuses
+    /// via the lifecycle-marker arm — never silently unfreezing or climbing
+    /// into main's scope.
+    #[cfg(unix)]
+    #[test]
+    fn test_uninspectable_markers_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("wt");
+        let gitdir = root.join(ROOT_DIR);
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), b"target").unwrap();
+        let writable = fs::metadata(&gitdir).unwrap().permissions();
+        fs::set_permissions(&gitdir, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::symlink_metadata(gitdir.join("commondir")).is_ok() {
+            fs::set_permissions(&gitdir, writable).unwrap();
+            eprintln!("skipped (running as root: permission bits cannot stage EPERM)");
+            return;
+        }
+
+        assert!(
+            is_valid_storage_dir(&gitdir),
+            "an uninspectable gitdir still STOPS repository discovery"
+        );
+        let err = try_get_storage_path(Some(root)).expect_err("uninspectable markers refuse");
+        fs::set_permissions(&gitdir, writable).unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("lifecycle marker"),
+            "the LIFECYCLE-marker arm must fire first (uninspectable = frozen, \
+             not absent): {err}"
+        );
+
+        // And the TERMINAL-target branch, reached only when the LOCAL gitdir
+        // is perfectly readable: a database-bearing target whose own
+        // `commondir` cannot be inspected must be refused, never blessed as
+        // terminal (the pre-fix behavior accepted it).
+        let opaque_target = temp.path().join("opaque-target");
+        fs::create_dir_all(&opaque_target).unwrap();
+        fs::write(opaque_target.join(DATABASE), b"").unwrap();
+        let pointing_root = temp.path().join("wt-pointing");
+        let pointing_gitdir = pointing_root.join(ROOT_DIR);
+        fs::create_dir_all(&pointing_gitdir).unwrap();
+        fs::write(
+            pointing_gitdir.join("commondir"),
+            opaque_target.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let target_writable = fs::metadata(&opaque_target).unwrap().permissions();
+        fs::set_permissions(&opaque_target, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::symlink_metadata(opaque_target.join("commondir")).is_ok() {
+            fs::set_permissions(&opaque_target, target_writable).unwrap();
+            eprintln!("skipped (running as root: permission bits cannot stage EPERM)");
+            return;
+        }
+        let err =
+            try_get_storage_path(Some(pointing_root)).expect_err("uninspectable target refuses");
+        fs::set_permissions(&opaque_target, target_writable).unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("TERMINAL common storage"),
+            "the TERMINAL-target branch must refuse an uninspectable target: {err}"
+        );
+    }
+
+    #[test]
+    fn test_find_git_repository_treats_dot_git_directory_as_worktree() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("project");
+        let git = repo.join(".git");
+        fs::create_dir_all(git.join("objects").join("aa")).unwrap();
+        fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("config"),
+            b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+
+        let location = find_git_repository(Some(&git.join("objects")))
+            .expect("should detect parent Git worktree from inside .git");
+
+        assert_eq!(location.root, repo.canonicalize().unwrap());
+        assert!(!location.is_bare);
+    }
+
+    #[test]
+    fn test_find_git_repository_keeps_bare_dot_git_directory_bare() {
+        let temp = tempdir().unwrap();
+        let bare = temp.path().join(".git");
+        fs::create_dir_all(bare.join("objects")).unwrap();
+        fs::write(bare.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(
+            bare.join("config"),
+            b"[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+        )
+        .unwrap();
+
+        let location = find_git_repository(Some(&bare))
+            .expect("should detect a bare repository named .git as bare");
+
+        assert_eq!(location.root, bare.canonicalize().unwrap());
+        assert!(location.is_bare);
+    }
+
+    /// Concurrent status walks must not clear each other's failure latch
+    /// (Codex WIO-02 r32 P1).
+    #[test]
+    #[serial_test::serial(cwd)]
+    fn concurrent_ignore_walks_keep_independent_failure_latches() {
+        use std::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+
+        let a = std::thread::spawn(move || {
+            let _walk = begin_secure_ignore_walk();
+            let epoch = secure_ignore_walk_epoch();
+            assert_ne!(epoch, 0);
+            barrier_a.wait();
+            // Peer walk begins/ends while we stay active.
+            barrier_a.wait();
+            latch_ignore_read_failed();
+            assert!(
+                ignore_read_failed(),
+                "walk A must still latch after peer walk ends"
+            );
+            epoch
+        });
+        let b = std::thread::spawn(move || {
+            barrier_b.wait();
+            let walk = begin_secure_ignore_walk();
+            let epoch = secure_ignore_walk_epoch();
+            assert_ne!(epoch, 0);
+            latch_ignore_read_failed();
+            assert!(ignore_read_failed());
+            drop(walk);
+            assert!(
+                !ignore_read_failed(),
+                "ended walk B must not report failure"
+            );
+            barrier_b.wait();
+            epoch
+        });
+
+        let epoch_a = a.join().expect("walk A");
+        let epoch_b = b.join().expect("walk B");
+        assert_ne!(epoch_a, epoch_b);
+    }
+
+    /// A timed-out worker from a finished walk must not poison a later walk.
+    #[test]
+    #[serial_test::serial(cwd)]
+    fn finished_ignore_walk_rejects_late_worker_latch() {
+        let epoch = {
+            let _walk = begin_secure_ignore_walk();
+            secure_ignore_walk_epoch()
+        };
+        assert_eq!(secure_ignore_walk_epoch(), 0);
+        IGNORE_OP_EPOCH.with(|cell| cell.set(epoch));
+        latch_ignore_read_failed();
+        IGNORE_OP_EPOCH.with(|cell| cell.set(0));
+
+        let _later = begin_secure_ignore_walk();
+        assert!(
+            !ignore_read_failed(),
+            "late latch from a finished epoch must not poison the next walk"
+        );
+    }
+
+    // ── RV-01 / RV-02 resolver parity unit tests ──
+
+    #[test]
+    fn status_ignore_context_epoch_guard_restores_on_unwind() {
+        let _outer = IgnoreOpEpochGuard(IGNORE_OP_EPOCH.with(|cell| cell.replace(17)));
+        let result = std::panic::catch_unwind(|| {
+            let _inner = IgnoreOpEpochGuard(IGNORE_OP_EPOCH.with(|cell| cell.replace(29)));
+            panic!("exercise epoch guard unwind restoration");
+        });
+        assert!(result.is_err());
+        assert_eq!(IGNORE_OP_EPOCH.with(|cell| cell.get()), 17);
+    }
+
+    #[test]
+    fn status_ignore_context_matches_captured_rules_without_source_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let deep = root.join("deep");
+        let build = |base: &Path, name: &str, rules: &[&str]| {
+            let mut builder = GitignoreBuilder::new(base);
+            for rule in rules {
+                builder.add_line(Some(base.join(name)), rule).unwrap();
+            }
+            Arc::new(builder.build().unwrap())
+        };
+        // No source file or child exists. Classification is entirely in memory,
+        // including parent-directory matches and nearest-source whitelists.
+        let context = DirectoryIgnoreContext {
+            workdir: root.clone(),
+            matchers: vec![
+                build(&deep, ".libraignore", &["!keep.tmp", "cache/"]),
+                build(&root, ".gitignore", &["*.tmp"]),
+            ],
+            layers: crate::internal::layer::ExclusionSnapshot::default(),
+        };
+        for _ in 0..100 {
+            assert!(!context.is_ignored(&deep.join("keep.tmp"), false));
+            assert!(context.is_ignored(&deep.join("drop.tmp"), false));
+            assert!(context.is_ignored(&deep.join("cache/child"), false));
+            assert!(context.is_ignored(&root.join(".git/config"), false));
+            assert!(!context.is_ignored(&deep.join("plain"), false));
+        }
+    }
+
+    #[test]
+    fn parse_index_path_spec_selects_stage_and_path() {
+        assert_eq!(parse_index_path_spec("foo"), (0, "foo"));
+        assert_eq!(parse_index_path_spec("0:foo"), (0, "foo"));
+        assert_eq!(parse_index_path_spec("1:foo"), (1, "foo"));
+        assert_eq!(parse_index_path_spec("3:foo"), (3, "foo"));
+        // A stage digit must be followed by `:`; otherwise the whole text is the path.
+        assert_eq!(parse_index_path_spec("4:foo"), (0, "4:foo"));
+        assert_eq!(parse_index_path_spec("12:foo"), (0, "12:foo"));
+    }
+
+    #[test]
+    fn parse_message_search_pattern_prefixes() {
+        assert_eq!(
+            parse_message_search_pattern("pat", "s").unwrap(),
+            (false, "pat")
+        );
+        assert_eq!(
+            parse_message_search_pattern("!-pat", "s").unwrap(),
+            (true, "pat")
+        );
+        assert_eq!(
+            parse_message_search_pattern("!!pat", "s").unwrap(),
+            (false, "!pat")
+        );
+        assert!(parse_message_search_pattern("!x", "s").is_err());
+        assert!(parse_message_search_pattern("!", "s").is_err());
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn index_path_spec_rejects_paths_outside_worktree() {
+        let repo = tempdir().unwrap();
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = test::ChangeDirGuard::new(repo.path());
+
+        let err = resolve_object_spec_typed(":../escaped.txt")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("outside repository"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// MX-02: the shared ambiguity diagnostic formats Git-style candidate hint
+    /// text (`The candidates are:` + `<abbrev> <type>` lines) and carries full
+    /// OID/type/abbrev details for `--json`, with LBR-CLI-003 / exit 129.
+    #[test]
+    fn ambiguous_short_oid_error_formats_candidates_and_json_details() {
+        let sha1_hex = |hex: &str| {
+            ObjectHash::from_hex_for_kind(git_internal::hash::HashKind::Sha1, hex)
+                .expect("valid sha1 object hash")
+        };
+        let candidates = vec![
+            AmbiguousCandidate {
+                oid: sha1_hex("1f2aa3bd5a96f8c1e2b0d9a7c4f5e6b1a2c3d4e5"),
+                object_type: ObjectType::Blob,
+                abbrev: "1f2aa3b".to_string(),
+            },
+            AmbiguousCandidate {
+                oid: sha1_hex("1f2ae0c7d8b9a6f5e4c3b2a19088776655443322"),
+                object_type: ObjectType::Blob,
+                abbrev: "1f2ae0c".to_string(),
+            },
+        ];
+        let error = ambiguous_short_oid_error("1f2a", &candidates);
+
+        assert_eq!(error.message(), "short object ID 1f2a is ambiguous");
+        assert_eq!(error.stable_code(), StableErrorCode::CliInvalidTarget);
+        assert_eq!(error.exit_code(), 129);
+        let hints = error.hints();
+        assert_eq!(hints.len(), 1);
+        assert_eq!(
+            hints[0].as_str(),
+            "The candidates are:\n  1f2aa3b blob\n  1f2ae0c blob"
+        );
+        let details = error.details();
+        let candidates_json = details
+            .get("candidates")
+            .expect("details.candidates")
+            .as_array()
+            .expect("candidates array");
+        assert_eq!(candidates_json.len(), 2);
+        assert_eq!(
+            candidates_json[0]["oid"],
+            "1f2aa3bd5a96f8c1e2b0d9a7c4f5e6b1a2c3d4e5"
+        );
+        assert_eq!(candidates_json[0]["type"], "blob");
+        assert_eq!(candidates_json[0]["abbrev"], "1f2aa3b");
+        assert_eq!(
+            candidates_json[1]["oid"],
+            "1f2ae0c7d8b9a6f5e4c3b2a19088776655443322"
+        );
+        assert_eq!(candidates_json[1]["type"], "blob");
+        assert_eq!(candidates_json[1]["abbrev"], "1f2ae0c");
+    }
+}

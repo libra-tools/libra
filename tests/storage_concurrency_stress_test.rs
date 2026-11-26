@@ -84,7 +84,7 @@ mod redb_stress {
 
         match role {
             "producer" => {
-                let lane = if worker_id % 2 == 0 {
+                let lane = if worker_id.is_multiple_of(2) {
                     CaptureQueueLane::Priority
                 } else {
                     CaptureQueueLane::Normal

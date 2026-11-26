@@ -11,139 +11,19 @@
 //! `for-each-ref` list them) and `--graft` / `--edit` / `--convert-graft-file`
 //! are documented follow-ups.
 
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::{Path, PathBuf},
-};
+use std::fs;
 
 use clap::Parser;
 use git_internal::hash::ObjectHash;
+pub(crate) use libra_core::internal::replace::{
+    load_replace_map, replace_dir, resolve, with_suppressed_peel,
+};
 
 use crate::utils::{
     error::{CliError, CliResult, StableErrorCode},
     output::OutputConfig,
     util,
 };
-
-const REPLACE_REF_DIR: &str = "refs/replace";
-/// Bound on how many `refs/replace` hops are followed, so a cycle or a long
-/// chain can never spin forever inside the hot object-load path.
-const MAX_REPLACE_DEPTH: usize = 8;
-
-/// W0 §C.4.1.1 process-cache rules, applied by NOT caching: this was a
-/// single process-global `OnceLock<HashMap>` loaded from whichever
-/// repository the process touched first — a long-lived host process
-/// (service, code runtime) then resolved repo B's objects through repo A's
-/// replacements, and any mutation (its own or another process's) stayed
-/// invisible until restart. [`replace_map`] now reads `refs/replace` fresh
-/// on every call; see its doc for why that is affordable.
-type ReplaceMap = HashMap<ObjectHash, ObjectHash>;
-
-/// The empty map returned whenever no replacements exist — shared so the
-/// common case allocates nothing.
-static EMPTY_REPLACE_MAP: std::sync::LazyLock<std::sync::Arc<ReplaceMap>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::new(HashMap::new()));
-
-/// This repository's CURRENT replacement map, read fresh from
-/// `refs/replace` on every call (§C.4.1.1 process-cache rules).
-///
-/// No snapshot is retained at all: every staleness class — another
-/// process's create/delete, a same-name `-f` retarget with unchanged
-/// metadata, this process's own mutations — is structurally impossible.
-/// The cost model that makes this acceptable on the hot object-load path:
-/// the overwhelmingly common case (no replacements, directory absent) is a
-/// single failed `read_dir` returning the shared empty map; when
-/// replacements DO exist they number a handful, and reading a handful of
-/// 41-byte ref files per resolve is bounded and far below the object read
-/// the caller is about to perform.
-fn replace_map() -> std::sync::Arc<ReplaceMap> {
-    let Some(dir) = replace_dir() else {
-        // Outside a repository nothing can be replaced.
-        return EMPTY_REPLACE_MAP.clone();
-    };
-    let map = load_replace_map(&dir);
-    if map.is_empty() {
-        return EMPTY_REPLACE_MAP.clone();
-    }
-    std::sync::Arc::new(map)
-}
-
-tokio::task_local! {
-    /// A PINNED replacement snapshot for callers that must hold ONE
-    /// immutable map across a signature stamp AND an object walk (the
-    /// revision-ordinal builder): with fresh per-call reads, a concurrent
-    /// retarget between the stamp and the walk could otherwise make the
-    /// stamped signature describe a different map than the chain actually
-    /// indexed.
-    static PINNED_SNAPSHOT: std::sync::Arc<ReplaceMap>;
-}
-
-/// One immutable snapshot of the CURRENT replacement map.
-pub(crate) fn snapshot() -> std::sync::Arc<ReplaceMap> {
-    replace_map()
-}
-
-/// Run `f` with every [`resolve`] (and [`effective_replace_signature`]) in
-/// this task answering from `map` instead of re-reading `refs/replace`.
-pub(crate) fn with_pinned_snapshot_sync<R>(
-    map: std::sync::Arc<ReplaceMap>,
-    f: impl FnOnce() -> R,
-) -> R {
-    PINNED_SNAPSHOT.sync_scope(map, f)
-}
-
-tokio::task_local! {
-    /// When set on the current task, [`resolve`] is a no-op. The `replace`
-    /// command names objects by their *literal* oid, so it suppresses the peel
-    /// while resolving its own arguments (otherwise creating a replacement would
-    /// change how its own arguments resolve — e.g. `HEAD~1` after `HEAD` was
-    /// already replaced). Task-local (not process-global) so a concurrent task
-    /// on the multi-thread runtime is never affected.
-    static SUPPRESS_PEEL: bool;
-}
-
-fn peel_suppressed() -> bool {
-    SUPPRESS_PEEL
-        .try_with(|suppressed| *suppressed)
-        .unwrap_or(false)
-}
-
-/// Signature of the EFFECTIVE replacement map. Under a pinned snapshot it
-/// describes exactly the map [`resolve`] answers from (the ordinal builder's
-/// coherence invariant); otherwise it digests a fresh read, so any replace
-/// mutation — this process's or another's — yields a differing signature
-/// that triggers an honest rebuild on the next read (lore.md 1.16).
-pub(crate) fn effective_replace_signature() -> String {
-    if let Ok(signature) = PINNED_SNAPSHOT.try_with(|map| signature_of(map)) {
-        return signature;
-    }
-    signature_of(&replace_map())
-}
-
-/// The signature of one SPECIFIC snapshot (see
-/// [`effective_replace_signature`] for the ambient form).
-pub(crate) fn signature_of(map: &ReplaceMap) -> String {
-    if map.is_empty() {
-        return String::new();
-    }
-    let mut pairs: Vec<String> = map
-        .iter()
-        .map(|(from, to)| format!("{from}={to}"))
-        .collect();
-    pairs.sort();
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
-    for pair in &pairs {
-        hasher.update(pair.as_bytes());
-        hasher.update(b"\n");
-    }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
 
 pub const REPLACE_EXAMPLES: &str = "\
 EXAMPLES:
@@ -197,111 +77,6 @@ pub struct ReplaceArgs {
     pub args: Vec<String>,
 }
 
-// ----------------------------------------------------------------------------
-// peel hook — called by `command::load_object`
-// ----------------------------------------------------------------------------
-
-/// Resolve an object id through `refs/replace`, following a chain (cycle-bounded).
-/// The unpinned form reads only the CHAIN's ref files by name — the common
-/// no-replacement case is ONE failed open of `refs/replace/<oid>` (plus the
-/// same ancestor walk the object read itself already performs) — bounded
-/// overhead on the hot object-load path, paid for always-current
-/// cross-repository/cross-process correctness.
-pub fn resolve(hash: ObjectHash) -> ObjectHash {
-    if peel_suppressed() {
-        return hash;
-    }
-    // Under a pinned snapshot (the ordinal builder), answer from the pin.
-    if let Ok(pinned) = PINNED_SNAPSHOT.try_with(|map| map.clone()) {
-        return resolve_via(&pinned, hash);
-    }
-    // HOT PATH: read only the CHAIN's ref files by name — O(chain hops,
-    // capped) per resolve regardless of how many replacements the
-    // repository holds, and the overwhelmingly common case (no replacement
-    // for this oid) is a single failed open of `refs/replace/<oid>`. Every
-    // read is fresh, so any process's create/delete/retarget is visible
-    // immediately.
-    let Some(dir) = replace_dir() else {
-        return hash;
-    };
-    let mut current = hash;
-    let mut visited = HashSet::new();
-    visited.insert(current);
-    for _ in 0..MAX_REPLACE_DEPTH {
-        match read_one_replace_ref(&dir, &current) {
-            Some(next) if visited.insert(next) => current = next,
-            _ => break,
-        }
-    }
-    current
-}
-
-/// Follow the chain within one immutable map (pinned-snapshot form).
-fn resolve_via(map: &ReplaceMap, hash: ObjectHash) -> ObjectHash {
-    if map.is_empty() {
-        return hash;
-    }
-    // Cycle-bounded exactly like the per-file walk.
-    let mut current = hash;
-    let mut visited = HashSet::new();
-    visited.insert(current);
-    for _ in 0..MAX_REPLACE_DEPTH {
-        match map.get(&current) {
-            Some(&next) if visited.insert(next) => current = next,
-            _ => break,
-        }
-    }
-    current
-}
-
-/// One replacement hop read directly by filename (malformed content is
-/// skipped, matching the loader's robustness-over-strictness stance).
-fn read_one_replace_ref(dir: &Path, hash: &ObjectHash) -> Option<ObjectHash> {
-    let content = fs::read_to_string(dir.join(hash.to_string())).ok()?;
-    crate::internal::object_format::parse_repo_oid(content.trim()).ok()
-}
-
-/// Scan `.libra/refs/replace/` into a map. Best-effort: a malformed entry is
-/// skipped rather than breaking every object read (robustness over strictness).
-fn load_replace_map(dir: &Path) -> HashMap<ObjectHash, ObjectHash> {
-    let mut map = HashMap::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return map; // absent directory ⇒ no replacements
-    };
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Ok(src) = crate::internal::object_format::parse_repo_oid(name) else {
-            continue;
-        };
-        let Ok(content) = fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(dst) = crate::internal::object_format::parse_repo_oid(content.trim()) else {
-            continue;
-        };
-        map.insert(src, dst);
-    }
-    map
-}
-
-fn replace_dir() -> Option<PathBuf> {
-    // Request-pinned storage first (§C.4.2): a host process serving several
-    // worktrees/repositories must key and load the map for the repository
-    // THIS invocation acts on, not for wherever the process cwd points.
-    if let Some(pinned) = crate::internal::worktree_scope::WorktreeScope::request_scope() {
-        return Some(pinned.storage.join(REPLACE_REF_DIR));
-    }
-    util::try_get_storage_path(None)
-        .ok()
-        .map(|root| root.join(REPLACE_REF_DIR))
-}
-
-// ----------------------------------------------------------------------------
-// CLI
-// ----------------------------------------------------------------------------
-
 pub async fn execute(args: ReplaceArgs) {
     if let Err(err) = execute_safe(args, &OutputConfig::default()).await {
         err.print_stderr();
@@ -314,7 +89,7 @@ pub async fn execute_safe(args: ReplaceArgs, _output: &OutputConfig) -> CliResul
     // The `replace` command names objects by their literal oid, so the peel must
     // not rewrite its own argument resolution. Scope the suppression to this
     // task so concurrent tasks on the runtime are unaffected.
-    SUPPRESS_PEEL.scope(true, run(args)).await
+    with_suppressed_peel(run(args)).await
 }
 
 async fn run(args: ReplaceArgs) -> CliResult<()> {
@@ -630,6 +405,13 @@ fn write_err(error: std::io::Error) -> CliError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use libra_core::internal::replace::{
+        REPLACE_REF_DIR, effective_replace_signature, signature_of, snapshot,
+        with_pinned_snapshot_sync,
+    };
+
     use super::*;
     use crate::internal::worktree_scope::WorktreeScope;
 

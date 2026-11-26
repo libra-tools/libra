@@ -1,0 +1,8786 @@
+//! Client-side object storage gateway.
+//!
+//! This module is the synchronous facade that the rest of the codebase uses to read,
+//! write, and search Git objects. It hides three orthogonal concerns:
+//!
+//! 1. **Storage backend selection** — local-only, or local cache plus a remote
+//!    object_store-backed bucket (S3/R2). Backend is chosen at construction time from
+//!    `LIBRA_STORAGE_*` environment variables and `vault.env.*` config entries.
+//! 2. **Sync/async bridging** — most of the codebase is synchronous CLI logic, while
+//!    every storage backend is async. A dedicated multi-thread Tokio runtime owned by
+//!    this module runs the async work and the CLI thread blocks on a `mpsc::channel`,
+//!    avoiding nested-runtime panics that would occur if we drove the storage from the
+//!    main runtime.
+//! 3. **Background object indexing** — every successful `put` enqueues an index-update
+//!    message for the cloud-backup object index. The consumer runs serially on the
+//!    background runtime so concurrent writers cannot deadlock on the SQLite database.
+//!
+//! Search supports Git's revision navigation suffixes (`HEAD`, `~`, `^`).
+
+use std::{
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    fs,
+    io::{self, Read, Seek, Write},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use async_trait::async_trait;
+use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream}; // Import for catch_unwind
+use git_internal::{
+    errors::GitError,
+    hash::ObjectHash,
+    internal::object::{commit::Commit, types::ObjectType},
+};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbConn, DbErr, EntityTrait, QueryFilter,
+    Statement, Value,
+};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    runtime::Runtime,
+    sync::mpsc::{Receiver, Sender, channel, error::TrySendError},
+};
+use uuid::Uuid;
+
+use crate::{
+    internal::{
+        branch::Branch,
+        config::{ConfigKv, decrypt_value},
+        config_scope::ConfigScope,
+        db,
+        db::{DatabaseRole, establish_connection_with_lock_timeout, schema},
+        head::Head,
+        model::object_index,
+        object_io::load_object,
+    },
+    utils::{
+        storage::{Storage, local::LocalStorage, remote::RemoteStorage, tiered::TieredStorage},
+        util::{DATABASE, try_get_storage_path},
+    },
+};
+
+// Dedicated runtime for storage operations to avoid blocking/deadlocks in the main runtime.
+// We never `await` storage from the calling tokio runtime; instead we hand the work to
+// this private runtime and block on an mpsc receiver. This avoids `block_on within
+// runtime` panics and decouples storage IO from the caller's executor.
+static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    // INVARIANT: `Builder::build()` only fails on platform resource
+    // exhaustion (cannot spawn the I/O reactor or worker threads). If
+    // that happens the process cannot make progress regardless, so
+    // surfacing the panic immediately is the right behavior. The
+    // panic message identifies that this is the storage runtime so
+    // the failure is distinguishable from caller-runtime issues.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build dedicated tokio runtime for ClientStorage IO")
+});
+
+// Message describing a single object_index update queued by `ClientStorage::put`.
+// Carries enough state for the consumer to run independently of the calling thread.
+struct IndexUpdateMsg {
+    hash: String,
+    obj_type: String,
+    size: i64,
+    db_path: PathBuf,
+    marker_path: Option<PathBuf>,
+    // Replay keeps this cross-process lock through the SQLite upsert and
+    // marker retirement. Queued writers acquire the same bounded OID-shard lock
+    // immediately before touching SQLite, so a marker retired by replay is a
+    // durable ownership fence rather than a racy existence hint.
+    _marker_lock: Option<Arc<ObjectIndexRepairLock>>,
+    failure_counter: Arc<AtomicUsize>,
+    pending_counter: Arc<AtomicUsize>,
+}
+
+/// In-process object-index fault controls used only by this module's unit
+/// tests. They are deliberately absent from normal and debug binaries: an
+/// environment variable must never make a capture writer sleep, fail, or
+/// retain a durable repair marker.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ObjectIndexTestFaults {
+    pub update_failure: bool,
+    pub marker_retirement_failure: bool,
+    pub consumer_delay: Option<Duration>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+static TEST_OBJECT_INDEX_FAULTS: Lazy<std::sync::Mutex<BTreeMap<PathBuf, ObjectIndexTestFaults>>> =
+    Lazy::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+#[cfg(any(test, feature = "test-helpers"))]
+static TEST_OBJECT_INDEX_FAULT_SERIAL: Lazy<std::sync::Mutex<()>> =
+    Lazy::new(|| std::sync::Mutex::new(()));
+
+/// Keep test fault controls tied to the same physical database even when a
+/// platform exposes its temporary directory through an alias (for example,
+/// macOS `/var` and `/private/var`). The database file need not exist yet:
+/// canonicalizing the parent preserves the key used when a later queue
+/// consumer opens it.
+#[cfg(any(test, feature = "test-helpers"))]
+fn test_object_index_fault_key(db_path: &Path) -> PathBuf {
+    db_path
+        .file_name()
+        .zip(db_path.parent())
+        .and_then(|(file_name, parent)| {
+            parent
+                .canonicalize()
+                .ok()
+                .map(|parent| parent.join(file_name))
+        })
+        .unwrap_or_else(|| db_path.to_path_buf())
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub struct ObjectIndexTestFaultGuard {
+    db_path: PathBuf,
+    previous: Option<ObjectIndexTestFaults>,
+    // Fault injection affects a background consumer shared by in-crate tests.
+    // Keep these scoped controls mutually exclusive so one test cannot restore
+    // another test's prior fixture while its queue is still draining.
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for ObjectIndexTestFaultGuard {
+    fn drop(&mut self) {
+        let mut faults = TEST_OBJECT_INDEX_FAULTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = self.previous {
+            faults.insert(self.db_path.clone(), previous);
+        } else {
+            faults.remove(&self.db_path);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn install_test_object_index_faults(
+    db_path: &Path,
+    faults: ObjectIndexTestFaults,
+) -> ObjectIndexTestFaultGuard {
+    let serial = TEST_OBJECT_INDEX_FAULT_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut active = TEST_OBJECT_INDEX_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let db_path = test_object_index_fault_key(db_path);
+    let previous = active.insert(db_path.clone(), faults);
+    ObjectIndexTestFaultGuard {
+        db_path,
+        previous,
+        _serial: serial,
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+#[allow(dead_code)]
+fn test_object_index_faults(db_path: &Path) -> ObjectIndexTestFaults {
+    let db_path = test_object_index_fault_key(db_path);
+    TEST_OBJECT_INDEX_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&db_path)
+        .copied()
+        .unwrap_or_default()
+}
+
+const INDEX_REPAIR_MARKER_DIR: &str = "object-index-repair";
+const INDEX_REPAIR_MARKER_STAGING_DIR: &str = "object-index-repair-tmp";
+const INDEX_REPAIR_LOCK_DIR: &str = "object-index-repair-locks";
+const INDEX_REPAIR_GENERATION_LOCK: &str = "object-index-repair-generation.lock";
+// Four hexadecimal digits cap the persistent cross-process lock namespace at
+// 65,536 files while keeping unrelated object writes well distributed.
+const INDEX_REPAIR_LOCK_SHARD_HEX_LEN: usize = 4;
+const INDEX_REPAIR_MARKER_SCHEMA_VERSION: u8 = 1;
+const INDEX_REPAIR_MARKER_READ_CAP: u64 = 16 * 1024;
+/// Upper bound for the one-line holder metadata read on lock timeout.
+/// Anything larger is treated as undetermined (ADR-OI-02 item 2).
+const INDEX_REPAIR_LOCK_METADATA_READ_CAP: u64 = 1024;
+const INDEX_REPAIR_STAGING_SCAN_CAP: usize = 1_024;
+const INDEX_REPAIR_STAGING_REMOVE_CAP: usize = 256;
+const INDEX_REPAIR_STAGING_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(not(test))]
+const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const INDEX_REPAIR_MARKER_PAGE_CAP: usize = 100_000;
+#[cfg(test)]
+const INDEX_REPAIR_MARKER_PAGE_CAP: usize = 3;
+#[cfg(not(test))]
+const INDEX_REPAIR_BATCH_SIZE: usize = 100;
+#[cfg(test)]
+const INDEX_REPAIR_BATCH_SIZE: usize = 2;
+/// Markers published per generation-lock acquisition in batch mode
+/// (ADR-OI-04 item 1). Not configurable.
+const INDEX_REPAIR_MARKER_BATCH: usize = 256;
+
+/// Debug-build counter of repository-wide generation lock acquisitions. The
+/// command-level OI-04 hook reports this process-wide total. Only
+/// `acquire_index_repair_generation_lock` increments it, and only in debug
+/// builds (release binaries carry zero cost).
+#[cfg(any(test, debug_assertions))]
+static GENERATION_LOCK_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Unit tests run different temporary repositories concurrently, so the
+/// process-wide debug counter above cannot attribute an acquisition to one
+/// queued update. Keep a test-only per-database view for the issue #469
+/// regression guard; this never ships in normal or debug CLI binaries.
+#[cfg(test)]
+static TEST_GENERATION_LOCK_ACQUISITIONS_BY_DATABASE: Lazy<
+    std::sync::Mutex<HashMap<PathBuf, usize>>,
+> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Batch-publication assertions must be attributed to their repository. A
+/// process-wide counter is inherently racy because unrelated test repositories
+/// publish batches concurrently on the shared storage runtime.
+#[cfg(test)]
+static TEST_BATCHED_MARKER_PUBLICATIONS_BY_DATABASE: Lazy<
+    std::sync::Mutex<HashMap<PathBuf, usize>>,
+> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn record_test_generation_lock_acquisition(db_path: &Path) {
+    let mut acquisitions = TEST_GENERATION_LOCK_ACQUISITIONS_BY_DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *acquisitions.entry(db_path.to_path_buf()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn test_generation_lock_acquisition_count(db_path: &Path) -> usize {
+    TEST_GENERATION_LOCK_ACQUISITIONS_BY_DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(db_path)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn record_test_batched_marker_publication(db_path: &Path) {
+    let mut publications = TEST_BATCHED_MARKER_PUBLICATIONS_BY_DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *publications.entry(db_path.to_path_buf()).or_default() += 1;
+}
+
+/// Holder metadata written into a repair lock file right after acquisition.
+/// Diagnostic only: lock semantics come from the advisory flock, never from
+/// this payload (ADR-OI-02 item 4).
+#[derive(Debug, Deserialize, Serialize)]
+struct IndexRepairLockMetadata {
+    pid: u32,
+    purpose: String,
+    started_at_ms: u64,
+    invocation: String,
+}
+
+struct PendingObjectIndexPage {
+    updates: Vec<IndexUpdateMsg>,
+    has_more: bool,
+    // Held from the directory snapshot through the batch upsert and durable
+    // marker retirement. Publishers, replay, and destructive deletion therefore
+    // observe one total order for marker generations.
+    _generation_lock: Option<ObjectIndexRepairLock>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectIndexRepairOutcome {
+    pub repaired: usize,
+    pub remaining: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingObjectIndexUpdate {
+    schema_version: u8,
+    o_id: String,
+    o_type: String,
+    o_size: i64,
+}
+
+/// Process-crash-safe advisory ownership for one bounded OID shard. Lock files
+/// remain stable after marker retirement so a delayed writer cannot acquire a
+/// newly created inode and bypass a replay process that still owns the old one.
+#[derive(Debug)]
+struct ObjectIndexRepairLock {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    file: fs::File,
+}
+
+fn index_repair_lock_shard(oid: &str) -> io::Result<String> {
+    if !valid_supported_index_repair_oid(oid) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "object-index repair lock identity contains an invalid object id",
+        ));
+    }
+    Ok(oid[..INDEX_REPAIR_LOCK_SHARD_HEX_LEN].to_string())
+}
+
+fn index_repair_lock_path(db_path: &Path, oid: &str) -> io::Result<PathBuf> {
+    let lock_shard = index_repair_lock_shard(oid)?;
+    let storage_dir = db_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "repository database path has no storage directory: {}",
+                db_path.display()
+            ),
+        )
+    })?;
+    Ok(storage_dir
+        .join(INDEX_REPAIR_LOCK_DIR)
+        .join(format!("{lock_shard}.lock")))
+}
+
+fn index_repair_generation_lock_path(db_path: &Path) -> io::Result<PathBuf> {
+    let storage_dir = db_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "repository database path has no storage directory: {}",
+                db_path.display()
+            ),
+        )
+    })?;
+    Ok(storage_dir
+        .join(INDEX_REPAIR_LOCK_DIR)
+        .join(INDEX_REPAIR_GENERATION_LOCK))
+}
+
+#[cfg(unix)]
+fn open_index_repair_lock_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(parent) {
+            let _ = crate::utils::shared_perm::adjust_shared_perm(parent, &shared);
+        }
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(path) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm(path, &shared);
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_index_repair_lock_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        // A zero share mode is released by the kernel on process death and is
+        // Windows' equivalent of the Unix advisory lock used below.
+        .share_mode(0)
+        .open(path)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn open_index_repair_lock_file(_path: &Path) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cross-process object-index repair locking is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn try_acquire_index_repair_lock_file(
+    path: &Path,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
+    use std::os::fd::AsRawFd;
+
+    let file = open_index_repair_lock_file(path)?;
+    // SAFETY: flock operates on an owned descriptor and does not outlive it.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        let mut lock = ObjectIndexRepairLock { file };
+        write_index_repair_lock_metadata(&mut lock, purpose);
+        return Ok(Some(lock));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
+        _ => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn try_acquire_index_repair_lock_file(
+    path: &Path,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
+    match open_index_repair_lock_file(path) {
+        Ok(file) => {
+            let mut lock = ObjectIndexRepairLock { file };
+            write_index_repair_lock_metadata(&mut lock, purpose);
+            Ok(Some(lock))
+        }
+        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION mean another
+        // process owns this zero-share handle.
+        Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn try_acquire_index_repair_lock_file(
+    path: &Path,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
+    let mut lock = ObjectIndexRepairLock {
+        file: open_index_repair_lock_file(path)?,
+    };
+    write_index_repair_lock_metadata(&mut lock, purpose);
+    Ok(Some(lock))
+}
+
+/// Write the one-line holder metadata after a successful acquisition.
+/// A write failure never fails the acquisition (ADR-OI-02 item 1 / M-DIAG D6):
+/// the advisory flock is the lock, the payload is only a diagnostic hint.
+fn write_index_repair_lock_metadata(lock: &mut ObjectIndexRepairLock, purpose: &'static str) {
+    let metadata = IndexRepairLockMetadata {
+        pid: std::process::id(),
+        purpose: purpose.to_string(),
+        started_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        invocation: Uuid::new_v4().to_string(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&metadata) else {
+        tracing::debug!("failed to encode object-index repair lock metadata");
+        return;
+    };
+    let result: io::Result<()> = (|| {
+        lock.file.set_len(0)?;
+        lock.file.seek(std::io::SeekFrom::Start(0))?;
+        lock.file.write_all(&bytes)?;
+        lock.file.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::debug!("failed to write object-index repair lock metadata: {error}");
+    }
+}
+
+/// Read holder metadata for lock diagnostics, capped at 1 KiB (ADR-OI-02
+/// item 2). Returns `None` when the file is unreadable, empty, oversized, or
+/// not valid metadata — callers then fall back to the undetermined message.
+fn read_index_repair_lock_metadata(path: &Path) -> Option<IndexRepairLockMetadata> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(INDEX_REPAIR_LOCK_METADATA_READ_CAP + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > INDEX_REPAIR_LOCK_METADATA_READ_CAP {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Best-effort liveness probe for a lock holder pid. Signal 0 performs an
+/// existence check only; EPERM still means the process exists.
+fn repair_lock_holder_is_live(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: kill with signal 0 sends no signal and only probes the pid.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Build the lock-timeout diagnostic per ADR-OI-02 item 2 and M-DIAG D1–D4.
+fn describe_index_repair_lock_timeout(lock_path: &Path, identity: &str) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let holder_clause = match read_index_repair_lock_metadata(lock_path) {
+        Some(metadata) if metadata.pid == std::process::id() => format!(
+            "; the lock is held by this Libra process itself (purpose: {}, started {}s ago) — internal lock contention is a Libra defect, please report it at https://github.com/libra-tools/libra/issues",
+            metadata.purpose,
+            now_ms.saturating_sub(metadata.started_at_ms) / 1000
+        ),
+        Some(metadata) if repair_lock_holder_is_live(metadata.pid) => format!(
+            "; another live Libra process (pid {}, purpose: {}, started {}s ago) holds it — wait for that process to finish and retry",
+            metadata.pid,
+            metadata.purpose,
+            now_ms.saturating_sub(metadata.started_at_ms) / 1000
+        ),
+        _ => "; the lock holder could not be determined".to_string(),
+    };
+    format!(
+        "timed out waiting for object-index repair lock '{}' for {identity}{holder_clause}; the lock file itself does not block anything and must not be deleted — it is released automatically when its owner exits",
+        lock_path.display()
+    )
+}
+
+fn try_acquire_index_repair_lock(
+    db_path: &Path,
+    oid: &str,
+    purpose: &'static str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
+    try_acquire_index_repair_lock_file(&index_repair_lock_path(db_path, oid)?, purpose)
+}
+
+/// Git-style quadratic lock-wait backoff (ADR-OI-03 item 1; git `lockfile.c:206-251`):
+/// 1ms × (attempt+1)² starting at 1ms for attempt 0, ±25% jitter, single sleep
+/// capped at 1 second.
+/// `jitter_factor` ∈ [0, 1] is the uniform random draw (0 → −25%, 1 → +25%).
+fn index_repair_lock_backoff_sleep(attempt: u32, jitter_factor: f64) -> Duration {
+    let step =
+        u64::from(attempt.saturating_add(1)).saturating_mul(u64::from(attempt.saturating_add(1)));
+    let base_ms = step.min(1_000);
+    let jittered = base_ms as f64 * (0.75 + jitter_factor.clamp(0.0, 1.0) * 0.5);
+    Duration::from_micros((jittered * 1_000.0).round() as u64)
+}
+
+fn acquire_index_repair_lock_file(
+    lock_path: &Path,
+    identity: &str,
+    purpose: &'static str,
+) -> io::Result<ObjectIndexRepairLock> {
+    let started = Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        if let Some(lock) = try_acquire_index_repair_lock_file(lock_path, purpose)? {
+            return Ok(lock);
+        }
+        if started.elapsed() >= INDEX_REPAIR_LOCK_WAIT_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                describe_index_repair_lock_timeout(lock_path, identity),
+            ));
+        }
+        std::thread::sleep(index_repair_lock_backoff_sleep(attempt, fastrand::f64()));
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+fn acquire_index_repair_lock(
+    db_path: &Path,
+    oid: &str,
+    purpose: &'static str,
+) -> io::Result<ObjectIndexRepairLock> {
+    acquire_index_repair_lock_file(
+        &index_repair_lock_path(db_path, oid)?,
+        &format!("object {oid}"),
+        purpose,
+    )
+}
+
+fn acquire_index_repair_generation_lock(
+    db_path: &Path,
+    purpose: &'static str,
+) -> io::Result<ObjectIndexRepairLock> {
+    let lock = acquire_index_repair_lock_file(
+        &index_repair_generation_lock_path(db_path)?,
+        "repair-marker generation",
+        purpose,
+    )?;
+    #[cfg(any(test, debug_assertions))]
+    GENERATION_LOCK_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    record_test_generation_lock_acquisition(db_path);
+    Ok(lock)
+}
+
+/// Debug-build accessor for the generation lock acquisition counter (M-BATCH
+/// B1 integration hook and the issue #469 regression guard).
+#[cfg(debug_assertions)]
+pub fn generation_lock_acquisition_count() -> usize {
+    GENERATION_LOCK_ACQUISITIONS.load(Ordering::Relaxed)
+}
+
+/// Test-build accessor for the batched-publication counter (M-BATCH B1),
+/// scoped to one repository database so parallel temporary repositories cannot
+/// perturb the assertion.
+#[cfg(test)]
+pub fn batched_marker_publication_count(db_path: &Path) -> usize {
+    TEST_BATCHED_MARKER_PUBLICATIONS_BY_DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(db_path)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+impl Drop for ObjectIndexRepairLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the descriptor is owned by this guard. Closing would also
+        // release the lock; explicit unlock makes the lifetime obvious.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Repository-wide fence for destructive `object_index` deletion. Marker
+/// publishers take the same generation lock before their atomic rename. Once
+/// this guard has verified that none of the candidate OIDs has a durable
+/// marker, holding it through the SQLite commit prevents a delayed publisher
+/// from recreating one of the deleted rows afterward.
+#[derive(Debug)]
+pub struct ObjectIndexDeletionFence {
+    _generation_lock: ObjectIndexRepairLock,
+}
+
+pub async fn acquire_object_index_deletion_fence(
+    db_path: &Path,
+    oids: &[String],
+) -> io::Result<Option<ObjectIndexDeletionFence>> {
+    if oids.is_empty() {
+        return Ok(None);
+    }
+    let db_path = db_path.to_path_buf();
+    let oids = oids.iter().cloned().collect::<HashSet<_>>();
+    tokio::task::spawn_blocking(move || {
+        if let Some(invalid) = oids
+            .iter()
+            .find(|oid| !valid_supported_index_repair_oid(oid))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot fence object-index deletion for invalid object id {invalid}"),
+            ));
+        }
+
+        let generation_lock = acquire_index_repair_generation_lock(&db_path, "deletion_fence")?;
+        let marker_dir = db_path
+            .parent()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "repository database path has no storage directory: {}",
+                        db_path.display()
+                    ),
+                )
+            })?
+            .join(INDEX_REPAIR_MARKER_DIR);
+        let entries = match fs::read_dir(&marker_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Some(ObjectIndexDeletionFence {
+                    _generation_lock: generation_lock,
+                }));
+            }
+            Err(error) => return Err(error),
+        };
+
+        for (scanned_entries, entry) in entries.enumerate() {
+            if scanned_entries >= INDEX_REPAIR_MARKER_PAGE_CAP {
+                return Err(io::Error::other(format!(
+                    "refusing object-index deletion because repair-marker validation exceeded the bounded limit of {INDEX_REPAIR_MARKER_PAGE_CAP} entries"
+                )));
+            }
+            let entry = entry?;
+            let path = entry.path();
+            let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+                io::Error::other(format!(
+                    "object-index repair directory contains a non-UTF-8 entry: {}",
+                    path.display()
+                ))
+            })?;
+            let marker_oid = name
+                .strip_suffix(".json")
+                .and_then(|identity| identity.split_once('.'))
+                .map(|(oid, _)| oid);
+            if let Some(marker_oid) = marker_oid
+                && oids.contains(marker_oid)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "refusing object-index deletion because object {} still has durable repair marker '{}'",
+                        marker_oid,
+                        path.display()
+                    ),
+                ));
+            }
+        }
+
+        Ok(Some(ObjectIndexDeletionFence {
+            _generation_lock: generation_lock,
+        }))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("object-index deletion fence task failed: {error}")))?
+}
+
+fn index_repair_marker_path(db_path: &Path, oid: &str, object_type: &str) -> io::Result<PathBuf> {
+    if !valid_supported_index_repair_oid(oid) || !valid_index_repair_type(object_type) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "object-index repair identity contains an invalid object id or type",
+        ));
+    }
+    let storage_dir = db_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "repository database path has no storage directory: {}",
+                db_path.display()
+            ),
+        )
+    })?;
+    Ok(storage_dir
+        .join(INDEX_REPAIR_MARKER_DIR)
+        .join(format!("{oid}.{object_type}.json")))
+}
+
+fn persist_index_repair_marker(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
+    // Marker creation participates in a repository-wide generation fence.
+    // Destructive cleanup holds this lock from its final marker revalidation
+    // through the catalog transaction, so a new durable repair job cannot be
+    // published in the deletion window. Replay holds the same fence while it
+    // owns and retires a page of markers. Do not also take the coarse OID-shard
+    // lock here: a queued consumer may hold that shard for an unrelated object
+    // with the same four-hex prefix, and repeated publication of the same
+    // content-addressed marker is idempotent. Queued and replay consumers still
+    // use the shard lock to arbitrate marker retirement.
+    let _generation_lock =
+        acquire_index_repair_generation_lock(&msg.db_path, "marker_publication")?;
+    persist_index_repair_marker_under_lock(msg)
+}
+
+/// Write one durable repair marker; the caller must hold the generation lock
+/// (see [`persist_index_repair_marker`] and [`persist_index_repair_marker_batch`]).
+fn persist_index_repair_marker_under_lock(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
+    let marker_path = index_repair_marker_path(&msg.db_path, &msg.hash, &msg.obj_type)?;
+    let marker = PendingObjectIndexUpdate {
+        schema_version: INDEX_REPAIR_MARKER_SCHEMA_VERSION,
+        o_id: msg.hash.clone(),
+        o_type: msg.obj_type.clone(),
+        o_size: msg.size,
+    };
+    let bytes = serde_json::to_vec(&marker)
+        .map_err(|error| io::Error::other(format!("encode object-index repair marker: {error}")))?;
+    let staging_dir = msg
+        .db_path
+        .parent()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "repository database path has no storage directory: {}",
+                    msg.db_path.display()
+                ),
+            )
+        })?
+        .join(INDEX_REPAIR_MARKER_STAGING_DIR);
+    let mut writer = crate::utils::atomic_stream::StreamingAtomicFile::new_in(
+        &staging_dir,
+        crate::utils::atomic_write::sync_data_enabled(),
+    )?;
+    writer.write_all(&bytes)?;
+    writer.persist(&marker_path)?;
+    if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(&marker_path) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm(&staging_dir, &shared);
+        if let Some(parent) = marker_path.parent() {
+            let _ = crate::utils::shared_perm::adjust_shared_perm(parent, &shared);
+        }
+        let _ = crate::utils::shared_perm::adjust_shared_perm(&marker_path, &shared);
+    }
+    Ok(marker_path)
+}
+
+/// Persist a batch of durable repair markers under ONE generation lock
+/// (ADR-OI-04 item 1). On failure the markers written so far stay on disk and
+/// the error is returned (M-BATCH B2); callers must not enqueue anything for
+/// the failed batch — already-stored payloads can be re-registered later via
+/// [`ClientStorage::ensure_existing_object_index`].
+/// Debug-build counter of batch publications (ADR-OI-04 item 1). The B1 unit
+/// assertion uses this instead of the total generation-lock counter so
+/// parallel tests' single-marker publications cannot skew it.
+#[cfg(any(test, debug_assertions))]
+static BATCHED_MARKER_PUBLICATIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn persist_index_repair_marker_batch(msgs: &[IndexUpdateMsg]) -> io::Result<Vec<PathBuf>> {
+    if msgs.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[cfg(any(test, debug_assertions))]
+    BATCHED_MARKER_PUBLICATIONS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    record_test_batched_marker_publication(&msgs[0].db_path);
+    let _generation_lock =
+        acquire_index_repair_generation_lock(&msgs[0].db_path, "marker_publication")?;
+    let mut paths = Vec::with_capacity(msgs.len());
+    for msg in msgs {
+        paths.push(persist_index_repair_marker_under_lock(msg)?);
+    }
+    Ok(paths)
+}
+
+fn retire_index_repair_marker(_db_path: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if test_object_index_faults(_db_path).marker_retirement_failure {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected object-index repair marker retirement failure",
+        ));
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if crate::utils::atomic_write::sync_data_enabled() {
+                let parent = path.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "object-index repair marker has no parent directory: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                crate::utils::atomic_write::fsync_parent_dir(parent)?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn current_index_work_scope() -> IndexWorkScope {
+    ACTIVE_INDEX_WORK_SCOPE
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| UNSCOPED_INDEX_WORK_SCOPE.clone())
+}
+
+fn current_index_failure_counter() -> Arc<AtomicUsize> {
+    current_index_work_scope().failures
+}
+
+fn current_index_pending_counter() -> Arc<AtomicUsize> {
+    current_index_work_scope().pending
+}
+
+fn record_index_update_failure(msg: &IndexUpdateMsg) {
+    msg.failure_counter.fetch_add(1, Ordering::SeqCst);
+}
+
+fn enqueue_index_update(msg: IndexUpdateMsg, context: &'static str) {
+    PENDING_TASKS.fetch_add(1, Ordering::Relaxed);
+    msg.pending_counter.fetch_add(1, Ordering::Relaxed);
+    let sender = if Arc::ptr_eq(&msg.pending_counter, &UNSCOPED_INDEX_WORK_SCOPE.pending) {
+        &INDEX_UPDATE_CHANNELS.unscoped
+    } else {
+        &INDEX_UPDATE_CHANNELS.scoped
+    };
+    match sender.try_send(msg) {
+        Ok(()) => {}
+        Err(TrySendError::Full(msg)) => {
+            let sender = sender.clone();
+            RUNTIME.spawn(async move {
+                if let Err(error) = sender.send(msg).await {
+                    record_index_update_failure(&error.0);
+                    error.0.pending_counter.fetch_sub(1, Ordering::Release);
+                    PENDING_TASKS.fetch_sub(1, Ordering::Release);
+                    tracing::warn!("Failed to queue {context}: channel closed");
+                }
+            });
+        }
+        Err(TrySendError::Closed(msg)) => {
+            record_index_update_failure(&msg);
+            msg.pending_counter.fetch_sub(1, Ordering::Release);
+            PENDING_TASKS.fetch_sub(1, Ordering::Release);
+            tracing::warn!("Failed to queue {context}: channel closed");
+        }
+    }
+}
+
+// RAII guard that decrements PENDING_TASKS exactly once even if the consumer task panics.
+// Drop runs on both the success path and during unwinding, so the pending counter
+// observed by `wait_for_background_tasks` cannot drift on errors.
+struct TaskGuard {
+    pending_counter: Arc<AtomicUsize>,
+}
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        // Release pairs with barrier Acquire loads so a foreground caller
+        // that observes zero also observes the terminal failure counter write.
+        self.pending_counter.fetch_sub(1, Ordering::Release);
+        PENDING_TASKS.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // consumed by the cfg(test) spawn-scope unit test
+fn register_pending_index_work(scope: &IndexWorkScope) -> TaskGuard {
+    PENDING_TASKS.fetch_add(1, Ordering::Relaxed);
+    scope.pending.fetch_add(1, Ordering::Relaxed);
+    TaskGuard {
+        pending_counter: Arc::clone(&scope.pending),
+    }
+}
+
+// Invocation-scoped updates and unrelated direct-library updates use separate
+// bounded FIFO lanes. A slow direct backlog therefore cannot consume a CLI
+// invocation's finite drain budget. Each lane remains serial, while SQLite's
+// bounded busy retry coordinates the rare case where both lanes target the
+// same repository concurrently.
+struct IndexUpdateChannels {
+    scoped: Sender<IndexUpdateMsg>,
+    unscoped: Sender<IndexUpdateMsg>,
+}
+
+static INDEX_UPDATE_CHANNELS: Lazy<IndexUpdateChannels> = Lazy::new(|| {
+    let (scoped, scoped_rx) = channel::<IndexUpdateMsg>(1000);
+    let (unscoped, unscoped_rx) = channel::<IndexUpdateMsg>(1000);
+    RUNTIME.spawn(run_index_update_consumer(scoped_rx));
+    RUNTIME.spawn(run_index_update_consumer(unscoped_rx));
+    IndexUpdateChannels { scoped, unscoped }
+});
+
+// ADR-OI-04 batch accumulation, keyed by repository database path so that
+// concurrent operations on different repositories (and parallel tests) never
+// share a batch. While a batch is active for a key (depth > 0),
+// `enqueue_stored_object_index` defers marker publication into that key's
+// pending list. `end_object_index_batch` (or a full batch of
+// `INDEX_REPAIR_MARKER_BATCH` entries) publishes every marker under a single
+// generation lock and then enqueues the messages. Global (not thread-local)
+// because async commands may hop Tokio worker threads between accumulation
+// and flush; the CLI runs one invocation per repository at a time.
+struct ObjectIndexBatchState {
+    depth: u32,
+    pending: Vec<IndexUpdateMsg>,
+}
+
+static OBJECT_INDEX_BATCH_STATE: std::sync::Mutex<BTreeMap<PathBuf, ObjectIndexBatchState>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+fn with_object_index_batch_state<R>(
+    key: &Path,
+    f: impl FnOnce(&mut ObjectIndexBatchState) -> R,
+) -> R {
+    let mut states = OBJECT_INDEX_BATCH_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(states
+        .entry(key.to_path_buf())
+        .or_insert_with(|| ObjectIndexBatchState {
+            depth: 0,
+            pending: Vec::new(),
+        }))
+}
+
+/// Canonical marker-registration failure message (ADR-OI-05 item 2): one
+/// prefix explaining that the payloads are safely stored, that no paths were
+/// staged, and that a direct retry reuses the payloads and needs no lock-file
+/// cleanup. Lock-timeout causes already carry the holder diagnostics from
+/// `describe_index_repair_lock_timeout` (ADR-OI-02).
+fn object_index_marker_registration_error(cause: io::Error) -> io::Error {
+    io::Error::new(
+        cause.kind(),
+        format!(
+            "object payloads were stored safely, but their cloud object-index repair markers could not be registered: {cause}; no paths were staged — retry the command directly (the retry reuses the already-stored payloads and needs no lock-file cleanup)"
+        ),
+    )
+}
+
+/// Publish every accumulated marker for `key` under ONE generation lock, then
+/// enqueue the messages. On a publish failure the already-written markers stay
+/// on disk, the pending list is cleared, and the error propagates (M-BATCH
+/// B2); a later retry re-registers the payloads via `ensure_existing_object_index`.
+fn flush_pending_object_index_batch(key: &Path) -> io::Result<()> {
+    let msgs = with_object_index_batch_state(key, |state| std::mem::take(&mut state.pending));
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    let marker_paths =
+        persist_index_repair_marker_batch(&msgs).map_err(object_index_marker_registration_error)?;
+    for (mut msg, marker_path) in msgs.into_iter().zip(marker_paths) {
+        msg.marker_path = Some(marker_path);
+        enqueue_index_update(msg, "object index update");
+    }
+    Ok(())
+}
+
+async fn run_index_update_consumer(mut rx: Receiver<IndexUpdateMsg>) {
+    while let Some(msg) = rx.recv().await {
+        // Guard ensures decrement happens on drop (scope exit or panic).
+        let _guard = TaskGuard {
+            pending_counter: Arc::clone(&msg.pending_counter),
+        };
+
+        // Catch one update's panic so the lane continues processing later
+        // durable markers instead of becoming permanently wedged.
+        let future = async {
+            #[cfg(test)]
+            if let Some(delay) = test_object_index_faults(&msg.db_path).consumer_delay {
+                tokio::time::sleep(delay).await;
+            }
+            match apply_queued_index_update(&msg).await {
+                Ok(()) => {}
+                Err(error) => {
+                    // ClientStorage::put registers the marker before queueing, so
+                    // terminal failure remains replayable after the foreground
+                    // command has already advanced refs or printed success.
+                    record_index_update_failure(&msg);
+                    tracing::warn!("Failed to update object index for {}: {}", msg.hash, error);
+                }
+            }
+        };
+        let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
+
+        if let Err(payload) = result {
+            record_index_update_failure(&msg);
+            tracing::error!("Panic in background index update task: {:?}", payload);
+        }
+    }
+}
+
+async fn apply_queued_index_update(msg: &IndexUpdateMsg) -> Result<(), String> {
+    let marker_path = msg.marker_path.as_deref().ok_or_else(|| {
+        format!(
+            "queued object-index update for {} has no durable repair marker",
+            msg.hash
+        )
+    })?;
+
+    // The marker was published under the generation lock before this message
+    // entered the queue. Keeping that repository-wide lock across SQLite retries
+    // would let the consumer starve the next foreground marker publisher. The
+    // OID-shard lock is sufficient here: same-OID deletion sees the marker and
+    // fails closed, while retirement happens only after the row update commits.
+    let db_path = msg.db_path.clone();
+    let oid = msg.hash.clone();
+    let _ownership = tokio::task::spawn_blocking(move || {
+        acquire_index_repair_lock(&db_path, &oid, "queued_update")
+    })
+    .await
+    .map_err(|error| {
+        format!(
+            "object-index repair ownership task failed for {}: {error}",
+            msg.hash
+        )
+    })?
+    .map_err(|error| {
+        format!(
+            "failed to acquire object-index repair ownership for {}: {error}",
+            msg.hash
+        )
+    })?;
+
+    match fs::symlink_metadata(marker_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(format!(
+                "object-index repair marker is not a regular file: {}",
+                marker_path.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A replay owner already reconciled and retired this exact marker
+            // while the queued writer was delayed. Skipping under the same
+            // OID-shard lock prevents post-clean resurrection.
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect object-index repair marker '{}': {error}",
+                marker_path.display()
+            ));
+        }
+    }
+
+    update_object_index(&msg.db_path, &msg.hash, &msg.obj_type, msg.size).await?;
+    retire_index_repair_marker(&msg.db_path, marker_path).map_err(|error| {
+        format!(
+            "object index updated for {}, but its repair marker '{}' could not be retired: {error}",
+            msg.hash,
+            marker_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+// Counter for active background tasks. Read by `wait_for_background_tasks` so the CLI
+// can drain pending index updates before exiting.
+static PENDING_TASKS: AtomicUsize = AtomicUsize::new(0);
+// Each top-level embedded CLI invocation owns a distinct failure counter.
+// Queue messages clone that counter at enqueue time, so a task that finishes
+// after the 60-second foreground budget cannot charge the next invocation.
+// Direct library callers outside a CLI invocation share the fallback counter.
+#[derive(Clone)]
+struct IndexWorkScope {
+    failures: Arc<AtomicUsize>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl IndexWorkScope {
+    fn new() -> Self {
+        Self {
+            failures: Arc::new(AtomicUsize::new(0)),
+            pending: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+static UNSCOPED_INDEX_WORK_SCOPE: Lazy<IndexWorkScope> = Lazy::new(IndexWorkScope::new);
+
+tokio::task_local! {
+    static ACTIVE_INDEX_WORK_SCOPE: IndexWorkScope;
+}
+
+pub struct BackgroundIndexFailureScope {
+    scope: IndexWorkScope,
+}
+
+impl BackgroundIndexFailureScope {
+    pub fn failure_count(&self) -> usize {
+        self.scope.failures.load(Ordering::SeqCst)
+    }
+}
+
+// Object-index updates run behind foreground repository writes. SQLite can keep
+// the repository database locked for longer than a single short busy timeout, so
+// cloud backup correctness depends on retrying instead of silently dropping rows.
+const INDEX_UPDATE_MAX_ATTEMPTS: usize = 12;
+
+/// Synchronous facade for the configured object backend.
+///
+/// Coarse classification of an object read failure (see
+/// [`ClientStorage::classify_read_failure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectReadFailure {
+    /// The object does not exist in any reachable tier.
+    Missing,
+    /// The object exists but its bytes are invalid (header/zlib/size).
+    Corrupt,
+    /// The object exists remotely but the read policy forbids fetching it.
+    Unavailable,
+    /// A bounded read refused the object because it exceeds the limit.
+    TooLarge,
+    /// Any other failure (I/O, runtime bridge, ...).
+    Other,
+}
+
+#[derive(Clone)]
+enum HeldStorage {
+    Ready(Arc<dyn Storage>),
+    Rejected(&'static str),
+}
+
+/// Wraps a `dyn Storage` (local, remote, or tiered) and adapts every operation to a
+/// blocking call by routing through the dedicated `RUNTIME`. Cheap to clone —
+/// internally it is an `Arc` plus a `PathBuf`. A rejected configuration keeps only
+/// the setting name.
+#[derive(Clone)]
+pub struct ClientStorage {
+    held: HeldStorage,
+    base_path: PathBuf, // Keep base_path for legacy access if needed
+}
+
+#[cfg(test)]
+thread_local! {
+    static STORAGE_TYPE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn read_storage_type() -> Result<Option<String>, StorageConfigResolutionError> {
+    #[cfg(test)]
+    STORAGE_TYPE_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+    resolve_env_sync_typed("LIBRA_STORAGE_TYPE")
+}
+
+fn storage_config_git_error(variable: &'static str) -> GitError {
+    GitError::CustomError(format!(
+        "failed to read storage configuration for {variable}"
+    ))
+}
+
+fn storage_config_io_error(variable: &'static str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "failed to read storage configuration for {variable}"
+    ))
+}
+
+fn refuse_rejected_presence(variable: &'static str) -> ! {
+    eprintln!("failed to read storage configuration for {variable}");
+    std::process::exit(1);
+}
+
+/// Parse only the reference-bearing commit headers. Commit messages are byte
+/// strings in Git, so decoding the full object as UTF-8 would reject valid
+/// commits and must not use unchecked string conversion on remote data.
+pub fn parse_commit_header_refs(
+    data: &[u8],
+    commit_hash: ObjectHash,
+) -> Result<(ObjectHash, Vec<ObjectHash>), GitError> {
+    fn next_line<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], GitError> {
+        let remaining = data.get(*cursor..).ok_or_else(|| {
+            GitError::InvalidObjectInfo("commit header position is out of bounds".to_string())
+        })?;
+        let end = remaining
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| {
+                GitError::InvalidObjectInfo("commit header is not newline-terminated".to_string())
+            })?;
+        *cursor += end + 1;
+        Ok(&remaining[..end])
+    }
+
+    fn parse_ref(
+        line: &[u8],
+        prefix: &[u8],
+        commit_hash: ObjectHash,
+        label: &str,
+    ) -> Result<ObjectHash, GitError> {
+        let raw = line.strip_prefix(prefix).ok_or_else(|| {
+            GitError::InvalidObjectInfo(format!("commit {commit_hash} is missing its {label} ID"))
+        })?;
+        let hex = std::str::from_utf8(raw).map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has a non-ASCII {label} ID: {error}"
+            ))
+        })?;
+        ObjectHash::from_hex_for_kind(commit_hash.kind(), hex).map_err(|error| {
+            GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has an invalid {label} ID: {error}"
+            ))
+        })
+    }
+
+    let mut cursor = 0;
+    let tree_line = next_line(data, &mut cursor)?;
+    let tree = parse_ref(tree_line, b"tree ", commit_hash, "tree")?;
+    if cursor == data.len() {
+        return Err(GitError::InvalidObjectInfo(format!(
+            "commit {commit_hash} ends immediately after its tree header"
+        )));
+    }
+    let mut parents = Vec::new();
+    while data[cursor..].starts_with(b"parent ") {
+        let line = next_line(data, &mut cursor)?;
+        if line.contains(&0) {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has a NUL byte in its reference headers"
+            )));
+        }
+        if parents.len() >= 262_144 {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} has more than 262144 parents"
+            )));
+        }
+        parents.push(parse_ref(line, b"parent ", commit_hash, "parent")?);
+        if cursor == data.len() {
+            return Err(GitError::InvalidObjectInfo(format!(
+                "commit {commit_hash} ends immediately after a parent header"
+            )));
+        }
+    }
+    // Git's graph parser stops at the first non-parent line after `tree`.
+    // Author, committer, extensions, and message bytes do not affect edges;
+    // legacy or historical commits can omit or reorder those later fields.
+    Ok((tree, parents))
+}
+
+/// Default tiered-storage small/large object threshold (1 MiB): objects at or
+/// above this size are LRU-cached rather than stored permanently locally.
+pub const DEFAULT_STORAGE_THRESHOLD_BYTES: usize = 1024 * 1024;
+/// Default local LRU disk budget for large cached objects (200 MiB).
+pub const DEFAULT_CACHE_SIZE_BYTES: usize = 200 * 1024 * 1024;
+/// Operator command shown when an old binary sees a newer global config schema.
+pub const INSTALL_NEWER_LIBRA_COMMAND: &str =
+    "curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh";
+
+static GLOBAL_CONFIG_SCHEMA_FUTURE_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+const REMOTE_STORAGE_ENV_KEYS_AFTER_TYPE: &[&str] = &[
+    "LIBRA_STORAGE_BUCKET",
+    "LIBRA_STORAGE_ENDPOINT",
+    "LIBRA_STORAGE_REGION",
+    "LIBRA_STORAGE_ACCESS_KEY",
+    "LIBRA_STORAGE_SECRET_KEY",
+    "LIBRA_STORAGE_ALLOW_HTTP",
+    "LIBRA_STORAGE_THRESHOLD",
+    "LIBRA_STORAGE_CACHE_SIZE",
+];
+
+/// Typed configuration-schema diagnostic. The historical type name and
+/// version fields remain stable; role/ledger/reason distinguish policy cases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalConfigSchemaFuture {
+    pub db_path: PathBuf,
+    pub current_version: i64,
+    pub latest_version: Option<i64>,
+    pub issue: schema::ConfigurationSchemaIssue,
+}
+
+impl GlobalConfigSchemaFuture {
+    pub fn latest_supported_display(&self) -> String {
+        self.latest_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    pub fn binary_path_display() -> String {
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|err| format!("unknown ({err})"))
+    }
+
+    pub fn diagnostic_message(&self, action: &str) -> String {
+        format!(
+            "{} config database {}; ledger: {}; binary: {}; version: {}; config database: {}; config schema version: {}; latest supported schema version: {}; {action}; update with: {INSTALL_NEWER_LIBRA_COMMAND}",
+            self.scope_name(),
+            self.issue.reason(),
+            self.issue.ledger.table_name(),
+            Self::binary_path_display(),
+            env!("LIBRA_PKG_VERSION"),
+            self.db_path.display(),
+            self.current_version,
+            self.latest_supported_display(),
+        )
+    }
+
+    pub fn scope_name(&self) -> &'static str {
+        match self.issue.role {
+            DatabaseRole::GlobalConfig => "global",
+            DatabaseRole::SystemConfig => "system",
+            DatabaseRole::Repository => "repository",
+            DatabaseRole::Derived => "derived",
+            DatabaseRole::Capture => "capture",
+        }
+    }
+}
+
+impl std::fmt::Display for GlobalConfigSchemaFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} config database '{}' {} (ledger: {}, version: {}, latest supported: {})",
+            self.scope_name(),
+            self.db_path.display(),
+            self.issue.reason(),
+            self.issue.ledger.table_name(),
+            self.current_version,
+            self.latest_supported_display()
+        )
+    }
+}
+
+/// Report a storage-configuration degrade (the backend fell back to local
+/// storage). Text output keeps the historical `Warning: ...` stderr line
+/// byte-for-byte and does not trip `--exit-code-on-warning`. A structured
+/// (`--json`/`--machine`) invocation must keep stderr a single JSON document,
+/// so the message joins the invocation's warning buffer instead, the same
+/// channel [`crate::utils::error::emit_warning`] uses for the global
+/// future-schema degrade.
+fn emit_storage_degrade_warning(message: String) {
+    if crate::utils::output::structured_output_active() {
+        crate::utils::output::record_warning_message(message);
+    } else {
+        eprintln!("Warning: {message}");
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StorageConfigResolutionError {
+    GlobalSchemaFuture(GlobalConfigSchemaFuture),
+    /// The repository scope has no value, and the global config store exists
+    /// but cannot be read. Object storage stays local so an unreadable global
+    /// store does not block reads of existing objects. A stored value that
+    /// cannot be decrypted is `Other` and stays fail-closed. The command's own
+    /// config read still fails.
+    GlobalStoreUnreadable(String),
+    Other(String),
+}
+
+impl std::fmt::Display for StorageConfigResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GlobalSchemaFuture(future) => future.fmt(f),
+            Self::GlobalStoreUnreadable(message) | Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+/// Confirmed object-storage configuration failure.
+///
+/// Only the variable name is retained. `Debug`, `Display`, and
+/// [`std::error::Error::source`] cannot reveal the configured value or the
+/// underlying database error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct StorageConfigFailure {
+    variable: &'static str,
+}
+
+impl StorageConfigFailure {
+    /// Variable whose value could not be used. This is a name, not a value.
+    pub fn variable(self) -> &'static str {
+        self.variable
+    }
+}
+
+impl std::fmt::Debug for StorageConfigFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfigFailure")
+            .field("variable", &self.variable)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for StorageConfigFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to read storage configuration for {}",
+            self.variable
+        )
+    }
+}
+
+impl std::error::Error for StorageConfigFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+enum StorageOpenError {
+    Config(StorageConfigFailure),
+    Io(io::Error),
+}
+
+impl From<StorageConfigFailure> for StorageOpenError {
+    fn from(failure: StorageConfigFailure) -> Self {
+        Self::Config(failure)
+    }
+}
+
+impl From<io::Error> for StorageOpenError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+fn require_storage_setting(name: &'static str) -> Result<Option<String>, StorageConfigFailure> {
+    match resolve_env_sync_typed(name) {
+        Ok(value) => Ok(value),
+        Err(_) => Err(StorageConfigFailure { variable: name }),
+    }
+}
+
+/// Warn once per invocation about unsupported Global/System metadata when
+/// the command may continue in a local/offline or config-irrelevant mode.
+pub fn emit_global_config_schema_future_warning(future: &GlobalConfigSchemaFuture, action: &str) {
+    if GLOBAL_CONFIG_SCHEMA_FUTURE_WARNING_EMITTED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        crate::utils::error::emit_warning(future.diagnostic_message(action));
+    }
+}
+
+pub fn reset_global_config_schema_future_warning_for_invocation() {
+    GLOBAL_CONFIG_SCHEMA_FUTURE_WARNING_EMITTED.store(false, Ordering::Relaxed);
+}
+
+/// Whether resolving the storage config for this process could fall through
+/// to the global config DB. Used by the P0-12 dispatch guard to decide if a
+/// remote-facing command must fail closed on a future-schema global store.
+///
+/// Fail-closed bias: an error while reading the process/repo-local scopes
+/// means we cannot PROVE resolution stops before the global scope, so this
+/// answers `true` (the guard errs on the side of failing the remote command
+/// closed) instead of letting an unreadable local store silently bypass the
+/// guard and degrade to local storage.
+pub async fn storage_config_resolution_may_read_global_config() -> bool {
+    let storage_type = match resolve_env_for_storage_init_without_global("LIBRA_STORAGE_TYPE").await
+    {
+        Ok(Some(storage_type)) => storage_type,
+        Ok(None) => return true,
+        Err(_) => return true,
+    };
+    match storage_type.as_str() {
+        "s3" | "r2" => {
+            for name in REMOTE_STORAGE_ENV_KEYS_AFTER_TYPE {
+                match resolve_env_for_storage_init_without_global(name).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return true,
+                    Err(_) => return true,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// See [`storage_config_resolution_may_read_global_config`] — same
+/// fail-closed bias on local-scope read errors.
+pub async fn env_resolution_may_read_global_config(names: &[&str]) -> bool {
+    for name in names {
+        match resolve_env_for_storage_init_without_global(name).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return true,
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// The resolved tiered-storage / LRU-cache tunables (lore.md §0.10). Exposes the
+/// existing `LIBRA_STORAGE_*` knobs for inspection via `libra cache info`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheConfig {
+    /// The RAW `LIBRA_STORAGE_TYPE` value (`local` only when unset), e.g.
+    /// `s3`/`r2`. Not normalized — a wrong-case `R2` is reported verbatim (and
+    /// `tiered` is false), matching how the backend interprets it.
+    pub storage_type: String,
+    /// Whether the static config selects a durable tier: a case-sensitive
+    /// `s3`/`r2` `storage_type` that also passes every static fallback check the
+    /// backend applies before connecting (non-empty bucket, parseable endpoint
+    /// URL, non-empty access/secret key). The cache tunables only take effect
+    /// when tiered. NB: an actual connection additionally requires valid
+    /// credentials, which this static report does not validate.
+    pub tiered: bool,
+    /// Small/large object threshold in bytes (`LIBRA_STORAGE_THRESHOLD`).
+    pub threshold_bytes: usize,
+    /// Local LRU disk budget in bytes (`LIBRA_STORAGE_CACHE_SIZE`).
+    pub cache_size_bytes: usize,
+}
+
+/// Resolve the cache/storage tunables from the environment and then the global
+/// config database. An unparseable numeric value falls back to the default.
+/// `libra cache info` uses this static report. It does not open a writable
+/// object backend: a wrong-case type, an empty key, or a bad endpoint reports
+/// `tiered=false`, while `ClientStorage::init` rejects those confirmed settings.
+///
+/// # Errors
+/// Propagates a config-resolution failure (e.g. an unreadable global config DB).
+/// Static checks short-circuit to `false` at the first empty bucket, unparseable
+/// endpoint, or empty access or secret key. `REGION` and `ALLOW_HTTP` do not
+/// gate the report, but a resolution error on either still fails the report.
+fn tiered_static_checks_pass() -> Result<bool, String> {
+    if resolve_env_sync("LIBRA_STORAGE_BUCKET")?.is_some_and(|bucket| bucket.is_empty()) {
+        return Ok(false);
+    }
+    if let Some(endpoint) = resolve_env_sync("LIBRA_STORAGE_ENDPOINT")?
+        && url::Url::parse(&endpoint).is_err()
+    {
+        return Ok(false);
+    }
+    let _region = resolve_env_sync("LIBRA_STORAGE_REGION")?;
+    if resolve_env_sync("LIBRA_STORAGE_ACCESS_KEY")?.is_some_and(|key| key.is_empty()) {
+        return Ok(false);
+    }
+    if resolve_env_sync("LIBRA_STORAGE_SECRET_KEY")?.is_some_and(|secret| secret.is_empty()) {
+        return Ok(false);
+    }
+    let _allow_http = resolve_env_sync("LIBRA_STORAGE_ALLOW_HTTP")?;
+    Ok(true)
+}
+
+pub fn resolve_cache_config() -> Result<CacheConfig, String> {
+    let (storage_type, mut tiered) = match resolve_env_sync("LIBRA_STORAGE_TYPE")? {
+        // Raw, case-sensitive match. A value other than `s3` or `r2`
+        // (for example `R2` or `" r2 "`) reports non-tiered.
+        Some(raw) => {
+            let tiered = matches!(raw.as_str(), "s3" | "r2");
+            (raw, tiered)
+        }
+        None => ("local".to_string(), false),
+    };
+    // Mirror every static pre-connection fallback the backend applies, in the
+    // SAME order, so `tiered` is never over-reported. (An actual connection
+    // additionally needs valid credentials, which a static report cannot verify.)
+    if tiered {
+        tiered = tiered_static_checks_pass()?;
+    }
+
+    // Raw `.parse()` (no trim) mirrors the backend exactly: an unparseable value
+    // like `" 2048 "` falls back to the default, just as the backend applies it.
+    let threshold_bytes = match resolve_env_sync("LIBRA_STORAGE_THRESHOLD")? {
+        Some(raw) => raw.parse().unwrap_or(DEFAULT_STORAGE_THRESHOLD_BYTES),
+        None => DEFAULT_STORAGE_THRESHOLD_BYTES,
+    };
+    let cache_size_bytes = match resolve_env_sync("LIBRA_STORAGE_CACHE_SIZE")? {
+        Some(raw) => raw.parse().unwrap_or(DEFAULT_CACHE_SIZE_BYTES),
+        None => DEFAULT_CACHE_SIZE_BYTES,
+    };
+
+    Ok(CacheConfig {
+        storage_type,
+        tiered,
+        threshold_bytes,
+        cache_size_bytes,
+    })
+}
+
+impl ClientStorage {
+    fn ready(storage: Arc<dyn Storage>, base_path: PathBuf) -> Self {
+        Self {
+            held: HeldStorage::Ready(storage),
+            base_path,
+        }
+    }
+
+    fn rejected(base_path: PathBuf, variable: &'static str) -> Self {
+        Self {
+            held: HeldStorage::Rejected(variable),
+            base_path,
+        }
+    }
+
+    pub fn configuration_variable(&self) -> Option<&'static str> {
+        match self.held {
+            HeldStorage::Rejected(variable) => Some(variable),
+            HeldStorage::Ready(_) => None,
+        }
+    }
+
+    fn ready_storage(&self) -> Result<Arc<dyn Storage>, GitError> {
+        match &self.held {
+            HeldStorage::Ready(storage) => Ok(Arc::clone(storage)),
+            HeldStorage::Rejected(variable) => Err(storage_config_git_error(variable)),
+        }
+    }
+
+    /// Evict verified-durable large objects until under budget (lore.md
+    /// 2.9). `Ok(None)` when the backing store is not tiered.
+    pub async fn evict_local(
+        &self,
+        request: crate::utils::storage::EvictRequest,
+    ) -> Result<Option<crate::utils::storage::EvictReport>, git_internal::errors::GitError> {
+        self.ready_storage()?.evict_local(request).await
+    }
+
+    pub fn base_path(&self) -> &PathBuf {
+        &self.base_path
+    }
+
+    /// Construct a `ClientStorage` rooted at `base_path` (typically `.libra/objects`).
+    ///
+    /// Functional scope:
+    /// - Uses [`Self::open_init_storage`]. Unset type and `local` stay on a
+    ///   local backend. A confirmed remote or unsupported type that cannot be
+    ///   completed does not construct `LocalStorage`.
+    ///
+    /// Boundary conditions:
+    /// - Does not panic on misconfiguration. Confirmed failures name only the
+    ///   setting. An unreadable repository database does not construct
+    ///   `LocalStorage`. An unreadable global store still uses the historical
+    ///   local backend. A failed decryption of a stored type stays fail-closed.
+    pub fn try_init(base_path: PathBuf) -> io::Result<ClientStorage> {
+        match Self::open_init_storage_inner(base_path.clone()) {
+            Ok(storage) => Ok(storage),
+            Err(StorageOpenError::Config(failure)) => {
+                Ok(Self::rejected(base_path, failure.variable()))
+            }
+            Err(StorageOpenError::Io(error)) => Err(error),
+        }
+    }
+
+    /// Construct a strictly **local** `ClientStorage` rooted at `base_path`,
+    /// ignoring `LIBRA_STORAGE_TYPE` and any cloud configuration.
+    ///
+    /// Use this when reading a *foreign* object store (for example another
+    /// repository's `objects` directory): the tiered backend would otherwise
+    /// fall back to the configured remote on a miss and could write fetched
+    /// objects back into that foreign directory using cloud credentials.
+    pub fn try_init_local(base_path: PathBuf) -> io::Result<ClientStorage> {
+        let storage = Arc::new(LocalStorage::try_new(base_path.clone())?);
+        Ok(Self::ready(storage, base_path))
+    }
+
+    /// Construct a local backend without touching the filesystem.
+    ///
+    /// Historical import uses this after consent: all repository object I/O
+    /// is delegated to deadline-bound helpers, so even object-directory
+    /// creation must not occur synchronously on the foreground thread.
+    pub fn init_local_existing(base_path: PathBuf) -> ClientStorage {
+        let storage = Arc::new(LocalStorage::open_no_create(base_path.clone()));
+        Self::ready(storage, base_path)
+    }
+
+    /// Local-only reader that still resolves `objects/info/alternates` and
+    /// never creates directories. Used by the WIO-03 object-read worker so a
+    /// hung/missing objects root cannot mutate the tree or panic.
+    pub fn init_local_existing_with_alternates(base_path: PathBuf) -> ClientStorage {
+        let storage = Arc::new(LocalStorage::open_no_create_with_alternates(
+            base_path.clone(),
+        ));
+        Self::ready(storage, base_path)
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn from_test_storage(storage: Arc<dyn Storage>, base_path: PathBuf) -> Self {
+        Self::ready(storage, base_path)
+    }
+
+    /// Report a degrade warning (a `Warning:` stderr line in text output, the
+    /// invocation's warning buffer under `--json`/`--machine`) and degrade to
+    /// `LocalStorage` when a storage env var cannot be resolved. Centralised so
+    /// every fallback reports the same message shape and CLI commands keep
+    /// working when remote storage is broken; in text output the `Warning:`
+    /// prefix marks the recovered, non-fatal nature of the degrade path so
+    /// users do not mistake it for a fatal command failure (e.g. a
+    /// `~/.libra/config.db` whose schema is newer than this binary supports
+    /// still surfaces a chain like "Repository database schema version ... is
+    /// newer than this Libra binary supports", but the clone/init operation
+    /// itself still succeeds via `LocalStorage`).
+    fn storage_config_resolution_fallback(
+        base_path: &Path,
+        name: &str,
+        error: &StorageConfigResolutionError,
+    ) -> io::Result<Arc<dyn Storage>> {
+        if let StorageConfigResolutionError::GlobalSchemaFuture(future) = error {
+            emit_global_config_schema_future_warning(
+                future,
+                "ignoring global storage config and falling back to local storage",
+            );
+            return Ok(Arc::new(LocalStorage::try_new_with_alternates(
+                base_path.to_path_buf(),
+            )?));
+        }
+        emit_storage_degrade_warning(format!(
+            "failed to resolve {}: {}. Falling back to local storage.",
+            name, error
+        ));
+        Ok(Arc::new(LocalStorage::try_new_with_alternates(
+            base_path.to_path_buf(),
+        )?))
+    }
+
+    fn create_storage_backend(base_path: PathBuf) -> io::Result<Arc<dyn Storage>> {
+        Ok(Arc::new(LocalStorage::try_new_with_alternates(base_path)?))
+    }
+
+    /// Open object storage from the current configuration.
+    ///
+    /// Confirmed remote settings that cannot be completed return
+    /// [`StorageConfigFailure`] and do not build `LocalStorage`. A readable
+    /// unset type, a future global schema, and an unreadable global store stay
+    /// on the historical local result. An unreadable repository database, or a
+    /// stored type that cannot be decrypted, is [`StorageConfigFailure`].
+    pub fn resolve_configured_storage(
+        base_path: PathBuf,
+    ) -> Result<ClientStorage, StorageConfigFailure> {
+        match Self::open_after_type_read(base_path, read_storage_type()) {
+            Ok(storage) => Ok(storage),
+            Err(StorageOpenError::Config(failure)) => Err(failure),
+            Err(StorageOpenError::Io(_)) => Err(StorageConfigFailure {
+                variable: "objects",
+            }),
+        }
+    }
+
+    /// Open storage for `init` and the legacy `Arc<dyn Storage>` callers.
+    ///
+    /// `LIBRA_STORAGE_TYPE=local` keeps the historical warning and a writable
+    /// local backend. An unread type other than a future global schema, and
+    /// every other confirmed failure, is [`StorageConfigFailure`].
+    pub fn open_init_storage(base_path: PathBuf) -> Result<ClientStorage, StorageConfigFailure> {
+        match Self::open_init_storage_inner(base_path) {
+            Ok(storage) => Ok(storage),
+            Err(StorageOpenError::Config(failure)) => Err(failure),
+            Err(StorageOpenError::Io(_)) => Err(StorageConfigFailure {
+                variable: "objects",
+            }),
+        }
+    }
+
+    fn open_init_storage_inner(base_path: PathBuf) -> Result<ClientStorage, StorageOpenError> {
+        let type_read = read_storage_type();
+        if let Ok(Some(value)) = &type_read
+            && value == "local"
+        {
+            return Self::historical_local_word(base_path).map_err(StorageOpenError::Io);
+        }
+        Self::open_after_type_read(base_path, type_read)
+    }
+
+    fn open_after_type_read(
+        base_path: PathBuf,
+        type_read: Result<Option<String>, StorageConfigResolutionError>,
+    ) -> Result<ClientStorage, StorageOpenError> {
+        let storage_type = match type_read {
+            Ok(Some(storage_type)) => storage_type,
+            Ok(None) => {
+                return Self::local_configured_client(base_path).map_err(StorageOpenError::Io);
+            }
+            Err(error) => {
+                if matches!(
+                    error,
+                    StorageConfigResolutionError::GlobalSchemaFuture(_)
+                        | StorageConfigResolutionError::GlobalStoreUnreadable(_)
+                ) {
+                    let storage = Self::storage_config_resolution_fallback(
+                        &base_path,
+                        "LIBRA_STORAGE_TYPE",
+                        &error,
+                    )?;
+                    return Ok(Self::ready(storage, base_path));
+                }
+                // A repository database that cannot be read, or a resolver that
+                // does not return, cannot tell local from remote. Do not build a
+                // writable backend or keep the underlying error text.
+                return Err(StorageOpenError::Config(StorageConfigFailure {
+                    variable: "LIBRA_STORAGE_TYPE",
+                }));
+            }
+        };
+        if storage_type != "s3" && storage_type != "r2" {
+            return Err(StorageOpenError::Config(StorageConfigFailure {
+                variable: "LIBRA_STORAGE_TYPE",
+            }));
+        }
+
+        let bucket = match require_storage_setting("LIBRA_STORAGE_BUCKET")? {
+            Some(bucket) if !bucket.is_empty() => bucket,
+            Some(_) => {
+                return Err(StorageOpenError::Config(StorageConfigFailure {
+                    variable: "LIBRA_STORAGE_BUCKET",
+                }));
+            }
+            None => "libra".to_string(),
+        };
+        let endpoint = require_storage_setting("LIBRA_STORAGE_ENDPOINT")?;
+        if let Some(endpoint) = endpoint.as_deref()
+            && url::Url::parse(endpoint).is_err()
+        {
+            return Err(StorageOpenError::Config(StorageConfigFailure {
+                variable: "LIBRA_STORAGE_ENDPOINT",
+            }));
+        }
+        let region = require_storage_setting("LIBRA_STORAGE_REGION")?;
+        let key = require_storage_setting("LIBRA_STORAGE_ACCESS_KEY")?;
+        if let Some(key) = key.as_deref()
+            && key.is_empty()
+        {
+            return Err(StorageOpenError::Config(StorageConfigFailure {
+                variable: "LIBRA_STORAGE_ACCESS_KEY",
+            }));
+        }
+        let secret = require_storage_setting("LIBRA_STORAGE_SECRET_KEY")?;
+        if let Some(secret) = secret.as_deref()
+            && secret.is_empty()
+        {
+            return Err(StorageOpenError::Config(StorageConfigFailure {
+                variable: "LIBRA_STORAGE_SECRET_KEY",
+            }));
+        }
+        let allow_http = require_storage_setting("LIBRA_STORAGE_ALLOW_HTTP")?;
+        let threshold = match require_storage_setting("LIBRA_STORAGE_THRESHOLD")? {
+            Some(raw) => raw.parse().unwrap_or(DEFAULT_STORAGE_THRESHOLD_BYTES),
+            None => DEFAULT_STORAGE_THRESHOLD_BYTES,
+        };
+        let disk_cache_limit_bytes = match require_storage_setting("LIBRA_STORAGE_CACHE_SIZE")? {
+            Some(raw) => raw.parse().unwrap_or(DEFAULT_CACHE_SIZE_BYTES),
+            None => DEFAULT_CACHE_SIZE_BYTES,
+        };
+
+        let mut builder = object_store::aws::AmazonS3Builder::new().with_bucket_name(&bucket);
+        builder = builder.with_retry(object_store::RetryConfig {
+            backoff: object_store::BackoffConfig {
+                init_backoff: Duration::from_millis(200),
+                max_backoff: Duration::from_secs(10),
+                base: 2.0,
+            },
+            max_retries: 5,
+            retry_timeout: Duration::from_secs(60),
+        });
+        if let Some(endpoint) = endpoint {
+            builder = builder.with_endpoint(endpoint);
+        }
+        if let Some(region) = region {
+            builder = builder.with_region(region);
+        }
+        if let Some(key) = key {
+            builder = builder.with_access_key_id(key);
+        }
+        if let Some(secret) = secret {
+            builder = builder.with_secret_access_key(secret);
+        }
+        if allow_http.as_deref() == Some("true") {
+            builder = builder.with_allow_http(true);
+        }
+        let object_store: Arc<dyn object_store::ObjectStore> = match builder.build() {
+            Ok(store) => Arc::new(store),
+            Err(_) => {
+                return Err(StorageOpenError::Config(StorageConfigFailure {
+                    variable: "LIBRA_STORAGE_TYPE",
+                }));
+            }
+        };
+        let prefix = repo_id_prefix_for_configured_remote()?;
+        let remote = match prefix {
+            Some(repo_id) => RemoteStorage::new_with_prefix(object_store, repo_id),
+            None => RemoteStorage::new(object_store),
+        };
+        let local = LocalStorage::try_new_with_alternates(base_path.clone())?;
+        Ok(Self::ready(
+            Arc::new(TieredStorage::new(
+                local,
+                remote,
+                threshold,
+                disk_cache_limit_bytes,
+            )),
+            base_path,
+        ))
+    }
+
+    /// `LIBRA_STORAGE_TYPE=local` follows the historical bucket check, then
+    /// the unsupported-type warning. The word `local` is not a secret.
+    fn historical_local_word(base_path: PathBuf) -> io::Result<ClientStorage> {
+        let bucket = match resolve_env_sync_typed("LIBRA_STORAGE_BUCKET") {
+            Ok(Some(bucket)) => bucket,
+            Ok(None) => "libra".to_string(),
+            Err(error) => {
+                let storage = Self::storage_config_resolution_fallback(
+                    &base_path,
+                    "LIBRA_STORAGE_BUCKET",
+                    &error,
+                )?;
+                return Ok(Self::ready(storage, base_path));
+            }
+        };
+        if bucket.is_empty() {
+            emit_storage_degrade_warning(
+                "LIBRA_STORAGE_BUCKET cannot be empty. Falling back to local storage.".to_string(),
+            );
+            return Self::local_configured_client(base_path);
+        }
+        emit_storage_degrade_warning(
+            "Unsupported storage type: local. Falling back to local storage.".to_string(),
+        );
+        Self::local_configured_client(base_path)
+    }
+
+    fn local_configured_client(base_path: PathBuf) -> io::Result<ClientStorage> {
+        let storage = Self::create_storage_backend(base_path.clone())?;
+        Ok(Self::ready(storage, base_path))
+    }
+
+    /// Helper to execute async task on dedicated runtime and block waiting for result.
+    ///
+    /// Functional scope:
+    /// - Spawns `future` on the private [`RUNTIME`] and blocks the calling thread on
+    ///   an `mpsc::channel` until the result is delivered.
+    ///
+    /// Boundary conditions:
+    /// - Panics if the runtime drops the future before sending a result (e.g. runtime
+    ///   shutdown) — this indicates a programmer error since RUNTIME is a `Lazy`
+    ///   static and should outlive the process.
+    /// - Safe to call from inside another tokio runtime: the work runs on RUNTIME, not
+    ///   the caller's runtime, so nested-runtime panics are avoided.
+    fn block_on_storage<F, T>(&self, future: F) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        RUNTIME.spawn(async move {
+            let res = future.await;
+            let _ = tx.send(res);
+        });
+        // INVARIANT: the spawned task above always either returns or panics
+        // before exiting. recv() therefore only returns Err if the spawned
+        // task panicked (sender dropped before sending). The function's doc
+        // comment already documents this as a programmer error since
+        // RUNTIME is a `Lazy` static that outlives the process.
+        rx.recv()
+            .expect("ClientStorage storage-runtime task panicked before sending result")
+    }
+
+    /// Wait for all background tasks (e.g. indexing) to complete.
+    ///
+    /// Functional scope:
+    /// - Polls `PENDING_TASKS` every 100 ms until it reaches zero; logs a progress
+    ///   line every 5 s so a stuck index update is visible to the user.
+    ///
+    /// Boundary conditions:
+    /// - Has no upper time bound. If the consumer is wedged the call blocks forever;
+    ///   in practice the only path that can wedge is a SQLite lock contention bug,
+    ///   which the consumer's panic catcher and short busy timeouts already mitigate.
+    /// - Called by the top-level CLI dispatcher just before process exit so queued
+    ///   index updates are not killed mid-write.
+    pub fn wait_for_background_tasks() {
+        // Wait until all tasks finish
+        let mut waited = 0;
+        loop {
+            let pending = PENDING_TASKS.load(Ordering::Acquire);
+            if pending == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 100;
+            if waited >= 5000 {
+                tracing::info!("Waiting for {} background tasks to complete...", pending);
+                waited = 0;
+            }
+        }
+    }
+
+    /// Asynchronously wait for the object-index queue without allowing a
+    /// foreground operation to block forever behind a wedged consumer.
+    pub async fn wait_for_background_tasks_until(deadline: Instant) -> bool {
+        let pending_counter = current_index_pending_counter();
+        loop {
+            if pending_counter.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            tokio::time::sleep(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(25)),
+            )
+            .await;
+        }
+    }
+
+    /// Start invocation-local attribution for subsequently enqueued index work.
+    /// The CLI serializes invocations, while each queued message retains this
+    /// counter independently if it outlives the foreground drain budget.
+    pub fn begin_background_index_failure_scope() -> BackgroundIndexFailureScope {
+        BackgroundIndexFailureScope {
+            scope: current_index_work_scope(),
+        }
+    }
+
+    /// Open an object-index publication batch (ADR-OI-04 item 1): while a
+    /// batch is active, `put`/`ensure_existing_object_index` accumulate their
+    /// markers instead of publishing per object; `end_object_index_batch`
+    /// publishes up to 256 markers per generation lock and then enqueues the
+    /// messages. Nested calls are depth-counted.
+    pub fn begin_object_index_batch(&self) {
+        if self.configuration_variable().is_some() {
+            return;
+        }
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            with_object_index_batch_state(&key, |state| {
+                state.depth = state.depth.saturating_add(1)
+            });
+        }
+    }
+
+    /// Close the innermost publication batch; at depth 0 everything
+    /// accumulated is published and enqueued (ADR-OI-04 item 1).
+    pub fn end_object_index_batch(&self) -> io::Result<()> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_io_error(variable));
+        }
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            let done = with_object_index_batch_state(&key, |state| {
+                state.depth = state.depth.saturating_sub(1);
+                state.depth == 0
+            });
+            if done {
+                return flush_pending_object_index_batch(&key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Discard the innermost publication batch without publishing. Used on
+    /// error paths: nothing was enqueued, so nothing durable is lost; the
+    /// stored payloads stay in place and a retry re-registers them via
+    /// [`Self::ensure_existing_object_index`].
+    pub fn abort_object_index_batch(&self) {
+        if self.configuration_variable().is_some() {
+            return;
+        }
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            with_object_index_batch_state(&key, |state| {
+                state.depth = state.depth.saturating_sub(1);
+                if state.depth == 0 {
+                    state.pending.clear();
+                }
+            });
+        }
+    }
+
+    /// Publish accumulated markers without closing the batch. Called right
+    /// before an index write so durable markers never lag behind index
+    /// content (ADR-OI-04 item 3).
+    pub fn flush_object_index_batch(&self) -> io::Result<()> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_io_error(variable));
+        }
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            return flush_pending_object_index_batch(&key);
+        }
+        Ok(())
+    }
+
+    /// Number of markers currently accumulated for this storage's repository
+    /// (ADR-OI-05 item 3: reported as `stored_objects` in the error envelope
+    /// when a batch flush fails).
+    pub fn pending_object_index_batch_count(&self) -> usize {
+        if let Some(key) = Self::index_db_path_from_base(&self.base_path) {
+            return with_object_index_batch_state(&key, |state| state.pending.len());
+        }
+        0
+    }
+
+    /// Run one top-level embedded CLI invocation with isolated background
+    /// index failure and pending-work attribution. Tokio task locals do not
+    /// leak into concurrent direct storage callers or independently spawned
+    /// tasks, unlike a process-global "active invocation" slot.
+    pub async fn with_background_index_failure_scope<F>(future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        ACTIVE_INDEX_WORK_SCOPE
+            .scope(IndexWorkScope::new(), future)
+            .await
+    }
+
+    /// Spawn command-owned work that may enqueue object-index updates.
+    ///
+    /// Tokio task-local state is not inherited by `tokio::spawn`. Registering
+    /// the producer before spawning prevents the foreground drain from seeing
+    /// a transient zero, and re-entering the captured scope keeps both pending
+    /// work and terminal failures attributed to the command that created it.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by the cfg(test) spawn-scope unit test
+    pub fn spawn_background_index_work<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let scope = current_index_work_scope();
+        let pending_guard = register_pending_index_work(&scope);
+        tokio::spawn(async move {
+            let _pending_guard = pending_guard;
+            ACTIVE_INDEX_WORK_SCOPE.scope(scope, future).await
+        })
+    }
+
+    /// Counter for terminal background index errors attributed to the active
+    /// top-level CLI invocation (or the process-wide fallback for direct
+    /// library callers). Queued messages retain the counter that was active
+    /// when they were created.
+    pub fn background_index_failure_count() -> usize {
+        current_index_failure_counter().load(Ordering::SeqCst)
+    }
+
+    /// Replay durable object-index updates left by terminal background failures.
+    ///
+    /// Schema-aware CLI preflight calls this before every ordinary repository
+    /// command. `cloud sync` treats an error as fatal so it cannot upload from an
+    /// incomplete catalogue; other commands may continue after a recorded warning.
+    pub async fn repair_pending_object_index_updates(
+        db_path: &Path,
+    ) -> Result<ObjectIndexRepairOutcome, String> {
+        Self::repair_pending_object_index_updates_with_lock_policy(db_path, false)
+            .await
+            .map(|page| page.expect("the blocking variant always replays instead of skipping"))
+    }
+
+    /// Like [`Self::repair_pending_object_index_updates`], but skip the replay
+    /// entirely (without waiting and without an error) when the generation
+    /// lock is busy: read-only preflight commands must not serialize behind a
+    /// batch writer (ADR-OI-03 item 2 / M-WAIT W5). Returns `Ok(None)` for a
+    /// skipped replay, `Ok(Some(outcome))` for a completed one.
+    pub async fn repair_pending_object_index_updates_if_uncontended(
+        db_path: &Path,
+    ) -> Result<Option<ObjectIndexRepairOutcome>, String> {
+        Self::repair_pending_object_index_updates_with_lock_policy(db_path, true).await
+    }
+
+    async fn repair_pending_object_index_updates_with_lock_policy(
+        db_path: &Path,
+        skip_when_busy: bool,
+    ) -> Result<Option<ObjectIndexRepairOutcome>, String> {
+        let db_path = db_path.to_path_buf();
+        let db_path_str = db_path.to_str().ok_or_else(|| {
+            format!(
+                "database path is not valid UTF-8 for object index repair: {}",
+                db_path.display()
+            )
+        })?;
+        let db_conn =
+            establish_connection_with_lock_timeout(db_path_str, Duration::from_millis(200))
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to connect to object index database {} for repair: {error}",
+                        db_path.display()
+                    )
+                })?;
+        let expected_oid_len = expected_index_repair_oid_len(&db_conn).await?;
+        let load_path = db_path.clone();
+        let page = tokio::task::spawn_blocking(move || {
+            let generation_lock = if skip_when_busy {
+                let Some(lock) = try_acquire_index_repair_lock_file(
+                    &index_repair_generation_lock_path(&load_path)?,
+                    "replay",
+                )?
+                else {
+                    return Ok(None);
+                };
+                lock
+            } else {
+                acquire_index_repair_generation_lock(&load_path, "replay")?
+            };
+            load_pending_object_index_updates(&load_path, expected_oid_len, generation_lock)
+                .map(Some)
+        })
+        .await
+        .map_err(|error| format!("object-index repair marker reader failed: {error}"))?
+        .map_err(|error| format!("failed to read object-index repair markers: {error}"))?;
+        let Some(page) = page else {
+            // Generation lock busy: this replay was deliberately skipped.
+            return Ok(None);
+        };
+        apply_pending_object_index_page(&db_conn, &db_path, page)
+            .await
+            .map(Some)
+    }
+
+    /// Read a Git object's *raw payload* by its hash.
+    ///
+    /// Functional scope:
+    /// - Returns the object content only; the `ObjectType` is dropped here. Use
+    ///   [`Self::get_object_type`] when the type is needed.
+    ///
+    /// Boundary conditions:
+    /// - Returns `GitError::ObjectNotFound` when neither local cache nor remote
+    ///   bucket holds the object.
+    /// - Blocks the calling thread on the storage runtime; safe to call from sync or
+    ///   async contexts.
+    pub fn get(&self, object_id: &ObjectHash) -> Result<Vec<u8>, GitError> {
+        self.get_typed(object_id).map(|(data, _)| data)
+    }
+
+    pub fn get_typed(&self, object_id: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *object_id;
+        self.block_on_storage(async move { storage.get(&hash).await })
+    }
+
+    /// Read a typed object with a strict load bound, including the durable
+    /// tier when read policy allows it. This is for fetch protocol inspection;
+    /// preview's `get_with_limit` remains local-only.
+    pub fn get_typed_with_limit(
+        &self,
+        object_id: &ObjectHash,
+        limit: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *object_id;
+        self.block_on_storage(async move { storage.get_typed_bounded(&hash, limit).await })
+    }
+
+    /// Read raw commit objects concurrently and retain only their parent IDs.
+    /// The operation does not resolve replacement refs. Distinct IDs are read
+    /// once, and remote reads honor the configured connection limit.
+    pub fn commit_parents_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, Vec<ObjectHash>>, GitError> {
+        const MAX_COMMIT_BYTES: u64 = 4 * 1024 * 1024;
+        const MAX_TOTAL_COMMIT_BYTES: u64 = 64 * 1024 * 1024;
+        const MAX_TOTAL_PARENTS: usize = 262_144;
+        self.commit_parents_many_with_limits(
+            hashes,
+            MAX_COMMIT_BYTES,
+            MAX_TOTAL_COMMIT_BYTES,
+            MAX_TOTAL_PARENTS,
+        )
+    }
+
+    fn commit_parents_many_with_limits(
+        &self,
+        hashes: &[ObjectHash],
+        max_commit_bytes: u64,
+        max_total_commit_bytes: u64,
+        max_total_parents: usize,
+    ) -> Result<HashMap<ObjectHash, Vec<ObjectHash>>, GitError> {
+        let unique: HashSet<ObjectHash> = hashes.iter().copied().collect();
+        let storage = self.ready_storage()?;
+        let max_in_flight = crate::utils::resource_limits::max_connections().min(16);
+        self.block_on_storage(async move {
+            let mut remaining: VecDeque<_> = unique.into_iter().collect();
+            let mut commits = HashMap::new();
+            let mut total_parents = 0usize;
+            let mut total_bytes = 0u64;
+            while !remaining.is_empty() {
+                let available = max_total_commit_bytes - total_bytes;
+                if available == 0 {
+                    return Err(GitError::InvalidObjectInfo(format!(
+                        "advertised shallow commits exceed {max_total_commit_bytes} bytes; fetch fewer refs or ask the remote owner to reduce shallow boundaries"
+                    )));
+                }
+                let (slots, per_commit_limit) = crate::utils::storage::bounded_read_batch_shape(
+                    available,
+                    max_commit_bytes,
+                    max_in_flight,
+                );
+                let batch: Vec<_> = (0..slots).filter_map(|_| remaining.pop_front()).collect();
+                let reads: Vec<(ObjectHash, Vec<ObjectHash>, u64)> = stream::iter(batch)
+                    .map(|hash| {
+                        let storage = storage.clone();
+                        async move {
+                            let (data, object_type) = storage
+                                .get_commit_bounded(&hash, per_commit_limit)
+                                .await
+                                .map_err(|error| {
+                                    crate::utils::storage::checked_read_error(&hash, error)
+                                })?;
+                            if object_type != ObjectType::Commit {
+                                return Err(GitError::InvalidObjectInfo(format!(
+                                    "advertised shallow boundary {hash} is {object_type}, expected a commit"
+                                )));
+                            }
+                            let len = u64::try_from(data.len()).map_err(|error| {
+                                GitError::InvalidObjectInfo(format!(
+                                    "commit object {hash} is too large to inspect: {error}"
+                                ))
+                            })?;
+                            if len > per_commit_limit {
+                                return Err(GitError::InvalidObjectInfo(format!(
+                                    "commit object {hash} exceeds the remaining {per_commit_limit}-byte shallow boundary budget; fetch fewer refs"
+                                )));
+                            }
+                            let (_, parents) =
+                                parse_commit_header_refs(&data, hash).map_err(|error| {
+                                    crate::utils::storage::checked_read_error(&hash, error)
+                                })?;
+                            Ok((hash, parents, len))
+                        }
+                    })
+                    .buffer_unordered(slots)
+                    .try_collect()
+                    .await?;
+                for (hash, parents, bytes) in reads {
+                    total_parents = total_parents.checked_add(parents.len()).ok_or_else(|| {
+                        GitError::InvalidObjectInfo(
+                            "shallow boundary parent count exceeds this platform".to_string(),
+                        )
+                    })?;
+                    if total_parents > max_total_parents {
+                        return Err(GitError::InvalidObjectInfo(format!(
+                            "advertised shallow commits have more than {max_total_parents} parents; fetch fewer refs or ask the remote owner to reduce shallow boundaries"
+                        )));
+                    }
+                    total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                        GitError::InvalidObjectInfo(
+                            "shallow boundary commit byte count exceeds u64".to_string(),
+                        )
+                    })?;
+                    if total_bytes > max_total_commit_bytes {
+                        return Err(GitError::InvalidObjectInfo(format!(
+                            "advertised shallow commits exceed {max_total_commit_bytes} bytes; fetch fewer refs or ask the remote owner to reduce shallow boundaries"
+                        )));
+                    }
+                    commits.insert(hash, parents);
+                }
+            }
+            Ok(commits)
+        })
+    }
+
+    /// Read an object only when the backend can enforce `limit` before
+    /// materializing its payload.
+    pub fn get_with_limit(&self, object_id: &ObjectHash, limit: u64) -> Result<Vec<u8>, GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *object_id;
+        self.block_on_storage(async move {
+            storage
+                .get_with_limit(&hash, limit)
+                .await
+                .map(|(data, _)| data)
+        })
+    }
+
+    /// Coarsely classify a read failure from [`Self::get`] /
+    /// [`Self::get_with_limit`] for callers that degrade per-object (rename
+    /// detection, previews) instead of failing the whole command.
+    ///
+    /// This lives in the storage layer, next to where the error messages are
+    /// produced (`storage/local.rs`, `storage/load_cost.rs`,
+    /// `storage/tiered.rs`), so the distinguishing details and this mapping
+    /// evolve together; see `classify_read_failure_pins_storage_messages`.
+    pub fn classify_read_failure(err: &GitError) -> ObjectReadFailure {
+        match err {
+            GitError::ObjectNotFound(detail) => {
+                // tiered.rs: "... the offline/local read policy forbids
+                // fetching it from the durable tier ..."
+                if detail.contains("read policy forbids") {
+                    ObjectReadFailure::Unavailable
+                } else {
+                    ObjectReadFailure::Missing
+                }
+            }
+            GitError::InvalidObjectInfo(detail) => {
+                // local.rs / load_cost.rs bounded reads: "... exceeds preview
+                // limit of {limit} bytes".
+                if detail.contains("exceeds preview limit") {
+                    ObjectReadFailure::TooLarge
+                } else {
+                    ObjectReadFailure::Corrupt
+                }
+            }
+            // A filesystem/transport failure reading the object STORE is an
+            // availability fault, not an unknown one: the object may well
+            // exist and be intact, we just cannot read it right now
+            // (EACCES on a loose file, a dropped tier connection). Routing
+            // it through `Other` would report an object-store problem under
+            // the worktree warning family and send readers to inspect the
+            // wrong subsystem.
+            GitError::IOError(_) | GitError::NetworkError(_) => ObjectReadFailure::Unavailable,
+            _ => ObjectReadFailure::Other,
+        }
+    }
+
+    /// Compute a conservative bounded load cost without materializing its payload.
+    pub fn object_size(&self, object_id: &ObjectHash) -> Result<Option<u64>, GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *object_id;
+        self.block_on_storage(async move { storage.object_size(&hash).await })
+    }
+
+    /// Batch bounded load-cost preflight with one storage-runtime round trip.
+    pub fn object_sizes(&self, object_ids: &[ObjectHash]) -> Result<Vec<Option<u64>>, GitError> {
+        let storage = self.ready_storage()?;
+        let hashes = object_ids.to_vec();
+        self.block_on_storage(async move { storage.object_sizes(&hashes).await })
+    }
+
+    /// Batch bounded load-cost preflight that stops when `aggregate_limit`
+    /// would be exceeded.
+    pub fn object_sizes_with_total_limit(
+        &self,
+        object_ids: &[ObjectHash],
+        aggregate_limit: u64,
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        let storage = self.ready_storage()?;
+        let hashes = object_ids.to_vec();
+        self.block_on_storage(async move {
+            storage
+                .object_sizes_with_total_limit(&hashes, aggregate_limit)
+                .await
+        })
+    }
+
+    /// Query the exact decoded payload length without materializing the object.
+    ///
+    /// Unlike [`Self::object_size`], packed deltas report their reconstructed
+    /// payload length (`result_size`) rather than their conservative memory
+    /// reconstruction budget (`peak_bytes`).
+    pub fn decoded_object_size(&self, object_id: &ObjectHash) -> Result<Option<u64>, GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *object_id;
+        self.block_on_storage(async move { storage.decoded_object_size(&hash).await })
+    }
+
+    /// Batch decoded payload-length lookup in one storage-runtime round trip.
+    pub fn decoded_object_sizes(
+        &self,
+        object_ids: &[ObjectHash],
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        let storage = self.ready_storage()?;
+        let hashes = object_ids.to_vec();
+        self.block_on_storage(async move { storage.decoded_object_sizes(&hashes).await })
+    }
+
+    /// Attempt to repair a missing or corrupted object from the durable tier
+    /// (`libra fsck --heal`, lore.md §0.4).
+    ///
+    /// Returns `Ok(true)` when the object was fetched, verified, and written
+    /// locally; `Ok(false)` when there is no durable tier (local-only backend)
+    /// or the object is absent from it. Never fabricates an object: only a
+    /// payload that verifies against `object_id` is persisted. See
+    /// [`crate::utils::storage::Storage::heal`].
+    pub fn heal(&self, object_id: &ObjectHash) -> Result<bool, GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *object_id;
+        self.block_on_storage(async move { storage.heal(&hash).await })
+    }
+
+    /// Persist a Git object and queue a recoverable background index update.
+    ///
+    /// Functional scope:
+    /// - Writes the object via the configured backend (synchronously, on the storage
+    ///   runtime), records an atomic repair marker, then enqueues an `IndexUpdateMsg`
+    ///   so the cloud-backup object index reflects the new entry.
+    ///
+    /// Boundary conditions:
+    /// - If the bounded channel is full, the message is forwarded to a runtime task
+    ///   that waits for capacity. A closed channel or terminal database error leaves
+    ///   the marker in `<storage>/object-index-repair`; the next schema-aware repo
+    ///   command retries it, and `cloud sync` refuses to proceed while repair fails.
+    /// - Failure to register the marker is returned to the caller before the queue
+    ///   operation, so a completed command can never lose its only repair identity.
+    /// - Returns `io::Error` (instead of `GitError`) so callers using `std::io`
+    ///   abstractions can propagate the error directly.
+    /// - The index update is skipped silently when the database path cannot be
+    ///   resolved (e.g. base_path has no parent), since some test harnesses use
+    ///   non-standard layouts.
+    /// - See: `test_content_store`, `background_index_update_uses_storage_database_instead_of_cwd`.
+    pub fn put(
+        &self,
+        obj_id: &ObjectHash,
+        content: &[u8],
+        obj_type: ObjectType,
+    ) -> Result<String, io::Error> {
+        let storage = match &self.held {
+            HeldStorage::Ready(storage) => Arc::clone(storage),
+            HeldStorage::Rejected(variable) => return Err(storage_config_io_error(variable)),
+        };
+        let hash = *obj_id;
+        let data = content.to_vec();
+        let data_len = data.len();
+        let hash_str = hash.to_string();
+        let type_str = obj_type.to_string();
+
+        // First, store the object
+        let result = self.block_on_storage(async move {
+            storage
+                .put(&hash, &data, obj_type)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))
+        })?;
+
+        self.enqueue_stored_object_index(&hash_str, &type_str, data_len)?;
+
+        Ok(result)
+    }
+
+    /// Register an object that is already present in the configured storage.
+    /// This is the retry path for callers whose payload write succeeded but
+    /// durable marker registration failed. It intentionally avoids rewriting a
+    /// potentially remote payload while still recreating the exact repair work.
+    pub fn ensure_existing_object_index(
+        &self,
+        obj_id: &ObjectHash,
+        content_len: usize,
+        obj_type: ObjectType,
+    ) -> io::Result<()> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_io_error(variable));
+        }
+        match self.exist_checked(obj_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "cannot register object {} in the cloud index because its payload is no longer present",
+                        obj_id
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "failed to read object {obj_id} while registering its index: {error}"
+                )));
+            }
+        }
+        self.enqueue_stored_object_index(&obj_id.to_string(), &obj_type.to_string(), content_len)
+    }
+
+    fn enqueue_stored_object_index(
+        &self,
+        hash_str: &str,
+        type_str: &str,
+        data_len: usize,
+    ) -> io::Result<()> {
+        // Update object index asynchronously (via sequential queue). This keeps
+        // foreground writes nonblocking while the marker makes retry durable.
+        if let Some(db_path) = Self::index_db_path_from_base(&self.base_path)
+            && db_path.exists()
+        {
+            let msg = IndexUpdateMsg {
+                hash: hash_str.to_string(),
+                obj_type: type_str.to_string(),
+                size: data_len as i64,
+                db_path: db_path.clone(),
+                marker_path: None,
+                _marker_lock: None,
+                failure_counter: current_index_failure_counter(),
+                pending_counter: current_index_pending_counter(),
+            };
+            let (batching, single_msg) = with_object_index_batch_state(&db_path, |state| {
+                if state.depth > 0 {
+                    // ADR-OI-04: accumulate, then publish up to 256 markers
+                    // under one generation lock. The batch is flushed by
+                    // `end_object_index_batch` (or automatically once it fills).
+                    state.pending.push(msg);
+                    (state.pending.len() >= INDEX_REPAIR_MARKER_BATCH, None)
+                } else {
+                    (false, Some(msg))
+                }
+            });
+            if batching {
+                flush_pending_object_index_batch(&db_path)?;
+            } else if let Some(mut msg) = single_msg {
+                // Single-object path keeps its existing semantics (batch = 1).
+                msg.marker_path = Some(
+                    persist_index_repair_marker(&msg)
+                        .map_err(object_index_marker_registration_error)?,
+                );
+                enqueue_index_update(msg, "object index update");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Physically delete an object's payload (lore.md 2.5) from the durable
+    /// tier and the in-memory cache; a no-op for a local-only store.
+    pub async fn delete_payload(&self, hash: &ObjectHash) -> Result<(), GitError> {
+        self.ready_storage()?.delete_payload(hash).await
+    }
+
+    /// Check whether an object exists in the configured backend.
+    ///
+    /// Boundary conditions:
+    /// - For tiered storage, returns `true` if the object lives in either tier; does
+    ///   not promote the object to the local cache.
+    pub fn exist(&self, obj_id: &ObjectHash) -> bool {
+        let storage = match &self.held {
+            HeldStorage::Ready(storage) => Arc::clone(storage),
+            HeldStorage::Rejected(variable) => refuse_rejected_presence(variable),
+        };
+        let hash = *obj_id;
+        self.block_on_storage(async move { storage.exist(&hash).await })
+    }
+
+    /// Probe presence without turning a storage or pack error into absence.
+    pub fn exist_checked(&self, obj_id: &ObjectHash) -> Result<bool, GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *obj_id;
+        self.block_on_storage(async move { storage.exist_checked(&hash).await })
+    }
+
+    /// Probe many distinct objects with bounded concurrency while preserving
+    /// storage failures as errors. Duplicate IDs are checked only once.
+    pub fn exist_checked_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, bool>, GitError> {
+        let storage = self.ready_storage()?;
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move { storage.exist_checked_batch(&hashes).await })
+    }
+
+    /// Read just the `ObjectType` for `obj_id`.
+    ///
+    /// Boundary conditions:
+    /// - For backends that store the object body inline with its type header, this
+    ///   may decode the entire body and discard the payload. Prefer
+    ///   [`Self::is_object_type`] when only checking a single type.
+    pub fn get_object_type(&self, obj_id: &ObjectHash) -> Result<ObjectType, GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *obj_id;
+        self.block_on_storage(async move { storage.get(&hash).await.map(|(_, t)| t) })
+    }
+
+    /// Inspect an object's type without an unbounded body read. Local loose
+    /// and pack objects use header-only probes; a remote-only object is read
+    /// through the verified 4 MiB typed bound or rejected if larger.
+    pub fn get_object_type_bounded(&self, obj_id: &ObjectHash) -> Result<ObjectType, GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *obj_id;
+        self.block_on_storage(async move { storage.object_type_bounded_probe(&hash).await })
+    }
+
+    /// Batch variant of [`Self::get_object_type_bounded`]. Missing IDs are
+    /// omitted; callers inspecting advertised refs must reject absent keys.
+    pub fn get_object_types_bounded_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        let storage = self.ready_storage()?;
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move { storage.object_types_bounded_probe(&hashes).await })
+    }
+
+    /// Like [`Self::get_object_types_bounded_many`], reporting decoded bytes
+    /// fetched from the durable tier so a caller can enforce one response-wide
+    /// budget across annotated-tag peel rounds.
+    pub fn get_object_types_bounded_many_with_budget(
+        &self,
+        hashes: &[ObjectHash],
+        remaining_remote_bytes: u64,
+    ) -> Result<(HashMap<ObjectHash, ObjectType>, u64), GitError> {
+        let storage = self.ready_storage()?;
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move {
+            storage
+                .object_types_bounded_probe_with_budget(&hashes, remaining_remote_bytes)
+                .await
+        })
+    }
+
+    /// Convenience wrapper: returns whether `obj_id` resolves to an object of the
+    /// requested type. Returns `false` on any read error (rather than propagating)
+    /// because callers typically use this in match arms where missing-or-wrong-type
+    /// have the same effect.
+    pub fn is_object_type(&self, obj_id: &ObjectHash, obj_type: ObjectType) -> bool {
+        if let Some(variable) = self.configuration_variable() {
+            refuse_rejected_presence(variable);
+        }
+        match self.get_object_type(obj_id) {
+            Ok(t) => t == obj_type,
+            Err(_) => false,
+        }
+    }
+
+    /// Like [`Self::is_object_type`], but a storage read failure stays an error.
+    pub fn is_object_type_checked(
+        &self,
+        obj_id: &ObjectHash,
+        obj_type: ObjectType,
+    ) -> Result<bool, GitError> {
+        Ok(self.get_object_type(obj_id)? == obj_type)
+    }
+
+    /// Search for objects matching the provided revision-ish identifier.
+    ///
+    /// Functional scope:
+    /// - Wraps [`Self::search_result`]; logs and swallows errors to keep the simple
+    ///   "list of hashes" return shape that callers expect.
+    ///
+    /// Boundary conditions:
+    /// - On any error, returns an empty vector and logs an `error!`. Use
+    ///   [`Self::search_result`] when the caller needs to react to the error.
+    pub async fn search(&self, obj_id: &str) -> Vec<ObjectHash> {
+        if let Some(variable) = self.configuration_variable() {
+            refuse_rejected_presence(variable);
+        }
+        match self.search_result(obj_id).await {
+            Ok(matches) => matches,
+            Err(error) => {
+                tracing::error!("failed to search objects for '{obj_id}': {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Prefix search of the object store. Unlike [`Self::search`], this does
+    /// not resolve `HEAD`, branch names, or `~` / `^` navigation, and a
+    /// directory or pack-index read failure stays an error.
+    pub async fn search_checked(&self, prefix: &str) -> Result<Vec<ObjectHash>, GitError> {
+        let mut matches = self.ready_storage()?.search_checked(prefix).await?;
+        matches.sort_unstable();
+        matches.dedup();
+        Ok(matches)
+    }
+
+    /// Search for objects matching `obj_id`, surfacing errors to the caller.
+    ///
+    /// Functional scope:
+    /// - Recognises `HEAD`, branch names, and Git navigation suffixes (`~`, `^`).
+    /// - For navigation forms (`HEAD~3`, `main^^`) resolves the base ref then walks
+    ///   parent commits via `Self::navigate_commit_path`.
+    /// - For prefix matches (e.g. an abbreviated SHA) delegates to the underlying
+    ///   storage's `search`.
+    ///
+    /// Boundary conditions:
+    /// - Returns `Ok(vec![])` when an empty base ref is supplied (e.g. `~1`, `^2`)
+    ///   to avoid degenerating into a prefix search of all objects.
+    /// - Returns `Ok(vec![])` when the base ref is ambiguous (multiple matching
+    ///   commit objects). The caller decides whether ambiguity is an error.
+    /// - Returns `Err` when an underlying database/branch read fails (e.g. corrupt
+    ///   `reference` row), or when a prefix hit's type cannot be read. A missing
+    ///   object stays an empty match. Users see the read error instead of silence.
+    /// - See: `test_search_result_surfaces_corrupt_branch_storage`,
+    ///   `test_search_result_rejects_empty_base_ref_navigation`.
+    pub async fn search_result(&self, obj_id: &str) -> Result<Vec<ObjectHash>, GitError> {
+        self.ready_storage()?;
+        if obj_id == "HEAD" {
+            return Ok(Head::current_commit_result()
+                .await
+                .map_err(|error| GitError::CustomError(format!("failed to resolve HEAD: {error}")))?
+                .into_iter()
+                .collect());
+        }
+
+        if obj_id.contains('~') || obj_id.contains('^') {
+            // Complex navigation relies on sync object loads. This stays on the
+            // current runtime thread and delegates object reads through `self.get()`,
+            // which already uses the dedicated background runtime.
+            let mut split_pos = 0;
+            let mut found_special = false;
+            for (i, c) in obj_id.char_indices() {
+                if c == '~' || c == '^' {
+                    found_special = true;
+                    split_pos = i;
+                    break;
+                }
+            }
+
+            if found_special {
+                let base_ref = &obj_id[..split_pos];
+                let path_part = &obj_id[split_pos..];
+
+                // Reject empty base_ref (e.g. user passes "~1" or "^2") to avoid
+                // a degenerate prefix search for "" which would list all objects.
+                if base_ref.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let base_commit =
+                    match base_ref {
+                        "HEAD" => match Head::current_commit_result().await.map_err(|error| {
+                            GitError::CustomError(format!("failed to resolve HEAD: {error}"))
+                        })? {
+                            Some(commit) => commit,
+                            None => return Ok(Vec::new()),
+                        },
+                        _ => match Branch::find_branch_result(base_ref, None).await.map_err(
+                            |error| {
+                                GitError::CustomError(format!(
+                                    "failed to resolve branch '{base_ref}': {error}"
+                                ))
+                            },
+                        )? {
+                            Some(branch) => branch.commit,
+                            None => {
+                                if Branch::exists_result(base_ref, None)
+                                    .await
+                                    .map_err(|error| {
+                                        GitError::CustomError(format!(
+                                            "failed to resolve branch '{base_ref}': {error}"
+                                        ))
+                                    })?
+                                {
+                                    return Ok(Vec::new());
+                                }
+
+                                let matches = self.ready_storage()?.search(base_ref).await;
+                                let mut commits = Vec::new();
+                                for hash in matches {
+                                    match self.is_object_type_checked(&hash, ObjectType::Commit) {
+                                        Ok(true) => commits.push(hash),
+                                        Ok(false) | Err(GitError::ObjectNotFound(_)) => {}
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+
+                                if commits.len() == 1 {
+                                    commits[0]
+                                } else {
+                                    return Ok(Vec::new());
+                                }
+                            }
+                        },
+                    };
+
+                let target_commit = match self.navigate_commit_path(base_commit, path_part) {
+                    Ok(commit) => commit,
+                    Err(_) => return Ok(Vec::new()),
+                };
+
+                return Ok(vec![target_commit]);
+            }
+        }
+
+        let mut matches = self.ready_storage()?.search(obj_id).await;
+        // The same object may exist in a loose object and one or more pack
+        // indexes; collapse duplicates before returning so callers that count
+        // matches never mistake a duplicate for genuine ambiguity (ADR-MX-04).
+        matches.sort_unstable();
+        matches.dedup();
+        Ok(matches)
+    }
+
+    /// Walk parent commits according to a Git revision suffix.
+    ///
+    /// Functional scope:
+    /// - Parses every `~N` and `^N` token in `path` and walks accordingly:
+    ///   `^N` selects the Nth parent of the current commit; `~N` walks N first-parent
+    ///   steps.
+    ///
+    /// Boundary conditions:
+    /// - Returns `GitError::InvalidArgument` when `path` does not match the expected
+    ///   shape at all (defensive: callers already pre-filter on `~` / `^`).
+    /// - Returns `GitError::ObjectNotFound` when a requested parent index does not
+    ///   exist (e.g. `~5` on a commit whose history is shorter, or `^2` on a non-merge
+    ///   commit).
+    /// - When the count is missing (`~` rather than `~1`) it defaults to 1, matching
+    ///   Git's convention.
+    fn navigate_commit_path(
+        &self,
+        base_commit: ObjectHash,
+        path: &str,
+    ) -> Result<ObjectHash, GitError> {
+        let mut current = base_commit;
+        // INVARIANT: compile-time literal regex with two capture groups;
+        // Regex::new only fails on syntactically invalid patterns, which
+        // is caught by the surrounding parent-traversal tests.
+        let re =
+            Regex::new(r"(\^|~)(\d*)").expect("revision-suffix regex is a valid hardcoded pattern");
+
+        if !re.is_match(path) {
+            return Err(GitError::InvalidArgument(format!(
+                "Invalid reference path: {path}"
+            )));
+        }
+        for cap in re.captures_iter(path) {
+            // INVARIANT: capture group 1 is non-optional (`(\^|~)`), so any
+            // match produced by `captures_iter` is guaranteed to populate it.
+            let symbol = cap
+                .get(1)
+                .expect("regex capture group 1 is non-optional")
+                .as_str();
+            let num_str = cap.get(2).map_or("1", |m| m.as_str());
+            let num: usize = num_str.parse().unwrap_or(1);
+
+            match symbol {
+                "^" => {
+                    current = self.get_parent_commit(&current, num)?;
+                }
+                "~" => {
+                    for _ in 0..num {
+                        current = self.get_parent_commit(&current, 1)?;
+                    }
+                }
+                // INVARIANT: regex `(\^|~)(\d*)` only captures "^" or "~" in
+                // group 1, so `symbol` cannot hold any other value here.
+                _ => unreachable!("regex capture group 1 is restricted to \"^\" or \"~\""),
+            }
+        }
+        Ok(current)
+    }
+
+    /// Return the Nth parent (1-indexed) of `commit_id`.
+    ///
+    /// Boundary conditions:
+    /// - Returns `GitError::ObjectNotFound` when `n == 0` or `n` exceeds the parent
+    ///   count. Callers using `^` semantics never pass 0; the explicit check is for
+    ///   safety against future callers.
+    fn get_parent_commit(&self, commit_id: &ObjectHash, n: usize) -> Result<ObjectHash, GitError> {
+        let commit: Commit = load_object(commit_id)?;
+        if n == 0 || n > commit.parent_commit_ids.len() {
+            return Err(GitError::ObjectNotFound(format!(
+                "Parent {n} does not exist"
+            )));
+        }
+        Ok(commit.parent_commit_ids[n - 1])
+    }
+
+    /// Compress `data` with zlib using the default compression level — exposed for
+    /// tests and other utilities that produce loose-object byte streams.
+    pub fn compress_zlib(data: &[u8]) -> io::Result<Vec<u8>> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data)?;
+        let compressed_data = encoder.finish()?;
+        Ok(compressed_data)
+    }
+
+    /// Inverse of [`Self::compress_zlib`] — decompress a previously-zlib-compressed
+    /// byte slice. Used by tests and pack inspection paths.
+    pub fn decompress_zlib(data: &[u8]) -> io::Result<Vec<u8>> {
+        let mut decoder = ZlibDecoder::new(data);
+        let mut decompressed_data = Vec::new();
+        decoder.read_to_end(&mut decompressed_data)?;
+        Ok(decompressed_data)
+    }
+
+    /// Map `<storage>/objects` back to `<storage>/<DATABASE>` so background index
+    /// updates write to the database that owns this objects directory rather than
+    /// to whichever database happens to be discoverable from the process CWD.
+    fn index_db_path_from_base(base_path: &Path) -> Option<PathBuf> {
+        base_path
+            .parent()
+            .map(|storage_path| storage_path.join(DATABASE))
+    }
+}
+
+/// Enqueue an `object_index` row for an object that was written outside the
+/// usual `ClientStorage::put` path — currently agent capture transcript and
+/// metadata blobs, which `HistoryManager::append_checkpoint_commit` writes
+/// directly via [`crate::utils::object::write_git_object`] for the orphan
+/// `refs/libra/traces` history.
+///
+/// Why this exists: cloud sync uploads only the rows it finds in
+/// `object_index` — anything that bypasses `object_index` is invisible to
+/// `libra cloud sync`. Without this hook, agent transcripts written by the
+/// hook runtime would never reach R2, and the Phase 3.5b `cloud restore`
+/// catalogue would resolve commit OIDs that pointed at missing blobs on a
+/// fresh clone (entire.md §14.3 phase-3 item 3 — "走正常 R2 同步").
+///
+/// The function takes the `.libra` directory rather than the storage objects
+/// path because agent capture callers already hold a `repo_path` shaped that
+/// way; the db lives at `<libra_dir>/<DATABASE>`. Returns immediately when
+/// the database file is absent so legacy bootstrap and tempdir tests stay
+/// quiet. Marker persistence is a hard precondition: callers receive an error
+/// and no queue item is created when durable repair ownership cannot be recorded.
+///
+/// `pub(crate)` — there is no validation that the (`o_id`, `o_type`,
+/// `o_size`) triple matches an actual on-disk Git object, so this is an
+/// internal escape hatch for agent-history/review/investigate callers that
+/// already hold the truth. External crates / users must go through
+/// `ClientStorage::put`, which both writes the object and indexes it.
+pub fn enqueue_agent_blob_object_index_update(
+    libra_dir: &Path,
+    o_id: &str,
+    o_type: &str,
+    o_size: i64,
+) -> io::Result<()> {
+    let db_path = libra_dir.join(DATABASE);
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let mut msg = IndexUpdateMsg {
+        hash: o_id.to_string(),
+        obj_type: o_type.to_string(),
+        size: o_size,
+        db_path,
+        marker_path: None,
+        _marker_lock: None,
+        failure_counter: current_index_failure_counter(),
+        pending_counter: current_index_pending_counter(),
+    };
+    msg.marker_path =
+        Some(persist_index_repair_marker(&msg).map_err(object_index_marker_registration_error)?);
+    enqueue_index_update(msg, "agent blob object index update");
+    Ok(())
+}
+
+/// Upsert agent-capture object-index rows in a caller-owned transaction.
+///
+/// Checkpoint writers use this at their final traces-ref CAS boundary: the
+/// ref/catalog mutation and every cloud-visible object-index row therefore
+/// commit together, or all roll back together. Unlike
+/// [`enqueue_agent_blob_object_index_update`], this deliberately creates no
+/// filesystem repair marker because the caller already owns a durable SQLite
+/// transaction.
+///
+/// Minimal/legacy databases without `object_index` remain a no-op, matching
+/// the background enqueue helper's absent-database compatibility behavior.
+pub async fn upsert_agent_object_index_rows_with_conn<C: ConnectionTrait>(
+    conn: &C,
+    updates: &[(String, String, i64)],
+) -> std::result::Result<(), DbErr> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let backend = conn.get_database_backend();
+    let table_exists = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'object_index' LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+        .is_some();
+    if !table_exists {
+        return Ok(());
+    }
+
+    let repo_id = match conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+    {
+        Some(row) => {
+            let value = row.try_get_by::<String, _>("value")?;
+            if value.trim().is_empty() {
+                "unknown-repo".to_string()
+            } else {
+                value
+            }
+        }
+        None => "unknown-repo".to_string(),
+    };
+    const UPSERT_CHUNK: usize = 200;
+    let created_at = chrono::Utc::now().timestamp();
+    for chunk in updates.chunks(UPSERT_CHUNK) {
+        let mut sql = String::from(
+            "INSERT INTO object_index \
+             (o_id, o_type, o_size, repo_id, created_at, is_synced) VALUES ",
+        );
+        let mut values = Vec::with_capacity(chunk.len() * 5);
+        for (index, (oid, object_type, size)) in chunk.iter().enumerate() {
+            if index != 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str("(?, ?, ?, ?, ?, 0)");
+            values.extend([
+                Value::from(oid.clone()),
+                Value::from(object_type.clone()),
+                Value::from(*size),
+                Value::from(repo_id.clone()),
+                Value::from(created_at),
+            ]);
+        }
+        // Match the queued repair worker exactly: a semantic agent type may
+        // promote a generic blob row, but a later generic write never
+        // demotes an already-semantic row or reopens a synced upload.
+        sql.push_str(
+            " ON CONFLICT(repo_id, o_id) DO UPDATE SET \
+             o_type = CASE \
+               WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                AND substr(object_index.o_type, 1, 6) != 'agent_' \
+               THEN excluded.o_type ELSE object_index.o_type END, \
+             o_size = CASE \
+               WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                AND substr(object_index.o_type, 1, 6) != 'agent_' \
+               THEN excluded.o_size ELSE object_index.o_size END, \
+             is_synced = CASE \
+               WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                AND substr(object_index.o_type, 1, 6) != 'agent_' \
+               THEN 0 ELSE object_index.is_synced END",
+        );
+        conn.execute_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Delete `object_index` rows for the given OIDs in the current repo
+/// (AG-20 prune-side counterpart of
+/// [`enqueue_agent_blob_object_index_update`]).
+///
+/// Functional scope:
+/// - Resolves the repo id the same way the indexing writer does
+///   (`libra.repoid` config, falling back to `unknown-repo` only when the
+///   value is absent or blank) so the delete predicate matches the rows the
+///   writer created.
+/// - Deletes in bounded `IN (...)` chunks and returns the total number of
+///   rows removed. Idempotent: OIDs without a row simply delete nothing.
+///
+/// Boundary conditions:
+/// - Returns `Ok(0)` without touching anything when `oids` is empty or the
+///   `object_index` table does not exist (minimal test databases).
+/// - `pub(crate)` — callers must already have proven the OIDs unreachable
+///   (only `HistoryManager::commit_checkpoint_prune` today); there is no
+///   reachability validation here.
+pub async fn remove_object_index_rows_with_conn<C: ConnectionTrait>(
+    conn: &C,
+    oids: &[String],
+) -> Result<u64, DbErr> {
+    if oids.is_empty() {
+        return Ok(0);
+    }
+    let backend = conn.get_database_backend();
+    let table_exists = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'object_index' LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+        .is_some();
+    if !table_exists {
+        return Ok(0);
+    }
+
+    // Resolve the repo id exactly like the indexing writer. Query and decode
+    // failures must abort the prune transaction: silently targeting the
+    // `unknown-repo` sentinel would report success while leaving stale cloud
+    // catalogue rows behind.
+    let repo_id = match conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+    {
+        Some(row) => {
+            let value = row.try_get_by::<String, _>("value")?;
+            if value.trim().is_empty() {
+                "unknown-repo".to_string()
+            } else {
+                value
+            }
+        }
+        None => "unknown-repo".to_string(),
+    };
+
+    // SQLite's default host-parameter limit is generous (32k), but keep the
+    // chunks small so a huge prune cannot produce pathological statements.
+    const DELETE_CHUNK: usize = 200;
+    let mut deleted = 0_u64;
+    for chunk in oids.chunks(DELETE_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql =
+            format!("DELETE FROM object_index WHERE repo_id = ? AND o_id IN ({placeholders})");
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() + 1);
+        values.push(Value::from(repo_id.clone()));
+        values.extend(chunk.iter().map(|oid| Value::from(oid.clone())));
+        let result = conn
+            .execute_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await?;
+        deleted += result.rows_affected();
+    }
+    Ok(deleted)
+}
+
+/// Count the `object_index` rows [`remove_object_index_rows_with_conn`]
+/// WOULD delete for `oids` — the `--dry-run` preview counterpart (PD-04).
+/// Mirrors the delete predicate exactly (same repo-id resolution, same
+/// chunking) and shares its boundary behavior: empty input or a missing
+/// `object_index` table count as zero.
+pub async fn count_object_index_rows_with_conn<C: ConnectionTrait>(
+    conn: &C,
+    oids: &[String],
+) -> Result<u64, DbErr> {
+    if oids.is_empty() {
+        return Ok(0);
+    }
+    let backend = conn.get_database_backend();
+    let table_exists = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'object_index' LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+        .is_some();
+    if !table_exists {
+        return Ok(0);
+    }
+    let repo_id = match conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+    {
+        Some(row) => {
+            let value = row.try_get_by::<String, _>("value")?;
+            if value.trim().is_empty() {
+                "unknown-repo".to_string()
+            } else {
+                value
+            }
+        }
+        None => "unknown-repo".to_string(),
+    };
+    const COUNT_CHUNK: usize = 200;
+    let mut total = 0_u64;
+    for chunk in oids.chunks(COUNT_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM object_index WHERE repo_id = ? AND o_id IN ({placeholders})"
+        );
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() + 1);
+        values.push(Value::from(repo_id.clone()));
+        values.extend(chunk.iter().map(|oid| Value::from(oid.clone())));
+        if let Some(row) = conn
+            .query_one_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await?
+        {
+            total += row.try_get_by::<i64, _>("n")? as u64;
+        }
+    }
+    Ok(total)
+}
+
+#[async_trait]
+impl Storage for ClientStorage {
+    async fn get(&self, hash: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let storage = self.ready_storage()?;
+        let hash = *hash;
+        self.block_on_storage(async move { storage.get(&hash).await })
+    }
+
+    async fn get_with_limit(
+        &self,
+        hash: &ObjectHash,
+        limit: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        // This trait method is already async and is used by callers that wrap
+        // each read in a Tokio deadline. Await the backend directly so that
+        // timeout/cancellation can be polled; routing through the synchronous
+        // `block_on_storage` facade would park the caller thread in recv() and
+        // make an outer timeout ineffective on a blocked local/pack read.
+        self.ready_storage()?.get_with_limit(hash, limit).await
+    }
+
+    async fn get_typed_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        self.ready_storage()?
+            .get_typed_bounded(hash, max_payload_bytes)
+            .await
+    }
+
+    async fn get_commit_bounded(
+        &self,
+        hash: &ObjectHash,
+        max_payload_bytes: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        self.ready_storage()?
+            .get_commit_bounded(hash, max_payload_bytes)
+            .await
+    }
+
+    async fn object_type_bounded_probe(&self, hash: &ObjectHash) -> Result<ObjectType, GitError> {
+        self.ready_storage()?.object_type_bounded_probe(hash).await
+    }
+
+    async fn object_types_bounded_probe(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        self.ready_storage()?
+            .object_types_bounded_probe(hashes)
+            .await
+    }
+
+    async fn object_types_bounded_probe_with_budget(
+        &self,
+        hashes: &[ObjectHash],
+        remaining_remote_bytes: u64,
+    ) -> Result<(HashMap<ObjectHash, ObjectType>, u64), GitError> {
+        self.ready_storage()?
+            .object_types_bounded_probe_with_budget(hashes, remaining_remote_bytes)
+            .await
+    }
+
+    async fn put(
+        &self,
+        hash: &ObjectHash,
+        data: &[u8],
+        obj_type: ObjectType,
+    ) -> Result<String, GitError> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_git_error(variable));
+        }
+        ClientStorage::put(self, hash, data, obj_type).map_err(GitError::IOError)
+    }
+
+    async fn exist(&self, hash: &ObjectHash) -> bool {
+        ClientStorage::exist(self, hash)
+    }
+
+    async fn object_size(&self, hash: &ObjectHash) -> Result<Option<u64>, GitError> {
+        ClientStorage::object_size(self, hash)
+    }
+
+    async fn object_sizes(&self, hashes: &[ObjectHash]) -> Result<Vec<Option<u64>>, GitError> {
+        ClientStorage::object_sizes(self, hashes)
+    }
+
+    async fn object_sizes_with_total_limit(
+        &self,
+        hashes: &[ObjectHash],
+        aggregate_limit: u64,
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        ClientStorage::object_sizes_with_total_limit(self, hashes, aggregate_limit)
+    }
+
+    async fn decoded_object_size(&self, hash: &ObjectHash) -> Result<Option<u64>, GitError> {
+        ClientStorage::decoded_object_size(self, hash)
+    }
+
+    async fn decoded_object_sizes(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        ClientStorage::decoded_object_sizes(self, hashes)
+    }
+
+    async fn search(&self, prefix: &str) -> Vec<ObjectHash> {
+        ClientStorage::search(self, prefix).await
+    }
+
+    async fn search_checked(&self, prefix: &str) -> Result<Vec<ObjectHash>, GitError> {
+        ClientStorage::search_checked(self, prefix).await
+    }
+
+    async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_git_error(variable));
+        }
+        Ok(ClientStorage::exist(self, hash))
+    }
+
+    async fn exist_checked_batch(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, bool>, GitError> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_git_error(variable));
+        }
+        let max_in_flight = crate::utils::resource_limits::max_connections().min(16);
+        let unique: HashSet<ObjectHash> = hashes.iter().copied().collect();
+        stream::iter(unique)
+            .map(|hash| async move {
+                let exists = <Self as crate::utils::storage::Storage>::exist_checked(self, &hash)
+                    .await
+                    .map_err(|error| crate::utils::storage::checked_probe_error(&hash, error))?;
+                Ok((hash, exists))
+            })
+            .buffer_unordered(max_in_flight)
+            .try_collect()
+            .await
+    }
+
+    async fn exist_batch(&self, hashes: &[ObjectHash]) -> Vec<bool> {
+        if let Some(variable) = self.configuration_variable() {
+            refuse_rejected_presence(variable);
+        }
+        let mut results = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            results.push(ClientStorage::exist(self, hash));
+        }
+        results
+    }
+
+    async fn heal(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_git_error(variable));
+        }
+        let _ = hash;
+        Ok(false)
+    }
+
+    async fn delete_payload(&self, hash: &ObjectHash) -> Result<(), GitError> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_git_error(variable));
+        }
+        let _ = hash;
+        Ok(())
+    }
+
+    async fn evict_local(
+        &self,
+        request: crate::utils::storage::EvictRequest,
+    ) -> Result<Option<crate::utils::storage::EvictReport>, GitError> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_git_error(variable));
+        }
+        let _ = request;
+        Ok(None)
+    }
+}
+
+/// Resolve an environment variable, checking both system env and vault config.
+///
+/// First checks `std::env::var` (fast, sync). If the system env var is absent,
+/// it reuses the async `resolve_env()` path on a dedicated thread so local/global
+/// config and vault-backed values share exactly the same semantics.
+///
+/// This avoids deadlocks from nested tokio runtimes during storage init, which
+/// runs synchronously and may be called from within async test contexts.
+///
+/// Boundary conditions:
+/// - Returns `Ok(None)` only when neither the system env nor any config scope
+///   contains the value.
+/// - Returns `Err(String)` when the worker thread crashes before sending or when
+///   the underlying config lookup raises an error (e.g. corrupt SQLite, unreadable
+///   permissions). Callers convert this into a hard storage configuration failure
+///   rather than silently degrading.
+fn resolve_env_sync(name: &str) -> Result<Option<String>, String> {
+    resolve_env_sync_typed(name).map_err(|err| err.to_string())
+}
+
+fn resolve_env_sync_typed(name: &str) -> Result<Option<String>, StorageConfigResolutionError> {
+    // Always check system environment first.
+    if let Ok(val) = std::env::var(name) {
+        return Ok(Some(val));
+    }
+
+    let owned = name.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = resolve_env_sync_worker(&owned);
+        let _ = tx.send(result);
+    });
+    match rx.recv() {
+        Ok(result) => result,
+        Err(_) => Err(StorageConfigResolutionError::Other(format!(
+            "env resolution worker for '{name}' exited before returning a result"
+        ))),
+    }
+}
+
+/// Worker side of [`resolve_env_sync`]: builds a single-purpose tokio runtime in a
+/// dedicated thread so we can drive the async config lookup without colliding with
+/// any runtime the caller already owns.
+fn resolve_env_sync_worker(name: &str) -> Result<Option<String>, StorageConfigResolutionError> {
+    let runtime = tokio::runtime::Runtime::new().map_err(|err| {
+        StorageConfigResolutionError::Other(format!(
+            "failed to create tokio runtime for env resolution of '{name}': {err}"
+        ))
+    })?;
+    runtime.block_on(resolve_env_for_storage_init_typed(name))
+}
+
+/// Look up `name` in the local repo's config first, then in the global config.
+///
+/// Functional scope:
+/// - Reads `vault.env.<name>` from `<repo>/.libra/<DATABASE>` if it exists, then from
+///   the global config (overridable via `LIBRA_CONFIG_GLOBAL_DB`).
+///
+/// Boundary conditions:
+/// - Returns `Ok(None)` when neither database holds the key.
+/// - Returns `Err` when a database file exists but cannot be opened or queried — the
+///   caller surfaces this so the user sees actionable errors rather than silently
+///   degrading to local-only storage on a typo'd schema.
+async fn resolve_env_for_storage_init_typed(
+    name: &str,
+) -> Result<Option<String>, StorageConfigResolutionError> {
+    if let Some(value) = resolve_env_for_storage_init_without_global(name).await? {
+        return Ok(Some(value));
+    }
+
+    let vault_key = format!("vault.env.{name}");
+
+    if let Some(global_db_path) = storage_global_config_path()
+        && global_db_path.exists()
+    {
+        if let Some(future) = inspect_global_config_schema_future_at_path(&global_db_path).await {
+            return Err(StorageConfigResolutionError::GlobalSchemaFuture(future));
+        }
+        match read_config_env_value(
+            name,
+            &vault_key,
+            &global_db_path,
+            DatabaseRole::GlobalConfig,
+        )
+        .await
+        {
+            Ok(Some(value)) => return Ok(Some(value)),
+            Ok(None) => {}
+            Err(message) => {
+                // A stored value that cannot be decrypted is not an unreadable
+                // store. Keep that fail-closed. Connection and query errors
+                // leave object reads on the historical local backend.
+                if message.starts_with("failed to decrypt ") {
+                    return Err(StorageConfigResolutionError::Other(message));
+                }
+                return Err(StorageConfigResolutionError::GlobalStoreUnreadable(message));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn resolve_env_for_storage_init_without_global(
+    name: &str,
+) -> Result<Option<String>, StorageConfigResolutionError> {
+    if let Ok(val) = std::env::var(name) {
+        return Ok(Some(val));
+    }
+
+    let vault_key = format!("vault.env.{name}");
+
+    if let Ok(storage_path) = try_get_storage_path(None) {
+        let local_db_path = storage_path.join(DATABASE);
+        if local_db_path.exists()
+            && let Some(value) =
+                read_config_env_value(name, &vault_key, &local_db_path, DatabaseRole::Repository)
+                    .await
+                    .map_err(StorageConfigResolutionError::Other)?
+        {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Inspect the configured global DB for future or unregistered receipts.
+/// Other config errors are left to the normal resolver path so commands
+/// that never touch global storage config keep their historical behavior.
+pub async fn inspect_global_config_schema_future() -> Option<GlobalConfigSchemaFuture> {
+    let global_db_path = storage_global_config_path()?;
+    if !global_db_path.exists() {
+        return None;
+    }
+    inspect_global_config_schema_future_at_path(&global_db_path).await
+}
+
+pub async fn inspect_global_config_schema_future_at_path(
+    global_db_path: &Path,
+) -> Option<GlobalConfigSchemaFuture> {
+    inspect_configuration_schema_issue_at_path(global_db_path, DatabaseRole::GlobalConfig).await
+}
+
+async fn inspect_configuration_schema_issue_at_path(
+    db_path: &Path,
+    role: DatabaseRole,
+) -> Option<GlobalConfigSchemaFuture> {
+    // Physically read-only, literal path, no creation or migration. Malformed
+    // and unreadable databases retain the normal resolver's error policy.
+    let conn = schema::open_readonly_connection_for_role(db_path, Duration::from_millis(200), role)
+        .await
+        .ok()?;
+    let inspection = schema::inspect_configuration_schema(&conn, role).await;
+    let _ = conn.close().await;
+    let issue = inspection.ok()?.issue?;
+    Some(GlobalConfigSchemaFuture {
+        db_path: db_path.to_path_buf(),
+        current_version: issue.current_version,
+        latest_version: issue.latest_version,
+        issue,
+    })
+}
+
+/// Inspect both scopes before dispatch makes any global-credential bypass
+/// decision. Environment credentials cannot prove System defaults irrelevant.
+pub async fn inspect_configuration_schema_issues() -> Vec<GlobalConfigSchemaFuture> {
+    let mut issues = Vec::new();
+    for scope in [ConfigScope::Global, ConfigScope::System] {
+        if let Some(path) = scope.get_config_path()
+            && let Some(issue) =
+                inspect_configuration_schema_issue_at_path(&path, scope.database_role()).await
+        {
+            issues.push(issue);
+        }
+    }
+    issues
+}
+
+/// Process-wide time that storage-config reads may spend waiting out a
+/// repository database held by another writer (FIX-LTR-08). Unresolved storage
+/// is never cached, so a per-read allowance would add up across lookups; once
+/// this one is spent, every read gets the single 200 ms attempt it had before.
+const STORAGE_CONFIG_BUSY_BUDGET: Duration = Duration::from_secs(5);
+const STORAGE_CONFIG_BUSY_BACKOFF_STEP: Duration = Duration::from_millis(50);
+const STORAGE_CONFIG_BUSY_BACKOFF_CAP: Duration = Duration::from_millis(500);
+static STORAGE_CONFIG_BUSY_SPENT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// One failed storage-config read. `busy` is set only when the repository
+/// database's own SQLite error says another writer holds it.
+struct ConfigReadFailure {
+    message: String,
+    busy: bool,
+}
+
+impl From<String> for ConfigReadFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            busy: false,
+        }
+    }
+}
+
+fn is_sqlite_busy_message(message: &str) -> bool {
+    message.contains("database is locked")
+        || message.contains("database schema is locked")
+        || message.contains("database table is locked")
+}
+
+/// `ConfigKv` errors carry the SQLite cause below an anyhow context such as
+/// "failed to query config_kv", so the whole chain is classified.
+fn is_sqlite_busy_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| is_sqlite_busy_message(&cause.to_string()))
+}
+
+fn storage_config_busy_budget_left() -> Duration {
+    STORAGE_CONFIG_BUSY_BUDGET.saturating_sub(Duration::from_millis(
+        STORAGE_CONFIG_BUSY_SPENT_MS.load(Ordering::Relaxed),
+    ))
+}
+
+fn spend_storage_config_busy_budget(spent: Duration) {
+    // Spending only happens while budget is left, so the counter stays near the
+    // budget; the per-call cap keeps `fetch_add` far from overflow.
+    let millis = u64::try_from(spent.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(60_000);
+    STORAGE_CONFIG_BUSY_SPENT_MS.fetch_add(millis, Ordering::Relaxed);
+}
+
+/// Read a single `vault.env.*` entry from a config database, decrypting if needed.
+///
+/// Functional scope:
+/// - Each attempt connects with a 200 ms busy timeout so background storage init
+///   cannot block on foreground writers. A repository database that another
+///   writer holds is retried with backoff while [`STORAGE_CONFIG_BUSY_BUDGET`],
+///   shared by the whole process, lasts; any other failure returns at once.
+/// - When the entry is encrypted, decrypts using the per-scope key (local repo key
+///   or global key).
+///
+/// Boundary conditions:
+/// - Global configuration opens a literal filename read-only with no creation
+///   or migration. Local repository reads retain their existing upgrade path.
+/// - Returns `Err` when decryption fails — the user sees the raw vault error, not a
+///   silent fall-back to plaintext.
+async fn read_config_env_value(
+    env_name: &str,
+    vault_key: &str,
+    db_path: &Path,
+    role: DatabaseRole,
+) -> Result<Option<String>, String> {
+    let mut attempt: u32 = 0;
+    loop {
+        let started = Instant::now();
+        let failure = match read_config_env_value_once(env_name, vault_key, db_path, role).await {
+            Ok(value) => return Ok(value),
+            Err(failure) => failure,
+        };
+        let left = storage_config_busy_budget_left();
+        if !failure.busy || left.is_zero() {
+            return Err(failure.message);
+        }
+        attempt = attempt.saturating_add(1);
+        let pause = STORAGE_CONFIG_BUSY_BACKOFF_STEP
+            .saturating_mul(attempt)
+            .min(STORAGE_CONFIG_BUSY_BACKOFF_CAP)
+            .min(left);
+        tokio::time::sleep(pause).await;
+        spend_storage_config_busy_budget(started.elapsed());
+    }
+}
+
+async fn read_config_env_value_once(
+    env_name: &str,
+    vault_key: &str,
+    db_path: &Path,
+    role: DatabaseRole,
+) -> Result<Option<String>, ConfigReadFailure> {
+    let (conn, scope) = match role {
+        DatabaseRole::GlobalConfig => {
+            let conn = schema::open_readonly_connection_for_role(
+                db_path,
+                Duration::from_millis(200),
+                role,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to connect to global config '{}': {error}",
+                    db_path.display()
+                )
+            })?;
+            schema::check_configuration_schema(&conn, role)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !schema::configuration_has_kv(&conn, role)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(None);
+            }
+            (conn, "global")
+        }
+        DatabaseRole::Repository => {
+            let path = db_path.to_str().ok_or_else(|| {
+                format!(
+                    "database path is not valid UTF-8 for local config: {}",
+                    db_path.display()
+                )
+            })?;
+            let conn = schema::establish_connection_with_lock_timeout_for_role(
+                path,
+                Duration::from_millis(200),
+                role,
+            )
+            .await
+            .map_err(|error| ConfigReadFailure {
+                busy: is_sqlite_busy_message(&error.to_string()),
+                message: format!(
+                    "failed to connect to local config '{}': {error}",
+                    db_path.display()
+                ),
+            })?;
+            (conn, "local")
+        }
+        DatabaseRole::SystemConfig | DatabaseRole::Derived | DatabaseRole::Capture => {
+            return Err(format!(
+                "{role} cannot supply storage credentials; use local or global configuration"
+            )
+            .into());
+        }
+    };
+
+    let entry = ConfigKv::get_with_conn(&conn, vault_key)
+        .await
+        .map_err(|err| ConfigReadFailure {
+            busy: role == DatabaseRole::Repository && is_sqlite_busy_error(&err),
+            message: format!("failed to read '{env_name}' from {scope} config: {err}"),
+        })?;
+
+    let value = match entry {
+        Some(entry) if entry.encrypted => decrypt_value(&entry.value, scope)
+            .await
+            .map(Some)
+            .map_err(|err| {
+                if scope == "global" {
+                    format!("failed to decrypt vault.env.{env_name} from global config: {err}")
+                } else {
+                    format!("failed to decrypt vault.env.{env_name}: {err}")
+                }
+            }),
+        Some(entry) => Ok(Some(entry.value)),
+        None => Ok(None),
+    };
+    value.map_err(ConfigReadFailure::from)
+}
+
+/// Locate the global config database.
+///
+/// Boundary conditions:
+/// - Delegates to the single resolver in [`crate::internal::config`] so storage
+///   and the config command cannot drift (ADR-GCX-01 / GC-GCX-01).
+/// - Returns `None` when no config directory is discoverable; on those platforms
+///   global config is unavailable.
+fn storage_global_config_path() -> Option<PathBuf> {
+    crate::internal::config::global_config_path()
+}
+
+/// Prefix for a remote whose storage settings are already confirmed.
+///
+/// A missing database is the only empty prefix. A failed path lookup, stat,
+/// read, write, or reply is [`StorageConfigFailure`] and does not publish a
+/// new id.
+fn repo_id_prefix_for_configured_remote() -> Result<Option<String>, StorageConfigFailure> {
+    let storage_path = try_get_storage_path(None).map_err(|_| StorageConfigFailure {
+        variable: "libra.repoid",
+    })?;
+    let db_path = storage_path.join(DATABASE);
+    match fs::symlink_metadata(&db_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(StorageConfigFailure {
+                variable: "libra.repoid",
+            });
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(StorageConfigFailure {
+                variable: "libra.repoid",
+            });
+        }
+        Ok(_) => {}
+    }
+
+    let (tx, rx) = mpsc::channel();
+    RUNTIME.spawn(async move {
+        let result = read_or_create_configured_repo_id(db_path).await;
+        let _ = tx.send(result);
+    });
+    rx.recv().unwrap_or(Err(StorageConfigFailure {
+        variable: "libra.repoid",
+    }))
+}
+
+async fn read_or_create_configured_repo_id(
+    db_path: PathBuf,
+) -> Result<Option<String>, StorageConfigFailure> {
+    let db = db::get_db_conn_instance_for_path(&db_path)
+        .await
+        .map_err(|_| StorageConfigFailure {
+            variable: "libra.repoid",
+        })?;
+    let current = ConfigKv::get_with_conn(&db, "libra.repoid")
+        .await
+        .map_err(|_| StorageConfigFailure {
+            variable: "libra.repoid",
+        })?
+        .map(|entry| entry.value);
+    let needs_init = current
+        .as_deref()
+        .map(|value| value.is_empty() || value == "unknown-repo")
+        .unwrap_or(true);
+    if !needs_init {
+        return Ok(current);
+    }
+    let new_id = Uuid::new_v4().to_string();
+    ConfigKv::set_with_conn(&db, "libra.repoid", &new_id, false)
+        .await
+        .map_err(|_| StorageConfigFailure {
+            variable: "libra.repoid",
+        })?;
+    Ok(Some(new_id))
+}
+
+async fn expected_index_repair_oid_len(db_conn: &DatabaseConnection) -> Result<usize, String> {
+    let object_format = ConfigKv::get_with_conn(db_conn, "core.objectformat")
+        .await
+        .map_err(|error| {
+            format!("failed to read core.objectformat for object-index repair: {error}")
+        })?
+        .map(|entry| entry.value)
+        .unwrap_or_else(|| "sha1".to_string());
+    let kind = crate::internal::object_format::parse_config_value(object_format.trim()).map_err(
+        |_| {
+            format!(
+                "unsupported core.objectformat '{object_format}' while validating object-index repair markers"
+            )
+        },
+    )?;
+    Ok(match kind {
+        git_internal::hash::HashKind::Sha1 => 40,
+        git_internal::hash::HashKind::Sha256 | git_internal::hash::HashKind::Blake3 => 64,
+    })
+}
+
+/// Apply one loaded replay page to the object index, retiring each durable
+/// marker after its row update commits. Shared by the blocking and the
+/// uncontended preflight variants.
+async fn apply_pending_object_index_page(
+    db_conn: &DbConn,
+    db_path: &Path,
+    page: PendingObjectIndexPage,
+) -> Result<ObjectIndexRepairOutcome, String> {
+    if page.updates.is_empty() {
+        return Ok(ObjectIndexRepairOutcome {
+            repaired: 0,
+            remaining: page.has_more,
+        });
+    }
+    #[cfg(test)]
+    if test_object_index_faults(db_path).update_failure {
+        return Err("injected object index update failure".to_string());
+    }
+    let repo_id = resolve_repo_id_for_index(db_conn).await?;
+    let mut repaired = 0;
+    for batch in page.updates.chunks(INDEX_REPAIR_BATCH_SIZE) {
+        update_object_index_batch(db_conn, db_path, &repo_id, batch).await?;
+        for msg in batch {
+            if let Some(marker_path) = msg.marker_path.as_deref() {
+                retire_index_repair_marker(db_path, marker_path).map_err(|error| {
+                    format!(
+                        "updated object index for {}, but failed to retire repair marker '{}': {error}",
+                        msg.hash,
+                        marker_path.display()
+                    )
+                })?;
+            }
+            repaired += 1;
+        }
+    }
+    Ok(ObjectIndexRepairOutcome {
+        repaired,
+        remaining: page.has_more,
+    })
+}
+
+fn load_pending_object_index_updates(
+    db_path: &Path,
+    expected_oid_len: usize,
+    generation_lock: ObjectIndexRepairLock,
+) -> io::Result<PendingObjectIndexPage> {
+    scavenge_index_repair_staging(db_path)?;
+    let marker_dir = db_path
+        .parent()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "repository database path has no storage directory: {}",
+                    db_path.display()
+                ),
+            )
+        })?
+        .join(INDEX_REPAIR_MARKER_DIR);
+    let entries = match fs::read_dir(&marker_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(PendingObjectIndexPage {
+                updates: Vec::new(),
+                has_more: false,
+                _generation_lock: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+
+    let mut marker_paths = Vec::new();
+    let mut held_locks: HashMap<String, Arc<ObjectIndexRepairLock>> = HashMap::new();
+    let mut has_more = false;
+    for (scanned_entries, entry) in entries.enumerate() {
+        let entry = entry?;
+        // A replay invocation owns at most one SQLite batch. This releases all
+        // OID-shard locks after each batch instead of blocking foreground
+        // writers for the lifetime of a potentially 100,000-marker page.
+        if marker_paths.len() >= INDEX_REPAIR_BATCH_SIZE {
+            has_more = true;
+            break;
+        }
+        // Bound raw directory enumeration, not just retained markers. The
+        // extra entry is only a sentinel: validating it would turn a bounded
+        // page into another full-directory scan under a very large outage.
+        if scanned_entries >= INDEX_REPAIR_MARKER_PAGE_CAP {
+            has_more = true;
+            break;
+        }
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "object-index repair directory contains a non-UTF-8 entry: {}",
+                    path.display()
+                ))
+            })?;
+        let Some(identity) = name.strip_suffix(".json") else {
+            // Current writers stage in a sibling directory, so any `.tmp*`
+            // entry here is a legacy crash remnant. Remove it within the raw
+            // enumeration budget; otherwise enough abandoned scratch files
+            // could permanently hide every real marker behind the page cap.
+            if name.starts_with(".tmp") {
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                if !metadata.file_type().is_file() {
+                    return Err(io::Error::other(format!(
+                        "object-index repair scratch entry is not a regular file: {}",
+                        path.display()
+                    )));
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+            return Err(io::Error::other(format!(
+                "unexpected entry in object-index repair directory: {}",
+                path.display()
+            )));
+        };
+        let (oid, object_type) = identity.split_once('.').ok_or_else(|| {
+            io::Error::other(format!(
+                "invalid object-index repair marker filename: {}",
+                path.display()
+            ))
+        })?;
+        if !valid_index_repair_oid(oid, expected_oid_len) || !valid_index_repair_type(object_type) {
+            return Err(io::Error::other(format!(
+                "invalid object-index repair marker filename: {}",
+                path.display()
+            )));
+        }
+        let lock_shard = index_repair_lock_shard(oid)?;
+        let marker_lock = if let Some(lock) = held_locks.get(&lock_shard) {
+            Arc::clone(lock)
+        } else {
+            let Some(lock) = try_acquire_index_repair_lock(db_path, oid, "replay")? else {
+                // A queued writer or another replay owns this marker. Leave it
+                // for a later bounded page rather than blocking an async CLI
+                // preflight.
+                has_more = true;
+                continue;
+            };
+            let lock = Arc::new(lock);
+            held_locks.insert(lock_shard, Arc::clone(&lock));
+            lock
+        };
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other(format!(
+                "object-index repair marker is not a regular file: {}",
+                path.display()
+            )));
+        }
+        marker_paths.push((path, marker_lock));
+    }
+    marker_paths.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut pending = Vec::with_capacity(marker_paths.len());
+    for (marker_path, marker_lock) in marker_paths {
+        let mut file = match fs::File::open(&marker_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(INDEX_REPAIR_MARKER_READ_CAP.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > INDEX_REPAIR_MARKER_READ_CAP {
+            return Err(io::Error::other(format!(
+                "object-index repair marker exceeds {} bytes: {}",
+                INDEX_REPAIR_MARKER_READ_CAP,
+                marker_path.display()
+            )));
+        }
+        let marker: PendingObjectIndexUpdate = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::other(format!(
+                "invalid object-index repair marker '{}': {error}",
+                marker_path.display()
+            ))
+        })?;
+        let file_identity = marker_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|identity| identity.split_once('.'));
+        if marker.schema_version != INDEX_REPAIR_MARKER_SCHEMA_VERSION
+            || file_identity != Some((marker.o_id.as_str(), marker.o_type.as_str()))
+            || !valid_index_repair_oid(&marker.o_id, expected_oid_len)
+            || !valid_index_repair_type(&marker.o_type)
+            || marker.o_size < 0
+        {
+            return Err(io::Error::other(format!(
+                "object-index repair marker failed validation: {}",
+                marker_path.display()
+            )));
+        }
+        pending.push(IndexUpdateMsg {
+            hash: marker.o_id,
+            obj_type: marker.o_type,
+            size: marker.o_size,
+            db_path: db_path.to_path_buf(),
+            marker_path: Some(marker_path),
+            _marker_lock: Some(marker_lock),
+            failure_counter: current_index_failure_counter(),
+            pending_counter: current_index_pending_counter(),
+        });
+    }
+    Ok(PendingObjectIndexPage {
+        updates: pending,
+        has_more,
+        _generation_lock: Some(generation_lock),
+    })
+}
+
+fn scavenge_index_repair_staging(db_path: &Path) -> io::Result<()> {
+    let storage_dir = db_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "repository database path has no storage directory: {}",
+                db_path.display()
+            ),
+        )
+    })?;
+    let staging_dir = storage_dir.join(INDEX_REPAIR_MARKER_STAGING_DIR);
+    let entries = match fs::read_dir(&staging_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0_usize;
+    for entry in entries.take(INDEX_REPAIR_STAGING_SCAN_CAP) {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(".tmp") {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other(format!(
+                "object-index repair staging entry is not a regular file: {}",
+                path.display()
+            )));
+        }
+        let modified = metadata.modified()?;
+        if now.duration_since(modified).unwrap_or_default() < INDEX_REPAIR_STAGING_STALE_AFTER {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if removed >= INDEX_REPAIR_STAGING_REMOVE_CAP {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn valid_supported_index_repair_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_index_repair_oid(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len && valid_supported_index_repair_oid(value)
+}
+
+fn valid_index_repair_type(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Reconcile one bounded page of durable repair markers with a single SQLite
+/// statement on an already-open connection. The marker itself is sufficient
+/// provenance that the content-addressed payload write completed: ordinary
+/// storage creates it only after the configured backend succeeds, and agent
+/// capture creates it only after its direct local object write succeeds.
+/// Payloads may subsequently be local, packed, alternate-backed, or remote-only;
+/// cloud sync remains responsible for reading and validating them before upload.
+async fn update_object_index_batch(
+    db_conn: &DatabaseConnection,
+    db_path: &Path,
+    repo_id: &str,
+    updates: &[IndexUpdateMsg],
+) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let created_at = chrono::Utc::now().timestamp();
+    let mut sql = String::from(
+        "INSERT INTO object_index \
+         (o_id, o_type, o_size, repo_id, created_at, is_synced) VALUES ",
+    );
+    let mut values = Vec::with_capacity(updates.len() * 5);
+    for (index, update) in updates.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?, ?, ?, 0)");
+        values.extend([
+            Value::from(update.hash.clone()),
+            Value::from(update.obj_type.clone()),
+            Value::from(update.size),
+            Value::from(repo_id.to_string()),
+            Value::from(created_at),
+        ]);
+    }
+    // A generic blob row may race the semantic agent row for the same OID.
+    // Promote to the agent type and mark it unsynced, but never demote an
+    // already-semantic row when the generic marker is replayed later.
+    sql.push_str(
+        " ON CONFLICT(repo_id, o_id) DO UPDATE SET \
+         o_type = CASE \
+           WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+            AND substr(object_index.o_type, 1, 6) != 'agent_' \
+           THEN excluded.o_type ELSE object_index.o_type END, \
+         o_size = CASE \
+           WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+            AND substr(object_index.o_type, 1, 6) != 'agent_' \
+           THEN excluded.o_size ELSE object_index.o_size END, \
+         is_synced = CASE \
+           WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+            AND substr(object_index.o_type, 1, 6) != 'agent_' \
+           THEN 0 ELSE object_index.is_synced END",
+    );
+
+    let mut last_error = None;
+    for attempt in 1..=INDEX_UPDATE_MAX_ATTEMPTS {
+        let statement = Statement::from_sql_and_values(
+            db_conn.get_database_backend(),
+            sql.clone(),
+            values.clone(),
+        );
+        match db_conn.execute_raw(statement).await {
+            Ok(_) if db_path.is_file() => return Ok(()),
+            Ok(_) => {
+                return Err(format!(
+                    "object-index database disappeared during durable repair: {}",
+                    db_path.display()
+                ));
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < INDEX_UPDATE_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "failed to reconcile {} durable object-index repair marker(s) in {}: {}",
+        updates.len(),
+        db_path.display(),
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "database update failed".to_string())
+    ))
+}
+
+/// Resolve repository ID for object-index rows.
+///
+/// Boundary conditions:
+/// - Returns the literal string `"unknown-repo"` only when the entry is missing or
+///   blank. A blank or placeholder id is re-rolled when a confirmed remote
+///   prefix is created.
+/// - Propagates query failures. Import turns them into its durable partial/repair
+///   contract; ordinary writers retain an atomic repair marker and the top-level
+///   CLI warns until a later schema-aware preflight replays it.
+async fn resolve_repo_id_for_index(db_conn: &DatabaseConnection) -> Result<String, String> {
+    match ConfigKv::get_with_conn(db_conn, "libra.repoid").await {
+        Ok(Some(entry)) if !entry.value.trim().is_empty() => Ok(entry.value),
+        Ok(_) => Ok("unknown-repo".to_string()),
+        Err(err) => Err(format!(
+            "Failed to resolve repo id for object index update: {err}"
+        )),
+    }
+}
+
+/// Insert (or no-op) an entry in the `object_index` table with bounded retries on
+/// transient failures.
+///
+/// Functional scope:
+/// - Calls [`update_object_index_once`] up to [`INDEX_UPDATE_MAX_ATTEMPTS`] times.
+///   SQLite locking errors are normally transient because object writes race with
+///   foreground commit/reference updates; dropping the row would make `cloud sync`
+///   upload an incomplete object graph.
+///
+/// Boundary conditions:
+/// - A missing database is an error. Every production caller owns a durable
+///   repair marker, so treating repository removal or replacement as success
+///   would retire the only evidence for a row that was never reconciled.
+async fn update_object_index(
+    db_path: &Path,
+    o_id: &str,
+    o_type: &str,
+    o_size: i64,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if test_object_index_faults(db_path).update_failure {
+        return Err("injected object index update failure".to_string());
+    }
+    let mut last_err = None;
+
+    for attempt in 1..=INDEX_UPDATE_MAX_ATTEMPTS {
+        match update_object_index_once(db_path, o_id, o_type, o_size).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if attempt == INDEX_UPDATE_MAX_ATTEMPTS {
+                    last_err = Some(err);
+                    break;
+                }
+
+                tracing::debug!(
+                    db_path = %db_path.display(),
+                    object_id = o_id,
+                    attempt,
+                    max_attempts = INDEX_UPDATE_MAX_ATTEMPTS,
+                    error = %err,
+                    "Retrying object index update after transient failure"
+                );
+                let delay_ms = 100 * attempt as u64;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| "object index update failed".to_string()))
+}
+
+/// Update `object_index` for cloud backup tracking — single attempt.
+///
+/// Functional scope:
+/// - Looks up the existing `(o_id, repo_id)` row; inserts only when missing.
+/// - Uses a short 200 ms busy timeout so foreground commit/reflog/etc. operations
+///   are not blocked by indexing. The outer retry loop gives longer lock windows
+///   time to clear without holding contention for a full second at a time.
+///
+/// Boundary conditions:
+/// - Returns `Err` when the database is absent or disappears. The queue keeps
+///   its durable repair marker so a later schema-aware command can replay it.
+/// - Returns `Err` when the database path is not valid UTF-8 — sea-orm requires a
+///   string URL.
+/// - See: `update_object_index_rejects_missing_database` and
+///   `queued_update_keeps_marker_until_a_moved_database_is_restored`.
+async fn update_object_index_once(
+    db_path: &Path,
+    o_id: &str,
+    o_type: &str,
+    o_size: i64,
+) -> Result<(), String> {
+    if !db_path.exists() {
+        return Err(format!(
+            "object-index database is missing while reconciling durable repair: {}",
+            db_path.display()
+        ));
+    }
+
+    let db_path_str = db_path.to_str().ok_or_else(|| {
+        format!(
+            "database path is not valid UTF-8 for object index update: {}",
+            db_path.display()
+        )
+    })?;
+
+    // Background indexing is best-effort but must not lose rows during ordinary
+    // commit-time SQLite lock windows; the outer retry loop handles longer locks.
+    let db_conn =
+        match db::establish_connection_with_lock_timeout(db_path_str, Duration::from_millis(200))
+            .await
+        {
+            Ok(conn) => conn,
+            Err(err) => {
+                return Err(format!(
+                    "Failed to connect to object index database {}: {}",
+                    db_path.display(),
+                    err
+                ));
+            }
+        };
+
+    let repo_id = resolve_repo_id_for_index(&db_conn).await?;
+    let created_at = chrono::Utc::now().timestamp();
+
+    // Check if object already exists
+    // With multi-repo support, we must check (o_id, repo_id)
+    use sea_orm::{ActiveModelTrait, Set};
+    let existing = object_index::Entity::find()
+        .filter(object_index::Column::OId.eq(o_id))
+        .filter(object_index::Column::RepoId.eq(&repo_id))
+        .one(&db_conn)
+        .await;
+
+    let existing = match existing {
+        Ok(existing) => existing,
+        Err(err) => return Err(format!("Database query failed: {}", err)),
+    };
+
+    if let Some(existing_row) = existing {
+        // Phase 3.5c codex review: a row may already exist with the
+        // generic `blob` tag (written by the standard storage path)
+        // before the agent capture runtime calls back with a more
+        // specific `agent_transcript` tag for the same content-addressed
+        // OID. Without this upgrade the `agent_transcript` tag would be
+        // silently dropped — first-writer-wins — and downstream tooling
+        // that filters by o_type would never see the captured
+        // transcripts. We promote a generic tag to the agent-specific
+        // one but never demote in the other direction (a row already
+        // tagged `agent_transcript` is left alone).
+        if existing_row.o_type != o_type
+            && o_type.starts_with("agent_")
+            && !existing_row.o_type.starts_with("agent_")
+        {
+            let mut active: object_index::ActiveModel = existing_row.into();
+            active.o_type = Set(o_type.to_string());
+            active.is_synced = Set(0);
+            if let Err(err) = active.update(&db_conn).await {
+                return Err(format!("Failed to upgrade object_index o_type: {}", err));
+            }
+        }
+        if !db_path.is_file() {
+            return Err(format!(
+                "object-index database disappeared after row reconciliation: {}",
+                db_path.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    // Insert new object index entry
+    let entry = object_index::ActiveModel {
+        o_id: Set(o_id.to_string()),
+        o_type: Set(o_type.to_string()),
+        o_size: Set(o_size),
+        repo_id: Set(repo_id),
+        created_at: Set(created_at),
+        is_synced: Set(0), // Not synced to cloud yet
+        ..Default::default()
+    };
+
+    if let Err(err) = entry.insert(&db_conn).await {
+        return Err(format!("Failed to insert object index: {}", err));
+    }
+
+    if !db_path.is_file() {
+        return Err(format!(
+            "object-index database disappeared after row reconciliation: {}",
+            db_path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsString,
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    use git_internal::{
+        errors::GitError,
+        hash::{HashKind, ObjectHash, set_hash_kind_for_test},
+        internal::{
+            metadata::{EntryMeta, MetaAttached},
+            object::{ObjectTrait, blob::Blob, types::ObjectType},
+            pack::{encode::PackEncoder, entry::Entry},
+        },
+    };
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
+    use serial_test::serial;
+    use tempfile::tempdir;
+    use tokio::sync::mpsc;
+
+    use super::{
+        ClientStorage, Commit, ObjectIndexRepairLock, ObjectReadFailure, StorageConfigFailure,
+        acquire_index_repair_lock, parse_commit_header_refs, remove_object_index_rows_with_conn,
+        resolve_env_sync, update_object_index, update_object_index_once,
+    };
+    use crate::{
+        internal::{
+            config::ConfigKv,
+            db,
+            model::{object_index, reference},
+        },
+        utils::{
+            object_ext::BlobExt,
+            storage::Storage,
+            test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
+        },
+    };
+
+    struct CheckedProbeStorage {
+        present: ObjectHash,
+        failed: Option<ObjectHash>,
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl CheckedProbeStorage {
+        fn new(present: ObjectHash, failed: Option<ObjectHash>) -> Self {
+            Self {
+                present,
+                failed,
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CheckedProbeStorage {
+        async fn get(&self, hash: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError> {
+            Err(GitError::ObjectNotFound(hash.to_string()))
+        }
+
+        async fn put(
+            &self,
+            _hash: &ObjectHash,
+            _data: &[u8],
+            _obj_type: ObjectType,
+        ) -> Result<String, GitError> {
+            unreachable!("checked-probe test never stores objects")
+        }
+
+        async fn exist(&self, _hash: &ObjectHash) -> bool {
+            unreachable!("checked-probe test must use error-aware existence")
+        }
+
+        async fn search(&self, _prefix: &str) -> Vec<ObjectHash> {
+            Vec::new()
+        }
+
+        async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if self.failed.as_ref() == Some(hash) {
+                return Err(GitError::IOError(std::io::Error::other(
+                    "simulated probe outage",
+                )));
+            }
+            Ok(*hash == self.present)
+        }
+    }
+
+    struct FailingTypeRead;
+
+    #[async_trait::async_trait]
+    impl Storage for FailingTypeRead {
+        async fn get(&self, _hash: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError> {
+            Err(GitError::IOError(std::io::Error::other(
+                "simulated type read failure",
+            )))
+        }
+
+        async fn put(
+            &self,
+            _hash: &ObjectHash,
+            _data: &[u8],
+            _obj_type: ObjectType,
+        ) -> Result<String, GitError> {
+            unreachable!("type-read test never stores objects")
+        }
+
+        async fn exist(&self, _hash: &ObjectHash) -> bool {
+            false
+        }
+
+        async fn search(&self, _prefix: &str) -> Vec<ObjectHash> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn is_object_type_checked_returns_read_error() {
+        let hash = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[7; 20]);
+        let client = ClientStorage::from_test_storage(Arc::new(FailingTypeRead), PathBuf::new());
+        let error = client
+            .is_object_type_checked(&hash, ObjectType::Blob)
+            .expect_err("a storage read failure must stay an error");
+        assert!(
+            matches!(error, GitError::IOError(_)),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !client.is_object_type(&hash, ObjectType::Blob),
+            "the legacy bool probe still collapses the same failure"
+        );
+    }
+
+    #[test]
+    fn checked_batch_deduplicates_and_bounds_concurrency() {
+        let hashes: Vec<ObjectHash> = (0..40)
+            .map(|byte| ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[byte; 20]))
+            .collect();
+        let backend = Arc::new(CheckedProbeStorage::new(hashes[3], None));
+        let client = ClientStorage::from_test_storage(backend.clone(), PathBuf::new());
+
+        let mut input = hashes.clone();
+        input.extend_from_slice(&[hashes[3], hashes[12]]);
+        let results = client.exist_checked_many(&input).expect("batch probe");
+
+        assert_eq!(results.len(), hashes.len());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), hashes.len());
+        assert!(results[&hashes[3]]);
+        assert!(!results[&hashes[12]]);
+        let peak = backend.peak.load(Ordering::SeqCst);
+        assert!(
+            (1..=16).contains(&peak),
+            "probe concurrency must be bounded: {peak}"
+        );
+    }
+
+    #[test]
+    fn checked_batch_reports_failing_oid() {
+        let failed = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[9; 20]);
+        let backend = Arc::new(CheckedProbeStorage::new(
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            Some(failed),
+        ));
+        let client = ClientStorage::from_test_storage(backend, PathBuf::new());
+
+        let error = client
+            .exist_checked_many(&[failed])
+            .expect_err("storage failure must not become absence");
+        assert!(error.to_string().contains(&failed.to_string()));
+        assert!(error.to_string().contains("simulated probe outage"));
+    }
+
+    #[test]
+    fn commit_parent_batch_reads_raw_commits_and_reports_missing_oid() {
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::try_init_local(dir.path().join("objects")).expect("storage");
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[3; 20]);
+        let root = Commit::from_tree_id(tree, vec![], "root");
+        let tip = Commit::from_tree_id(tree, vec![root.id], "tip");
+        for commit in [&root, &tip] {
+            client
+                .put(
+                    &commit.id,
+                    &commit.to_data().expect("serialize fixture commit"),
+                    ObjectType::Commit,
+                )
+                .expect("store fixture commit");
+        }
+
+        let parents = client
+            .commit_parents_many(&[root.id, tip.id, tip.id])
+            .expect("batch read commits");
+        assert_eq!(parents.len(), 2);
+        assert!(parents[&root.id].is_empty());
+        assert_eq!(parents[&tip.id], vec![root.id]);
+
+        let absent = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[4; 20]);
+        let error = client
+            .commit_parents_many(&[absent])
+            .expect_err("missing commit must be an error");
+        assert!(error.to_string().contains(&absent.to_string()));
+    }
+
+    #[test]
+    fn commit_parent_batch_rejects_wrong_type_and_oversized_payload() {
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::try_init_local(dir.path().join("objects")).expect("storage");
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[5; 20]);
+        let wrong_type = Commit::from_tree_id(tree, vec![], "content shaped like a commit");
+        let wrong_type_data = wrong_type.to_data().expect("serialize fixture");
+        let wrong_type_id = ObjectHash::from_type_and_data_for_kind(
+            wrong_type.id.kind(),
+            ObjectType::Blob,
+            &wrong_type_data,
+        )
+        .expect("hash blob fixture");
+        client
+            .put(&wrong_type_id, &wrong_type_data, ObjectType::Blob)
+            .expect("store wrong-type fixture");
+        let error = client
+            .commit_parents_many(&[wrong_type_id])
+            .expect_err("blob must not be accepted as a commit");
+        assert!(error.to_string().contains("expected a commit"), "{error}");
+
+        let oversized = Commit::from_tree_id(tree, vec![], &"x".repeat(4 * 1024 * 1024));
+        client
+            .put(
+                &oversized.id,
+                &oversized.to_data().expect("serialize large commit"),
+                ObjectType::Commit,
+            )
+            .expect("store oversized fixture");
+        let error = client
+            .commit_parents_many(&[oversized.id])
+            .expect_err("oversized commit must be refused");
+        assert!(error.to_string().contains(&oversized.id.to_string()));
+        assert!(error.to_string().contains("4194304"), "{error}");
+    }
+
+    #[test]
+    fn commit_parent_batch_rejects_mismatched_local_oid() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::try_init_local(dir.path().join("objects")).expect("storage");
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[5; 20]);
+        let actual = Commit::from_tree_id(tree, vec![], "actual contents");
+        let requested = Commit::from_tree_id(tree, vec![], "requested contents");
+        client
+            .put(
+                &requested.id,
+                &actual.to_data().expect("serialize actual commit"),
+                ObjectType::Commit,
+            )
+            .expect("seed mismatched commit under requested OID");
+
+        let error = client
+            .commit_parents_many(&[requested.id])
+            .expect_err("bounded commit read must verify the requested OID");
+        assert!(error.to_string().contains("integrity check"), "{error}");
+        assert!(error.to_string().contains(&requested.id.to_string()));
+    }
+
+    #[test]
+    fn commit_parent_batch_reserves_in_flight_byte_budget() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::try_init_local(dir.path().join("objects")).expect("storage");
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[6; 20]);
+        let mut hashes = Vec::new();
+        let mut commit_bytes = 0u64;
+        for message in *b"abc" {
+            let mut data =
+                format!("tree {tree}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n")
+                    .into_bytes();
+            data.push(message);
+            commit_bytes = data.len() as u64;
+            let hash =
+                ObjectHash::from_type_and_data_for_kind(HashKind::Sha1, ObjectType::Commit, &data)
+                    .expect("hash commit fixture");
+            client
+                .put(&hash, &data, ObjectType::Commit)
+                .expect("store commit fixture");
+            hashes.push(hash);
+        }
+        let last_read_limit = commit_bytes / 2;
+        let error = client
+            .commit_parents_many_with_limits(
+                &hashes,
+                commit_bytes,
+                2 * commit_bytes + last_read_limit,
+                10,
+            )
+            .expect_err("third commit must be bounded by the remaining response budget");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("limit of {last_read_limit} bytes")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn commit_parent_batch_caps_total_parents() {
+        let dir = tempdir().expect("temporary object directory");
+        let client = ClientStorage::try_init_local(dir.path().join("objects")).expect("storage");
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[6; 20]);
+        let parent = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[7; 20]);
+        let mut commits = Vec::new();
+        for index in 0..4 {
+            let commit =
+                Commit::from_tree_id(tree, vec![parent; 65_537], &format!("wide merge {index}"));
+            client
+                .put(
+                    &commit.id,
+                    &commit.to_data().expect("serialize wide commit"),
+                    ObjectType::Commit,
+                )
+                .expect("store wide commit");
+            commits.push(commit.id);
+        }
+
+        let error = client
+            .commit_parents_many(&commits)
+            .expect_err("aggregate parent cap must be enforced");
+        assert!(error.to_string().contains("262144 parents"), "{error}");
+    }
+
+    #[test]
+    fn commit_header_parser_accepts_binary_message_and_ignores_signature_continuation() {
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let commit = ObjectHash::new_for_kind(kind, b"commit");
+            let tree = ObjectHash::new_for_kind(kind, b"tree");
+            let parent = ObjectHash::new_for_kind(kind, b"parent");
+            let ignored_continuation = ObjectHash::new_for_kind(kind, b"ignored");
+            let mut bytes = format!(
+                "tree {tree}\nparent {parent}\nauthor Author <a@example.com> 0 +0000\ncommitter Committer <c@example.com> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n parent {ignored_continuation}\n\n"
+            )
+            .into_bytes();
+            bytes.extend_from_slice(&[0xff, 0x00, 0xfe]);
+
+            let (parsed_tree, parents) =
+                parse_commit_header_refs(&bytes, commit).expect("parse only commit headers");
+            assert_eq!(parsed_tree, tree);
+            assert_eq!(parents, vec![parent]);
+        }
+    }
+
+    #[test]
+    fn commit_header_parser_ignores_legacy_message_without_blank_separator() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha1, b"commit");
+        let tree = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let parent = ObjectHash::new_for_kind(HashKind::Sha1, b"parent");
+        let message_oid = ObjectHash::new_for_kind(HashKind::Sha1, b"message text");
+        let body = format!(
+            "tree {tree}\nparent {parent}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\nparent {message_oid}\n"
+        );
+        let (parsed_tree, parents) =
+            parse_commit_header_refs(body.as_bytes(), commit).expect("legacy commit header");
+        assert_eq!(parsed_tree, tree);
+        assert_eq!(parents, vec![parent]);
+    }
+
+    #[test]
+    fn commit_header_parser_rejects_wrong_kind_and_malformed_parent() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha256, b"commit");
+        let wrong_kind = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let bad_tree =
+            format!("tree {wrong_kind}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n");
+        let error = parse_commit_header_refs(bad_tree.as_bytes(), commit)
+            .expect_err("tree kind mismatch must be rejected");
+        assert!(error.to_string().contains("invalid tree ID"));
+
+        let tree = ObjectHash::new_for_kind(HashKind::Sha256, b"tree");
+        let bad_parent = format!(
+            "tree {tree}\nparent {}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n",
+            "z".repeat(64)
+        );
+        let error = parse_commit_header_refs(bad_parent.as_bytes(), commit)
+            .expect_err("non-hex parent must be rejected");
+        assert!(error.to_string().contains("invalid parent ID"));
+    }
+
+    #[test]
+    fn commit_header_parser_stops_at_first_non_parent_line() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha1, b"commit");
+        let tree = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let parent = ObjectHash::new_for_kind(HashKind::Sha1, b"parent");
+        let cases = [
+            format!(
+                "tree {tree}\nauthor A <a@b> 0 +0000\nparent {parent}\ncommitter C <c@d> 0 +0000\n\n"
+            ),
+            format!("tree {tree}\ncommitter C <c@d> 0 +0000\nauthor A <a@b> 0 +0000\n\n"),
+            format!(
+                "tree {tree}\nauthor A <a@b> 0 +0000\nauthor B <b@c> 0 +0000\ncommitter C <c@d> 0 +0000\n\n"
+            ),
+            format!(
+                "tree {tree}\ntree {tree}\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n"
+            ),
+            format!("tree {tree}\n orphan\nauthor A <a@b> 0 +0000\ncommitter C <c@d> 0 +0000\n\n"),
+        ];
+        for body in cases {
+            let (parsed_tree, parents) = parse_commit_header_refs(body.as_bytes(), commit)
+                .expect("later noncanonical headers do not affect the parent graph");
+            assert_eq!(parsed_tree, tree);
+            assert!(parents.is_empty(), "later parent lines are not edges");
+        }
+    }
+
+    #[test]
+    fn commit_header_parser_accepts_missing_author_and_committer() {
+        let commit = ObjectHash::new_for_kind(HashKind::Sha1, b"commit");
+        let tree = ObjectHash::new_for_kind(HashKind::Sha1, b"tree");
+        let parent = ObjectHash::new_for_kind(HashKind::Sha1, b"parent");
+        for body in [
+            format!("tree {tree}\n\n"),
+            format!("tree {tree}\nparent {parent}\n\n"),
+            format!("tree {tree}\nparent {parent}\ncommitter before author\n"),
+        ] {
+            let (parsed_tree, parents) = parse_commit_header_refs(body.as_bytes(), commit)
+                .expect("Git graph parser only requires tree and leading parents");
+            assert_eq!(parsed_tree, tree);
+            assert_eq!(
+                parents,
+                if body.contains("parent ") {
+                    vec![parent]
+                } else {
+                    vec![]
+                }
+            );
+        }
+
+        for body in [
+            format!("tree {tree}\n"),
+            format!("tree {tree}\nparent {parent}\n"),
+        ] {
+            let error = parse_commit_header_refs(body.as_bytes(), commit)
+                .expect_err("a commit cannot end directly after a reference header");
+            assert!(error.to_string().contains("ends immediately"), "{error}");
+        }
+    }
+
+    #[test]
+    fn typed_bounded_read_preserves_type_and_enforces_limit() {
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("create object directory");
+        let storage = ClientStorage::try_init_local(dir.path().join("objects")).expect("storage");
+        let blob = Blob::from_content("bounded typed read");
+        storage
+            .put(&blob.id, &blob.data, ObjectType::Blob)
+            .expect("store local blob");
+
+        let (payload, object_type) = storage
+            .get_typed_with_limit(&blob.id, 1024)
+            .expect("read typed object within bound");
+        assert_eq!(payload, blob.data);
+        assert_eq!(object_type, ObjectType::Blob);
+        let error = storage
+            .get_typed_with_limit(&blob.id, 1)
+            .expect_err("small limit must reject the object");
+        assert!(error.to_string().contains("limit"), "{error}");
+
+        let mismatched = Blob::from_content("different object").id;
+        storage
+            .put(&mismatched, &blob.data, ObjectType::Blob)
+            .expect("seed payload under the wrong local OID");
+        let error = storage
+            .get_typed_with_limit(&mismatched, 1024)
+            .expect_err("bounded local tag/want reads must verify the requested OID");
+        assert!(error.to_string().contains("integrity check"), "{error}");
+        assert!(
+            error.to_string().contains(&mismatched.to_string()),
+            "{error}"
+        );
+    }
+
+    /// Test helper that clears an env var on construction and restores it on drop.
+    /// Combined with `#[serial]`, this lets tests assert behaviour when a specific
+    /// env var is unset without leaking state into sibling tests.
+    struct ClearedEnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ClearedEnvVarGuard {
+        fn new(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: these tests are `#[serial]`, so process env mutation is isolated.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ClearedEnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: this restores the exact previous value for the same process env key.
+            unsafe {
+                if let Some(value) = &self.previous {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    // Helper to build packs (copied from previous version for tests)
+    async fn encode_entries_to_pack_bytes(entries: Vec<Entry>) -> Result<Vec<u8>, GitError> {
+        assert!(!entries.is_empty(), "encode requires at least one entry");
+        let (pack_tx, mut pack_rx) = mpsc::channel::<Vec<u8>>(128);
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(entries.len());
+        let kind = git_internal::hash::get_hash_kind();
+        let mut encoder = PackEncoder::new_with_hash_kind(kind, entries.len(), 0, pack_tx);
+        let encode_handle = tokio::spawn(async move { encoder.encode(entry_rx).await });
+
+        for entry in entries {
+            entry_tx
+                .send(MetaAttached {
+                    inner: entry,
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .map_err(|e| GitError::PackEncodeError(format!("send entry failed: {e}")))?;
+        }
+        drop(entry_tx);
+
+        let mut pack_bytes = Vec::new();
+        while let Some(chunk) = pack_rx.recv().await {
+            pack_bytes.extend_from_slice(&chunk);
+        }
+
+        let encode_result = encode_handle
+            .await
+            .map_err(|e| GitError::PackEncodeError(format!("pack encoder task join error: {e}")))?;
+        encode_result?;
+        Ok(pack_bytes)
+    }
+
+    fn build_pack_bytes(entries: Vec<Entry>) -> Result<Vec<u8>, GitError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(encode_entries_to_pack_bytes(entries))
+    }
+
+    fn write_pack_to_objects(
+        pack_bytes: &[u8],
+        label: &str,
+    ) -> Result<(tempfile::TempDir, PathBuf, PathBuf), GitError> {
+        let dir = tempdir()?;
+        let objects_dir = dir.path().join("objects");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir)?;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pack_path = pack_dir.join(format!("client-storage-{label}-{unique}.pack"));
+        fs::write(&pack_path, pack_bytes)?;
+        Ok((dir, objects_dir, pack_path))
+    }
+
+    #[test]
+    fn object_index_repair_lock_wait_is_bounded() {
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join("libra.db");
+        let oid = "a".repeat(40);
+        let _held = acquire_index_repair_lock(&db_path, &oid, "queued_update")
+            .expect("acquire first repair lock");
+
+        let started = Instant::now();
+        let error = match acquire_index_repair_lock(&db_path, &oid, "queued_update") {
+            Ok(_) => panic!("a competing repair lock must time out"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= super::INDEX_REPAIR_LOCK_WAIT_TIMEOUT);
+        let message = error.to_string();
+        assert!(
+            message.contains("timed out waiting for object-index repair lock"),
+            "{message}"
+        );
+        // The holder is this very process: the diagnostic must say so (M-DIAG
+        // D2) and must include the D4 note about never deleting lock files.
+        assert!(
+            message.contains("held by this Libra process itself"),
+            "{message}"
+        );
+        assert!(message.contains("must not be deleted"), "{message}");
+    }
+
+    #[test]
+    fn lock_timeout_reports_live_foreign_holder() {
+        #[cfg(unix)]
+        {
+            let storage = tempdir().expect("create storage directory");
+            let db_path = storage.path().join("libra.db");
+            let oid = "f".repeat(40);
+            let lock_path = super::index_repair_lock_path(&db_path, &oid).expect("lock path");
+
+            // Hold the shard lock from a helper process so the metadata reports
+            // a genuinely foreign live pid (M-DIAG D1).
+            let helper = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("utils::client_storage::tests::lock_holder_helper_process")
+                .arg("--exact")
+                .env("LIBRA_TEST_LOCK_HOLD_PATH", &lock_path)
+                .spawn()
+                .expect("spawn lock holder helper");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while super::read_index_repair_lock_metadata(&lock_path).is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "helper never wrote holder metadata"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let error = match acquire_index_repair_lock(&db_path, &oid, "queued_update") {
+                Ok(_) => panic!("the foreign holder must make the acquisition time out"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let message = error.to_string();
+            assert!(
+                message.contains("another live Libra process (pid"),
+                "{message}"
+            );
+            assert!(message.contains("purpose: marker_publication"), "{message}");
+            assert!(
+                message.contains("wait for that process to finish"),
+                "{message}"
+            );
+            let _ = helper.wait_with_output();
+        }
+        #[cfg(not(unix))]
+        {
+            // The foreign-holder reproduction needs flock semantics; on
+            // Windows the D5 read-failure path is covered by
+            // `lock_metadata_read_failure_falls_back_to_undetermined`.
+        }
+    }
+
+    /// Helper invoked as its own process by `lock_timeout_reports_live_foreign_holder`.
+    /// Holds the shard lock named by LIBRA_TEST_LOCK_HOLD_PATH with realistic
+    /// `marker_publication`-style metadata until the process exits.
+    #[test]
+    fn lock_holder_helper_process() {
+        let Ok(lock_path) = std::env::var("LIBRA_TEST_LOCK_HOLD_PATH") else {
+            return; // regular test run: nothing to hold
+        };
+        let lock_path = PathBuf::from(lock_path);
+        #[cfg(unix)]
+        {
+            use std::{io::Write, os::fd::AsRawFd};
+
+            if let Some(parent) = lock_path.parent() {
+                fs::create_dir_all(parent).expect("create lock directory");
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open helper lock file");
+            // SAFETY: flock on an owned descriptor held until process exit.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(result, 0, "helper flock must succeed");
+            let metadata = format!(
+                "{{\"pid\":{},\"purpose\":\"marker_publication\",\"started_at_ms\":{},\"invocation\":\"helper\"}}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+            file.set_len(0).expect("truncate helper lock file");
+            file.write_all(metadata.as_bytes())
+                .expect("write helper metadata");
+            file.flush().expect("flush helper metadata");
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lock_path;
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn lock_timeout_without_metadata_is_undetermined() {
+        #[cfg(unix)]
+        {
+            let storage = tempdir().expect("create storage directory");
+            let db_path = storage.path().join("libra.db");
+            let oid = "b".repeat(40);
+            let lock_path = super::index_repair_lock_path(&db_path, &oid).expect("lock path");
+
+            // Hold the lock with a raw flock and NO metadata payload: the
+            // timeout diagnostic must not claim anything about the holder
+            // (M-DIAG D3).
+            let _raw_holder = {
+                use std::os::fd::AsRawFd;
+                if let Some(parent) = lock_path.parent() {
+                    fs::create_dir_all(parent).expect("create lock directory");
+                }
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .expect("open raw lock file");
+                // SAFETY: flock on an owned descriptor held until the end of the test.
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                assert_eq!(result, 0, "raw flock must succeed");
+                file
+            };
+
+            let error = match acquire_index_repair_lock(&db_path, &oid, "queued_update") {
+                Ok(_) => panic!("the raw holder must make the acquisition time out"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let message = error.to_string();
+            assert!(
+                message.contains("the lock holder could not be determined"),
+                "{message}"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            // Raw flock reproduction is unix-only; non-unix read-failure
+            // coverage lives in `lock_metadata_read_failure_falls_back_to_undetermined`.
+        }
+    }
+
+    #[test]
+    fn lock_metadata_write_failure_does_not_fail_acquire() {
+        // A read-only handle cannot be truncated or written; the metadata write
+        // must degrade to a debug log without failing the acquisition (M-DIAG
+        // D6).
+        let dir = tempdir().expect("create metadata failure directory");
+        let path = dir.path().join("lock");
+        fs::write(&path, b"").expect("seed lock file");
+        let file = fs::File::open(&path).expect("open lock file read-only");
+        let mut lock = ObjectIndexRepairLock { file };
+        super::write_index_repair_lock_metadata(&mut lock, "marker_publication");
+        assert_eq!(
+            fs::read(&path).expect("read lock file"),
+            b"",
+            "a failed metadata write must leave the lock file unchanged"
+        );
+    }
+
+    #[test]
+    fn lock_metadata_read_failure_falls_back_to_undetermined() {
+        // Unreadable metadata (missing file, empty payload, invalid JSON, or
+        // oversized content) must all resolve to the undetermined clause.
+        // Windows zero-share handles hit the same open-failure branch (D5).
+        let dir = tempdir().expect("create read failure directory");
+        assert!(super::read_index_repair_lock_metadata(&dir.path().join("missing")).is_none());
+        let empty = dir.path().join("empty");
+        fs::write(&empty, b"").expect("write empty lock file");
+        assert!(super::read_index_repair_lock_metadata(&empty).is_none());
+        let invalid = dir.path().join("invalid");
+        fs::write(&invalid, b"not json").expect("write invalid lock file");
+        assert!(super::read_index_repair_lock_metadata(&invalid).is_none());
+        let oversized = dir.path().join("oversized");
+        fs::write(&oversized, vec![b'x'; 2048]).expect("write oversized lock file");
+        assert!(super::read_index_repair_lock_metadata(&oversized).is_none());
+    }
+
+    #[test]
+    fn lock_wait_uses_bounded_quadratic_backoff() {
+        // M-WAIT W3: 1ms × (attempt+1)², ±25% jitter, single sleep capped at 1s.
+        for (attempt, step_ms) in [
+            (0u32, 1u64),
+            (1, 4),
+            (2, 9),
+            (9, 100),
+            (30, 961),
+            (31, 1000),
+            (500, 1000),
+        ] {
+            let min = super::index_repair_lock_backoff_sleep(attempt, 0.0);
+            let max = super::index_repair_lock_backoff_sleep(attempt, 1.0);
+            assert_eq!(
+                min,
+                Duration::from_micros(step_ms * 750),
+                "attempt {attempt} lower bound"
+            );
+            assert_eq!(
+                max,
+                Duration::from_micros(step_ms * 1250),
+                "attempt {attempt} upper bound"
+            );
+            let mid = super::index_repair_lock_backoff_sleep(attempt, 0.5);
+            assert!(min <= mid && mid <= max, "attempt {attempt} midpoint");
+        }
+    }
+
+    #[test]
+    fn test_lock_wait_budget_stays_short_in_test_builds() {
+        // M-WAIT W7: the test-build budget must stay at 100ms so suites do
+        // not slow down behind the 10s production budget.
+        assert_eq!(
+            super::INDEX_REPAIR_LOCK_WAIT_TIMEOUT,
+            Duration::from_millis(100)
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn batched_marker_publication_takes_generation_lock_per_batch() {
+        // M-BATCH B1: 300 markers publish under ⌈300/256⌉ = 2 generation locks.
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "batch-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+
+        let before = super::BATCHED_MARKER_PUBLICATIONS.load(super::Ordering::Relaxed);
+        client.begin_object_index_batch();
+        for index in 0..300 {
+            let blob = Blob::from_content(&format!("batch payload {index}"));
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object inside the batch");
+        }
+        client
+            .end_object_index_batch()
+            .expect("flush the final batch");
+        let delta = super::BATCHED_MARKER_PUBLICATIONS.load(super::Ordering::Relaxed) - before;
+        assert_eq!(
+            delta, 2,
+            "300 markers must publish in exactly 2 batch publications, got {delta}"
+        );
+        ClientStorage::wait_for_background_tasks();
+    }
+
+    #[test]
+    fn batch_failure_keeps_published_markers() {
+        // M-BATCH B2: when marker N fails, markers 1..N-1 already written stay
+        // on disk and the error propagates.
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let second_db = storage
+            .path()
+            .join("second")
+            .join(crate::utils::util::DATABASE);
+        let mk = |hash: &str, db: PathBuf| super::IndexUpdateMsg {
+            hash: hash.to_string(),
+            obj_type: "blob".to_string(),
+            size: 1,
+            db_path: db,
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        };
+        let first_hash = format!("{:040x}", 1);
+        let second_hash = format!("{:040x}", 2);
+        // A directory squatting on the second marker path makes the atomic
+        // rename fail after the first marker was written.
+        let second_marker = super::index_repair_marker_path(&second_db, &second_hash, "blob")
+            .expect("second marker path");
+        fs::create_dir_all(second_marker.parent().expect("marker parent"))
+            .expect("create second marker parent");
+        fs::create_dir_all(&second_marker).expect("squat a directory on the marker path");
+
+        let msgs = vec![
+            mk(&first_hash, db_path.clone()),
+            mk(&second_hash, second_db),
+        ];
+        let result = super::persist_index_repair_marker_batch(&msgs);
+        assert!(result.is_err(), "the second marker must fail the batch");
+        let first_marker = super::index_repair_marker_path(&db_path, &first_hash, "blob")
+            .expect("first marker path");
+        assert!(
+            first_marker.is_file(),
+            "the already-written first marker must remain (B2)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn deletion_fence_waits_between_batches() {
+        // M-BATCH B3: after a full batch auto-flushes, the generation lock is
+        // free again before the next batch publishes.
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "fence-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+
+        client.begin_object_index_batch();
+        for index in 0..300 {
+            let blob = Blob::from_content(&format!("fence payload {index}"));
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object inside the batch");
+        }
+        // The first 256 markers flushed during the loop; the lock must be free
+        // for a deletion fence between batches.
+        let lock_path = super::index_repair_generation_lock_path(&db_path).expect("lock path");
+        let probe = super::try_acquire_index_repair_lock_file(&lock_path, "replay")
+            .expect("probe generation lock");
+        assert!(
+            probe.is_some(),
+            "the generation lock must be free between batches (B3)"
+        );
+        drop(probe);
+        client
+            .end_object_index_batch()
+            .expect("flush the final batch");
+        ClientStorage::wait_for_background_tasks();
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn nonblocking_preflight_skips_busy_generation_lock() {
+        // M-WAIT W5: with the generation lock busy, the uncontended preflight
+        // skips the replay immediately, without waiting and without an error.
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "skip-repo", false)
+            .await
+            .expect("set repo id");
+        let _held = super::acquire_index_repair_generation_lock(&db_path, "queued_update")
+            .expect("hold generation lock");
+
+        let started = Instant::now();
+        let outcome = ClientStorage::repair_pending_object_index_updates_if_uncontended(&db_path)
+            .await
+            .expect("busy preflight must not error");
+        assert!(
+            outcome.is_none(),
+            "a busy generation lock must skip the replay"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the skip must not wait for the lock"
+        );
+    }
+
+    #[test]
+    fn object_index_repair_locks_are_isolated_across_shards() {
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join("libra.db");
+        let first_oid = format!("aa{}", "1".repeat(38));
+        let second_oid = format!("aa{}", "2".repeat(38));
+        let _first = acquire_index_repair_lock(&db_path, &first_oid, "queued_update")
+            .expect("acquire first object-index repair shard");
+        let _second = acquire_index_repair_lock(&db_path, &second_oid, "queued_update")
+            .expect("objects in different shards must use independent repair locks");
+    }
+
+    #[test]
+    fn marker_publication_does_not_wait_for_unrelated_object_in_same_shard() {
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join("libra.db");
+        let held_oid = format!("abcd{}", "1".repeat(36));
+        let published_oid = format!("abcd{}", "2".repeat(36));
+        let _held = acquire_index_repair_lock(&db_path, &held_oid, "queued_update")
+            .expect("acquire unrelated object-index repair shard");
+
+        let marker_path = super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: published_oid,
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path,
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("a coarse shard collision must not block durable marker publication");
+
+        assert!(marker_path.is_file());
+    }
+
+    #[test]
+    fn object_index_repair_lock_namespace_is_bounded_and_stable() {
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join("libra.db");
+        let first_oid = format!("abcd{}", "1".repeat(36));
+        let same_shard_oid = format!("abcd{}", "2".repeat(36));
+        let other_shard_oid = format!("abce{}", "1".repeat(36));
+
+        let first_path = super::index_repair_lock_path(&db_path, &first_oid)
+            .expect("resolve first object-index repair lock path");
+        let same_shard_path = super::index_repair_lock_path(&db_path, &same_shard_oid)
+            .expect("resolve same-shard object-index repair lock path");
+        let other_shard_path = super::index_repair_lock_path(&db_path, &other_shard_oid)
+            .expect("resolve other-shard object-index repair lock path");
+
+        assert_eq!(first_path, same_shard_path);
+        assert_ne!(first_path, other_shard_path);
+        assert_eq!(
+            first_path.file_name().and_then(|name| name.to_str()),
+            Some("abcd.lock")
+        );
+    }
+
+    /// Scenario: a freshly-built SHA-1 pack must be readable through `ClientStorage`
+    /// without the caller having touched any database. Guards the pack-reading code
+    /// path that `clone`/`fetch` rely on so they can fall back to packs when the
+    /// loose-object directory is absent.
+    #[test]
+    #[serial(hash_kind)]
+    fn client_storage_reads_pack_sha1() -> Result<(), GitError> {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let blob = Blob::from_content("client-storage-sha1");
+        let pack_bytes = build_pack_bytes(vec![Entry::from(blob.clone())])?;
+        let (_tmp, objects_dir, _) = write_pack_to_objects(&pack_bytes, "sha1")?;
+
+        let storage = ClientStorage::try_init(objects_dir)?;
+        let data = storage.get(&blob.id)?;
+        assert_eq!(data, blob.data);
+        Ok(())
+    }
+
+    /// Pins `classify_read_failure` to the real storage error paths: the
+    /// mapping relies on message details produced by `storage/local.rs`,
+    /// `storage/load_cost.rs` and `storage/tiered.rs`, so exercise those
+    /// paths end-to-end instead of matching hand-written strings.
+    #[test]
+    #[serial(hash_kind)]
+    fn classify_read_failure_pins_storage_messages() -> Result<(), GitError> {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = ClientStorage::try_init_local(tmp.path().join("objects"))?;
+
+        // Missing: never-written object.
+        let ghost = Blob::from_content("classify-missing-object");
+        let missing = storage.get(&ghost.id).expect_err("object must be absent");
+        assert_eq!(
+            ClientStorage::classify_read_failure(&missing),
+            ObjectReadFailure::Missing
+        );
+
+        // TooLarge: bounded read below the object's load cost.
+        let big = Blob::from_content(&"x".repeat(4096));
+        storage.put(
+            &big.id,
+            &big.data,
+            git_internal::internal::object::types::ObjectType::Blob,
+        )?;
+        let too_large = storage
+            .get_with_limit(&big.id, 8)
+            .expect_err("limit below cost must refuse");
+        assert_eq!(
+            ClientStorage::classify_read_failure(&too_large),
+            ObjectReadFailure::TooLarge
+        );
+
+        // Corrupt: truncate the loose file so the zlib/header decode fails.
+        let corrupt_victim = Blob::from_content("classify-corrupt-object");
+        storage.put(
+            &corrupt_victim.id,
+            &corrupt_victim.data,
+            git_internal::internal::object::types::ObjectType::Blob,
+        )?;
+        let hex = corrupt_victim.id.to_string();
+        let loose = tmp.path().join("objects").join(&hex[..2]).join(&hex[2..]);
+        assert!(
+            loose.is_file(),
+            "loose object expected at {}",
+            loose.display()
+        );
+        // Loose objects are written read-only; lift the mode before corrupting.
+        let mut perms = std::fs::metadata(&loose)
+            .expect("loose metadata")
+            .permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&loose, perms).expect("make loose writable");
+        std::fs::write(&loose, b"not a zlib stream").expect("corrupt loose object");
+        let corrupt = storage
+            .get(&corrupt_victim.id)
+            .expect_err("corrupt loose object must fail");
+        assert_eq!(
+            ClientStorage::classify_read_failure(&corrupt),
+            ObjectReadFailure::Corrupt
+        );
+
+        Ok(())
+    }
+
+    /// Scenario: parallel test for SHA-256 pack reading. SHA-256 has a different
+    /// header layout and crc table; this test pins backwards/forwards compatibility
+    /// for repositories created with `core.objectformat=sha256`.
+    #[test]
+    #[serial(hash_kind)]
+    fn client_storage_reads_pack_sha256() -> Result<(), GitError> {
+        let _guard = set_hash_kind_for_test(HashKind::Sha256);
+        let blob = Blob::from_content("client-storage-sha256");
+        let pack_bytes = build_pack_bytes(vec![Entry::from(blob.clone())])?;
+        let (_tmp, objects_dir, _) = write_pack_to_objects(&pack_bytes, "sha256")?;
+
+        let storage = ClientStorage::try_init(objects_dir)?;
+        let data = storage.get(&blob.id)?;
+        assert_eq!(data, blob.data);
+        Ok(())
+    }
+
+    /// Scenario: round-trip a blob through `put`/`exist`/`get`. This is the smallest
+    /// possible regression check that the synchronous facade and its blocking-on-
+    /// runtime bridge are wired up correctly.
+    #[test]
+    #[serial(cwd, env, hash_kind)]
+    fn test_content_store() {
+        let content = "Hello, world!";
+        let blob = Blob::from_content(content);
+
+        let _tmp = tempdir().unwrap();
+        let source = _tmp.path().join("objects");
+
+        let client_storage = ClientStorage::try_init(source.clone()).expect("storage");
+        assert!(
+            client_storage
+                .put(&blob.id, &blob.data, blob.get_type())
+                .is_ok()
+        );
+        assert!(client_storage.exist(&blob.id));
+
+        let data = client_storage.get(&blob.id).unwrap();
+        assert_eq!(data, blob.data);
+        assert_eq!(String::from_utf8(data).unwrap(), content);
+    }
+
+    /// Scenario: searching for a freshly-stored object by its full hash must return a
+    /// non-empty result. This guards the storage-search wiring that downstream
+    /// commands (`cat-file`, `rev-parse`) rely on for hash resolution.
+    #[tokio::test]
+    async fn test_search() {
+        let blob = Blob::from_content("Hello, world!");
+
+        let _tmp = tempdir().unwrap();
+        let source = _tmp.path().join("objects");
+
+        let client_storage = ClientStorage::try_init(source.clone()).expect("storage");
+        assert!(
+            client_storage
+                .put(&blob.id, &blob.data, blob.get_type())
+                .is_ok()
+        );
+
+        // Search by full hash should return it
+        let objs = client_storage.search(&blob.id.to_string()).await;
+        assert!(!objs.is_empty());
+    }
+
+    /// Scenario: when a branch row exists but its `commit` column is not a valid
+    /// hash, navigation like `main~1` must surface a fatal error rather than
+    /// silently returning an empty match list. This protects users from acting on
+    /// stale or corrupt references without realising it.
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn test_search_result_surfaces_corrupt_branch_storage() {
+        let repo = tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+
+        let db_conn = db::get_db_conn_instance().await;
+        reference::ActiveModel {
+            name: Set(Some("main".to_string())),
+            kind: Set(reference::ConfigKind::Branch),
+            commit: Set(Some("not-a-valid-hash".to_string())),
+            remote: Set(None),
+            ..Default::default()
+        }
+        .insert(&db_conn)
+        .await
+        .unwrap();
+
+        let storage = ClientStorage::try_init(crate::utils::path::objects()).expect("storage");
+        let error = storage
+            .search_result("main~1")
+            .await
+            .expect_err("corrupt branch storage should be surfaced");
+        assert!(
+            error
+                .to_string()
+                .contains("stored branch reference 'main' is corrupt"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Scenario: input like `~1` or `^2` has no base ref. Without a guard, those
+    /// would degenerate into a prefix search of the empty string, returning every
+    /// object in the repository. The test verifies that we instead return an empty
+    /// vector — the safe behaviour for invalid navigation requests.
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn test_search_result_rejects_empty_base_ref_navigation() {
+        let repo = tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+
+        let storage = ClientStorage::try_init(crate::utils::path::objects()).expect("storage");
+        assert!(
+            storage
+                .search_result("~1")
+                .await
+                .expect("empty-base ~ navigation should not error")
+                .is_empty()
+        );
+        assert!(
+            storage
+                .search_result("^2")
+                .await
+                .expect("empty-base ^ navigation should not error")
+                .is_empty()
+        );
+    }
+
+    struct PrefixHit {
+        hit: ObjectHash,
+        missing: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for PrefixHit {
+        async fn get(&self, hash: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError> {
+            if self.missing {
+                Err(GitError::ObjectNotFound(hash.to_string()))
+            } else {
+                Err(GitError::IOError(std::io::Error::other(
+                    "simulated type read failure",
+                )))
+            }
+        }
+
+        async fn put(
+            &self,
+            _hash: &ObjectHash,
+            _data: &[u8],
+            _obj_type: ObjectType,
+        ) -> Result<String, GitError> {
+            unreachable!("prefix-hit test must not store")
+        }
+
+        async fn exist(&self, _hash: &ObjectHash) -> bool {
+            false
+        }
+
+        async fn search(&self, _prefix: &str) -> Vec<ObjectHash> {
+            vec![self.hit]
+        }
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn search_result_type_read_error_is_not_empty() {
+        let repo = tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        let hit = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[8; 20]);
+        let failing = ClientStorage::from_test_storage(
+            Arc::new(PrefixHit {
+                hit,
+                missing: false,
+            }),
+            PathBuf::new(),
+        );
+        let error = failing
+            .search_result("abcdef01~1")
+            .await
+            .expect_err("a type read failure must stay an error");
+        let rendered = error.to_string();
+        assert!(
+            matches!(error, GitError::IOError(_)),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            rendered.contains("simulated type read failure"),
+            "{rendered}"
+        );
+
+        let missing = ClientStorage::from_test_storage(
+            Arc::new(PrefixHit { hit, missing: true }),
+            PathBuf::new(),
+        );
+        let matches = missing
+            .search_result("abcdef01~1")
+            .await
+            .expect("a missing prefix hit stays an empty match");
+        assert!(matches.is_empty(), "{matches:?}");
+    }
+
+    #[test]
+    fn ensure_existing_object_index_read_error_is_not_missing() {
+        let present = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]);
+        let failed = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[8; 20]);
+        let absent = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[2; 20]);
+        let client = ClientStorage::from_test_storage(
+            Arc::new(CheckedProbeStorage::new(present, Some(failed))),
+            PathBuf::new(),
+        );
+        let error = client
+            .ensure_existing_object_index(&failed, 4, ObjectType::Blob)
+            .expect_err("a read failure must not register");
+        let rendered = error.to_string();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(rendered.contains("simulated probe outage"), "{rendered}");
+        assert!(!rendered.contains("no longer present"), "{rendered}");
+
+        let missing = client
+            .ensure_existing_object_index(&absent, 4, ObjectType::Blob)
+            .expect_err("a missing payload stays NotFound");
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        assert!(missing.to_string().contains("no longer present"));
+    }
+
+    /// Scenario: zlib compress then decompress must yield the original bytes
+    /// verbatim. Pins the compression helpers used by the loose-object writer so a
+    /// crate upgrade cannot silently change the round-trip.
+    #[test]
+    fn test_decompress() {
+        let data = b"blob 13\0Hello, world!";
+        let compressed_data = ClientStorage::compress_zlib(data).unwrap();
+        let decompressed_data = ClientStorage::decompress_zlib(&compressed_data).unwrap();
+        assert_eq!(decompressed_data, data);
+    }
+
+    /// Scenario: `put` should write its index update to the database that owns the
+    /// objects directory it just wrote into, *not* whichever database is reachable
+    /// from the process CWD. Regression guard for a bug where two repositories sharing
+    /// a CWD could cross-pollinate their object indexes.
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn background_index_update_uses_storage_database_instead_of_cwd() {
+        let workspace = tempdir().unwrap();
+        let storage_path = workspace.path().join(".libra");
+        fs::create_dir_all(&storage_path).unwrap();
+        let objects_dir = storage_path.join("objects");
+        fs::create_dir_all(&objects_dir).unwrap();
+
+        let db_path = storage_path.join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let _ = ConfigKv::set_with_conn(&db_conn, "libra.repoid", "repo-from-storage", false).await;
+
+        // CWD must be the workspace so `try_get_storage_path` can find `.libra/`.
+        let _guard = ChangeDirGuard::new(workspace.path());
+
+        let blob = Blob::from_content("index from explicit storage db");
+        let storage = ClientStorage::try_init(objects_dir).expect("storage");
+        storage.put(&blob.id, &blob.data, blob.get_type()).unwrap();
+        ClientStorage::wait_for_background_tasks();
+
+        let row = object_index::Entity::find()
+            .filter(object_index::Column::OId.eq(blob.id.to_string()))
+            .filter(object_index::Column::RepoId.eq("repo-from-storage"))
+            .one(&db_conn)
+            .await
+            .unwrap();
+        assert!(row.is_some());
+    }
+
+    #[tokio::test]
+    #[serial(env)]
+    async fn durable_index_marker_survives_failure_and_repairs_idempotently() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "repair-repo", false)
+            .await
+            .expect("set repo id");
+        let payload = b"durable repair payload";
+        let oid = crate::utils::object::write_git_object(storage.path(), "blob", payload)
+            .expect("write repair fixture object");
+        let oid = oid.to_string();
+
+        let msg = super::IndexUpdateMsg {
+            hash: oid.clone(),
+            obj_type: "blob".to_string(),
+            size: payload.len() as i64,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        };
+        let marker_path = super::persist_index_repair_marker(&msg)
+            .expect("persist repair marker before queueing");
+        let agent_marker_path = super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: oid.clone(),
+            obj_type: "agent_transcript".to_string(),
+            size: payload.len() as i64,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist distinct semantic-type repair marker");
+        assert_ne!(marker_path, agent_marker_path);
+        let loose_path = storage
+            .path()
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..]);
+        fs::remove_file(&loose_path)
+            .expect("evict local payload after its successful write and durable marker");
+
+        {
+            let _faults = super::install_test_object_index_faults(
+                &db_path,
+                super::ObjectIndexTestFaults {
+                    update_failure: true,
+                    ..Default::default()
+                },
+            );
+            let error = ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect_err("injected index failure should preserve the marker");
+            assert!(error.contains("injected object index update failure"));
+            assert!(marker_path.is_file());
+            assert!(agent_marker_path.is_file());
+        }
+
+        assert_eq!(
+            ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect("repair pending row")
+                .repaired,
+            2
+        );
+        assert!(!marker_path.exists());
+        assert!(!agent_marker_path.exists());
+        let row = object_index::Entity::find()
+            .filter(object_index::Column::OId.eq(&oid))
+            .filter(object_index::Column::RepoId.eq("repair-repo"))
+            .one(&db_conn)
+            .await
+            .expect("query repaired row");
+        assert!(row.is_some());
+        assert_eq!(
+            row.expect("repaired row should exist").o_type,
+            "agent_transcript",
+            "generic replay must not demote the agent-specific semantic type"
+        );
+        assert_eq!(
+            ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect("second repair should be a no-op")
+                .repaired,
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn blob_save_returns_marker_error_and_retry_recreates_the_marker() {
+        ClientStorage::wait_for_background_tasks();
+        let repo = tempdir().expect("create temporary repository");
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        let marker_dir = repo.path().join(".libra/object-index-repair");
+        fs::write(&marker_dir, b"conflicting non-directory")
+            .expect("inject marker-directory creation failure");
+        let blob = Blob::from_content("legacy save repair retry");
+
+        let first = blob.save();
+        assert!(
+            first.is_err(),
+            "the fallible public API must return marker registration failures"
+        );
+        let oid = blob.id.to_string();
+        assert!(
+            crate::utils::path::objects()
+                .join(&oid[..2])
+                .join(&oid[2..])
+                .is_file(),
+            "the injected failure should happen after the payload write"
+        );
+
+        fs::remove_file(&marker_dir).expect("remove marker-directory conflict");
+        assert_eq!(
+            blob.save().expect("retry fallible blob save"),
+            blob.id,
+            "retrying the public API should register the existing payload"
+        );
+        ClientStorage::wait_for_background_tasks();
+
+        let db_conn = db::get_db_conn_instance().await;
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::OId.eq(oid))
+                .count(&db_conn)
+                .await
+                .expect("count object-index rows after legacy save retry"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env)]
+    async fn repair_queue_replays_bounded_pages_without_permanent_cap_failure() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "paged-repair-repo", false)
+            .await
+            .expect("set repo id");
+
+        for index in 1..=super::INDEX_REPAIR_MARKER_PAGE_CAP + 1 {
+            super::persist_index_repair_marker(&super::IndexUpdateMsg {
+                hash: format!("{index:040x}"),
+                obj_type: "blob".to_string(),
+                size: index as i64,
+                db_path: db_path.clone(),
+                marker_path: None,
+                _marker_lock: None,
+                failure_counter: super::current_index_failure_counter(),
+                pending_counter: super::current_index_pending_counter(),
+            })
+            .expect("persist paged repair marker");
+        }
+
+        let first = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("repair first bounded page");
+        assert_eq!(first.repaired, super::INDEX_REPAIR_BATCH_SIZE);
+        assert!(
+            first.remaining,
+            "one batch should remain for the next replay"
+        );
+
+        let second = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("repair final bounded page");
+        assert_eq!(
+            second.repaired,
+            super::INDEX_REPAIR_MARKER_PAGE_CAP + 1 - super::INDEX_REPAIR_BATCH_SIZE
+        );
+        assert!(!second.remaining);
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq("paged-repair-repo"))
+                .count(&db_conn)
+                .await
+                .expect("count repaired rows"),
+            (super::INDEX_REPAIR_MARKER_PAGE_CAP + 1) as u64
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn legacy_scratch_cannot_starve_a_real_repair_marker() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "scratch-repair-repo", false)
+            .await
+            .expect("set repo id");
+        let marker_dir = storage.path().join(super::INDEX_REPAIR_MARKER_DIR);
+        fs::create_dir_all(&marker_dir).expect("create marker directory");
+        for index in 0..=super::INDEX_REPAIR_MARKER_PAGE_CAP {
+            fs::write(marker_dir.join(format!(".tmpLegacy{index:04}")), b"partial")
+                .expect("write legacy scratch fixture");
+        }
+        super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist real repair marker behind scratch fixtures");
+
+        let mut repaired = 0;
+        let mut remaining = true;
+        for _ in 0..=super::INDEX_REPAIR_MARKER_PAGE_CAP + 2 {
+            let outcome = ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect("bounded repair invocation should make progress");
+            repaired += outcome.repaired;
+            remaining = outcome.remaining;
+            if !remaining {
+                break;
+            }
+        }
+        assert_eq!(repaired, 1, "the real marker must eventually be replayed");
+        assert!(
+            !remaining,
+            "all scratch and marker entries must be consumed"
+        );
+        assert_eq!(
+            fs::read_dir(&marker_dir)
+                .expect("read repaired marker directory")
+                .count(),
+            0,
+            "legacy scratch remnants must be scavenged"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn malformed_final_repair_filename_fails_closed_but_legacy_scratch_is_scavenged() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        let marker_dir = storage.path().join(super::INDEX_REPAIR_MARKER_DIR);
+        fs::create_dir_all(&marker_dir).expect("create marker directory");
+        fs::write(marker_dir.join(".tmpAbCd12"), b"partial")
+            .expect("write abandoned atomic scratch file");
+
+        let empty = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("known legacy atomic scratch file should be scavenged");
+        assert_eq!(empty.repaired, 0);
+        assert!(!empty.remaining);
+        assert!(
+            !marker_dir.join(".tmpAbCd12").exists(),
+            "legacy scratch must be removed so it cannot consume every future page"
+        );
+
+        fs::write(marker_dir.join("broken.json"), b"{}").expect("write malformed final marker");
+        let error = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect_err("malformed final marker filename must fail closed");
+        assert!(
+            error.contains("invalid object-index repair marker filename"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn repair_rejects_marker_oid_from_the_wrong_repository_hash_format() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist structurally valid SHA-256 marker");
+
+        let error = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect_err("a SHA-1 repository must reject a SHA-256 marker");
+        assert!(
+            error.contains("invalid object-index repair marker filename"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn repair_accepts_marker_oid_matching_sha256_repository_format() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "core.objectformat", "sha256", false)
+            .await
+            .expect("set SHA-256 object format");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "sha256-repair-repo", false)
+            .await
+            .expect("set repo id");
+        super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist SHA-256 repair marker");
+
+        // A fault fixture for another repository must not make this valid
+        // SHA-256 replay fail. The background consumer is process-wide, but
+        // its test controls are repository-local just like durable markers.
+        let unrelated_storage = tempdir().expect("create unrelated storage dir");
+        let unrelated_db_path = unrelated_storage.path().join(crate::utils::util::DATABASE);
+        let _unrelated_fault = super::install_test_object_index_faults(
+            &unrelated_db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                ..Default::default()
+            },
+        );
+        let outcome = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("matching SHA-256 marker should repair despite an unrelated fault fixture");
+        assert_eq!(outcome.repaired, 1);
+        assert!(!outcome.remaining);
+    }
+
+    #[test]
+    #[serial]
+    fn object_index_test_faults_follow_canonical_database_path() {
+        let storage = tempdir().expect("create storage dir");
+        let raw_db_path = storage.path().join(crate::utils::util::DATABASE);
+        let canonical_db_path = storage
+            .path()
+            .canonicalize()
+            .expect("canonicalize existing storage parent")
+            .join(crate::utils::util::DATABASE);
+        let _fault = super::install_test_object_index_faults(
+            &raw_db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            super::test_object_index_faults(&canonical_db_path).update_failure,
+            "a fault installed through a temporary-directory alias must affect the physical database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn object_index_test_faults_follow_symlinked_database_parent() {
+        let storage = tempdir().expect("create storage dir");
+        let real_parent = storage.path().join("real");
+        fs::create_dir(&real_parent).expect("create real database parent");
+        let alias_parent = storage.path().join("alias");
+        std::os::unix::fs::symlink(&real_parent, &alias_parent)
+            .expect("create database-parent alias");
+        let real_db_path = real_parent.join(crate::utils::util::DATABASE);
+        let alias_db_path = alias_parent.join(crate::utils::util::DATABASE);
+        let _fault = super::install_test_object_index_faults(
+            &alias_db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            super::test_object_index_faults(&real_db_path).update_failure,
+            "a fault installed through a symlinked parent must target the physical database"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn repair_scavenges_bounded_stale_staging_files() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        let staging_dir = storage.path().join(super::INDEX_REPAIR_MARKER_STAGING_DIR);
+        fs::create_dir_all(&staging_dir).expect("create marker staging directory");
+        let stale = staging_dir.join(".tmpAbandoned");
+        fs::write(&stale, b"partial marker").expect("write abandoned staging file");
+        let old = SystemTime::now()
+            .checked_sub(super::INDEX_REPAIR_STAGING_STALE_AFTER + Duration::from_secs(1))
+            .expect("construct stale timestamp");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .expect("open stale staging file")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("age staging file");
+
+        let outcome = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("repair should scavenge stale staging state");
+        assert_eq!(outcome.repaired, 0);
+        assert!(!outcome.remaining);
+        assert!(!stale.exists(), "stale staging file was not scavenged");
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn agent_indexing_fails_before_enqueue_when_marker_cannot_be_persisted() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        fs::write(
+            storage.path().join(super::INDEX_REPAIR_MARKER_DIR),
+            b"conflicting non-directory",
+        )
+        .expect("create conflicting marker path");
+
+        let error = super::enqueue_agent_blob_object_index_update(
+            storage.path(),
+            "0123456789abcdef0123456789abcdef01234567",
+            "agent_transcript",
+            42,
+        )
+        .expect_err("agent indexing must fail before enqueue without a durable marker");
+        assert!(
+            error
+                .to_string()
+                .contains("cloud object-index repair markers could not be registered"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env)]
+    async fn marker_retirement_failure_is_counted_and_remains_repairable() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "retire-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+        let blob = Blob::from_content("retirement warning");
+        let failures_before = ClientStorage::background_index_failure_count();
+        {
+            let _faults = super::install_test_object_index_faults(
+                &db_path,
+                super::ObjectIndexTestFaults {
+                    marker_retirement_failure: true,
+                    ..Default::default()
+                },
+            );
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object and marker");
+            ClientStorage::wait_for_background_tasks();
+        }
+        assert_eq!(
+            ClientStorage::background_index_failure_count(),
+            failures_before + 1,
+            "marker retirement failure did not enter the foreground warning counter"
+        );
+        assert_eq!(
+            ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect("retry retained marker")
+                .repaired,
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env)]
+    async fn late_failure_stays_with_the_invocation_that_enqueued_it() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "scope-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                consumer_delay: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        );
+        let blob = Blob::from_content("late invocation-scoped failure");
+        let first_scope = ClientStorage::with_background_index_failure_scope(async {
+            let scope = ClientStorage::begin_background_index_failure_scope();
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object and enqueue delayed index update");
+            scope
+        })
+        .await;
+
+        // A later embedded invocation starts before the old queue task reaches
+        // its terminal failure. The message must retain the first scope.
+        let second_scope = ClientStorage::with_background_index_failure_scope(async {
+            let scope = ClientStorage::begin_background_index_failure_scope();
+            ClientStorage::wait_for_background_tasks();
+            scope
+        })
+        .await;
+        assert_eq!(first_scope.failure_count(), 1);
+        assert_eq!(
+            second_scope.failure_count(),
+            0,
+            "late work from the prior invocation leaked into the next warning scope"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn queued_update_never_takes_generation_lock() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "guard-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+
+        // Model another parallel test publishing a marker for a different
+        // temporary repository. That acquisition must not affect this
+        // repository's queued-consumer assertion.
+        let unrelated_storage = tempdir().expect("create unrelated storage dir");
+        let unrelated_db_path = unrelated_storage.path().join(crate::utils::util::DATABASE);
+        let unrelated_before = super::test_generation_lock_acquisition_count(&unrelated_db_path);
+        let _unrelated_generation_lock =
+            super::acquire_index_repair_generation_lock(&unrelated_db_path, "marker_publication")
+                .expect("acquire unrelated generation lock");
+        assert_eq!(
+            super::test_generation_lock_acquisition_count(&unrelated_db_path),
+            unrelated_before + 1,
+            "test telemetry must retain the database that acquired the lock"
+        );
+
+        // The foreground publisher takes the generation lock exactly once to
+        // persist the durable repair marker before queueing.
+        // Other tests can publish markers for their own temporary repositories
+        // while this queue drains. Attribute lock telemetry to this database so
+        // their work cannot mask or fabricate a queued-consumer acquisition.
+        let before = super::test_generation_lock_acquisition_count(&db_path);
+        let blob = Blob::from_content("generation lock guard payload");
+        client
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect("store object and enqueue index update");
+        let after_put = super::test_generation_lock_acquisition_count(&db_path);
+        assert_eq!(
+            after_put,
+            before + 1,
+            "foreground marker publication must take exactly one generation lock"
+        );
+
+        ClientStorage::wait_for_background_tasks();
+
+        // The queued consumer must apply the update through the OID-shard lock
+        // only: no additional generation lock acquisition may have happened.
+        assert_eq!(
+            super::test_generation_lock_acquisition_count(&db_path),
+            after_put,
+            "queued consumer must never acquire the generation lock"
+        );
+        let row = object_index::Entity::find()
+            .filter(object_index::Column::OId.eq(blob.id.to_string()))
+            .filter(object_index::Column::RepoId.eq("guard-repo"))
+            .one(&db_conn)
+            .await
+            .expect("query repaired row");
+        assert!(row.is_some(), "the queued update must land in the index");
+    }
+
+    #[tokio::test]
+    #[serial(env)]
+    async fn concurrent_direct_storage_work_is_not_charged_to_cli_scope() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "direct-scope-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                consumer_delay: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        );
+        let scope = ClientStorage::with_background_index_failure_scope(async {
+            let scope = ClientStorage::begin_background_index_failure_scope();
+            let direct_client = client.clone();
+            tokio::spawn(async move {
+                let blob = Blob::from_content("concurrent unscoped storage failure");
+                direct_client
+                    .put(&blob.id, &blob.data, blob.get_type())
+                    .expect("store direct object and enqueue delayed index update");
+            })
+            .await
+            .expect("direct storage task should not panic");
+
+            assert!(
+                ClientStorage::wait_for_background_tasks_until(
+                    Instant::now() + Duration::from_millis(25)
+                )
+                .await,
+                "an unrelated direct write must not enter the CLI pending-work scope"
+            );
+            scope
+        })
+        .await;
+
+        ClientStorage::wait_for_background_tasks();
+        assert_eq!(
+            scope.failure_count(),
+            0,
+            "an unrelated direct write must not enter the CLI failure scope"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env)]
+    async fn direct_fifo_backlog_does_not_delay_invocation_scoped_updates() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "lane-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                consumer_delay: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        );
+        for index in 0..8 {
+            let blob = Blob::from_content(&format!("unscoped backlog {index}"));
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("enqueue unscoped backlog object");
+        }
+
+        ClientStorage::with_background_index_failure_scope(async {
+            let blob = Blob::from_content("invocation-scoped lane object");
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("enqueue invocation-scoped object");
+            assert!(
+                ClientStorage::wait_for_background_tasks_until(
+                    Instant::now() + Duration::from_millis(400)
+                )
+                .await,
+                "the invocation lane must drain independently of the earlier direct FIFO backlog"
+            );
+        })
+        .await;
+
+        ClientStorage::wait_for_background_tasks();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(env)]
+    async fn command_owned_spawn_is_registered_before_it_enqueues_index_work() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "spawn-scope-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                update_failure: true,
+                ..Default::default()
+            },
+        );
+        let scope = ClientStorage::with_background_index_failure_scope(async move {
+            let scope = ClientStorage::begin_background_index_failure_scope();
+            let producer = ClientStorage::spawn_background_index_work(async move {
+                tokio::task::yield_now().await;
+                let blob = Blob::from_content("command-owned spawned storage failure");
+                client
+                    .put(&blob.id, &blob.data, blob.get_type())
+                    .expect("store spawned object and enqueue index update");
+            });
+
+            assert!(
+                ClientStorage::wait_for_background_tasks_until(
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .await,
+                "the invocation drain must wait for the producer and its queued update"
+            );
+            producer.await.expect("spawned producer should not panic");
+            scope
+        })
+        .await;
+
+        assert_eq!(
+            scope.failure_count(),
+            1,
+            "the spawned producer's terminal failure must stay with its invocation"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env)]
+    async fn replay_retirement_fences_a_delayed_queued_writer_after_prune() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "ownership-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+        let blob = Blob::from_content("delayed writer must not resurrect a pruned row");
+
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                consumer_delay: Some(Duration::from_millis(500)),
+                ..Default::default()
+            },
+        );
+        client
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect("store object and enqueue delayed index update");
+
+        let replay = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("foreground replay owns and retires the marker");
+        assert_eq!(replay.repaired, 1);
+        assert!(!replay.remaining);
+
+        object_index::Entity::delete_many()
+            .filter(object_index::Column::RepoId.eq("ownership-repo"))
+            .filter(object_index::Column::OId.eq(blob.id.to_string()))
+            .exec(&db_conn)
+            .await
+            .expect("simulate destructive prune after replay");
+        ClientStorage::wait_for_background_tasks();
+
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq("ownership-repo"))
+                .filter(object_index::Column::OId.eq(blob.id.to_string()))
+                .count(&db_conn)
+                .await
+                .expect("count rows after delayed writer drains"),
+            0,
+            "a queued writer whose marker ownership was retired must not resurrect the row"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn deletion_fence_refuses_an_oid_with_a_durable_marker() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let oid = "0123456789abcdef0123456789abcdef01234567".to_string();
+        super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: oid.clone(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist deletion-conflict marker");
+
+        let error = super::acquire_object_index_deletion_fence(&db_path, &[oid])
+            .await
+            .expect_err("destructive deletion must fail closed while a marker exists");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("durable repair marker"));
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn queued_reconciliation_ignores_an_unrelated_deletion_fence() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "queued-fence-repo", false)
+            .await
+            .expect("set repo id");
+
+        let queued_oid = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let mut msg = super::IndexUpdateMsg {
+            hash: queued_oid.clone(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        };
+        let marker_path = super::persist_index_repair_marker(&msg)
+            .expect("persist marker before queued reconciliation");
+        msg.marker_path = Some(marker_path.clone());
+
+        let unrelated_oid = "fedcba9876543210fedcba9876543210fedcba98".to_string();
+        let fence = super::acquire_object_index_deletion_fence(&db_path, &[unrelated_oid])
+            .await
+            .expect("acquire unrelated deletion fence")
+            .expect("non-empty OID set must return a fence");
+
+        super::apply_queued_index_update(&msg)
+            .await
+            .expect("a durable queued marker must reconcile through an unrelated deletion fence");
+        assert!(
+            !marker_path.exists(),
+            "successful queued reconciliation must retire its marker"
+        );
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq("queued-fence-repo"))
+                .filter(object_index::Column::OId.eq(queued_oid))
+                .count(&db_conn)
+                .await
+                .expect("count reconciled object-index row"),
+            1
+        );
+
+        drop(fence);
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn deletion_fence_blocks_new_marker_publication_until_released() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let oid = "fedcba9876543210fedcba9876543210fedcba98".to_string();
+        let fence =
+            super::acquire_object_index_deletion_fence(&db_path, std::slice::from_ref(&oid))
+                .await
+                .expect("acquire deletion fence")
+                .expect("non-empty OID set must return a fence");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            started_tx.send(()).ok();
+            let result = super::persist_index_repair_marker(&super::IndexUpdateMsg {
+                hash: oid,
+                obj_type: "blob".to_string(),
+                size: 42,
+                db_path,
+                marker_path: None,
+                _marker_lock: None,
+                failure_counter: super::current_index_failure_counter(),
+                pending_counter: super::current_index_pending_counter(),
+            });
+            result_tx.send(result).ok();
+        });
+        started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("marker publisher started");
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "marker publication crossed a held destructive-deletion fence"
+        );
+
+        drop(fence);
+        result_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("marker publisher resumed after fence release")
+            .expect("persist marker after fence release");
+        publisher.join().expect("marker publisher thread");
+    }
+
+    /// A missing database cannot be treated as successful reconciliation: doing
+    /// so would let the queue retire its only durable repair marker.
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn update_object_index_rejects_missing_database() {
+        let missing_root = tempdir().unwrap();
+        let missing_db = missing_root.path().join(crate::utils::util::DATABASE);
+
+        let result = update_object_index(&missing_db, "deadbeef", "blob", 12).await;
+        let error = result.expect_err("a missing repository database must preserve repair work");
+        assert!(error.contains("object-index database is missing"));
+    }
+
+    #[tokio::test]
+    #[serial(env)]
+    async fn queued_update_keeps_marker_until_a_moved_database_is_restored() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should contain valid UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "moved-db-repo", false)
+            .await
+            .expect("set repository id");
+        db_conn.close().await.expect("close setup database");
+
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::try_init_local(objects).expect("storage");
+        let blob = Blob::from_content("database path must remain durable");
+        let marker_path = super::index_repair_marker_path(&db_path, &blob.id.to_string(), "blob")
+            .expect("derive marker path");
+        let moved_db_path = storage.path().join("libra.db.moved");
+
+        let _faults = super::install_test_object_index_faults(
+            &db_path,
+            super::ObjectIndexTestFaults {
+                consumer_delay: Some(Duration::from_millis(250)),
+                ..Default::default()
+            },
+        );
+        let scope = ClientStorage::with_background_index_failure_scope(async {
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object and durable repair marker");
+            assert!(marker_path.is_file(), "marker must precede queue execution");
+            fs::rename(&db_path, &moved_db_path).expect("move database out of canonical path");
+            ClientStorage::wait_for_background_tasks();
+            ClientStorage::begin_background_index_failure_scope()
+        })
+        .await;
+
+        assert_eq!(scope.failure_count(), 1);
+        assert!(
+            marker_path.is_file(),
+            "a missing canonical database must leave the marker retryable"
+        );
+        fs::rename(&moved_db_path, &db_path).expect("restore canonical database path");
+        let outcome = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("replay marker after restoring database");
+        assert_eq!(outcome.repaired, 1);
+        assert!(!outcome.remaining);
+        assert!(!marker_path.exists());
+
+        let db_conn = db::get_db_conn_instance_for_path(&db_path)
+            .await
+            .expect("reopen restored database");
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq("moved-db-repo"))
+                .filter(object_index::Column::OId.eq(blob.id.to_string()))
+                .count(&db_conn)
+                .await
+                .expect("count replayed object-index row"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_object_index_rows_fails_when_repo_id_cannot_be_resolved() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let tmp = tempdir().expect("create temporary database directory");
+        let db_path = tmp.path().join(crate::utils::util::DATABASE);
+        let conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("test database path must contain valid UTF-8"),
+        )
+        .await
+        .expect("create test database");
+        conn.execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "DROP TABLE config_kv".to_string(),
+        ))
+        .await
+        .expect("remove repository-id source table");
+
+        let error = remove_object_index_rows_with_conn(
+            &conn,
+            &["0123456789012345678901234567890123456789".to_string()],
+        )
+        .await
+        .expect_err("repository-id lookup failure must abort object-index cleanup");
+
+        assert!(
+            error.to_string().contains("no such table: config_kv"),
+            "unexpected cleanup error: {error}"
+        );
+    }
+
+    /// Phase 3.5c codex round-2 follow-up: a row written first by the
+    /// standard storage path with `o_type='blob'` must be UPGRADED to
+    /// the agent-specific tag (`agent_transcript`) when the agent
+    /// capture call back arrives for the same content-addressed OID.
+    /// This is the regression case the round-1 review flagged: a naive
+    /// "skip if exists" silently kept the generic tag and downstream
+    /// tooling that filtered by o_type lost visibility on captured
+    /// transcripts. We exercise the upgrade branch directly here.
+    #[tokio::test]
+    #[serial(cwd, env, hash_kind)]
+    async fn update_object_index_upgrades_generic_blob_to_agent_specific_o_type() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join(crate::utils::util::DATABASE);
+        let conn = db::create_database(db_path.to_str().expect("test database path is UTF-8"))
+            .await
+            .expect("create database");
+
+        // Seed a generic-blob row that mimics the standard storage path.
+        // The repo_id matches the sentinel returned by
+        // `resolve_repo_id_for_index` when `libra.repoid` is absent. That
+        // keeps the seeded row aligned with what `update_object_index_once`
+        // queries while preserving the full current schema contract.
+        const OID: &str = "abcdef1234567890abcdef1234567890abcdef12";
+        let backend = conn.get_database_backend();
+        conn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced) \
+             VALUES (?, 'blob', 42, 'unknown-repo', 0, 1)",
+            [OID.into()],
+        ))
+        .await
+        .unwrap();
+
+        // First call: agent-specific tag arrives. The row must be
+        // promoted in place; o_id stays unique.
+        update_object_index_once(&db_path, OID, "agent_transcript", 42)
+            .await
+            .expect("upgrade ok");
+
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT o_type, is_synced FROM object_index WHERE o_id = ? LIMIT 1",
+                [OID.into()],
+            ))
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(
+            row.try_get_by::<String, _>("o_type").unwrap(),
+            "agent_transcript",
+            "blob row must upgrade to agent_transcript"
+        );
+        assert_eq!(
+            row.try_get_by::<i64, _>("is_synced").unwrap(),
+            0,
+            "a promoted row must be offered to cloud sync again"
+        );
+
+        // Second call: a *generic* tag arrives for an OID that is
+        // already agent-specific. The row must NOT demote — that would
+        // strip the spec-mandated tag from the catalogue.
+        update_object_index_once(&db_path, OID, "blob", 42)
+            .await
+            .expect("no-op ok");
+        let row_again = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT o_type FROM object_index WHERE o_id = ? LIMIT 1",
+                [OID.into()],
+            ))
+            .await
+            .unwrap()
+            .expect("row still exists");
+        assert_eq!(
+            row_again.try_get_by::<String, _>("o_type").unwrap(),
+            "agent_transcript",
+            "no demotion: agent_transcript stays sticky"
+        );
+
+        // Third call: same agent tag, same OID — idempotent no-op.
+        update_object_index_once(&db_path, OID, "agent_transcript", 42)
+            .await
+            .expect("idempotent ok");
+
+        let count_row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT COUNT(*) AS n FROM object_index WHERE o_id = ?",
+                [OID.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let count: i64 = count_row.try_get_by("n").unwrap();
+        assert_eq!(count, 1, "single row preserved through upgrade + no-op");
+    }
+
+    /// Scenario: when the system environment variable is unset, `resolve_env_sync`
+    /// must consult the repository's `vault.env.*` config entries. This is the
+    /// primary mechanism users rely on to keep storage credentials inside the
+    /// repository config rather than in their shell rc.
+    #[test]
+    #[serial(cwd, env)]
+    fn resolve_env_sync_reads_non_allowlisted_local_config_values() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let repo = tempdir().unwrap();
+        rt.block_on(setup_with_new_libra_in(repo.path()));
+        let _guard = ChangeDirGuard::new(repo.path());
+        let _endpoint = ClearedEnvVarGuard::new("LIBRA_STORAGE_ENDPOINT");
+
+        rt.block_on(async {
+            ConfigKv::set(
+                "vault.env.LIBRA_STORAGE_ENDPOINT",
+                "https://storage.example.com",
+                false,
+            )
+            .await
+            .unwrap();
+        });
+
+        let value = resolve_env_sync("LIBRA_STORAGE_ENDPOINT").unwrap();
+        assert_eq!(value.as_deref(), Some("https://storage.example.com"));
+    }
+
+    /// Scenario: a corrupt global config file must propagate a fatal error rather
+    /// than silently ignoring the global-scope value. Without this guard, an
+    /// invalid global config would silently degrade remote storage to local-only
+    /// without telling the user anything is wrong.
+    #[test]
+    #[serial(cwd, env)]
+    fn resolve_env_sync_surfaces_global_config_connection_errors() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let repo = tempdir().unwrap();
+        rt.block_on(setup_with_new_libra_in(repo.path()));
+        let _guard = ChangeDirGuard::new(repo.path());
+        let _threshold = ClearedEnvVarGuard::new("LIBRA_STORAGE_THRESHOLD");
+
+        let bad_global_dir = tempdir().unwrap();
+        let bad_global_db = bad_global_dir.path().join("bad-global.db");
+        fs::write(&bad_global_db, "not sqlite").unwrap();
+        let _global_db = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &bad_global_db);
+
+        let err = resolve_env_sync("LIBRA_STORAGE_THRESHOLD")
+            .expect_err("global config connection failure should surface");
+        assert!(
+            err.contains("failed to connect to global config"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// B3-14: object-index repair OID width follows stored `core.objectformat`
+    /// via `object_format::parse_config_value` (blake3 → 64; unknown fail-closed).
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn object_index_repair_uses_stored_object_format() {
+        let repo = tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let db = db::get_db_conn_instance().await;
+
+        ConfigKv::set_with_conn(&db, "core.objectformat", "blake3", false)
+            .await
+            .expect("set blake3");
+        assert_eq!(
+            super::expected_index_repair_oid_len(&db)
+                .await
+                .expect("blake3 width"),
+            64
+        );
+
+        ConfigKv::set_with_conn(&db, "core.objectformat", "sha1", false)
+            .await
+            .expect("set sha1");
+        assert_eq!(
+            super::expected_index_repair_oid_len(&db)
+                .await
+                .expect("sha1 width"),
+            40
+        );
+
+        ConfigKv::set_with_conn(&db, "core.objectformat", "not-a-format", false)
+            .await
+            .expect("set illegal");
+        let err = super::expected_index_repair_oid_len(&db)
+            .await
+            .expect_err("unknown format");
+        assert!(
+            err.contains("unsupported core.objectformat"),
+            "unexpected error: {err}"
+        );
+    }
+
+    const STORAGE_ENV_KEYS: &[&str] = &[
+        "LIBRA_STORAGE_TYPE",
+        "LIBRA_STORAGE_BUCKET",
+        "LIBRA_STORAGE_ENDPOINT",
+        "LIBRA_STORAGE_REGION",
+        "LIBRA_STORAGE_ACCESS_KEY",
+        "LIBRA_STORAGE_SECRET_KEY",
+        "LIBRA_STORAGE_ALLOW_HTTP",
+        "LIBRA_STORAGE_THRESHOLD",
+        "LIBRA_STORAGE_CACHE_SIZE",
+        "LIBRA_CONFIG_GLOBAL_DB",
+    ];
+
+    fn isolate_storage_env() -> Vec<ScopedEnvVar> {
+        STORAGE_ENV_KEYS
+            .iter()
+            .map(|key| ScopedEnvVar::unset(*key))
+            .collect()
+    }
+
+    fn must_err(
+        result: Result<ClientStorage, StorageConfigFailure>,
+        label: &str,
+    ) -> StorageConfigFailure {
+        match result {
+            Ok(_) => panic!("{label} returned storage"),
+            Err(error) => error,
+        }
+    }
+
+    fn must_ok(result: Result<ClientStorage, StorageConfigFailure>, label: &str) -> ClientStorage {
+        match result {
+            Ok(storage) => storage,
+            Err(error) => panic!("{label}: {error}"),
+        }
+    }
+
+    fn assert_redacted(error: &StorageConfigFailure, canary: &str) {
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(!display.contains(canary), "{display}");
+        assert!(!debug.contains(canary), "{debug}");
+        assert!(std::error::Error::source(error).is_none());
+        assert!(display.contains(error.variable()));
+    }
+
+    fn break_repository_database(repo: &std::path::Path) {
+        let db = repo.join(".libra").join(crate::utils::util::DATABASE);
+        if db.exists() {
+            fs::remove_file(&db).expect("remove repository database");
+        }
+        fs::create_dir(&db).expect("replace repository database with a directory");
+    }
+
+    #[test]
+    #[serial(cwd, env)]
+    fn storage_config_resolve_unsupported_type_is_not_local() {
+        let _env = isolate_storage_env();
+        let root = tempdir().expect("temp");
+        let _cwd = ChangeDirGuard::new(root.path());
+        for canary in ["gcs-canary", "S3-canary"] {
+            let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", canary);
+            let objects = root.path().join(canary);
+            let error = must_err(
+                ClientStorage::resolve_configured_storage(objects.clone()),
+                "unsupported type",
+            );
+            assert_eq!(error.variable(), "LIBRA_STORAGE_TYPE");
+            assert_redacted(&error, canary);
+            assert!(
+                !objects.exists(),
+                "failed config must not create local storage"
+            );
+        }
+    }
+
+    #[test]
+    #[serial(cwd, env)]
+    fn storage_config_resolve_empty_and_invalid_values_hide_canary() {
+        let _env = isolate_storage_env();
+        let root = tempdir().expect("temp");
+        let _cwd = ChangeDirGuard::new(root.path());
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "s3");
+        let cases = [
+            ("LIBRA_STORAGE_BUCKET", ""),
+            ("LIBRA_STORAGE_ENDPOINT", "canary-secret-not-a-url"),
+            ("LIBRA_STORAGE_ACCESS_KEY", ""),
+            ("LIBRA_STORAGE_SECRET_KEY", ""),
+        ];
+        for (name, canary) in cases {
+            let _value = ScopedEnvVar::set(name, canary);
+            let _bucket = if name != "LIBRA_STORAGE_BUCKET" {
+                Some(ScopedEnvVar::set("LIBRA_STORAGE_BUCKET", "bucket"))
+            } else {
+                None
+            };
+            let objects = root.path().join(name);
+            let error = must_err(
+                ClientStorage::resolve_configured_storage(objects.clone()),
+                name,
+            );
+            assert_eq!(error.variable(), name);
+            assert_eq!(
+                error.to_string(),
+                format!("failed to read storage configuration for {name}")
+            );
+            if !canary.is_empty() {
+                assert_redacted(&error, canary);
+            }
+            assert!(!objects.exists());
+        }
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_resolve_later_key_errors_are_not_local() {
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        break_repository_database(repo.path());
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "s3");
+        let _global = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            repo.path().join("missing-global.db"),
+        );
+        let keys = [
+            "LIBRA_STORAGE_BUCKET",
+            "LIBRA_STORAGE_ENDPOINT",
+            "LIBRA_STORAGE_REGION",
+            "LIBRA_STORAGE_ACCESS_KEY",
+            "LIBRA_STORAGE_SECRET_KEY",
+            "LIBRA_STORAGE_ALLOW_HTTP",
+            "LIBRA_STORAGE_THRESHOLD",
+            "LIBRA_STORAGE_CACHE_SIZE",
+        ];
+        let priors = [
+            "bucket",
+            "https://example.com",
+            "auto",
+            "access",
+            "secret",
+            "false",
+            "1024",
+        ];
+        for (index, name) in keys.iter().enumerate() {
+            let _priors: Vec<_> = keys[..index]
+                .iter()
+                .zip(priors)
+                .map(|(key, value)| ScopedEnvVar::set(*key, value))
+                .collect();
+            let objects = repo.path().join(format!("objects-{index}"));
+            let error = must_err(
+                ClientStorage::resolve_configured_storage(objects.clone()),
+                name,
+            );
+            assert_eq!(error.variable(), *name, "{name}");
+            assert_redacted(&error, "canary");
+            assert!(!objects.exists(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_resolve_repo_id_stat_failure_is_not_a_prefix() {
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        break_repository_database(repo.path());
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            repo.path().join("missing-global.db"),
+        );
+        let _vars = remote_env();
+        let objects = repo.path().join("configured-objects");
+        let error = must_err(
+            ClientStorage::resolve_configured_storage(objects),
+            "directory database",
+        );
+        assert_eq!(error.variable(), "libra.repoid");
+        assert_redacted(&error, "canary");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_resolve_repo_id_write_failure_does_not_publish_uuid() {
+        // SAFETY: geteuid is a pure libc query used only to skip a mode-bit test.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped (root ignores mode 0444)");
+            return;
+        }
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        let db = repo
+            .path()
+            .join(".libra")
+            .join(crate::utils::util::DATABASE);
+        let before = fs::read(&db).expect("read database");
+        let mut permissions = fs::metadata(&db).expect("metadata").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o444);
+        fs::set_permissions(&db, permissions.clone()).expect("chmod");
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            repo.path().join("missing-global.db"),
+        );
+        let _vars = remote_env();
+        let error = must_err(
+            ClientStorage::resolve_configured_storage(repo.path().join("objects")),
+            "read-only repository database",
+        );
+        assert_eq!(error.variable(), "libra.repoid");
+        permissions.set_mode(0o644);
+        fs::set_permissions(&db, permissions).expect("restore mode");
+        assert_eq!(fs::read(&db).expect("reread"), before);
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_resolve_missing_database_has_no_prefix_file() {
+        let _env = isolate_storage_env();
+        let root = tempdir().expect("temp");
+        setup_with_new_libra_in(root.path()).await;
+        let db = root
+            .path()
+            .join(".libra")
+            .join(crate::utils::util::DATABASE);
+        fs::remove_file(&db).expect("remove database");
+        let _cwd = ChangeDirGuard::new(root.path());
+        let _global = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            root.path().join("missing-global.db"),
+        );
+        let _vars = remote_env();
+        must_ok(
+            ClientStorage::resolve_configured_storage(root.path().join("objects")),
+            "confirmed missing database is local-prefix absence, not a read error",
+        );
+        assert!(!db.exists());
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_resolve_unresolved_type_is_not_local() {
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        break_repository_database(repo.path());
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            repo.path().join("missing-global.db"),
+        );
+        let objects = repo.path().join("local-objects");
+        let error = must_err(
+            ClientStorage::resolve_configured_storage(objects.clone()),
+            "an unread type is not local",
+        );
+        assert_eq!(error.variable(), "LIBRA_STORAGE_TYPE");
+        assert_eq!(
+            error.to_string(),
+            "failed to read storage configuration for LIBRA_STORAGE_TYPE"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains(repo.path().to_str().expect("utf8"))
+        );
+        assert!(!objects.exists());
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_resolve_does_not_use_objects_cache() {
+        let _env = isolate_storage_env();
+        let root = tempdir().expect("temp");
+        setup_with_new_libra_in(root.path()).await;
+        let _cwd = ChangeDirGuard::new(root.path());
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "gcs-canary");
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let cached = crate::utils::util::objects_storage().expect("storage");
+        assert_eq!(cached.configuration_variable(), Some("LIBRA_STORAGE_TYPE"));
+        let blob = Blob::from_content("cached");
+        let put_error = cached
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect_err("rejected client is not a writable cache entry");
+        assert_eq!(
+            put_error.to_string(),
+            "failed to read storage configuration for LIBRA_STORAGE_TYPE"
+        );
+        assert!(!crate::utils::util::objects_storage_cache_contains(
+            &crate::utils::path::objects()
+        ));
+        let error = must_err(
+            crate::utils::util::resolve_configured_objects_storage(),
+            "new resolver ignores the fail-open cache",
+        );
+        assert_eq!(error.variable(), "LIBRA_STORAGE_TYPE");
+        assert_redacted(&error, "gcs-canary");
+    }
+
+    fn remote_env() -> Vec<ScopedEnvVar> {
+        [
+            ("LIBRA_STORAGE_TYPE", "s3"),
+            ("LIBRA_STORAGE_BUCKET", "bucket"),
+            ("LIBRA_STORAGE_ENDPOINT", "https://example.com"),
+            ("LIBRA_STORAGE_REGION", "auto"),
+            ("LIBRA_STORAGE_ACCESS_KEY", "access"),
+            ("LIBRA_STORAGE_SECRET_KEY", "secret"),
+            ("LIBRA_STORAGE_ALLOW_HTTP", "false"),
+            ("LIBRA_STORAGE_THRESHOLD", "1024"),
+            ("LIBRA_STORAGE_CACHE_SIZE", "1024"),
+        ]
+        .into_iter()
+        .map(|(key, value)| ScopedEnvVar::set(key, value))
+        .collect()
+    }
+
+    async fn write_future_global_db(path: &std::path::Path) {
+        use sea_orm::{ConnectionTrait, Statement};
+        let conn = db::create_database(path.to_str().expect("utf8"))
+            .await
+            .expect("create global fixture");
+        let backend = conn.get_database_backend();
+        conn.execute_raw(Statement::from_string(
+            backend,
+            "CREATE TABLE IF NOT EXISTS configuration_schema_versions (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)",
+        ))
+        .await
+        .expect("create ledger");
+        conn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO configuration_schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+            [9_000_000_001i64.into(), "future".into(), "fixture".into()],
+        ))
+        .await
+        .expect("insert future version");
+        conn.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_resolve_type_global_schema_stays_local() {
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        let global = repo.path().join("future.db");
+        write_future_global_db(&global).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global);
+        let objects = repo.path().join("schema-objects");
+        must_ok(
+            ClientStorage::resolve_configured_storage(objects.clone()),
+            "future schema while reading the type stays local",
+        );
+        assert!(objects.exists());
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_resolve_later_global_schema_is_not_local() {
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        let global = repo.path().join("future.db");
+        write_future_global_db(&global).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global);
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "r2");
+        let objects = repo.path().join("later-schema");
+        let error = must_err(
+            ClientStorage::resolve_configured_storage(objects.clone()),
+            "future schema after a confirmed type",
+        );
+        assert_eq!(error.variable(), "LIBRA_STORAGE_BUCKET");
+        assert!(!objects.exists());
+    }
+
+    const CONFIG_SENTENCE: &str = "failed to read storage configuration for LIBRA_STORAGE_TYPE";
+
+    fn rejected_storage() -> (tempfile::TempDir, ClientStorage) {
+        let _env = isolate_storage_env();
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "gcs-canary");
+        let root = tempdir().expect("temp");
+        let objects = root.path().join("objects");
+        let storage = ClientStorage::try_init(objects.clone()).expect("storage");
+        assert!(!objects.exists(), "rejected init must not create storage");
+        assert_eq!(storage.configuration_variable(), Some("LIBRA_STORAGE_TYPE"));
+        (root, storage)
+    }
+
+    fn assert_config_display(text: &str) {
+        assert_eq!(text, CONFIG_SENTENCE);
+    }
+
+    #[test]
+    #[serial(env)]
+    fn storage_config_hold_result_methods_name_only_the_variable() {
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let (_root, storage) = rejected_storage();
+        let blob = Blob::from_content("hold");
+        let hash = blob.id;
+        assert_config_display(&storage.get(&hash).expect_err("get").to_string());
+        assert_config_display(
+            &storage
+                .get_with_limit(&hash, 16)
+                .expect_err("limit")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .get_typed_with_limit(&hash, 16)
+                .expect_err("typed")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .put(&hash, &blob.data, blob.get_type())
+                .expect_err("put")
+                .to_string(),
+        );
+        assert_config_display(&storage.exist_checked(&hash).expect_err("exist").to_string());
+        assert_config_display(
+            &storage
+                .exist_checked_many(&[])
+                .expect_err("exist many")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .get_object_type(&hash)
+                .expect_err("type")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .get_object_type_bounded(&hash)
+                .expect_err("bounded type")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .get_object_types_bounded_many(&[])
+                .expect_err("types")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .get_object_types_bounded_many_with_budget(&[], 0)
+                .expect_err("types budget")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .is_object_type_checked(&hash, ObjectType::Blob)
+                .expect_err("type checked")
+                .to_string(),
+        );
+        assert_config_display(&storage.object_size(&hash).expect_err("size").to_string());
+        assert_config_display(&storage.object_sizes(&[]).expect_err("sizes").to_string());
+        assert_config_display(
+            &storage
+                .object_sizes_with_total_limit(&[], 1)
+                .expect_err("sizes limit")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .decoded_object_size(&hash)
+                .expect_err("decoded size")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .decoded_object_sizes(&[])
+                .expect_err("decoded sizes")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .commit_parents_many(&[])
+                .expect_err("parents")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .ensure_existing_object_index(&hash, 1, ObjectType::Blob)
+                .expect_err("index")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .end_object_index_batch()
+                .expect_err("end batch")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .flush_object_index_batch()
+                .expect_err("flush batch")
+                .to_string(),
+        );
+        storage.begin_object_index_batch();
+        storage.abort_object_index_batch();
+    }
+
+    #[tokio::test]
+    #[serial(env)]
+    async fn storage_config_hold_async_methods_reject_empty_batches() {
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let (_root, storage) = rejected_storage();
+        let hash = Blob::from_content("hold").id;
+        assert_config_display(
+            &storage
+                .delete_payload(&hash)
+                .await
+                .expect_err("delete")
+                .to_string(),
+        );
+        assert_config_display(&storage.heal(&hash).expect_err("heal").to_string());
+        assert_config_display(
+            &storage
+                .evict_local(crate::utils::storage::EvictRequest {
+                    budget_bytes: 1,
+                    min_age_secs: 0,
+                    dry_run: true,
+                })
+                .await
+                .expect_err("evict")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .search_checked("")
+                .await
+                .expect_err("search")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .search_result("abc")
+                .await
+                .expect_err("search result")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .search_result("HEAD")
+                .await
+                .expect_err("head")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .search_result("~1")
+                .await
+                .expect_err("tilde")
+                .to_string(),
+        );
+        assert_config_display(
+            &storage
+                .search_result("^2")
+                .await
+                .expect_err("caret")
+                .to_string(),
+        );
+        let as_storage = &storage as &dyn crate::utils::storage::Storage;
+        assert_config_display(
+            &as_storage
+                .get(&hash)
+                .await
+                .expect_err("trait get")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .get_with_limit(&hash, 8)
+                .await
+                .expect_err("trait limit")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .get_typed_bounded(&hash, 8)
+                .await
+                .expect_err("trait typed")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .get_commit_bounded(&hash, 8)
+                .await
+                .expect_err("trait commit")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .object_type_bounded_probe(&hash)
+                .await
+                .expect_err("trait probe")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .object_types_bounded_probe(&[])
+                .await
+                .expect_err("trait probes")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .object_types_bounded_probe_with_budget(&[], 0)
+                .await
+                .expect_err("trait probe budget")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .put(&hash, b"x", ObjectType::Blob)
+                .await
+                .expect_err("trait put")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .exist_checked(&hash)
+                .await
+                .expect_err("trait exist")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .exist_checked_batch(&[])
+                .await
+                .expect_err("trait exist batch")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .object_size(&hash)
+                .await
+                .expect_err("trait size")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .object_sizes(&[])
+                .await
+                .expect_err("trait sizes")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .object_sizes_with_total_limit(&[], 1)
+                .await
+                .expect_err("trait size limit")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .decoded_object_size(&hash)
+                .await
+                .expect_err("trait decoded size")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .decoded_object_sizes(&[])
+                .await
+                .expect_err("trait decoded sizes")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .search_checked("")
+                .await
+                .expect_err("trait search")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .delete_payload(&hash)
+                .await
+                .expect_err("trait delete")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .heal(&hash)
+                .await
+                .expect_err("trait heal")
+                .to_string(),
+        );
+        assert_config_display(
+            &as_storage
+                .evict_local(crate::utils::storage::EvictRequest {
+                    budget_bytes: 1,
+                    min_age_secs: 0,
+                    dry_run: true,
+                })
+                .await
+                .expect_err("trait evict")
+                .to_string(),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn storage_config_hold_probe() {
+        if std::env::var("STORAGE_CONFIG_HOLD_PROBE").ok().as_deref() == Some("unresolved_put") {
+            let _hash = set_hash_kind_for_test(HashKind::Sha1);
+            let storage = crate::utils::util::objects_storage().expect("storage");
+            let blob = Blob::from_content("unresolved");
+            let error = storage
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect_err("an unread type must not be writable");
+            assert_eq!(
+                error.to_string(),
+                "failed to read storage configuration for LIBRA_STORAGE_TYPE"
+            );
+            return;
+        }
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let root = tempdir().expect("temp");
+        let storage = ClientStorage::try_init(root.path().join("objects")).expect("storage");
+        let hash = Blob::from_content("probe").id;
+        match std::env::var("STORAGE_CONFIG_HOLD_PROBE")
+            .expect("probe mode")
+            .as_str()
+        {
+            "exist" => {
+                storage.exist(&hash);
+            }
+            "is_object_type" => {
+                storage.is_object_type(&hash, ObjectType::Blob);
+            }
+            "search" => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(storage.search("ab"));
+            }
+            "trait_exist" => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async {
+                    let storage = &storage as &dyn crate::utils::storage::Storage;
+                    storage.exist(&hash).await;
+                });
+            }
+            "trait_search" => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async {
+                    let storage = &storage as &dyn crate::utils::storage::Storage;
+                    storage.search("ab").await;
+                });
+            }
+            "exist_batch_empty" => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async {
+                    let storage = &storage as &dyn crate::utils::storage::Storage;
+                    storage.exist_batch(&[]).await;
+                });
+            }
+            "exist_batch_one" => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async {
+                    let storage = &storage as &dyn crate::utils::storage::Storage;
+                    storage.exist_batch(&[hash]).await;
+                });
+            }
+            "local_put" => {
+                let blob = Blob::from_content("local-word");
+                storage
+                    .put(&blob.id, &blob.data, blob.get_type())
+                    .expect("local stays writable");
+            }
+            other => panic!("unknown probe {other}"),
+        }
+    }
+
+    fn spawn_hold_probe(mode: &str, env: &[(&str, &str)]) -> std::process::Output {
+        let root = tempdir().expect("temp");
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test bin"));
+        command
+            .current_dir(root.path())
+            .env("HOME", root.path())
+            .env(
+                "LIBRA_CONFIG_GLOBAL_DB",
+                root.path().join("missing-global.db"),
+            )
+            .env("STORAGE_CONFIG_HOLD_PROBE", mode)
+            .args([
+                "utils::client_storage::tests::storage_config_hold_probe",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_remove("LIBRA_STORAGE_TYPE")
+            .env_remove("LIBRA_STORAGE_BUCKET")
+            .env_remove("LIBRA_STORAGE_ENDPOINT")
+            .env_remove("LIBRA_STORAGE_REGION")
+            .env_remove("LIBRA_STORAGE_ACCESS_KEY")
+            .env_remove("LIBRA_STORAGE_SECRET_KEY")
+            .env_remove("LIBRA_STORAGE_ALLOW_HTTP")
+            .env_remove("LIBRA_STORAGE_THRESHOLD")
+            .env_remove("LIBRA_STORAGE_CACHE_SIZE");
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        // The temp dir must live until the child finishes. `output` waits.
+        let output = command.output().expect("spawn hold probe");
+        // Keep the directory until the child has exited. `output` already waited.
+        drop(root);
+        output
+    }
+
+    #[test]
+    #[serial(env)]
+    fn storage_config_hold_bool_queries_exit_without_a_presence_bit() {
+        let confirmed = [("LIBRA_STORAGE_TYPE", "gcs-canary")];
+        for mode in [
+            "exist",
+            "is_object_type",
+            "search",
+            "trait_exist",
+            "trait_search",
+            "exist_batch_empty",
+            "exist_batch_one",
+        ] {
+            let output = spawn_hold_probe(mode, &confirmed);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{mode}: {stderr}");
+            assert_eq!(stderr.trim(), CONFIG_SENTENCE, "{mode}");
+            assert!(!stderr.contains("gcs-canary"), "{mode}");
+            assert!(!stderr.contains("Warning"), "{mode}");
+        }
+    }
+
+    #[test]
+    #[serial(env)]
+    fn storage_config_init_fallback_local_word_stays_writable() {
+        let output = spawn_hold_probe("local_put", &[("LIBRA_STORAGE_TYPE", "local")]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{text}");
+        assert!(
+            text.contains("Warning: Unsupported storage type: local"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    #[serial(env)]
+    fn storage_config_init_fallback_local_empty_bucket_keeps_bucket_warning() {
+        let output = spawn_hold_probe(
+            "local_put",
+            &[
+                ("LIBRA_STORAGE_TYPE", "local"),
+                ("LIBRA_STORAGE_BUCKET", ""),
+            ],
+        );
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{text}");
+        assert!(
+            text.contains("LIBRA_STORAGE_BUCKET cannot be empty"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    #[serial(env)]
+    fn storage_config_hold_type_is_read_once() {
+        let _env = isolate_storage_env();
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "gcs-canary");
+        let root = tempdir().expect("temp");
+        super::STORAGE_TYPE_READS.with(|reads| reads.set(0));
+        let error = must_err(
+            ClientStorage::open_init_storage(root.path().join("once")),
+            "open",
+        );
+        assert_eq!(error.variable(), "LIBRA_STORAGE_TYPE");
+        assert_eq!(super::STORAGE_TYPE_READS.with(|reads| reads.get()), 1);
+        super::STORAGE_TYPE_READS.with(|reads| reads.set(0));
+        let error = must_err(
+            ClientStorage::resolve_configured_storage(root.path().join("resolve-once")),
+            "resolve",
+        );
+        assert_eq!(error.variable(), "LIBRA_STORAGE_TYPE");
+        assert_eq!(super::STORAGE_TYPE_READS.with(|reads| reads.get()), 1);
+    }
+
+    #[test]
+    #[serial(env)]
+    fn storage_config_upcast_open_init_rejects_unsupported_type() {
+        let _env = isolate_storage_env();
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "gcs-canary");
+        let root = tempdir().expect("temp");
+        let error = must_err(
+            ClientStorage::open_init_storage(root.path().join("upcast")),
+            "upcast",
+        );
+        assert_eq!(
+            error.to_string(),
+            "failed to read storage configuration for LIBRA_STORAGE_TYPE"
+        );
+        assert!(!error.to_string().contains("gcs-canary"));
+    }
+
+    #[test]
+    #[serial(env)]
+    fn storage_config_upcast_open_init_local_is_ready() {
+        let _env = isolate_storage_env();
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "local");
+        let root = tempdir().expect("temp");
+        let storage = must_ok(
+            ClientStorage::open_init_storage(root.path().join("local-upcast")),
+            "local upcast",
+        );
+        assert!(storage.configuration_variable().is_none());
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_hold_cache_does_not_keep_rejection() {
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "gcs-canary");
+        let cached = crate::utils::util::objects_storage().expect("storage");
+        assert_eq!(cached.configuration_variable(), Some("LIBRA_STORAGE_TYPE"));
+        assert!(!crate::utils::util::objects_storage_cache_contains(
+            &crate::utils::path::objects()
+        ));
+        drop(_type);
+        let restored = crate::utils::util::objects_storage().expect("storage");
+        assert!(restored.configuration_variable().is_none());
+        let blob = Blob::from_content("recovered");
+        restored
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect("recovered storage can put");
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_hold_unresolved_type_is_not_local() {
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        let database = repo
+            .path()
+            .join(".libra")
+            .join(crate::utils::util::DATABASE);
+        let saved = fs::read(&database).expect("save repository database");
+        break_repository_database(repo.path());
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            repo.path().join("missing-global.db"),
+        );
+        super::STORAGE_TYPE_READS.with(|reads| reads.set(0));
+        let first = crate::utils::util::objects_storage().expect("storage");
+        assert_eq!(super::STORAGE_TYPE_READS.with(|reads| reads.get()), 1);
+        assert_eq!(first.configuration_variable(), Some("LIBRA_STORAGE_TYPE"));
+        assert!(!crate::utils::util::objects_storage_cache_contains(
+            &crate::utils::path::objects()
+        ));
+        let blob = Blob::from_content("unresolved-once");
+        let put_error = first
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect_err("an unread type is not writable");
+        let repo_text = repo.path().to_str().expect("utf8");
+        assert_eq!(
+            put_error.to_string(),
+            "failed to read storage configuration for LIBRA_STORAGE_TYPE"
+        );
+        assert!(!put_error.to_string().contains(repo_text));
+
+        super::STORAGE_TYPE_READS.with(|reads| reads.set(0));
+        let side = repo.path().join("side-objects");
+        let error = must_err(
+            ClientStorage::resolve_configured_storage(side.clone()),
+            "resolve rejects an unread type",
+        );
+        assert_eq!(super::STORAGE_TYPE_READS.with(|reads| reads.get()), 1);
+        assert_eq!(error.variable(), "LIBRA_STORAGE_TYPE");
+        assert!(!side.exists());
+        assert!(!crate::utils::util::objects_storage_cache_contains(
+            &crate::utils::path::objects()
+        ));
+
+        fs::remove_dir_all(&database).expect("remove broken database");
+        fs::write(&database, saved).expect("restore repository database");
+        let restored = crate::utils::util::objects_storage().expect("storage");
+        assert!(restored.configuration_variable().is_none());
+        assert!(crate::utils::util::objects_storage_cache_contains(
+            &crate::utils::path::objects()
+        ));
+        let recovered = Blob::from_content("unresolved-recovered");
+        restored
+            .put(&recovered.id, &recovered.data, recovered.get_type())
+            .expect("a repaired database can put");
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_hold_unreadable_global_stays_local() {
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        let global = repo.path().join("broken-global.db");
+        fs::write(&global, b"not a sqlite database").expect("write broken global");
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global);
+        let storage = crate::utils::util::objects_storage().expect("storage");
+        assert!(storage.configuration_variable().is_none());
+        assert!(crate::utils::util::objects_storage_cache_contains(
+            &crate::utils::path::objects()
+        ));
+        let blob = Blob::from_content("broken-global");
+        storage
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect("an unreadable global store does not block local objects");
+    }
+
+    /// FIX-LTR-08: holds an exclusive write lock on `repo`'s database from a
+    /// dedicated OS thread and runtime, so no test worker can strand the pooled
+    /// connection, until `release_when` reports true (or 30 s pass); then rolls
+    /// back and writes the `released` marker. Returns once the lock is held.
+    fn hold_repository_write_lock(
+        repo: &std::path::Path,
+        mut release_when: impl FnMut() -> bool + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        use sea_orm::ConnectionTrait;
+
+        let database = repo.join(".libra").join(crate::utils::util::DATABASE);
+        let released = repo.join("busy-probe").join("released");
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("locker runtime");
+            runtime.block_on(async move {
+                let locker = db::open_connection_without_schema_management(
+                    database.to_str().expect("utf8 database path"),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("open the locker connection");
+                locker
+                    .execute_unprepared("PRAGMA journal_mode = DELETE")
+                    .await
+                    .expect("rollback journal");
+                locker
+                    .execute_unprepared("BEGIN EXCLUSIVE")
+                    .await
+                    .expect("take the write lock");
+                held_tx.send(()).expect("report the held lock");
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !release_when() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                locker
+                    .execute_unprepared("ROLLBACK")
+                    .await
+                    .expect("release the write lock");
+                fs::write(&released, b"").expect("write the released marker");
+            });
+        });
+        held_rx.recv().expect("the locker holds the write lock");
+        handle
+    }
+
+    /// Runs `storage_config_busy_probe` as its own process in `repo`, so the
+    /// held repository, the process-wide wait budget and the cwd stay out of
+    /// every other test in this binary.
+    fn spawn_busy_probe(repo: &std::path::Path, mode: &str) -> std::process::Output {
+        let home = repo.join("probe-home");
+        fs::create_dir_all(&home).expect("probe home");
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test bin"));
+        for key in STORAGE_ENV_KEYS {
+            command.env_remove(key);
+        }
+        command
+            .current_dir(repo)
+            .env("HOME", &home)
+            .env("LIBRA_CONFIG_GLOBAL_DB", repo.join("missing-global.db"))
+            .env("STORAGE_CONFIG_BUSY_PROBE", mode)
+            .env("STORAGE_CONFIG_BUSY_DIR", repo.join("busy-probe"))
+            .args([
+                "utils::client_storage::tests::storage_config_busy_probe",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+        command.output().expect("spawn the busy probe")
+    }
+
+    fn assert_busy_probe_passed(output: &std::process::Output) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "busy probe failed\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Child side of the FIX-LTR-08 busy-lock cases; does nothing in a normal run.
+    #[test]
+    #[ignore]
+    fn storage_config_busy_probe() {
+        let Ok(mode) = std::env::var("STORAGE_CONFIG_BUSY_PROBE") else {
+            return;
+        };
+        let dir = PathBuf::from(
+            std::env::var("STORAGE_CONFIG_BUSY_DIR").expect("probe marker directory"),
+        );
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        fs::write(dir.join("started"), b"").expect("write the started marker");
+        let started = Instant::now();
+        match mode.as_str() {
+            "waited_out" => {
+                let storage = must_ok(
+                    ClientStorage::resolve_configured_storage(dir.join("objects")),
+                    "a briefly held repository database is waited out",
+                );
+                let waited = started.elapsed();
+                assert!(
+                    waited >= Duration::from_millis(500),
+                    "the read waited for the writer: {waited:?}"
+                );
+                let blob = Blob::from_content("busy-waited-out");
+                storage
+                    .put(&blob.id, &blob.data, blob.get_type())
+                    .expect("put after the wait");
+                assert_eq!(storage.get(&blob.id).expect("read back"), blob.data);
+            }
+            "past_budget" => {
+                let side = dir.join("side-objects");
+                let error = must_err(
+                    ClientStorage::resolve_configured_storage(side.clone()),
+                    "a database held past the budget is not local",
+                );
+                let waited = started.elapsed();
+                assert_eq!(error.variable(), "LIBRA_STORAGE_TYPE");
+                assert_eq!(
+                    error.to_string(),
+                    "failed to read storage configuration for LIBRA_STORAGE_TYPE"
+                );
+                assert!(!side.exists());
+                assert!(
+                    waited >= super::STORAGE_CONFIG_BUSY_BUDGET,
+                    "the first read spends the budget: {waited:?}"
+                );
+                assert!(
+                    waited < super::STORAGE_CONFIG_BUSY_BUDGET + Duration::from_secs(3),
+                    "the first read stops after the budget: {waited:?}"
+                );
+
+                let again = Instant::now();
+                let spent = crate::utils::util::objects_storage().expect("storage");
+                let waited = again.elapsed();
+                assert_eq!(spent.configuration_variable(), Some("LIBRA_STORAGE_TYPE"));
+                assert!(!crate::utils::util::objects_storage_cache_contains(
+                    &crate::utils::path::objects()
+                ));
+                assert!(
+                    waited < Duration::from_millis(1500),
+                    "a spent budget leaves a single attempt: {waited:?}"
+                );
+
+                fs::write(dir.join("phase1"), b"").expect("write the phase1 marker");
+                let released = dir.join("released");
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !released.exists() {
+                    assert!(Instant::now() < deadline, "the locker never released");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let restored = crate::utils::util::objects_storage().expect("storage");
+                assert!(restored.configuration_variable().is_none());
+                let blob = Blob::from_content("busy-restored");
+                restored
+                    .put(&blob.id, &blob.data, blob.get_type())
+                    .expect("put after the release");
+            }
+            other => panic!("unknown busy probe mode {other}"),
+        }
+    }
+
+    /// FIX-LTR-08: another process holding the repository database briefly is
+    /// waited out instead of failing closed at the first 200 ms busy timeout.
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_busy_repository_lock_is_waited_out() {
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        fs::create_dir_all(repo.path().join("busy-probe")).expect("probe marker directory");
+        let started = repo.path().join("busy-probe").join("started");
+        let probe_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::clone(&probe_done);
+        let mut seen: Option<Instant> = None;
+        let locker = hold_repository_write_lock(repo.path(), move || {
+            if seen.is_none() && started.exists() {
+                seen = Some(Instant::now());
+            }
+            done.load(Ordering::SeqCst)
+                || seen.is_some_and(|at| at.elapsed() >= Duration::from_millis(600))
+        });
+        let output = spawn_busy_probe(repo.path(), "waited_out");
+        probe_done.store(true, Ordering::SeqCst);
+        locker.join().expect("locker thread");
+        assert_busy_probe_passed(&output);
+        assert!(
+            output.stderr.is_empty(),
+            "waiting prints nothing: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// FIX-LTR-08: a lock that outlasts the process-wide budget still fails
+    /// closed as before; once the budget is spent the next read gets a single
+    /// attempt, and the released database resolves again.
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_busy_repository_lock_past_budget_fails_closed() {
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        fs::create_dir_all(repo.path().join("busy-probe")).expect("probe marker directory");
+        let phase1 = repo.path().join("busy-probe").join("phase1");
+        let probe_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::clone(&probe_done);
+        let locker = hold_repository_write_lock(repo.path(), move || {
+            done.load(Ordering::SeqCst) || phase1.exists()
+        });
+        let output = spawn_busy_probe(repo.path(), "past_budget");
+        probe_done.store(true, Ordering::SeqCst);
+        locker.join().expect("locker thread");
+        assert_busy_probe_passed(&output);
+    }
+
+    /// FIX-LTR-08: only SQLite's own "held by another writer" errors count as busy.
+    #[test]
+    fn storage_config_busy_message_classifier() {
+        for busy in [
+            "error returned from database: (code: 5) database is locked",
+            "error returned from database: (code: 6) database table is locked",
+            "database schema is locked: main",
+        ] {
+            assert!(super::is_sqlite_busy_message(busy), "{busy}");
+        }
+        for other in [
+            "unable to open database file",
+            "file is not a database",
+            "no such table: config_kv",
+            "failed to decrypt vault.env.LIBRA_STORAGE_TYPE",
+        ] {
+            assert!(!super::is_sqlite_busy_message(other), "{other}");
+        }
+        let wrapped = anyhow::anyhow!("error returned from database: (code: 5) database is locked")
+            .context("failed to query config_kv");
+        assert_eq!(wrapped.to_string(), "failed to query config_kv");
+        assert!(super::is_sqlite_busy_error(&wrapped));
+        assert!(!super::is_sqlite_busy_error(
+            &anyhow::anyhow!("no such table: config_kv").context("failed to query config_kv")
+        ));
+    }
+
+    /// FIX-LTR-08: a failure that is not a held lock is not retried.
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_busy_non_busy_failure_returns_at_once() {
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        break_repository_database(repo.path());
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            repo.path().join("missing-global.db"),
+        );
+        let started = Instant::now();
+        let error = must_err(
+            ClientStorage::resolve_configured_storage(repo.path().join("local-objects")),
+            "a broken repository database is not local",
+        );
+        let waited = started.elapsed();
+        assert_eq!(error.variable(), "LIBRA_STORAGE_TYPE");
+        assert!(
+            waited < Duration::from_secs(1),
+            "a non-busy failure is not retried: {waited:?}"
+        );
+    }
+
+    fn spawn_unresolved_probe(repo: &std::path::Path) -> std::process::Output {
+        let home = repo.join("probe-home");
+        fs::create_dir_all(&home).expect("probe home");
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test bin"));
+        command
+            .current_dir(repo)
+            .env("HOME", &home)
+            .env("LIBRA_CONFIG_GLOBAL_DB", repo.join("missing-global.db"))
+            .env("STORAGE_CONFIG_HOLD_PROBE", "unresolved_put")
+            .env_remove("LIBRA_STORAGE_TYPE")
+            .env_remove("LIBRA_STORAGE_BUCKET")
+            .env_remove("LIBRA_STORAGE_ENDPOINT")
+            .env_remove("LIBRA_STORAGE_REGION")
+            .env_remove("LIBRA_STORAGE_ACCESS_KEY")
+            .env_remove("LIBRA_STORAGE_SECRET_KEY")
+            .env_remove("LIBRA_STORAGE_ALLOW_HTTP")
+            .env_remove("LIBRA_STORAGE_THRESHOLD")
+            .env_remove("LIBRA_STORAGE_CACHE_SIZE")
+            .args([
+                "utils::client_storage::tests::storage_config_hold_probe",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+        command.output().expect("spawn unresolved probe")
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_hold_unresolved_type_stderr_has_no_warning() {
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        break_repository_database(repo.path());
+        let output = spawn_unresolved_probe(repo.path());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{stderr}{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!stderr.contains("Warning"), "{stderr}");
+        assert!(!stderr.contains("Falling back"), "{stderr}");
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_hold_cache_keeps_readable_unset_type() {
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            repo.path().join("missing-global.db"),
+        );
+        let first = crate::utils::util::objects_storage().expect("storage");
+        assert!(first.configuration_variable().is_none());
+        assert!(crate::utils::util::objects_storage_cache_contains(
+            &crate::utils::path::objects()
+        ));
+        let blob = Blob::from_content("unset-cached");
+        first
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect("a readable unset type stays writable");
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "gcs-canary");
+        let second = crate::utils::util::objects_storage().expect("storage");
+        assert!(second.configuration_variable().is_none());
+        let next = Blob::from_content("unset-still-cached");
+        second
+            .put(&next.id, &next.data, next.get_type())
+            .expect("a cached readable unset type is not reread");
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_hold_cache_keeps_local_word() {
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            repo.path().join("missing-global.db"),
+        );
+        let _type = ScopedEnvVar::set("LIBRA_STORAGE_TYPE", "local");
+        let storage = crate::utils::util::objects_storage().expect("storage");
+        assert!(storage.configuration_variable().is_none());
+        assert!(crate::utils::util::objects_storage_cache_contains(
+            &crate::utils::path::objects()
+        ));
+        let blob = Blob::from_content("local-word-cached");
+        storage
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect("exact local stays writable and cached");
+    }
+
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn storage_config_hold_cache_keeps_global_schema_future() {
+        let _hash = set_hash_kind_for_test(HashKind::Sha1);
+        let _env = isolate_storage_env();
+        let repo = tempdir().expect("temp");
+        setup_with_new_libra_in(repo.path()).await;
+        let global = repo.path().join("future.db");
+        write_future_global_db(&global).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global);
+        let storage = crate::utils::util::objects_storage().expect("storage");
+        assert!(storage.configuration_variable().is_none());
+        assert!(crate::utils::util::objects_storage_cache_contains(
+            &crate::utils::path::objects()
+        ));
+    }
+
+    #[test]
+    #[serial(cwd, env)]
+    fn try_init_ok() {
+        let repo = tempdir().expect("temp");
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(setup_with_new_libra_in(repo.path()));
+        let objects = repo.path().join(".libra/objects");
+        let client = ClientStorage::try_init(objects.clone()).expect("try_init");
+        assert!(
+            client.configuration_variable().is_none(),
+            "a fresh repository uses a ready local backend"
+        );
+        assert_eq!(client.base_path(), &objects);
+        assert!(objects.is_dir());
+    }
+
+    #[test]
+    fn try_init_local_ok() {
+        let dir = tempdir().expect("temp");
+        let objects = dir.path().join("objects");
+        let client = ClientStorage::try_init_local(objects.clone()).expect("try_init_local");
+        assert!(
+            objects.is_dir(),
+            "try_init_local creates the objects directory"
+        );
+        assert_eq!(client.base_path(), &objects);
+        assert!(client.configuration_variable().is_none());
+    }
+
+    #[test]
+    fn create_storage_backend_mkdir_err() {
+        let file = tempfile::NamedTempFile::new().expect("file");
+        let blocked = file.path().join("objects");
+        let error = match ClientStorage::create_storage_backend(blocked.clone()) {
+            Ok(_) => panic!("mkdir through a file returned storage"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&blocked.display().to_string()),
+            "mkdir failure must name the path: {rendered}"
+        );
+    }
+
+    #[test]
+    fn fallback_mkdir_err() {
+        let file = tempfile::NamedTempFile::new().expect("file");
+        let blocked = file.path().join("objects");
+        let reason = super::StorageConfigResolutionError::Other("test mkdir failure".to_string());
+        let error = match ClientStorage::storage_config_resolution_fallback(
+            &blocked,
+            "LIBRA_STORAGE_TYPE",
+            &reason,
+        ) {
+            Ok(_) => panic!("mkdir through a file returned storage"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&blocked.display().to_string()),
+            "mkdir failure must name the path: {rendered}"
+        );
+    }
+}

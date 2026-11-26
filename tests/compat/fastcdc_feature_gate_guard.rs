@@ -37,11 +37,20 @@ fn fastcdc_feature_stays_out_of_default() {
 
 #[test]
 fn fastcdc_use_sites_stay_cfg_gated() {
+    let core_utils_mod = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/libra-core/src/utils/mod.rs"
+    ))
+    .expect("read libra-core utils/mod.rs");
+    assert!(
+        core_utils_mod.contains("#[cfg(feature = \"fastcdc\")]\npub mod media;"),
+        "the libra-core utils::media module must stay feature-gated"
+    );
     let utils_mod = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/utils/mod.rs"))
         .expect("read utils/mod.rs");
     assert!(
-        utils_mod.contains("#[cfg(feature = \"fastcdc\")]\npub mod media;"),
-        "the utils::media module must stay feature-gated"
+        utils_mod.contains("#[cfg(feature = \"fastcdc\")]\npub use libra_core::utils::media;"),
+        "the root utils::media re-export must stay feature-gated"
     );
     let command_mod =
         fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/command/mod.rs"))

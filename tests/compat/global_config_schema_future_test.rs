@@ -2284,10 +2284,10 @@ fn config_callsites_do_not_use_generic_schema_wrapper() {
         );
     }
     assert_scoped(
-        include_str!("../../src/command/config.rs"),
+        include_str!("../../crates/libra-core/src/internal/config_scope.rs"),
         &["ensure_config_exists", "get_or_create_cached_connection"],
     );
-    let readers = include_str!("../../src/internal/config.rs");
+    let readers = include_str!("../../crates/libra-core/src/internal/config.rs");
     assert_scoped(
         readers,
         &[
@@ -2299,7 +2299,7 @@ fn config_callsites_do_not_use_generic_schema_wrapper() {
         ],
     );
     assert_scoped(
-        include_str!("../../src/utils/client_storage.rs"),
+        include_str!("../../crates/libra-core/src/utils/client_storage.rs"),
         &["read_config_env_value"],
     );
     let compact = readers.split_whitespace().collect::<String>();
@@ -2307,7 +2307,7 @@ fn config_callsites_do_not_use_generic_schema_wrapper() {
         compact.contains("DatabaseRole::Repository=>get_db_conn_instance_for_path(db_path)"),
         "only the explicit repository branch may use its migrating cache"
     );
-    let schema = include_str!("../../src/internal/db/schema.rs")
+    let schema = include_str!("../../crates/libra-core/src/internal/db/schema.rs")
         .split_whitespace()
         .collect::<String>();
     assert!(schema.contains(".filename(&filename).read_only(read_only).create_if_missing(false)"));

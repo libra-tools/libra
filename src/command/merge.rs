@@ -85,9 +85,7 @@ pub(crate) use output::{
     clear_squash_message, load_squash_message, merge_commit_message, merge_commit_parents,
 };
 pub(crate) use rename_merge::*;
-pub(crate) use state::{
-    MergeState, merge_in_progress, merge_state_for_pseudo_refs, merge_state_gc_oids,
-};
+pub(crate) use state::{MergeState, merge_in_progress, merge_state_gc_oids};
 pub(crate) use tree_merge::*;
 pub(crate) use virtual_base::*;
 pub(crate) use workdir::*;

@@ -28,10 +28,9 @@ mod legacy;
 // through `worktree.rs`.
 pub use legacy::WORKTREE_EXAMPLES;
 pub(crate) use legacy::{
-    WorktreeError, WorktreeState, acquire_registry_lock_async, local_gitdir_for_scope,
-    registered_fuse_worktree_at, registered_fuse_worktree_paths, registry_knows_linked_worktree,
-    registry_knows_linked_worktree_in_storage, reject_bare_repository, run_list_worktrees,
-    run_list_worktrees_at,
+    WorktreeError, WorktreeState, acquire_registry_lock_async, registered_fuse_worktree_paths,
+    registry_knows_linked_worktree, registry_knows_linked_worktree_in_storage,
+    reject_bare_repository, run_list_worktrees, run_list_worktrees_at,
 };
 
 const FUSE_MOUNT_TIMEOUT: Duration = Duration::from_secs(15);

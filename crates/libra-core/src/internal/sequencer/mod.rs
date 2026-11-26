@@ -1,0 +1,2255 @@
+//! Unified sequencer state (lore.md 2.6).
+//!
+//! Single owner of the `sequence_state` SQLite table: a repository has at most
+//! one active multi-step sequence at a time (enforced by `CHECK(id = 1)`), and
+//! this module is the ONLY code allowed to read or write it — no command may
+//! `CREATE TABLE` or touch the row directly. v1 migrates **cherry-pick** onto
+//! it (retiring cherry-pick's lazy in-command DDL and the never-read
+//! `revert_sequence` orphan); `am` also uses this table through a crate-private
+//! row type so the public `SequenceKind` enum remains source-compatible; merge
+//! / revert / rebase keep their existing stores and migrate in scoped follow-ups.
+//!
+//! Two responsibilities:
+//!
+//! 1. **Storage** — [`load`] / [`save`] / [`clear`] for the migrated public
+//!    consumer, plus crate-private `am` counterparts.
+//!    `save` is a single `DELETE`+`INSERT` inside one transaction, so a reader
+//!    sees either the full old row or the full new row, never a torn write;
+//!    durability rides SQLite's `synchronous = FULL` (pinned in `db.rs`), the
+//!    equal of the JSON stores' `write_atomic(.., fsync = true)`.
+//!
+//! 2. **Detection + the symmetric mutex** — [`detect_active`] is a strictly
+//!    READ-ONLY probe (safe for `libra status`; it never mutates or triggers a
+//!    migration) that resolves the one active sequence across the unified table
+//!    AND the three still-legacy stores. [`ensure_none_in_progress`] is the
+//!    guard every sequence-start path calls so any in-progress sequence rejects
+//!    any *new* one with `LBR-CONFLICT-002` — never blocking the in-progress
+//!    op's own continue/abort/skip (those paths do not call the guard).
+
+use std::{path::Path, time::Duration};
+
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+
+use crate::utils::{
+    error::{CliError, CliResult, StableErrorCode},
+    util,
+};
+
+/// Which multi-step operation owns the active sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceKind {
+    Merge,
+    Revert,
+    CherryPick,
+    Rebase,
+}
+
+impl SequenceKind {
+    /// Stable token stored in the `kind` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SequenceKind::Merge => "merge",
+            SequenceKind::Revert => "revert",
+            SequenceKind::CherryPick => "cherry_pick",
+            SequenceKind::Rebase => "rebase",
+        }
+    }
+
+    /// CLI spelling used in durable operation records. The storage token
+    /// remains cherry_pick, while operation names follow the invoked command.
+    #[cfg(test)]
+    fn command_name(self) -> &'static str {
+        match self {
+            SequenceKind::CherryPick => "cherry-pick",
+            _ => self.as_str(),
+        }
+    }
+
+    fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "merge" => Some(SequenceKind::Merge),
+            "revert" => Some(SequenceKind::Revert),
+            "cherry_pick" => Some(SequenceKind::CherryPick),
+            "rebase" => Some(SequenceKind::Rebase),
+            _ => None,
+        }
+    }
+
+    /// `(human label, "conclude with … / abort with …")` — used to make the
+    /// mutex rejection name the blocking op and its resume/abort commands.
+    fn describe(self) -> (&'static str, &'static str) {
+        match self {
+            SequenceKind::Merge => (
+                "a merge",
+                "conclude it with 'libra merge --continue' or 'libra merge --abort'",
+            ),
+            SequenceKind::Revert => (
+                "a revert",
+                "conclude it with 'libra revert --continue' or 'libra revert --abort'",
+            ),
+            SequenceKind::CherryPick => (
+                "a cherry-pick",
+                "conclude it with 'libra cherry-pick --continue' or 'libra cherry-pick --abort'",
+            ),
+            SequenceKind::Rebase => (
+                "a rebase",
+                "conclude it with 'libra rebase --continue' or 'libra rebase --abort'",
+            ),
+        }
+    }
+}
+
+/// The unified sequence row (superset of the per-command state structs).
+#[derive(Debug, Clone)]
+pub struct SequenceState {
+    pub kind: SequenceKind,
+    /// Branch HEAD pointed at when the sequence began.
+    pub head_name: String,
+    /// That branch's commit at sequence start — the `--abort` rollback target.
+    pub head_orig: String,
+    /// The commit whose application is currently conflicted.
+    pub current_oid: String,
+    /// Remaining commit OIDs to apply, in order.
+    pub todo: Vec<String>,
+    /// Op-specific JSON payload (cherry-pick: the serialized commit-modifier
+    /// options; empty when unused).
+    pub payload: String,
+}
+
+/// Crate-private `am` row. Keeping this separate avoids adding a variant to
+/// the public [`SequenceKind`] enum, which would break downstream exhaustive
+/// matches in a patch release, while still sharing the one-row sequencer table.
+#[derive(Debug, Clone)]
+pub struct AmSequenceState {
+    pub head_name: String,
+    pub head_orig: String,
+    pub current_oid: String,
+    pub todo: Vec<String>,
+    pub payload: String,
+}
+
+#[derive(Debug)]
+struct StoredSequenceState {
+    kind: String,
+    head_name: String,
+    head_orig: String,
+    current_oid: String,
+    todo: Vec<String>,
+    payload: String,
+}
+
+async fn load_stored() -> Result<Option<StoredSequenceState>, String> {
+    load_stored_in_scope(&current_scope_key()).await
+}
+
+/// [`load_stored`] against an ALREADY-RESOLVED scope key (§C.4.2
+/// resolve-once): the detection path resolves the scope once and threads it
+/// through, so two probes can never disagree about which worktree they are
+/// answering for.
+async fn load_stored_in_scope(scope_key: &str) -> Result<Option<StoredSequenceState>, String> {
+    let db = request_db_checked().await?;
+    load_stored_with_conn(&db, scope_key).await
+}
+
+/// [`load_stored_in_scope`] against an already-opened connection, so a caller
+/// that resolved the repository once does not resolve it again.
+async fn load_stored_with_conn<C: ConnectionTrait>(
+    db: &C,
+    scope_key: &str,
+) -> Result<Option<StoredSequenceState>, String> {
+    // Part C W1 (§C.4.2): the row is keyed by worktree scope — never read
+    // another worktree's in-progress sequence. `storage_key()` is "" for main.
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT kind, head_name, head_orig, current_oid, todo, payload \
+         FROM sequence_state WHERE worktree_id = ?",
+        [scope_key.into()],
+    );
+    let row = match db.query_one_raw(stmt).await {
+        Ok(row) => row,
+        // Absence-tolerant (the facade must resolve, not error, before the
+        // migration has created the table or on an old binary); real DB
+        // errors still propagate.
+        Err(err) if is_missing_table(&err) => return Ok(None),
+        Err(err) => return Err(format!("failed to load sequence_state: {err}")),
+    };
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let kind: String = row
+        .try_get_by_index(0)
+        .map_err(|e| format!("invalid kind: {e}"))?;
+    let head_name: String = row
+        .try_get_by_index(1)
+        .map_err(|e| format!("invalid head_name: {e}"))?;
+    let head_orig: String = row
+        .try_get_by_index(2)
+        .map_err(|e| format!("invalid head_orig: {e}"))?;
+    let current_oid: String = row
+        .try_get_by_index(3)
+        .map_err(|e| format!("invalid current_oid: {e}"))?;
+    let todo_str: String = row
+        .try_get_by_index(4)
+        .map_err(|e| format!("invalid todo: {e}"))?;
+    let payload: String = row
+        .try_get_by_index(5)
+        .map_err(|e| format!("invalid payload: {e}"))?;
+    let todo = todo_str
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(Some(StoredSequenceState {
+        kind,
+        head_name,
+        head_orig,
+        current_oid,
+        todo,
+        payload,
+    }))
+}
+
+/// Load the active unified-table sequence, if any (v1: cherry-pick).
+pub async fn load() -> Result<Option<SequenceState>, String> {
+    let Some(stored) = load_stored().await? else {
+        return Ok(None);
+    };
+    let kind = SequenceKind::from_token(&stored.kind)
+        .ok_or_else(|| format!("unknown sequence kind '{}'", stored.kind))?;
+    Ok(Some(SequenceState {
+        kind,
+        head_name: stored.head_name,
+        head_orig: stored.head_orig,
+        current_oid: stored.current_oid,
+        todo: stored.todo,
+        payload: stored.payload,
+    }))
+}
+
+/// [`load`] for an ALREADY-RESOLVED scope (§C.4.2).
+///
+/// The pseudo-ref service (§C.5) projects `CHERRY_PICK_HEAD`/`REVERT_HEAD`
+/// from this row and must answer for the scope its CALLER resolved, not for
+/// whichever worktree the process cwd currently names.
+pub async fn load_for_scope(
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<Option<SequenceState>, String> {
+    let Some(stored) = load_stored_in_scope(scope.storage_key()).await? else {
+        return Ok(None);
+    };
+    let kind = SequenceKind::from_token(&stored.kind)
+        .ok_or_else(|| format!("unknown sequence kind '{}'", stored.kind))?;
+    Ok(Some(SequenceState {
+        kind,
+        head_name: stored.head_name,
+        head_orig: stored.head_orig,
+        current_oid: stored.current_oid,
+        todo: stored.todo,
+        payload: stored.payload,
+    }))
+}
+
+/// Capture a sequencer row from an explicit storage path. Facet capture runs
+/// synchronously behind a snapshot trait, so it must not borrow the parent's
+/// cached async pool from a newly-created runtime thread; doing so can wait
+/// forever when the parent runtime is blocked in that trait call.
+pub async fn load_snapshot_for_storage(
+    storage: &Path,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<Option<serde_json::Value>, String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some(stored) = load_stored_with_conn(&db, scope.storage_key()).await? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::json!({
+        "present": true,
+        "kind": stored.kind,
+        "head_name": stored.head_name,
+        "head_orig": stored.head_orig,
+        "current_oid": stored.current_oid,
+        "todo": stored.todo,
+        "payload": stored.payload,
+    })))
+}
+
+/// Restore a facet against an explicitly resolved storage path. StateFacet's
+/// synchronous API runs its helper future on a short-lived runtime, so using
+/// the ambient cached pool here can deadlock when the caller is already
+/// blocking that pool's parent runtime.
+pub async fn restore_snapshot_for_storage(
+    storage: &Path,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin sequence_state transaction: {error}"))?;
+    let (kind, state) = parse_snapshot_state(value)?;
+    save_fields_for_scope(
+        &txn,
+        scope.storage_key(),
+        SequenceStateFields {
+            kind: &kind,
+            head_name: &state.head_name,
+            head_orig: &state.head_orig,
+            current_oid: &state.current_oid,
+            todo: &state.todo,
+            payload: &state.payload,
+        },
+    )
+    .await
+    .map_err(|error| format!("failed to restore sequence_state: {error}"))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("failed to commit sequence_state transaction: {error}"))?;
+    Ok(())
+}
+
+pub async fn clear_snapshot_for_storage(
+    storage: &Path,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<(), String> {
+    let db_path = storage.join(util::DATABASE);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| format!("database path is not valid UTF-8: {}", db_path.display()))?;
+    let db = crate::internal::db::open_connection_without_schema_management(
+        db_path,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM sequence_state WHERE worktree_id = ?",
+        [scope.storage_key().into()],
+    ))
+    .await
+    .map_err(|error| format!("failed to clear sequence_state: {error}"))?;
+    Ok(())
+}
+
+fn parse_snapshot_state(value: &serde_json::Value) -> Result<(String, AmSequenceState), String> {
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("sequencer kind missing")?
+        .to_string();
+    let state = AmSequenceState {
+        head_name: string_value(value, "head_name")?,
+        head_orig: string_value(value, "head_orig")?,
+        current_oid: string_value(value, "current_oid")?,
+        todo: value
+            .get("todo")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("sequencer todo missing")?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        payload: string_value(value, "payload")?,
+    };
+    if kind != "am" && SequenceKind::from_token(&kind).is_none() {
+        return Err(format!("unknown sequencer kind '{kind}'"));
+    }
+    Ok((kind, state))
+}
+
+fn string_value(value: &serde_json::Value, key: &str) -> Result<String, String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("sequencer field '{key}' missing"))
+}
+
+pub async fn load_am() -> Result<Option<AmSequenceState>, String> {
+    let Some(stored) = load_stored().await? else {
+        return Ok(None);
+    };
+    if stored.kind != "am" {
+        if SequenceKind::from_token(&stored.kind).is_none() {
+            return Err(format!("unknown sequence kind '{}'", stored.kind));
+        }
+        return Ok(None);
+    }
+    Ok(Some(AmSequenceState {
+        head_name: stored.head_name,
+        head_orig: stored.head_orig,
+        current_oid: stored.current_oid,
+        todo: stored.todo,
+        payload: stored.payload,
+    }))
+}
+
+/// Claim this worktree's sequence slot for a STARTING sequence (§C.4.4).
+///
+/// `ensure_none_for_control` is a check, and a check followed by a replace is
+/// a TOCTOU window: two `cherry-pick` starts racing in one worktree both see
+/// no row, and the loser's `DELETE`+`INSERT` then erases the winner's todo
+/// while the winner's checkout stays on disk. The claim is a bare `INSERT`
+/// against `worktree_id PRIMARY KEY`, so exactly one starter can win and the
+/// loser is told an operation is already in progress — the same refusal it
+/// would have received a moment earlier.
+///
+/// Progress updates keep using [`save`]: by then the caller IS the owner, and
+/// replacing its own row is what advancing a sequence means.
+pub async fn claim_start(state: &SequenceState) -> Result<(), String> {
+    claim_fields(
+        state.kind.as_str(),
+        &state.head_name,
+        &state.head_orig,
+        &state.current_oid,
+        &state.todo,
+        &state.payload,
+    )
+    .await
+}
+
+/// The shared INSERT behind [`claim_start`] and [`claim_start_am`]: `am` is
+/// stored in the same table under its own `kind`, and both starts need the
+/// same all-or-nothing claim.
+async fn claim_fields(
+    kind: &str,
+    head_name: &str,
+    head_orig: &str,
+    current_oid: &str,
+    todo: &[String],
+    payload: &str,
+) -> Result<(), String> {
+    let db = request_db_checked().await?;
+    let scope_key = current_scope_key();
+    let todo = todo.join("\n");
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO sequence_state \
+             (worktree_id, kind, head_name, head_orig, current_oid, todo, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                scope_key.into(),
+                kind.into(),
+                head_name.into(),
+                head_orig.into(),
+                current_oid.into(),
+                todo.into(),
+                payload.into(),
+            ],
+        ))
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if is_unique_violation(&err) => Err(format!(
+            "another {kind} is already in progress in this worktree"
+        )),
+        Err(err) => Err(format!("failed to claim sequence_state: {err}")),
+    }
+}
+
+/// Whether a database error is the PRIMARY KEY/UNIQUE violation that means
+/// "someone else claimed this scope first" rather than a real failure.
+pub fn is_unique_violation(err: &sea_orm::DbErr) -> bool {
+    is_unique_violation_text(&err.to_string())
+}
+
+/// The same recognition against an already-rendered message, for the layers
+/// that have flattened their error to a `String`.
+pub fn is_unique_violation_text(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("unique constraint failed") || text.contains("constraint violation")
+}
+
+/// Persist (upsert) the active sequence. `DELETE`+`INSERT` in one transaction:
+/// atomic, and the `id = 1` replace never trips the single-row `CHECK`.
+pub async fn save(state: &SequenceState) -> Result<(), String> {
+    use sea_orm::TransactionTrait;
+    let db = request_db_checked().await?;
+    let txn = db
+        .begin()
+        .await
+        .map_err(|e| format!("failed to begin sequence_state transaction: {e}"))?;
+    save_with_conn(&txn, state)
+        .await
+        .map_err(|e| format!("failed to save sequence_state: {e}"))?;
+    txn.commit()
+        .await
+        .map_err(|e| format!("failed to commit sequence_state transaction: {e}"))?;
+    Ok(())
+}
+
+/// Replace the unified sequence row using the caller's transaction. Commands
+/// that move a ref and advance their sequencer position use this to make both
+/// changes commit atomically with the reflog entry.
+pub async fn save_with_conn<C>(db: &C, state: &SequenceState) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    save_fields(
+        db,
+        state.kind.as_str(),
+        &state.head_name,
+        &state.head_orig,
+        &state.current_oid,
+        &state.todo,
+        &state.payload,
+    )
+    .await
+}
+
+/// Outcome of concluding a stopped sequence item from outside the sequencer
+/// (#477 HF-01): `reset` (and later `commit`) ends the stopped item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalConclusion {
+    /// No cherry-pick row in this worktree: nothing to conclude.
+    NotInProgress,
+    /// The stopped item was the whole sequence (nothing left to pick), so the
+    /// row is gone.
+    Cleared,
+    /// A multi-commit sequence keeps its remaining `todo`; the stopped item is
+    /// marked concluded by an additive `stop_concluded` flag inside the
+    /// existing `payload` column (ADR-HF-03 item 3 — no schema change).
+    Marked,
+    /// The row changed between the read and the write — a concurrent `--quit`
+    /// plus a fresh start owns the sequence now. The conclusion is dropped and
+    /// the new owner's row is left exactly as it is (#477 HF-01, Codex R5).
+    Superseded,
+}
+
+/// Read the current sequence only when it belongs to the requested command.
+/// The snapshot does not mutate the row; pass it to [`conclude_stopped_sequence`].
+pub async fn snapshot_stopped_sequence(
+    kind: SequenceKind,
+) -> Result<Option<SequenceState>, String> {
+    let Some(state) = load().await? else {
+        return Ok(None);
+    };
+    if state.kind != kind {
+        return Ok(None);
+    }
+    Ok(Some(state))
+}
+
+/// End the sequence item a stopped run is sitting on, because a later `reset`
+/// concluded it (ADR-HF-03 items 1 and 4, #477 HF-01).
+///
+/// Clears the row when nothing remains, otherwise keeps `current_oid`, `todo`
+/// and the row shape and lets the owning command mark the payload
+/// (`mark_payload`). The marker is an additive payload field, so a row written
+/// here still loads on binaries that predate it (ER-HF-02).
+///
+/// `mark_payload` is fallible: a payload this binary cannot read must surface
+/// as an error so the caller warns about the row it left behind, never as a
+/// silent "already marked" (the unchanged-payload shortcut below would
+/// otherwise swallow it).
+///
+/// Conclude exactly the `snapshot` the caller observed.
+///
+/// Taking the snapshot as an argument is what keeps `reset` honest (Codex R6):
+/// the row is read BEFORE the reset moves the tree, so a sequence started after
+/// the reset finished can never be concluded by it — the fence below simply
+/// misses and reports [`ExternalConclusion::Superseded`].
+pub async fn conclude_stopped_sequence(
+    snapshot: SequenceState,
+    mark_payload: impl Fn(&str) -> Result<String, String>,
+) -> Result<ExternalConclusion, String> {
+    let state = snapshot;
+    let payload = if state.todo.is_empty() {
+        None
+    } else {
+        let marked = mark_payload(&state.payload)?;
+        if marked == state.payload {
+            // Already concluded by an earlier reset; nothing more to mark.
+            return Ok(ExternalConclusion::Marked);
+        }
+        Some(marked)
+    };
+    reclaim_race_seam().await?;
+    // Fenced write: the DELETE/UPDATE only fires while every column still holds
+    // the snapshot this conclusion read. A `--quit` racing us, followed by a new
+    // pick, therefore keeps its own row instead of losing it to a stale write.
+    match payload {
+        None if clear_if_unchanged(&state).await? => Ok(ExternalConclusion::Cleared),
+        Some(payload) if mark_if_unchanged(&state, &payload).await? => {
+            Ok(ExternalConclusion::Marked)
+        }
+        _ => Ok(ExternalConclusion::Superseded),
+    }
+}
+
+/// `LIBRA_TEST`-gated seam that replaces this worktree's row between the
+/// conclusion's read and its fenced write, so the quit/reclaim race is a
+/// deterministic test rather than a timing hope (#477 HF-01, Codex R5).
+async fn reclaim_race_seam() -> Result<(), String> {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return Ok(());
+    }
+    let Some(payload) = std::env::var_os("LIBRA_TEST_SEQUENCER_RECLAIM_BEFORE_CONCLUDE") else {
+        return Ok(());
+    };
+    let reclaimed = SequenceState {
+        kind: SequenceKind::CherryPick,
+        head_name: "master".to_string(),
+        head_orig: "0".repeat(40),
+        current_oid: "9".repeat(40),
+        todo: vec!["8".repeat(40)],
+        payload: payload.to_string_lossy().into_owned(),
+    };
+    save(&reclaimed).await
+}
+
+/// Delete this worktree's row only while it still matches `snapshot`.
+async fn clear_if_unchanged(snapshot: &SequenceState) -> Result<bool, String> {
+    let db = request_db_checked().await?;
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM sequence_state WHERE worktree_id = ? AND kind = ? AND head_name = ? \
+             AND head_orig = ? AND current_oid = ? AND todo = ? AND payload = ?",
+            fence_values(snapshot),
+        ))
+        .await
+        .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Rewrite only the payload of this worktree's row, and only while every other
+/// column still matches `snapshot`.
+async fn mark_if_unchanged(snapshot: &SequenceState, payload: &str) -> Result<bool, String> {
+    let db = request_db_checked().await?;
+    let mut values = vec![payload.to_string().into()];
+    values.extend(fence_values(snapshot));
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE sequence_state SET payload = ?, updated_at = CURRENT_TIMESTAMP \
+             WHERE worktree_id = ? AND kind = ? AND head_name = ? AND head_orig = ? \
+             AND current_oid = ? AND todo = ? AND payload = ?",
+            values,
+        ))
+        .await
+        .map_err(|e| format!("failed to save sequence_state: {e}"))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// The snapshot columns both fenced statements compare against, in WHERE order.
+fn fence_values(snapshot: &SequenceState) -> Vec<sea_orm::Value> {
+    vec![
+        current_scope_key().into(),
+        snapshot.kind.as_str().into(),
+        snapshot.head_name.clone().into(),
+        snapshot.head_orig.clone().into(),
+        snapshot.current_oid.clone().into(),
+        snapshot.todo.join("\n").into(),
+        snapshot.payload.clone().into(),
+    ]
+}
+
+/// Clear this worktree's row of `kind` only while its payload still contains
+/// `needle` (#477 HF-31): a run releasing its own claim after an early refusal
+/// must not erase a row another start claimed after a concurrent `--quit`.
+/// Returns whether a row was removed.
+pub async fn clear_if_payload_contains(kind: SequenceKind, needle: &str) -> Result<bool, String> {
+    let db = request_db_checked().await?;
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ? AND instr(payload, ?) > 0",
+            [kind.as_str().into(), current_scope_key().into(), needle.into()],
+        ))
+        .await
+        .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The FIRST write of a starting `am`, as an atomic claim (§C.4.4) — see
+/// [`claim_start`].
+pub async fn claim_start_am(state: &AmSequenceState) -> Result<(), String> {
+    claim_fields(
+        "am",
+        &state.head_name,
+        &state.head_orig,
+        &state.current_oid,
+        &state.todo,
+        &state.payload,
+    )
+    .await
+}
+
+pub async fn save_am(state: &AmSequenceState) -> Result<(), String> {
+    use sea_orm::TransactionTrait;
+    let db = request_db_checked().await?;
+    let txn = db
+        .begin()
+        .await
+        .map_err(|e| format!("failed to begin sequence_state transaction: {e}"))?;
+    save_am_with_conn(&txn, state)
+        .await
+        .map_err(|e| format!("failed to save am sequence_state: {e}"))?;
+    txn.commit()
+        .await
+        .map_err(|e| format!("failed to commit sequence_state transaction: {e}"))?;
+    Ok(())
+}
+
+pub async fn save_am_with_conn<C>(db: &C, state: &AmSequenceState) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    save_fields(
+        db,
+        "am",
+        &state.head_name,
+        &state.head_orig,
+        &state.current_oid,
+        &state.todo,
+        &state.payload,
+    )
+    .await
+}
+
+async fn save_fields<C>(
+    db: &C,
+    kind: &str,
+    head_name: &str,
+    head_orig: &str,
+    current_oid: &str,
+    todo: &[String],
+    payload: &str,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    let scope_key = current_scope_key();
+    save_fields_for_scope(
+        db,
+        &scope_key,
+        SequenceStateFields {
+            kind,
+            head_name,
+            head_orig,
+            current_oid,
+            todo,
+            payload,
+        },
+    )
+    .await
+}
+
+struct SequenceStateFields<'a> {
+    kind: &'a str,
+    head_name: &'a str,
+    head_orig: &'a str,
+    current_oid: &'a str,
+    todo: &'a [String],
+    payload: &'a str,
+}
+
+async fn save_fields_for_scope<C>(
+    db: &C,
+    scope_key: &str,
+    fields: SequenceStateFields<'_>,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    // Part C W1 (§C.4.2): replace only THIS worktree's row. An unscoped
+    // `DELETE FROM sequence_state` would wipe every other worktree's
+    // in-progress sequence.
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM sequence_state WHERE worktree_id = ?",
+        [scope_key.to_string().into()],
+    ))
+    .await?;
+    let todo = fields.todo.join("\n");
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO sequence_state \
+         (worktree_id, kind, head_name, head_orig, current_oid, todo, payload) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            scope_key.into(),
+            fields.kind.to_string().into(),
+            fields.head_name.to_string().into(),
+            fields.head_orig.to_string().into(),
+            fields.current_oid.to_string().into(),
+            todo.into(),
+            fields.payload.to_string().into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// This process's worktree scope key for the sequencer tables (`""` = main).
+///
+/// Resolved through [`crate::internal::worktree_scope::WorktreeScope`] so the NOT NULL empty-string convention
+/// is applied in exactly one place — see `src/internal/worktree_scope.rs` for
+/// why it differs from the `reference` table's nullable spelling.
+/// The database of the repository THIS INVOCATION pinned, as a `Result`.
+///
+/// NOT a fallback when a pin exists: `request_db` already returns the ambient
+/// connection for an unpinned caller, so an `Err` here means the PINNED
+/// repository could not be resolved — and substituting whichever repository the
+/// cwd points at is exactly the write this pairing exists to prevent.
+///
+/// The realistic trigger is a linked worktree whose `commondir` is missing or
+/// corrupt, which is a repairable user-facing condition rather than a bug, so
+/// the message names the worktree and the command that fixes it.
+pub async fn request_db_checked() -> Result<sea_orm::DatabaseConnection, String> {
+    crate::internal::worktree_scope::request_db()
+        .await
+        .map_err(|error| {
+            let workdir = crate::internal::worktree_scope::WorktreeScope::request_scope()
+                .map(|pinned| pinned.workdir.display().to_string())
+                .unwrap_or_else(|| "this worktree".to_string());
+            format!(
+                "cannot open the repository database for '{workdir}': {error}. If this is a \
+                 linked worktree, its `.libra/commondir` may be missing or corrupt — run \
+                 `libra worktree repair --confirm --path <worktree-path>` from the main worktree"
+            )
+        })
+}
+
+/// This INVOCATION's scope key (§C.4.2 resolve-once): the pinned request scope
+/// when dispatch resolved one, the cwd otherwise. Every sequencer read and
+/// write goes through here, so a cwd that moves mid-command cannot send a save
+/// into another worktree's row.
+fn current_scope_key() -> String {
+    crate::internal::worktree_scope::WorktreeScope::for_request()
+        .storage_key()
+        .to_string()
+}
+
+/// Clear the active sequence of a SPECIFIC kind (completion or abort).
+/// Scoped by `kind` so a mis-routed abort can never erase a DIFFERENT
+/// consumer's row once merge/revert/rebase also migrate (Codex P1).
+/// Idempotent.
+pub async fn clear(kind: SequenceKind) -> Result<(), String> {
+    let db = request_db_checked().await?;
+    clear_with_conn(&db, kind)
+        .await
+        .map_err(|e| format!("failed to clear sequence_state: {e}"))
+}
+
+/// Transaction-scoped counterpart of [`clear`].
+pub async fn clear_with_conn<C>(db: &C, kind: SequenceKind) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    // Part C W1 (§C.4.2): scoped by worktree AND kind — a mis-routed abort can
+    // erase neither a different consumer's row nor another worktree's sequence.
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ?",
+        [kind.as_str().into(), current_scope_key().into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_am() -> Result<(), String> {
+    let db = request_db_checked().await?;
+    clear_am_with_conn(&db)
+        .await
+        .map_err(|e| format!("failed to clear am sequence_state: {e}"))
+}
+
+pub async fn clear_am_with_conn<C>(db: &C) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    // Part C W1 (§C.4.2): scoped like `clear_with_conn` — clearing this
+    // worktree's `am` sequence must not touch another worktree's.
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ?",
+        ["am".into(), current_scope_key().into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Whether a SQLite error is a "missing table" — the ONLY error the read-only
+/// detection facade may treat as "not active". Every other error (corrupt or
+/// locked DB, I/O, permissions) MUST propagate so `ensure_none_in_progress`
+/// fails CLOSED rather than starting a new sequence over an undetected one.
+fn is_missing_table(err: &sea_orm::DbErr) -> bool {
+    err.to_string().contains("no such table")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveSequenceKind {
+    Am,
+    /// A bisect owns this scope. Crate-private for the same reason `Am` is:
+    /// adding a variant to the public [`SequenceKind`] would break downstream
+    /// exhaustive matches in a patch release.
+    Bisect,
+    Known(SequenceKind),
+    /// A legacy common `rebase-merge/` or `rebase-apply/` directory exists,
+    /// linked worktrees are registered, and nothing can say whose rebase it
+    /// is (§C.4.2 / ADR-0714-08).
+    ///
+    /// Deliberately NOT `Known(Rebase)`: this worktree has no scoped state,
+    /// so a reporting command (`status`) must keep working and say what it
+    /// found, while a command that would START a sequence must refuse — the
+    /// directory is neither adopted nor cleared.
+    ///
+    /// The observed path travels WITH the variant: the refusal and the status
+    /// advisory both have to name the directory that actually exists, and
+    /// re-probing at render time could name a different one (or none).
+    AmbiguousLegacy(AmbiguousLegacyState),
+}
+
+/// WHERE the ambiguous legacy state lives, so the guidance can be true.
+///
+/// A DB table is not a file: telling a user to remove a directory that does not
+/// exist is guidance they cannot follow, and telling them to `rm` something
+/// that is actually a table would be worse if they found a way to try.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmbiguousLegacyState {
+    /// A crash-recovery DIRECTORY in common storage (`rebase-merge/`,
+    /// `rebase-apply/`).
+    Directory(std::path::PathBuf),
+    /// A per-operation sidecar FILE in common storage
+    /// (`merge-state.json`, `revert-state.json`).
+    File(std::path::PathBuf),
+    /// An unscoped legacy TABLE in the repository database.
+    Table(&'static str),
+}
+
+impl AmbiguousLegacyState {
+    /// `(what it is, how to clear it)` — accurate for each medium.
+    pub fn describe(&self) -> (String, String) {
+        match self {
+            // Names the directory that actually EXISTS: a refusal the user
+            // cannot locate is a refusal they cannot clear.
+            Self::Directory(path) => (
+                format!(
+                    "a legacy rebase state directory at '{}', whose owning worktree cannot be \
+                     determined",
+                    path.display()
+                ),
+                "finish or abort that rebase in the worktree that owns it, or remove that \
+                 directory once you have confirmed it is stale"
+                    .to_string(),
+            ),
+            Self::File(path) => (
+                format!(
+                    "a legacy state file at '{}' in shared storage, whose owning worktree \
+                     cannot be determined",
+                    path.display()
+                ),
+                "conclude that operation in the worktree that owns it, or remove that file \
+                 once you have confirmed it is stale"
+                    .to_string(),
+            ),
+            Self::Table(table) => (
+                format!(
+                    "an unscoped legacy `{table}` row in the repository database, whose owning \
+                     worktree cannot be determined"
+                ),
+                "conclude that operation in the worktree that owns it. This is a DATABASE row, \
+                 not a file — there is nothing to delete on disk, and clearing it needs an \
+                 explicit repair. Inspect it with `libra worktree doctor`"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+impl ActiveSequenceKind {
+    fn describe(&self) -> (String, String) {
+        match self {
+            ActiveSequenceKind::Am => (
+                "an am operation".to_string(),
+                "conclude it with 'libra am --continue' or 'libra am --abort'".to_string(),
+            ),
+            ActiveSequenceKind::Bisect => (
+                "a bisect".to_string(),
+                "conclude it with 'libra bisect reset'".to_string(),
+            ),
+            ActiveSequenceKind::Known(kind) => {
+                let (label, how) = kind.describe();
+                (label.to_string(), how.to_string())
+            }
+            // Names the directory that actually EXISTS: a refusal the user
+            // cannot locate is a refusal they cannot clear.
+            ActiveSequenceKind::AmbiguousLegacy(state) => state.describe(),
+        }
+    }
+}
+
+/// READ-ONLY: does the unified table hold an active row? (No migration, no
+/// write — safe on the mutex hot path and in `libra status`.)
+async fn unified_active_in_scope<C: ConnectionTrait>(
+    db: &C,
+    scope_key: &str,
+) -> Result<Option<ActiveSequenceKind>, String> {
+    let Some(stored) = load_stored_with_conn(db, scope_key).await? else {
+        return Ok(None);
+    };
+    if stored.kind == "am" {
+        return Ok(Some(ActiveSequenceKind::Am));
+    }
+    SequenceKind::from_token(&stored.kind)
+        .map(ActiveSequenceKind::Known)
+        .map(Some)
+        .ok_or_else(|| format!("unknown sequence kind '{}'", stored.kind))
+}
+
+/// READ-ONLY error-aware probe of a legacy `<store>` table for a single row.
+/// A MISSING table (fresh repo, or a consumer never used) resolves to `false`;
+/// any other DB error propagates (fail-closed). Never mutates.
+async fn legacy_table_active<C: ConnectionTrait>(db: &C, table: &str) -> Result<bool, String> {
+    let stmt = Statement::from_string(DbBackend::Sqlite, format!("SELECT 1 FROM {table} LIMIT 1"));
+    match db.query_one_raw(stmt).await {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(err) if is_missing_table(&err) => Ok(false),
+        Err(err) => Err(format!("failed to probe {table}: {err}")),
+    }
+}
+
+/// Resolve the ONE active sequence for THIS worktree across the unified
+/// table, the per-worktree stores (merge / revert JSON sidecars in the local
+/// gitdir; the scoped `rebase_state` row), and the main-owned legacy stores
+/// (`rebase-merge`/`rebase-apply` dirs, pre-2.6 `cherry_pick_state`).
+/// Strictly read-only — `libra status` and the mutex both rely on this
+/// never mutating repo state (a killed sequence must stay resumable, and
+/// status must never trigger a migration).
+///
+/// During the compat window this deliberately also probes the migrated
+/// consumer's OLD store: an intervening OLD binary can recreate
+/// `revert-state.json` (or a `cherry_pick_state` row), and the mutex must see
+/// it — otherwise a new sequence could start over an old-binary sequence.
+pub async fn detect_active_operation() -> Result<Option<ActiveSequenceKind>, String> {
+    // §C.4.2 resolve-once: the scope is read from the process CWD, so
+    // resolving it separately in each probe lets a CWD change between two
+    // awaits combine one worktree's unified row with another's sidecar or
+    // `rebase_state` probe — and a start could then pass a mutex that should
+    // have refused it. Resolved ONCE here and threaded through every probe
+    // below. (The wider cleanup of ambient resolution across the sequencer,
+    // dirty cache, layer and sparse stores stays with LR-02; this function is
+    // the one W1 changes, so it is the one W1 fixes.)
+    // ONE observation of the working directory, and everything derived from
+    // THAT — not three independent ambient reads. "No await between them" is
+    // not enough: `set_current_dir` is process-global, so another thread can
+    // move the CWD between two of those reads and produce scope A with
+    // gitdir/database B, bypassing or misapplying the mutex.
+    //
+    // The invocation's PINNED context wins when there is one (§C.4.2): dispatch
+    // resolved it before any handler ran, so a cwd that has since moved cannot
+    // point the mutex at another worktree's rows. Only an unpinned caller — a
+    // library user, the `libra code` server, a unit test — reads the cwd, and
+    // then both halves come from that one read.
+    // A pinned invocation uses the context the pin ALREADY resolved. An
+    // unpinned one — a library user, the `libra code` server, a unit test —
+    // resolves ONE through the very same constructor, so both branches produce
+    // a scope, gitdir and storage that came from a single filesystem walk.
+    //
+    // Three separate walks here was the defect: `for_workdir`, then a gitdir
+    // lookup, then a storage lookup, each re-reading the tree. A repository
+    // replaced (or a cwd moved) between them handed the mutex one worktree's
+    // scope key and another's gitdir, which is exactly what the mutex must
+    // never do — it would take a lock in repository B on behalf of A.
+    let context = match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned,
+        None => {
+            let workdir = std::env::current_dir()
+                .map_err(|error| format!("failed to resolve the current directory: {error}"))?;
+            crate::internal::worktree_scope::RequestScope::resolve(workdir).ok_or_else(|| {
+                "failed to resolve this worktree: the current directory is not inside a libra                  repository"
+                    .to_string()
+            })?
+        }
+    };
+    let scope_gitdir = context.gitdir;
+    let common_storage = context.storage;
+    let scope_key = context.scope.storage_key().to_string();
+    let scope = context.scope;
+    let db =
+        crate::internal::db::get_db_conn_instance_for_path(&common_storage.join(util::DATABASE))
+            .await
+            .map_err(|error| format!("failed to open the repository database: {error}"))?;
+    // Unified table first (cherry-pick/am in v1), against the resolved scope.
+    if let Some(kind) = unified_active_in_scope(&db, &scope_key).await? {
+        return Ok(Some(kind));
+    }
+    // `merge` and `revert` state are per-worktree JSON sidecars in THIS
+    // worktree's gitdir (§C.4.2/§C.4.3), and both are allowed in a linked
+    // worktree — so they are probed with the worktree-local path, before the
+    // main-only early-return below. For the main worktree the local gitdir ==
+    // common storage, so this is unchanged.
+    for (name, kind) in [
+        ("merge-state.json", SequenceKind::Merge),
+        ("revert-state.json", SequenceKind::Revert),
+    ] {
+        let sidecar = scope_gitdir.join(name);
+        if !sidecar.exists() {
+            continue;
+        }
+        // §C.4.3: for a LINKED worktree the sidecar is in its own gitdir, so it
+        // is unambiguously that worktree's. For MAIN the local gitdir IS common
+        // storage — and a sidecar there could have been written by a linked
+        // worktree that has since been removed, in which case continuing or
+        // aborting it would reset MAIN's HEAD, index and working tree from
+        // another worktree's state and then delete the evidence. With
+        // linked-worktree history and no way to prove ownership, it is
+        // AMBIGUOUS: status reports it, control paths refuse.
+        // W2: a sidecar whose writer RECORDED main's scope is proven main's,
+        // even in a repository with linked history — the guess W1 had to make
+        // is only made for files that carry no record (an old binary's).
+        let proven_main = sidecar_recorded_owner(&sidecar)?.as_deref() == Some("");
+        if !proven_main
+            && !scope.is_linked()
+            && crate::internal::worktree_registry::repository_had_linked_worktrees()
+        {
+            return Ok(Some(ActiveSequenceKind::AmbiguousLegacy(
+                AmbiguousLegacyState::File(sidecar),
+            )));
+        }
+        return Ok(Some(ActiveSequenceKind::Known(kind)));
+    }
+
+    // Part C W1 (§C.4.2/§C.4.4): `rebase_state` is keyed by `worktree_id`
+    // (migration 2026072101), so probe THIS worktree's row BEFORE the linked
+    // early-return — once the rebase guard lifts, a linked worktree's own
+    // rebase must occupy its own mutex, while main's rebase must not block a
+    // linked worktree's sequence (and vice versa).
+    if scoped_rebase_state_active(&db, &scope_key).await? {
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Rebase)));
+    }
+    // §C.4.4 bisect/sequencer mutual exclusion: a bisect owns the scope just
+    // as a rebase does. It was missing here entirely, so `bisect start` could
+    // begin beside an active sequence (and vice versa) in the same worktree.
+    if scoped_bisect_state_active(&db, &scope_key).await? {
+        return Ok(Some(ActiveSequenceKind::Bisect));
+    }
+    // The remaining probes cover main-owned COMMON state only (the legacy
+    // rebase dirs and the pre-2.6 cherry_pick_state table have no worktree
+    // scope — ambiguous-sidecar rule: they belong to main).
+    if scope.is_linked() {
+        return Ok(None);
+    }
+    // The storage this invocation RESOLVED, not the ambient one: the unified
+    // row above was read from the pinned database, and pairing it with a
+    // sidecar directory found under a cwd that has since moved is precisely
+    // the mismatch §C.4.2 exists to prevent.
+    if let Some(legacy_dir) = ambiguous_legacy_dir(&common_storage) {
+        // The common legacy dirs carry no owner metadata. Treating one as
+        // MAIN's rebase is only correct when main is the unambiguous owner.
+        // With linked worktrees registered it may be any of them — and since
+        // `rebase --abort` now PRESERVES such a directory instead of deleting
+        // it (§C.4.2 / ADR-0714-08), reading it as "a rebase is in progress"
+        // would block main's next cherry-pick forever on state that is not
+        // main's and that main is not allowed to clear.
+        //
+        // Reported as its OWN kind rather than as an error: a command that
+        // only READS state must keep working and say what it found, while a
+        // command that would START a sequence refuses.
+        if crate::internal::worktree_registry::repository_had_linked_worktrees() {
+            return Ok(Some(ActiveSequenceKind::AmbiguousLegacy(
+                AmbiguousLegacyState::Directory(legacy_dir),
+            )));
+        }
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Rebase)));
+    }
+    // Compat window: an old binary may have recreated the pre-2.6
+    // `cherry_pick_state` table after this binary migrated it away.
+    if legacy_table_active(&db, "cherry_pick_state").await? {
+        // Same rule: an unscoped legacy table cannot prove it was main's.
+        if !scope.is_linked()
+            && crate::internal::worktree_registry::repository_had_linked_worktrees()
+        {
+            return Ok(Some(ActiveSequenceKind::AmbiguousLegacy(
+                AmbiguousLegacyState::Table("cherry_pick_state"),
+            )));
+        }
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::CherryPick)));
+    }
+    Ok(None)
+}
+
+/// READ-ONLY probe of THIS scope's `bisect_state` row (§C.4.4).
+///
+/// A missing table (a database that never ran the migration runner) resolves
+/// to `false`; any other DB error propagates. Never mutates.
+async fn scoped_bisect_state_active<C: ConnectionTrait>(
+    db: &C,
+    scope_key: &str,
+) -> Result<bool, String> {
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        // ANY retained row, converged or not: a completed bisect deliberately
+        // keeps its row and `orig_head` so `bisect reset` can return HEAD
+        // there. If a rebase could start in between, that reset would move
+        // HEAD away from the new work. Only `reset` clears ownership.
+        "SELECT 1 FROM bisect_state WHERE worktree_id = ? LIMIT 1",
+        [scope_key.into()],
+    );
+    match db.query_one_raw(stmt).await {
+        Ok(row) => Ok(row.is_some()),
+        Err(err) if is_missing_table(&err) => Ok(false),
+        Err(err) => Err(format!("failed to probe bisect_state: {err}")),
+    }
+}
+
+/// The legacy common rebase directory that ACTUALLY exists, if either does.
+///
+/// Callers name this rather than a fixed `rebase-merge`: pointing a user at a
+/// path that is not there leaves them unable to clear the block.
+/// The scope RECORDED inside a merge/revert sidecar, if the writing binary
+/// recorded one (W2, ADR-0714-08).
+///
+/// W1 had to treat every common-storage sidecar with linked-worktree history
+/// as ambiguous, because ownership was a guess. W2 removes the guess for its
+/// own files: `merge`/`revert` record the writer's storage key as
+/// `owner_scope` when they save, so a sidecar main just wrote is PROVEN
+/// main's and stays operable. An absent field (an old binary's file) or an
+/// unreadable document answers `None`, which every caller treats as "cannot
+/// prove" — exactly the W1 rule.
+pub fn sidecar_recorded_owner(path: &std::path::Path) -> Result<Option<String>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // An UNREADABLE file is not evidence of anything — calling it
+        // "ownerless" would tell the user to inspect-or-delete a file whose
+        // real problem is a read error they need to see.
+        Err(error) => return Err(format!("cannot read '{}': {error}", path.display())),
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "'{}' is not valid JSON ({error}); the sidecar is corrupt, not merely \
+             unowned — repair or remove it after inspecting a backup",
+            path.display()
+        )
+    })?;
+    Ok(value
+        .get("owner_scope")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
+}
+
+pub fn ambiguous_legacy_dir(storage: &std::path::Path) -> Option<std::path::PathBuf> {
+    ["rebase-merge", "rebase-apply"]
+        .into_iter()
+        .map(|name| storage.join(name))
+        .find(|candidate| candidate.exists())
+}
+
+/// READ-ONLY probe of THIS worktree's `rebase_state` row (Part C W1 §C.4.2).
+/// A missing table (bare test database that never ran the migration runner)
+/// resolves to `false`; any other DB error propagates (fail-closed). Never
+/// mutates.
+async fn scoped_rebase_state_active<C: ConnectionTrait>(
+    db: &C,
+    scope_key: &str,
+) -> Result<bool, String> {
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT 1 FROM rebase_state WHERE worktree_id = ? LIMIT 1",
+        [scope_key.into()],
+    );
+    match db.query_one_raw(stmt).await {
+        Ok(row) => Ok(row.is_some()),
+        Err(err) if is_missing_table(&err) => Ok(false),
+        Err(err) => Err(format!("failed to probe rebase_state: {err}")),
+    }
+}
+
+/// Backward-compatible public facade for the pre-`am` enum surface. An active
+/// `am` cannot be represented by [`SequenceKind`], so callers receive an error
+/// instead of a misleading `None` while crate-internal consumers use
+/// `detect_active_operation`.
+pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
+    match detect_active_operation().await? {
+        Some(ActiveSequenceKind::Known(kind)) => Ok(Some(kind)),
+        Some(ActiveSequenceKind::Am) => {
+            Err("an am operation is active and is not representable by SequenceKind".to_string())
+        }
+        Some(ActiveSequenceKind::Bisect) => {
+            Err("a bisect is active and is not representable by SequenceKind".to_string())
+        }
+        // Not a sequence this worktree owns, and not representable as one:
+        // the public facade reports "none active" for THIS scope, which is
+        // the truth. The mutex path handles the refusal.
+        Some(ActiveSequenceKind::AmbiguousLegacy(_)) | None => Ok(None),
+    }
+}
+
+/// Every sequencer CONTROL ACTION, and the mutable state it may touch.
+///
+/// §C.9 asks W1 for exactly this: "`worktree add/move/remove/repair/migrate`
+/// 与 sequencer start/continue/skip/abort 声明 mutation scope，为 LR-02
+/// wrapper coverage guard 提供枚举" — the declaration, so LR-02's coverage
+/// middleware coverage guard has a complete list to check the mutation
+/// boundary against. These actions run inside the v2 operation middleware;
+/// their checkout/file work and pooled transactions are kept in the
+/// `_with_conn` contract in `internal/branch.rs` to avoid deadlocks.
+///
+/// The match in `SequencerControl::mutation_scope` is exhaustive with no
+/// wildcard, so a new control action does not compile until it declares.
+// The continue/skip/abort variants and `ALL` are the ENUMERATION §C.9 asks
+// for, not call-site helpers: their consumer is LR-02's wrapper-coverage
+// guard, which does not exist yet, plus the declaration test below. They are
+// listed here — rather than derived later from whatever the commands happen to
+// do — precisely so that guard has something authoritative to check against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-helpers"))]
+pub enum SequencerControl {
+    Start(SequenceKind),
+    Continue(SequenceKind),
+    Skip(SequenceKind),
+    Abort(SequenceKind),
+    /// `merge --restart`: discards the conflicted attempt and re-runs the
+    /// merge from its recorded target. It resets this worktree and rewrites the
+    /// sequencer row, so it is a control action like any other.
+    Restart(SequenceKind),
+    /// `cherry-pick --quit`: clears the sequencer row and leaves
+    /// the working tree where it is. It changes no ref, but it DOES end the
+    /// sequence, so it is a control action like any other.
+    Quit(SequenceKind),
+    AmStart,
+    AmContinue,
+    AmSkip,
+    AmAbort,
+    BisectStart,
+    BisectMark,
+    BisectSkip,
+    BisectReset,
+    /// `bisect run <cmd>`: drives mark after mark automatically. It is the
+    /// most mutating control of all — it checks out a candidate per step —
+    /// so leaving it undeclared would exempt the one that changes the most.
+    BisectRun,
+}
+
+/// What a control action mutates (§C.9 / §C.4.1.1 inventory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+pub struct ControlMutationScope {
+    /// THIS worktree's HEAD, index or working files.
+    pub worktree_state: bool,
+    /// Repository-wide refs (branch tips, notes, reflogs).
+    pub repository_refs: bool,
+    /// This worktree's sequencer row / sidecars.
+    pub sequencer_state: bool,
+}
+
+#[cfg(test)]
+impl SequencerControl {
+    pub fn mutation_scope(self) -> ControlMutationScope {
+        match self {
+            // Every start writes the scoped sequencer row and moves this
+            // worktree's HEAD/index; only the ones that can land a commit
+            // touch repository refs.
+            SequencerControl::Start(_) | SequencerControl::AmStart => ControlMutationScope {
+                worktree_state: true,
+                repository_refs: true,
+                sequencer_state: true,
+            },
+            SequencerControl::Continue(_)
+            | SequencerControl::AmContinue
+            | SequencerControl::Skip(_)
+            | SequencerControl::AmSkip => ControlMutationScope {
+                worktree_state: true,
+                repository_refs: true,
+                sequencer_state: true,
+            },
+            // An abort restores this worktree and clears its row; it moves the
+            // branch back to where the sequence started, so refs too.
+            SequencerControl::Restart(_) => ControlMutationScope {
+                worktree_state: true,
+                repository_refs: true,
+                sequencer_state: true,
+            },
+            SequencerControl::Abort(_) | SequencerControl::AmAbort => ControlMutationScope {
+                worktree_state: true,
+                repository_refs: true,
+                sequencer_state: true,
+            },
+            // `--quit` forgets the sequence and keeps whatever is already in
+            // the tree: the row goes, nothing is restored, no ref moves.
+            SequencerControl::Quit(_) => ControlMutationScope {
+                worktree_state: false,
+                repository_refs: false,
+                sequencer_state: true,
+            },
+            // Bisect checks out candidates in THIS worktree and keeps its own
+            // scoped row; it never moves a branch.
+            SequencerControl::BisectStart
+            | SequencerControl::BisectMark
+            | SequencerControl::BisectSkip
+            | SequencerControl::BisectReset
+            | SequencerControl::BisectRun => ControlMutationScope {
+                worktree_state: true,
+                repository_refs: false,
+                sequencer_state: true,
+            },
+        }
+    }
+
+    /// The operation-log identity of this control: the command name recorded
+    /// in `operation`, and its human description.
+    pub fn describe_operation(self) -> (String, String) {
+        let (command, action) = match self {
+            SequencerControl::Start(kind) => (kind.command_name(), "start"),
+            SequencerControl::Continue(kind) => (kind.command_name(), "continue"),
+            SequencerControl::Skip(kind) => (kind.command_name(), "skip"),
+            SequencerControl::Abort(kind) => (kind.command_name(), "abort"),
+            SequencerControl::Quit(kind) => (kind.command_name(), "quit"),
+            SequencerControl::Restart(kind) => (kind.command_name(), "restart"),
+            SequencerControl::AmStart => ("am", "start"),
+            SequencerControl::AmContinue => ("am", "continue"),
+            SequencerControl::AmSkip => ("am", "skip"),
+            SequencerControl::AmAbort => ("am", "abort"),
+            SequencerControl::BisectStart => ("bisect", "start"),
+            SequencerControl::BisectMark => ("bisect", "mark"),
+            SequencerControl::BisectSkip => ("bisect", "skip"),
+            SequencerControl::BisectReset => ("bisect", "reset"),
+            SequencerControl::BisectRun => ("bisect", "run"),
+        };
+        (command.to_string(), format!("{command} {action}"))
+    }
+
+    /// The full enumeration, for the coverage guard and its test.
+    pub const ALL: &'static [SequencerControl] = &[
+        SequencerControl::Start(SequenceKind::Merge),
+        SequencerControl::Start(SequenceKind::Revert),
+        SequencerControl::Start(SequenceKind::CherryPick),
+        SequencerControl::Start(SequenceKind::Rebase),
+        SequencerControl::Continue(SequenceKind::Merge),
+        SequencerControl::Continue(SequenceKind::Revert),
+        SequencerControl::Continue(SequenceKind::CherryPick),
+        SequencerControl::Continue(SequenceKind::Rebase),
+        SequencerControl::Skip(SequenceKind::CherryPick),
+        SequencerControl::Skip(SequenceKind::Rebase),
+        SequencerControl::Skip(SequenceKind::Revert),
+        SequencerControl::Abort(SequenceKind::Merge),
+        SequencerControl::Abort(SequenceKind::Revert),
+        SequencerControl::Abort(SequenceKind::CherryPick),
+        SequencerControl::Abort(SequenceKind::Rebase),
+        SequencerControl::Restart(SequenceKind::Merge),
+        SequencerControl::Quit(SequenceKind::CherryPick),
+        SequencerControl::AmStart,
+        SequencerControl::AmContinue,
+        SequencerControl::AmSkip,
+        SequencerControl::AmAbort,
+        SequencerControl::BisectStart,
+        SequencerControl::BisectMark,
+        SequencerControl::BisectSkip,
+        SequencerControl::BisectReset,
+        SequencerControl::BisectRun,
+    ];
+}
+
+/// The other half of §C.9's declaration requirement: what a `worktree`
+/// lifecycle action mutates.
+///
+/// The plan names `worktree add/move/remove/repair/migrate` alongside the
+/// sequencer controls, for the same reason — LR-02's wrapper-coverage guard
+/// needs an authoritative enumeration to check against, and deriving one later
+/// from whatever the commands happen to do would encode the drift rather than
+/// catch it. Registry and workspace are their own axes here: a `worktree`
+/// action can rewrite `worktrees.json` and the workspace lease without
+/// touching any scoped sequencer row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeControl {
+    Add,
+    Move,
+    Remove,
+    /// `worktree prune`: retires entries whose path is gone. It writes the
+    /// registry and drops those scopes' rows, so it is a lifecycle action like
+    /// the rest — leaving it undeclared let a replayable journal op escape the
+    /// inventory the declaration exists to close.
+    Prune,
+    Repair,
+    MigrateLayout,
+}
+
+/// What a worktree lifecycle action mutates (§C.9 / §C.4.1.1 inventory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorktreeMutationScope {
+    /// `worktrees.json` — the registry of which worktrees exist.
+    pub registry: bool,
+    /// A worktree's own gitdir, HEAD row, index or files.
+    pub worktree_state: bool,
+    /// Repository-wide refs (a `-b` branch created by `add`).
+    pub repository_refs: bool,
+    /// Rows scoped to a worktree that is being retired or moved.
+    pub scoped_rows: bool,
+}
+
+impl WorktreeControl {
+    pub fn mutation_scope(self) -> WorktreeMutationScope {
+        match self {
+            // `add` writes the registry, seeds the new worktree's own HEAD and
+            // index, and with `-b` creates a branch.
+            WorktreeControl::Add => WorktreeMutationScope {
+                registry: true,
+                worktree_state: true,
+                repository_refs: true,
+                scoped_rows: true,
+            },
+            // `move` rewrites the entry's path and the gitdir pointers; the
+            // scoped rows travel with it untouched in content but re-homed.
+            WorktreeControl::Move => WorktreeMutationScope {
+                registry: true,
+                worktree_state: true,
+                repository_refs: false,
+                scoped_rows: true,
+            },
+            // `remove` retires the entry and, with `--delete-dir`, the scoped
+            // rows and the directory. It never moves a branch.
+            WorktreeControl::Remove => WorktreeMutationScope {
+                registry: true,
+                worktree_state: true,
+                repository_refs: false,
+                scoped_rows: true,
+            },
+            // `prune` retires entries whose directory is gone: the registry
+            // and those scopes' rows. It touches no surviving worktree's HEAD
+            // or index, and moves no branch.
+            WorktreeControl::Prune => WorktreeMutationScope {
+                registry: true,
+                worktree_state: false,
+                repository_refs: false,
+                scoped_rows: true,
+            },
+            // `repair` restores a worktree's identity files and reconciles the
+            // registry; it does not touch that worktree's HEAD or index.
+            WorktreeControl::Repair => WorktreeMutationScope {
+                registry: true,
+                worktree_state: true,
+                repository_refs: false,
+                scoped_rows: false,
+            },
+            // `repair --migrate-layout` replaces a legacy symlink gitdir with
+            // a real one and seeds the migrated worktree's own scoped rows.
+            WorktreeControl::MigrateLayout => WorktreeMutationScope {
+                registry: true,
+                worktree_state: true,
+                repository_refs: false,
+                scoped_rows: true,
+            },
+        }
+    }
+
+    /// The full enumeration, for the coverage guard and its test.
+    pub const ALL: &'static [WorktreeControl] = &[
+        WorktreeControl::Add,
+        WorktreeControl::Move,
+        WorktreeControl::Remove,
+        WorktreeControl::Prune,
+        WorktreeControl::Repair,
+        WorktreeControl::MigrateLayout,
+    ];
+
+    pub fn command_name(self) -> &'static str {
+        match self {
+            WorktreeControl::Add => "worktree add",
+            WorktreeControl::Move => "worktree move",
+            WorktreeControl::Remove => "worktree remove",
+            WorktreeControl::Prune => "worktree prune",
+            WorktreeControl::Repair => "worktree repair",
+            WorktreeControl::MigrateLayout => "worktree repair --migrate-layout",
+        }
+    }
+
+    /// The declaration, asserted at the point of use.
+    ///
+    /// Every lifecycle action states what it is about to mutate before it
+    /// writes its journal row, so the §C.9 inventory is exercised by the code
+    /// it describes rather than only by its own test.
+    pub fn declare(self) -> &'static str {
+        let scope = self.mutation_scope();
+        debug_assert!(
+            scope.registry,
+            "{} is a registry mutation: {scope:?}",
+            self.command_name()
+        );
+        debug_assert!(
+            Self::ALL.contains(&self),
+            "undeclared worktree lifecycle action: {}",
+            self.command_name()
+        );
+        self.journal_op()
+    }
+
+    /// The `op` value this action writes into `worktree_intent_journal`.
+    ///
+    /// The journal is what crash recovery replays, so the declaration and the
+    /// durable record are the SAME value rather than two strings that can
+    /// drift: a declared action with no journal op, or a journal op nothing
+    /// declares, is a gap in the §C.9 inventory by construction.
+    pub fn journal_op(self) -> &'static str {
+        match self {
+            WorktreeControl::Add => "add",
+            WorktreeControl::Move => "move",
+            WorktreeControl::Remove => "remove",
+            WorktreeControl::Prune => "prune",
+            WorktreeControl::Repair => "repair",
+            WorktreeControl::MigrateLayout => "migrate",
+        }
+    }
+}
+
+/// The symmetric start-time mutex (lore.md 2.6): reject a NEW sequence when any
+/// sequence is already in progress. Called from every start path; NOT from
+/// continue/abort/skip, so the in-progress op can still be concluded. The
+/// error names the blocking op and how to conclude or abort it.
+pub async fn ensure_none_in_progress(next: SequenceKind) -> CliResult<()> {
+    ensure_none_for(ActiveSequenceKind::Known(next)).await
+}
+
+pub async fn ensure_none_for_am() -> CliResult<()> {
+    ensure_none_for(ActiveSequenceKind::Am).await
+}
+
+/// The bisect side of the symmetric mutex (§C.4.4).
+pub async fn ensure_none_for_bisect() -> CliResult<()> {
+    ensure_none_for(ActiveSequenceKind::Bisect).await
+}
+
+async fn ensure_none_for(next: ActiveSequenceKind) -> CliResult<()> {
+    let active = detect_active_operation().await.map_err(|e| {
+        CliError::fatal(format!("failed to check for an in-progress sequence: {e}"))
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+    })?;
+    let Some(active) = active else {
+        return Ok(());
+    };
+    if active == next {
+        // Same-op already in progress is handled by the command's OWN
+        // resume/abort check (with its typed message); the cross-op mutex
+        // only blocks a DIFFERENT kind of sequence.
+        return Ok(());
+    }
+    let (label, how) = active.describe();
+    let (starting, _) = next.describe();
+    Err(CliError::fatal(format!(
+        "{label} is already in progress; cannot start {starting}"
+    ))
+    .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+    .with_hint(how))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §C.4.2: active-operation detection reads the sidecars of the
+    /// repository it is PINNED to, not of the one the cwd wandered into.
+    ///
+    /// The unified/scoped rows come from the pinned database; if the legacy
+    /// sidecar probe re-resolved storage from the cwd, a repository with a
+    /// `rebase-merge` directory could be reported as the pinned repository's
+    /// in-progress rebase — blocking a sequence that has nothing to resume,
+    /// or resuming against another repository's files.
+    // The later bare attribute wraps the named one: retain legacy test
+    // exclusion while also holding resource lanes, with the legacy lock first.
+    #[tokio::test]
+    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial]
+    async fn detection_probes_the_pinned_repository_not_the_cwd() {
+        let quiet = tempfile::tempdir().expect("quiet repo");
+        let noisy = tempfile::tempdir().expect("noisy repo");
+        for repo in [quiet.path(), noisy.path()] {
+            let _cd = crate::utils::test::ChangeDirGuard::new(repo);
+            crate::utils::test::setup_with_new_libra_in(repo).await;
+        }
+        // The OTHER repository has a legacy rebase directory; the pinned one
+        // has nothing in progress.
+        std::fs::create_dir_all(noisy.path().join(util::ROOT_DIR).join("rebase-merge"))
+            .expect("legacy dir");
+
+        let _pin = crate::internal::worktree_scope::WorktreeScope::pin_request_scope(
+            quiet.path().to_path_buf(),
+        );
+        let _cd = crate::utils::test::ChangeDirGuard::new(noisy.path());
+
+        let detected = detect_active_operation()
+            .await
+            .expect("detection reads the pinned repository");
+        assert_eq!(
+            detected, None,
+            "the other repository's legacy rebase directory is not this one's sequence"
+        );
+    }
+
+    /// §C.9: every sequencer control action DECLARES its mutation scope, and
+    /// every one of them touches this worktree's sequencer state — that is
+    /// what makes them scope-bearing actions at all. The enumeration is what
+    /// LR-02's wrapper-coverage guard consumes.
+    #[test]
+    #[serial_test::serial(cwd, env)]
+    fn every_sequencer_control_declares_its_mutation_scope() {
+        assert_eq!(
+            SequencerControl::ALL.len(),
+            26,
+            "the enumeration is the contract: add the new control here too"
+        );
+        // No duplicates: a repeated entry inflates the count and lets the
+        // cardinality assertion above pass while a real control is missing.
+        for (index, control) in SequencerControl::ALL.iter().enumerate() {
+            assert!(
+                !SequencerControl::ALL[..index].contains(control),
+                "{control:?} appears twice in ALL"
+            );
+        }
+        for control in SequencerControl::ALL {
+            let scope = control.mutation_scope();
+            assert!(
+                scope.sequencer_state,
+                "{control:?} owns scoped sequencer state"
+            );
+            // `--quit` is the exception that proves the rule: it forgets the
+            // sequence and deliberately leaves the tree exactly as it is.
+            if !matches!(control, SequencerControl::Quit(_)) {
+                assert!(
+                    scope.worktree_state,
+                    "{control:?} touches THIS worktree's HEAD/index/files"
+                );
+            }
+        }
+        // Every declared control has an operation-log identity, or boundary
+        // recording could not name it.
+        for control in SequencerControl::ALL {
+            let (command, description) = control.describe_operation();
+            assert!(!command.is_empty(), "{control:?} needs a command name");
+            assert!(
+                description.contains(&command),
+                "{control:?} description should name its command: {description}"
+            );
+        }
+        // Bisect never moves a branch; the sequence controls do.
+        assert!(
+            !SequencerControl::BisectMark
+                .mutation_scope()
+                .repository_refs,
+            "bisect checks out candidates without moving refs"
+        );
+        assert!(
+            SequencerControl::Continue(SequenceKind::Rebase)
+                .mutation_scope()
+                .repository_refs,
+            "a rebase --continue can land commits on the branch"
+        );
+    }
+    use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+    fn sample(kind: SequenceKind) -> SequenceState {
+        SequenceState {
+            kind,
+            head_name: "main".to_string(),
+            head_orig: "a".repeat(40),
+            current_oid: "b".repeat(40),
+            todo: vec!["c".repeat(40), "d".repeat(40)],
+            payload: "{\"signoff\":true}".to_string(),
+        }
+    }
+
+    fn sample_am() -> AmSequenceState {
+        AmSequenceState {
+            head_name: "main".to_string(),
+            head_orig: "a".repeat(40),
+            current_oid: "b".repeat(40),
+            todo: vec!["one.patch".to_string(), "two.patch".to_string()],
+            payload: "{\"current\":0}".to_string(),
+        }
+    }
+
+    /// Every control the CLI can DISPATCH must be declared, or
+    /// the v2 control-operation declaration's debug assertion aborts the command.
+    ///
+    /// This is not hypothetical: `revert --skip` dispatched
+    /// `Skip(SequenceKind::Revert)` while `ALL` listed only the cherry-pick and
+    /// rebase skips, so a debug build panicked on a perfectly ordinary command.
+    /// The declaration and the dispatch table have to be checked against each
+    /// other, not merely each against itself.
+    #[test]
+    fn every_dispatchable_control_is_declared() {
+        // The controls `cli::sequencer_control_for` can produce, by kind.
+        let dispatched = [
+            SequencerControl::Start(SequenceKind::CherryPick),
+            SequencerControl::Continue(SequenceKind::CherryPick),
+            SequencerControl::Skip(SequenceKind::CherryPick),
+            SequencerControl::Abort(SequenceKind::CherryPick),
+            SequencerControl::Quit(SequenceKind::CherryPick),
+            SequencerControl::Start(SequenceKind::Revert),
+            SequencerControl::Continue(SequenceKind::Revert),
+            SequencerControl::Skip(SequenceKind::Revert),
+            SequencerControl::Abort(SequenceKind::Revert),
+            SequencerControl::Start(SequenceKind::Rebase),
+            SequencerControl::Continue(SequenceKind::Rebase),
+            SequencerControl::Skip(SequenceKind::Rebase),
+            SequencerControl::Abort(SequenceKind::Rebase),
+            SequencerControl::Start(SequenceKind::Merge),
+            SequencerControl::Continue(SequenceKind::Merge),
+            SequencerControl::Restart(SequenceKind::Merge),
+            SequencerControl::Abort(SequenceKind::Merge),
+            SequencerControl::AmStart,
+            SequencerControl::AmContinue,
+            SequencerControl::AmSkip,
+            SequencerControl::AmAbort,
+            SequencerControl::BisectStart,
+            SequencerControl::BisectMark,
+            SequencerControl::BisectSkip,
+            SequencerControl::BisectReset,
+            SequencerControl::BisectRun,
+        ];
+        for control in dispatched {
+            assert!(
+                SequencerControl::ALL.contains(&control),
+                "{control:?} is dispatched by the CLI but missing from ALL — a debug build \
+                 aborts on it"
+            );
+        }
+        // SET EQUALITY, not one-way containment: a declaration nothing
+        // dispatches is dead weight that hides a missing dispatch arm, and the
+        // count check alone cannot tell the two apart.
+        for control in SequencerControl::ALL {
+            assert!(
+                dispatched.contains(control),
+                "{control:?} is declared but never dispatched — either wire it up or drop it"
+            );
+        }
+        assert_eq!(
+            dispatched.len(),
+            SequencerControl::ALL.len(),
+            "the dispatch list and the declaration must be the same size"
+        );
+    }
+
+    /// §C.9: `worktree add/move/remove/repair/migrate` declare their mutation
+    /// scope too — the plan names them in the same sentence as the sequencer
+    /// controls, and a guard that enumerated only one family would pass while
+    /// a worktree action went uncovered.
+    #[test]
+    fn every_worktree_control_declares_its_mutation_scope() {
+        assert_eq!(
+            WorktreeControl::ALL.len(),
+            6,
+            "the enumeration is the contract: add the new action here too"
+        );
+        for control in WorktreeControl::ALL {
+            let scope = control.mutation_scope();
+            assert!(
+                scope.registry,
+                "{control:?} is a registry mutation — that is what makes it a \
+                 lifecycle action"
+            );
+            assert!(
+                !control.command_name().is_empty(),
+                "{control:?} needs a command name"
+            );
+        }
+        // Only `add` can create a branch (`-b`); the rest never move a ref.
+        assert!(WorktreeControl::Add.mutation_scope().repository_refs);
+        for control in [
+            WorktreeControl::Move,
+            WorktreeControl::Remove,
+            WorktreeControl::Prune,
+            WorktreeControl::Repair,
+            WorktreeControl::MigrateLayout,
+        ] {
+            assert!(
+                !control.mutation_scope().repository_refs,
+                "{control:?} must not move a branch"
+            );
+        }
+        // `repair` restores identity FILES; it must not claim to rewrite the
+        // scoped rows, which would license it to delete a worktree's HEAD.
+        assert!(!WorktreeControl::Repair.mutation_scope().scoped_rows);
+        // Journal ops are distinct — two actions sharing one would make crash
+        // recovery replay the wrong one.
+        let mut ops: Vec<&str> = WorktreeControl::ALL
+            .iter()
+            .map(|control| control.journal_op())
+            .collect();
+        ops.sort_unstable();
+        let unique = ops.len();
+        ops.dedup();
+        assert_eq!(unique, ops.len(), "journal ops must be distinct: {ops:?}");
+        // Every op string the journal can hold is declared — the direction
+        // that matters, since crash recovery dispatches on those strings and
+        // an op with no declaration is a replayable mutation outside the
+        // inventory. The converse does not hold: `repair` declares but writes
+        // no journal row, because each of its writes is a single atomic
+        // rename with no crash window to roll forward.
+        let mut declared: Vec<&str> = WorktreeControl::ALL
+            .iter()
+            .map(|control| control.journal_op())
+            .collect();
+        declared.sort_unstable();
+        assert_eq!(
+            declared,
+            vec!["add", "migrate", "move", "prune", "remove", "repair"],
+            "the declared journal ops must match what the journal can contain"
+        );
+    }
+
+    /// §C.4.4: the start-time exclusion is the INSERT, not the check before
+    /// it. Two starts racing in one worktree both pass `ensure_none_for_*`
+    /// (nothing is in progress yet); if the first persistence were an upsert,
+    /// the loser would silently replace the winner's todo while the winner's
+    /// checkout stayed on disk. Exactly one claim may win.
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn only_one_start_can_claim_this_worktrees_sequence() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+
+        let first = sample(SequenceKind::CherryPick);
+        claim_start(&first).await.expect("the first start wins");
+
+        let mut second = sample(SequenceKind::Rebase);
+        second.current_oid = "e".repeat(40);
+        let refused = claim_start(&second)
+            .await
+            .expect_err("the second start must be refused, not silently applied");
+        assert!(
+            refused.contains("already in progress"),
+            "the loser gets the ordinary refusal: {refused}"
+        );
+
+        // The winner's row is intact — this is the assertion an upsert fails.
+        let loaded = load().await.expect("load").expect("present");
+        assert_eq!(loaded.kind, SequenceKind::CherryPick);
+        assert_eq!(loaded.current_oid, first.current_oid);
+
+        // The OWNER can still advance its own sequence.
+        let mut advanced = first.clone();
+        advanced.current_oid = "f".repeat(40);
+        save(&advanced).await.expect("the owner advances");
+        assert_eq!(
+            load().await.expect("load").expect("present").current_oid,
+            "f".repeat(40)
+        );
+    }
+
+    /// #477 HF-01 (ER-HF-02): the external-conclusion marker is an additive
+    /// payload field — `current_oid`, `todo` and the row shape stay valid for a
+    /// binary that predates it — and a sequence with nothing left is cleared.
+    // Keep both legacy and resource-keyed exclusion; the bare attribute wraps
+    // the named one and acquires the legacy lock before the sorted lane locks.
+    #[tokio::test]
+    #[serial_test::serial(env, cwd, hash_kind)]
+    #[serial_test::serial]
+    async fn external_conclusion_marker_uses_existing_columns() {
+        for key in [None, Some("cwd"), Some("env"), Some("hash_kind")] {
+            assert!(
+                serial_test::is_locked_serially(key),
+                "external conclusion must retain legacy and resource exclusion: {key:?}"
+            );
+        }
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        // Callers snapshot first (Codex R6); `taken()` is that read.
+        async fn taken() -> Option<SequenceState> {
+            snapshot_stopped_sequence(SequenceKind::CherryPick)
+                .await
+                .expect("snapshot")
+        }
+        let keep = |payload: &str| Ok(payload.to_string());
+        let mark = |payload: &str| Ok(format!("{payload}|concluded"));
+        let unreadable = |_: &str| Err("unreadable options".to_string());
+
+        // Nothing in progress: there is no snapshot to conclude.
+        assert!(taken().await.is_none(), "idle");
+
+        // Multi-commit sequence: only the payload changes.
+        let mut multi = sample(SequenceKind::CherryPick);
+        multi.todo = vec!["c".repeat(40), "d".repeat(40)];
+        multi.payload = r#"{"signoff":false}"#.to_string();
+        save(&multi).await.expect("save multi");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), mark)
+                .await
+                .expect("mark"),
+            ExternalConclusion::Marked
+        );
+        let marked = load().await.expect("load").expect("row kept");
+        assert_eq!(
+            marked.current_oid, multi.current_oid,
+            "the stopped commit id stays readable by older binaries"
+        );
+        assert_eq!(marked.todo, multi.todo, "remaining todo is kept");
+        assert_eq!(marked.payload, format!("{}|concluded", multi.payload));
+        assert_eq!(marked.head_orig, multi.head_orig);
+        // Marking again is idempotent once the mark is present.
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), keep)
+                .await
+                .expect("re-mark"),
+            ExternalConclusion::Marked
+        );
+
+        // A payload this binary cannot read is an error, not a silent "already
+        // marked": the row is left byte-identical for the caller to warn about.
+        let before = load().await.expect("load").expect("row kept");
+        assert!(
+            conclude_stopped_sequence(taken().await.expect("row"), unreadable)
+                .await
+                .is_err(),
+            "an unreadable payload must not report success"
+        );
+        let after = load().await.expect("load").expect("row kept");
+        assert_eq!(after.payload, before.payload, "payload untouched");
+        assert_eq!(after.current_oid, before.current_oid, "row untouched");
+        assert_eq!(after.todo, before.todo, "todo untouched");
+
+        // Nothing left to pick: the row goes away.
+        clear(SequenceKind::CherryPick).await.expect("clear");
+        let single = SequenceState {
+            todo: Vec::new(),
+            ..sample(SequenceKind::CherryPick)
+        };
+        save(&single).await.expect("save single");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), keep)
+                .await
+                .expect("clear"),
+            ExternalConclusion::Cleared
+        );
+        assert!(load().await.expect("load").is_none());
+
+        // A different kind is left alone.
+        save(&sample(SequenceKind::Rebase))
+            .await
+            .expect("save rebase");
+        assert!(taken().await.is_none(), "a different kind is not ours");
+        assert!(
+            load().await.expect("load").is_some(),
+            "rebase state is untouched"
+        );
+        // Codex R5: a `--quit` racing the conclusion, followed by a fresh start,
+        // keeps its own row — the fenced write only fires on the snapshot it
+        // read, and the stale conclusion reports `Superseded`.
+        let reclaimed_payload = r#"{"signoff":true,"reclaimed":1}"#;
+        unsafe {
+            std::env::set_var("LIBRA_TEST", "1");
+            std::env::set_var(
+                "LIBRA_TEST_SEQUENCER_RECLAIM_BEFORE_CONCLUDE",
+                reclaimed_payload,
+            );
+        }
+        clear(SequenceKind::CherryPick).await.expect("clear");
+        let mut racing = sample(SequenceKind::CherryPick);
+        racing.todo = vec!["e".repeat(40)];
+        racing.payload = r#"{"signoff":false}"#.to_string();
+        save(&racing).await.expect("save racing");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), mark)
+                .await
+                .expect("superseded"),
+            ExternalConclusion::Superseded
+        );
+        let winner = load().await.expect("load").expect("reclaimed row kept");
+        assert_eq!(
+            winner.payload, reclaimed_payload,
+            "the row the concurrent start wrote survives"
+        );
+        assert_eq!(winner.current_oid, "9".repeat(40));
+
+        // Same fence on the clearing branch: nothing left to pick, but the row
+        // was reclaimed under us.
+        clear(SequenceKind::CherryPick).await.expect("clear");
+        let single_racing = SequenceState {
+            todo: Vec::new(),
+            ..sample(SequenceKind::CherryPick)
+        };
+        save(&single_racing).await.expect("save single racing");
+        assert_eq!(
+            conclude_stopped_sequence(taken().await.expect("row"), keep)
+                .await
+                .expect("superseded"),
+            ExternalConclusion::Superseded
+        );
+        assert_eq!(
+            load()
+                .await
+                .expect("load")
+                .expect("reclaimed row kept")
+                .payload,
+            reclaimed_payload,
+            "the clearing branch does not delete someone else's row"
+        );
+        unsafe {
+            std::env::remove_var("LIBRA_TEST_SEQUENCER_RECLAIM_BEFORE_CONCLUDE");
+            std::env::remove_var("LIBRA_TEST");
+        }
+    }
+
+    /// #477 HF-31: a fenced clear removes the row only while its payload still
+    /// carries the caller's token.
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn clear_if_payload_contains_only_removes_the_owners_row() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+        let mut row = sample(SequenceKind::CherryPick);
+        row.payload = r#"{"claim_token":"theirs"}"#.to_string();
+        save(&row).await.expect("save");
+        let mine = r#""claim_token":"mine""#;
+        assert!(
+            !clear_if_payload_contains(SequenceKind::CherryPick, mine)
+                .await
+                .expect("fenced clear")
+        );
+        assert!(
+            load().await.expect("load").is_some(),
+            "another owner's row stays"
+        );
+        let theirs = r#""claim_token":"theirs""#;
+        assert!(
+            clear_if_payload_contains(SequenceKind::CherryPick, theirs)
+                .await
+                .expect("fenced clear")
+        );
+        assert!(
+            load().await.expect("load").is_none(),
+            "the owner's row is removed"
+        );
+    }
+
+    /// Round-trip every SequenceKind through the unified table so the superset
+    /// schema is validated for all four consumers (not just the migrated one).
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn save_load_clear_round_trip_all_kinds() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+
+        for kind in [
+            SequenceKind::CherryPick,
+            SequenceKind::Revert,
+            SequenceKind::Merge,
+            SequenceKind::Rebase,
+        ] {
+            let state = sample(kind);
+            save(&state).await.expect("save");
+            let loaded = load().await.expect("load").expect("present");
+            assert_eq!(loaded.kind, kind);
+            assert_eq!(loaded.head_orig, state.head_orig);
+            assert_eq!(loaded.current_oid, state.current_oid);
+            assert_eq!(loaded.todo, state.todo);
+            assert_eq!(loaded.payload, state.payload);
+            // Re-save (replace) must not trip CHECK(id=1).
+            save(&state).await.expect("re-save replaces");
+            assert!(load().await.expect("load").is_some());
+            clear(kind).await.expect("clear");
+            assert!(load().await.expect("load").is_none());
+            // clear() is idempotent.
+            clear(kind).await.expect("idempotent clear");
+        }
+
+        let state = sample_am();
+        save_am(&state).await.expect("save am");
+        let loaded = load_am().await.expect("load am").expect("am present");
+        assert_eq!(loaded.head_orig, state.head_orig);
+        assert_eq!(loaded.current_oid, state.current_oid);
+        assert_eq!(loaded.todo, state.todo);
+        assert_eq!(loaded.payload, state.payload);
+        save_am(&state).await.expect("re-save am replaces");
+        clear_am().await.expect("clear am");
+        assert!(load_am().await.expect("load cleared am").is_none());
+        clear_am().await.expect("idempotent clear am");
+    }
+
+    /// The symmetric mutex blocks a DIFFERENT sequence, allows the same kind
+    /// (its own command handles same-op), and passes when idle.
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn ensure_none_in_progress_cross_op_matrix() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = ChangeDirGuard::new(tmp.path());
+        setup_with_new_libra_in(tmp.path()).await;
+
+        // Idle: any start is allowed.
+        ensure_none_in_progress(SequenceKind::Merge)
+            .await
+            .expect("idle allows start");
+
+        // An active cherry-pick blocks every other operation, including am,
+        // but not a new cherry-pick (its own InProgress check owns that).
+        save(&sample(SequenceKind::CherryPick)).await.expect("save");
+        for other in [
+            SequenceKind::Merge,
+            SequenceKind::Revert,
+            SequenceKind::Rebase,
+        ] {
+            let err = ensure_none_in_progress(other)
+                .await
+                .expect_err("cross-op blocked");
+            assert!(
+                err.to_string().contains("cherry-pick"),
+                "names the blocking op: {err}"
+            );
+        }
+        ensure_none_in_progress(SequenceKind::CherryPick)
+            .await
+            .expect("same-op defers to the command's own check");
+        let err = ensure_none_for_am()
+            .await
+            .expect_err("cherry-pick blocks am");
+        assert!(err.to_string().contains("cherry-pick"), "{err}");
+        assert_eq!(
+            detect_active().await.expect("detect"),
+            Some(SequenceKind::CherryPick)
+        );
+        clear(SequenceKind::CherryPick).await.expect("clear");
+
+        // The crate-private am kind symmetrically blocks every public
+        // sequencer kind without expanding the public enum.
+        save_am(&sample_am()).await.expect("save am");
+        for other in [
+            SequenceKind::Merge,
+            SequenceKind::Revert,
+            SequenceKind::CherryPick,
+            SequenceKind::Rebase,
+        ] {
+            let err = ensure_none_in_progress(other)
+                .await
+                .expect_err("am blocks cross-op start");
+            assert!(err.to_string().contains("am operation"), "{err}");
+        }
+        ensure_none_for_am()
+            .await
+            .expect("same am defers to the command's own check");
+        assert_eq!(
+            detect_active_operation().await.expect("detect am"),
+            Some(ActiveSequenceKind::Am)
+        );
+        assert!(
+            detect_active().await.is_err(),
+            "public legacy enum must not silently hide active am"
+        );
+        clear_am().await.expect("clear am");
+    }
+}

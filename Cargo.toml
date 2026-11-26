@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "crates/libra-model"]
-default-members = [".", "crates/libra-model"]
+members = [".", "crates/libra-model", "crates/libra-core"]
+default-members = [".", "crates/libra-model", "crates/libra-core"]
 resolver = "3"
 
 [package]
@@ -21,20 +21,21 @@ default = ["storage-sqlite"]
 storage-sqlite = []
 storage-redb = ["storage-queue", "dep:redb", "dep:postcard", "dep:crc32c"]
 storage-queue = ["dep:postcard", "dep:crc32c"]
-worktree-fuse  = []   # Unix FUSE-backed worktree commands (optional)
+worktree-fuse  = ["libra-core/worktree-fuse"]   # Unix FUSE-backed worktree commands (optional)
 test-network   = []   # L2: tests requiring outbound network but no secrets
 test-live-ai   = []   # L3: tests calling real LLM APIs
 test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
-test-live-agent = [] # plan-20260713 live agent gate: real local claude/codex/opencode CLI data (dev machine acceptance; env LIBRA_RUN_LIVE_AGENT_GATE=1)
-test-upgrade   = []   # plan-20260714 §A.11: auto-upgrade test hooks (trust-root/endpoint injection; requires LIBRA_TEST=1 at runtime; release workflow must NEVER enable this feature)
-test-bridge-hooks = [] # fault injection for isolated bridge integration tests; never enable in released binaries
-fastcdc        = ["dep:fastcdc"]   # default-OFF FastCDC LFS transport (fastcdc crate; SHA-256 digests)
+test-live-agent = ["libra-core/test-live-agent"] # plan-20260713 live agent gate: real local claude/codex/opencode CLI data (dev machine acceptance; env LIBRA_RUN_LIVE_AGENT_GATE=1)
+test-upgrade   = ["libra-core/test-upgrade"]   # plan-20260714 §A.11: auto-upgrade test hooks (trust-root/endpoint injection; requires LIBRA_TEST=1 at runtime; release workflow must NEVER enable this feature)
+test-bridge-hooks = ["libra-core/test-bridge-hooks"] # fault injection for isolated bridge integration tests; never enable in released binaries
+fastcdc        = ["dep:fastcdc", "libra-core/fastcdc"]   # default-OFF FastCDC LFS transport (fastcdc crate; SHA-256 digests)
 subagent-scaffold = []  # CEX-S2-10 schema-only scaffold (Step 2 sub-agent contracts; gated on CP-4 in production — see docs/development/tracing/agent.md "Step 2 audit closure")
-otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]  # lore.md 1.7: OTLP trace export (default binary unaffected)
-keyring = ["dep:keyring"]  # lore.md 2.7: OS-keyring auth backend (release builds enable it; default dev builds unaffected)
+otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "libra-core/otlp"]  # lore.md 1.7: OTLP trace export (default binary unaffected)
+keyring = ["dep:keyring", "libra-core/keyring"]  # lore.md 2.7: OS-keyring auth backend (release builds enable it; default dev builds unaffected)
 
 [dependencies]
 libra-model = { path = "crates/libra-model" }
+libra-core = { path = "crates/libra-core" }
 uuid = { version = "1.23.1", features = ["v4", "v5", "v7"] }
 git-internal = "=0.10.4"
 anyhow = "1.0.102"
@@ -177,6 +178,7 @@ seccompiler = { version = "0.5.0", features = ["json"] }
 windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Pipes", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
+libra-core = { path = "crates/libra-core", features = ["test-helpers"] }
 serial_test = { version = "3.4.0", default-features = false, features = ["async"] }
 tokio = { version = "1.52.1", features = [
     "io-util",

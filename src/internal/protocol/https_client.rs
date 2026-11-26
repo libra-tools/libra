@@ -737,22 +737,7 @@ fn normalize_url(url: &Url) -> Url {
 /// Authorization only when the HOST or PORT changes — a same-host cleartext
 /// downgrade would re-send credentials over http (lore.md 1.6 review
 /// finding). Same-scheme redirects keep reqwest's default 10-hop limit.
-pub(crate) fn no_downgrade_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        let downgraded = attempt.url().scheme() == "http"
-            && attempt
-                .previous()
-                .last()
-                .is_some_and(|previous| previous.scheme() == "https");
-        if downgraded {
-            attempt.error("refusing an https->http downgrade redirect")
-        } else if attempt.previous().len() > 10 {
-            attempt.error("too many redirects")
-        } else {
-            attempt.follow()
-        }
-    })
-}
+pub(crate) use libra_core::utils::http_policy::no_downgrade_redirect_policy;
 
 /// Loopback must bypass the OS/system HTTP proxy.
 ///
