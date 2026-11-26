@@ -924,3 +924,5 @@ an existing config lock fails with no write.
 file writes reject vault options.
 
 edit temp files are mode 0600.
+
+a syntax error in an edit keeps the temp path.

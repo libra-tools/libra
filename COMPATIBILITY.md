@@ -2091,3 +2091,5 @@ file writes reject vault options.
 | `config edit` | Supported via `edit`, `-e`, `--edit`; temp file is 0600 and syntax errors keep the temp path. |
 
 edit temp files are mode 0600.
+
+a syntax error in an edit keeps the temp path.
