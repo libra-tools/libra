@@ -416,14 +416,15 @@ impl From<RemoteError> for CliError {
                     .with_hint("fetch the remote first, or run 'libra remote -v' to inspect remotes")
             }
             RemoteError::Discovery { remote, source } => {
-                let is_ssh_auth = matches!(
+                let is_typed_ssh_discovery_error = matches!(
                     &source,
                     fetch::FetchError::Discovery {
                         source: git_internal::errors::GitError::IOError(error),
                         ..
                     } if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error)
+                        || crate::internal::protocol::ssh_client::is_ssh_connection_failed(error)
                 );
-                if is_ssh_auth {
+                if is_typed_ssh_discovery_error {
                     CliError::from(source)
                 } else {
                     CliError::fatal(format!("failed to query remote '{remote}': {source}"))
@@ -2390,5 +2391,34 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn remote_discovery_preserves_ssh_connection_failure() {
+        use crate::internal::protocol::ssh_client::{
+            SshConnectionFailed, SshConnectionFailureKind,
+        };
+
+        let failure = SshConnectionFailed::new(SshConnectionFailureKind::TimedOut);
+        let cli_err = CliError::from(RemoteError::Discovery {
+            remote: "origin".to_string(),
+            source: fetch::FetchError::Discovery {
+                remote: "git@github.com:libra-tools/libra.git/".to_string(),
+                source: git_internal::errors::GitError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    failure,
+                )),
+            },
+        });
+        assert_eq!(cli_err.stable_code(), StableErrorCode::NetworkUnavailable);
+        assert_eq!(cli_err.message(), failure.message());
+        assert_eq!(
+            cli_err
+                .hints()
+                .iter()
+                .map(|hint| hint.as_str())
+                .collect::<Vec<_>>(),
+            [failure.hint()]
+        );
     }
 }

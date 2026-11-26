@@ -1219,6 +1219,14 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
                     .with_stable_code(StableErrorCode::AuthPermissionDenied)
                     .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
             }
+            GitError::IOError(error)
+                if let Some(failure) =
+                    crate::internal::protocol::ssh_client::ssh_connection_failed(error) =>
+            {
+                CliError::fatal(failure.to_string())
+                    .with_stable_code(StableErrorCode::NetworkUnavailable)
+                    .with_hint(failure.hint())
+            }
             GitError::IOError(error) if fetch::is_pkt_line_io_error(error) => {
                 CliError::fatal(format!("remote discovery failed: {source}"))
                     .with_stable_code(StableErrorCode::NetworkProtocol)
@@ -1289,6 +1297,14 @@ fn map_fetch_error(source: fetch::FetchError) -> CliError {
             CliError::fatal(source.to_string())
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("retry after the remote repository stops changing")
+        }
+        fetch::FetchError::FetchObjects { source: error, .. }
+            if let Some(failure) =
+                crate::internal::protocol::ssh_client::ssh_connection_failed(error) =>
+        {
+            CliError::fatal(failure.to_string())
+                .with_stable_code(StableErrorCode::NetworkUnavailable)
+                .with_hint(failure.hint())
         }
         fetch::FetchError::FetchObjects { source: error, .. }
         | fetch::FetchError::PacketRead { source: error }

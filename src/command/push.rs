@@ -288,6 +288,9 @@ pub enum PushError {
     #[error("SSH public-key authentication failed: Permission denied (publickey)")]
     SshPublicKeyAuthenticationFailed,
 
+    #[error("{0}")]
+    SshConnectionFailed(crate::internal::protocol::ssh_client::SshConnectionFailed),
+
     #[error("failed to discover references from '{url}': {detail}")]
     DiscoveryFailed { url: String, detail: String },
 
@@ -390,6 +393,12 @@ fn map_push_discovery_error(repo_url: &str, error: GitError) -> PushError {
         {
             PushError::SshPublicKeyAuthenticationFailed
         }
+        GitError::IOError(error)
+            if let Some(failure) =
+                crate::internal::protocol::ssh_client::ssh_connection_failed(&error) =>
+        {
+            PushError::SshConnectionFailed(failure)
+        }
         GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
             PushError::Protocol { detail }
         }
@@ -478,6 +487,9 @@ impl From<PushError> for CliError {
             PushError::SshPublicKeyAuthenticationFailed => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::AuthPermissionDenied)
                 .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT),
+            PushError::SshConnectionFailed(failure) => CliError::fatal(failure.to_string())
+                .with_stable_code(StableErrorCode::NetworkUnavailable)
+                .with_hint(failure.hint()),
             PushError::DiscoveryFailed { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkUnavailable)
                 .with_hint("check the remote URL and network connectivity"),
@@ -2987,6 +2999,9 @@ fn porcelain_ref_fields(update: &PushRefUpdate) -> (char, String) {
 /// (from SSH idle timeout or reqwest read_timeout) become `PushError::Timeout`;
 /// remaining errors become `PushError::Network`.
 fn classify_transport_error(phase: &str, e: std::io::Error) -> PushError {
+    if let Some(failure) = crate::internal::protocol::ssh_client::ssh_connection_failed(&e) {
+        return PushError::SshConnectionFailed(failure);
+    }
     if crate::command::fetch::is_pkt_line_io_error(&e) {
         return PushError::Protocol {
             detail: e.to_string(),

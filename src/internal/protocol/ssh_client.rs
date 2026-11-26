@@ -273,6 +273,94 @@ pub(crate) fn is_ssh_public_key_authentication_failed(error: &IoError) -> bool {
         .is_some_and(|inner| inner.is::<SshPublicKeyAuthenticationFailed>())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SshConnectionFailureKind {
+    TimedOut,
+    ConnectionClosed,
+    ConnectionRefused,
+    HostResolutionFailed,
+    NetworkUnreachable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SshConnectionFailed {
+    kind: SshConnectionFailureKind,
+}
+
+impl SshConnectionFailed {
+    #[cfg(test)]
+    pub(crate) const fn new(kind: SshConnectionFailureKind) -> Self {
+        Self { kind }
+    }
+
+    pub(crate) const fn message(self) -> &'static str {
+        match self.kind {
+            SshConnectionFailureKind::TimedOut => "SSH connection failed: connection timed out",
+            SshConnectionFailureKind::ConnectionClosed => {
+                "SSH connection failed: connection closed or reset before Git negotiation"
+            }
+            SshConnectionFailureKind::ConnectionRefused => {
+                "SSH connection failed: connection refused"
+            }
+            SshConnectionFailureKind::HostResolutionFailed => {
+                "SSH connection failed: could not resolve hostname"
+            }
+            SshConnectionFailureKind::NetworkUnreachable => {
+                "SSH connection failed: network or host unreachable"
+            }
+        }
+    }
+
+    pub(crate) const fn hint(self) -> &'static str {
+        match self.kind {
+            SshConnectionFailureKind::TimedOut => {
+                "Check network connectivity, proxy/firewall settings for SSH, and SSH ConnectTimeout, then retry"
+            }
+            SshConnectionFailureKind::ConnectionClosed => {
+                "Check network connectivity, VPN/proxy stability, and SSH port access (for GitHub, try ssh.github.com on port 443), then retry"
+            }
+            SshConnectionFailureKind::ConnectionRefused => {
+                "Verify the remote SSH host, port, and firewall/proxy settings, then retry"
+            }
+            SshConnectionFailureKind::HostResolutionFailed => {
+                "Check the remote hostname, DNS configuration, and network/VPN connectivity, then retry"
+            }
+            SshConnectionFailureKind::NetworkUnreachable => {
+                "Check network connectivity, routing, and VPN/proxy settings, then retry"
+            }
+        }
+    }
+
+    const fn io_error_kind(self) -> ErrorKind {
+        match self.kind {
+            SshConnectionFailureKind::TimedOut => ErrorKind::TimedOut,
+            SshConnectionFailureKind::ConnectionClosed => ErrorKind::ConnectionReset,
+            SshConnectionFailureKind::ConnectionRefused => ErrorKind::ConnectionRefused,
+            SshConnectionFailureKind::HostResolutionFailed
+            | SshConnectionFailureKind::NetworkUnreachable => ErrorKind::NotConnected,
+        }
+    }
+}
+
+impl std::fmt::Display for SshConnectionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for SshConnectionFailed {}
+
+pub(crate) fn ssh_connection_failed(error: &IoError) -> Option<SshConnectionFailed> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<SshConnectionFailed>())
+        .copied()
+}
+
+pub(crate) fn is_ssh_connection_failed(error: &IoError) -> bool {
+    ssh_connection_failed(error).is_some()
+}
+
 fn ssh_host_key_unconfirmed(
     status: &std::process::ExitStatus,
     stderr: Option<&SshCapturedBytes>,
@@ -360,13 +448,115 @@ fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
     value
 }
 
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    if value.len() < prefix.len() {
+        return None;
+    }
+    let (head, tail) = value.split_at(prefix.len());
+    head.eq_ignore_ascii_case(prefix).then_some(tail)
+}
+
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|part| part.eq_ignore_ascii_case(needle))
+}
+
+fn ssh_connection_failure(
+    status: &std::process::ExitStatus,
+    stderr: Option<&SshCapturedBytes>,
+) -> Option<SshConnectionFailed> {
+    if status.code() != Some(255) {
+        return None;
+    }
+    let stderr = stderr?;
+    // Prefer the last matching transport diagnostic so a dual-stack fallback
+    // (for example IPv6 unreachable followed by IPv4 timeout) reports the
+    // final failure that aborted SSH.
+    let mut matched = None;
+    for raw_line in stderr.bytes.split(|byte| matches!(*byte, b'\n' | b'\r')) {
+        let line = trim_ascii_whitespace(raw_line);
+        if let Some(kind) = ssh_connection_failure_line(line) {
+            matched = Some(SshConnectionFailed { kind });
+        }
+    }
+    matched
+}
+
+fn ssh_connection_failure_line(line: &[u8]) -> Option<SshConnectionFailureKind> {
+    if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"ssh: Could not resolve hostname ") {
+        return (!trim_ascii_whitespace(rest).is_empty())
+            .then_some(SshConnectionFailureKind::HostResolutionFailed);
+    }
+    if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"ssh: connect to host ") {
+        let port_sep = rest
+            .windows(b" port ".len())
+            .position(|window| window.eq_ignore_ascii_case(b" port "))?;
+        let after_port = &rest[port_sep + b" port ".len()..];
+        let colon = after_port
+            .windows(b": ".len())
+            .position(|window| window == b": ")?;
+        let reason = trim_ascii_whitespace(&after_port[colon + b": ".len()..]);
+        if contains_ignore_ascii_case(reason, b"connection timed out")
+            || contains_ignore_ascii_case(reason, b"operation timed out")
+        {
+            return Some(SshConnectionFailureKind::TimedOut);
+        }
+        if contains_ignore_ascii_case(reason, b"connection refused") {
+            return Some(SshConnectionFailureKind::ConnectionRefused);
+        }
+        if contains_ignore_ascii_case(reason, b"connection reset by peer")
+            || contains_ignore_ascii_case(reason, b"broken pipe")
+        {
+            return Some(SshConnectionFailureKind::ConnectionClosed);
+        }
+        if contains_ignore_ascii_case(reason, b"network is unreachable")
+            || contains_ignore_ascii_case(reason, b"no route to host")
+            || contains_ignore_ascii_case(reason, b"host is unreachable")
+            || contains_ignore_ascii_case(reason, b"software caused connection abort")
+        {
+            return Some(SshConnectionFailureKind::NetworkUnreachable);
+        }
+        return None;
+    }
+    if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"kex_exchange_identification: ") {
+        let rest = trim_ascii_whitespace(rest);
+        if contains_ignore_ascii_case(rest, b"connection timed out")
+            || contains_ignore_ascii_case(rest, b"operation timed out")
+        {
+            return Some(SshConnectionFailureKind::TimedOut);
+        }
+        if strip_prefix_ignore_ascii_case(rest, b"Connection closed by ").is_some()
+            || contains_ignore_ascii_case(rest, b"connection reset by peer")
+        {
+            return Some(SshConnectionFailureKind::ConnectionClosed);
+        }
+        return None;
+    }
+    if strip_prefix_ignore_ascii_case(line, b"Connection timed out during banner exchange")
+        .is_some()
+    {
+        return Some(SshConnectionFailureKind::TimedOut);
+    }
+    if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Connection closed by ") {
+        return (!trim_ascii_whitespace(rest).is_empty())
+            .then_some(SshConnectionFailureKind::ConnectionClosed);
+    }
+    if let Some(rest) = strip_prefix_ignore_ascii_case(line, b"Connection reset by ") {
+        return (!trim_ascii_whitespace(rest).is_empty())
+            .then_some(SshConnectionFailureKind::ConnectionClosed);
+    }
+    None
+}
+
 fn ssh_discovery_read_error(error: IoError) -> GitError {
     if let Some(kind) = error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<SshHostKeyUnconfirmed>())
     {
         GitError::NetworkError(format!("{}{kind}", kind.signal()))
-    } else if is_ssh_public_key_authentication_failed(&error) {
+    } else if is_ssh_public_key_authentication_failed(&error) || is_ssh_connection_failed(&error) {
         GitError::IOError(error)
     } else {
         GitError::NetworkError(error.to_string())
@@ -1713,6 +1903,13 @@ fn wrap_ssh_read_error_with_auth_classification(
     {
         return IoError::other(SshPublicKeyAuthenticationFailed);
     }
+    if header_eof
+        && let Some(Ok(output)) = &output
+        && !output.stdout_observed
+        && let Some(failure) = ssh_connection_failure(&output.status, output.stderr.as_ref())
+    {
+        return IoError::new(failure.io_error_kind(), failure);
+    }
     if is_pkt_line_io_error(&read_error) {
         if let Some(Ok(output)) = &output
             && let Some(code) = output.status.code()
@@ -1872,6 +2069,7 @@ fn finish_ssh_read_result_with_auth_classification(
             .get_ref()
             .is_some_and(|inner| inner.is::<SshHostKeyUnconfirmed>())
         && !is_ssh_public_key_authentication_failed(&error)
+        && !is_ssh_connection_failed(&error)
     {
         // Preserve typed protocol, shallow-negotiation, and host-trust errors.
         // An ordinary failure includes collected status and the cleanup warning.
@@ -3145,6 +3343,203 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("SSH exited with status 255"));
     }
 
+    #[test]
+    fn ssh_connection_failure_classification() {
+        for (stderr, expected_kind, expected_io_kind) in [
+            (
+                "ssh: connect to host github.com port 22: Connection timed out",
+                SshConnectionFailureKind::TimedOut,
+                ErrorKind::TimedOut,
+            ),
+            (
+                "ssh: connect to host github.com port 22: Operation timed out",
+                SshConnectionFailureKind::TimedOut,
+                ErrorKind::TimedOut,
+            ),
+            (
+                "kex_exchange_identification: read: Connection timed out",
+                SshConnectionFailureKind::TimedOut,
+                ErrorKind::TimedOut,
+            ),
+            (
+                "Connection timed out during banner exchange",
+                SshConnectionFailureKind::TimedOut,
+                ErrorKind::TimedOut,
+            ),
+            (
+                "kex_exchange_identification: Connection closed by remote host",
+                SshConnectionFailureKind::ConnectionClosed,
+                ErrorKind::ConnectionReset,
+            ),
+            (
+                "kex_exchange_identification: read: Connection reset by peer",
+                SshConnectionFailureKind::ConnectionClosed,
+                ErrorKind::ConnectionReset,
+            ),
+            (
+                "ssh: connect to host 198.18.0.11 port 22: Connection reset by peer",
+                SshConnectionFailureKind::ConnectionClosed,
+                ErrorKind::ConnectionReset,
+            ),
+            (
+                "Connection closed by 198.18.0.11 port 22",
+                SshConnectionFailureKind::ConnectionClosed,
+                ErrorKind::ConnectionReset,
+            ),
+            (
+                "Connection reset by 198.18.0.11 port 22",
+                SshConnectionFailureKind::ConnectionClosed,
+                ErrorKind::ConnectionReset,
+            ),
+            (
+                "ssh: connect to host github.com port 22: Connection refused",
+                SshConnectionFailureKind::ConnectionRefused,
+                ErrorKind::ConnectionRefused,
+            ),
+            (
+                "ssh: Could not resolve hostname github.com: Temporary failure in name resolution",
+                SshConnectionFailureKind::HostResolutionFailed,
+                ErrorKind::NotConnected,
+            ),
+            (
+                "ssh: connect to host 2001:db8::1 port 22: Network is unreachable",
+                SshConnectionFailureKind::NetworkUnreachable,
+                ErrorKind::NotConnected,
+            ),
+            (
+                "ssh: connect to host github.com port 22: No route to host",
+                SshConnectionFailureKind::NetworkUnreachable,
+                ErrorKind::NotConnected,
+            ),
+            (
+                "ssh: connect to host 2001:db8::1 port 22: Network is unreachable\nssh: connect to host 198.18.0.11 port 22: Connection timed out",
+                SshConnectionFailureKind::TimedOut,
+                ErrorKind::TimedOut,
+            ),
+        ] {
+            let expected = SshConnectionFailed::new(expected_kind);
+            let mut output = pkt12_output_with_code(255);
+            output.stderr = Some(SshCapturedBytes::from_fixture(
+                format!("{stderr}\n{PKT12_SENTINEL}").as_bytes(),
+                SSH_STDERR_LIMIT,
+            ));
+            let error = finish_ssh_discovery_read_result(
+                pkt12_typed_error(),
+                "SSH read failed",
+                Ok(output),
+                Some(IoError::other("fixture cleanup warning")),
+            );
+            assert_eq!(error.kind(), expected_io_kind, "{stderr}");
+            assert_eq!(ssh_connection_failed(&error), Some(expected), "{stderr}");
+            assert_eq!(error.to_string(), expected.message(), "{stderr}");
+            assert!(!is_pkt_line_io_error(&error), "{stderr}");
+            let GitError::IOError(error) = ssh_discovery_read_error(error) else {
+                panic!("SSH connection failure must retain a typed IO carrier: {stderr}")
+            };
+            assert_eq!(error.to_string(), expected.message(), "{stderr}");
+            assert!(!error.to_string().contains(PKT12_SENTINEL));
+            assert!(!error.to_string().contains("cleanup warning"));
+        }
+
+        // Upload-pack / receive-pack advertisement reads also classify SSH transport failures.
+        let mut output = pkt12_output_with_code(255);
+        output.stderr = Some(SshCapturedBytes::from_fixture(
+            b"kex_exchange_identification: Connection closed by remote host",
+            SSH_STDERR_LIMIT,
+        ));
+        let transfer_error = wrap_ssh_read_error(
+            pkt12_typed_error(),
+            "SSH advertisement read failed",
+            Some(Ok(output)),
+        );
+        assert_eq!(
+            ssh_connection_failed(&transfer_error),
+            Some(SshConnectionFailed::new(
+                SshConnectionFailureKind::ConnectionClosed
+            ))
+        );
+        assert!(!is_pkt_line_io_error(&transfer_error));
+
+        // Precedence: host-key and public-key auth rejection take priority over earlier connect warnings.
+        let mut host_key_output = pkt12_output_with_code(255);
+        host_key_output.stderr = Some(SshCapturedBytes::from_fixture(
+            b"ssh: connect to host 2001:db8::1 port 22: Network is unreachable\nHost key verification failed.",
+            SSH_STDERR_LIMIT,
+        ));
+        let error = wrap_ssh_discovery_read_error(
+            pkt12_typed_error(),
+            "SSH read failed",
+            Some(Ok(host_key_output)),
+        );
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<SshHostKeyUnconfirmed>())
+        );
+
+        let mut auth_output = pkt12_output_with_code(255);
+        auth_output.stderr = Some(SshCapturedBytes::from_fixture(
+            b"ssh: connect to host 2001:db8::1 port 22: Network is unreachable\ngit@github.com: Permission denied (publickey).",
+            SSH_STDERR_LIMIT,
+        ));
+        let error = wrap_ssh_discovery_read_error(
+            pkt12_typed_error(),
+            "SSH read failed",
+            Some(Ok(auth_output)),
+        );
+        assert!(is_ssh_public_key_authentication_failed(&error));
+
+        // Strict negative cases: must NOT classify as SshConnectionFailed.
+        for (stderr, code, stdout_observed, header_eof) in [
+            (
+                "ssh: connect to host github.com port 22: Connection timed out",
+                23,
+                false,
+                true,
+            ),
+            (
+                "ssh: connect to host github.com port 22: Connection timed out",
+                255,
+                true,
+                true,
+            ),
+            (
+                "ssh: connect to host github.com port 22: Connection timed out",
+                255,
+                false,
+                false,
+            ),
+            (
+                "kex_exchange_identification: banner line contains invalid characters",
+                255,
+                false,
+                true,
+            ),
+            ("remote banner says Connection timed out", 255, false, true),
+            (
+                "SSH fixture failed without authentication diagnostic.",
+                255,
+                false,
+                true,
+            ),
+        ] {
+            let mut output = pkt12_output_with_code(code);
+            output.stdout_observed = stdout_observed;
+            output.stderr = Some(SshCapturedBytes::from_fixture(
+                stderr.as_bytes(),
+                SSH_STDERR_LIMIT,
+            ));
+            let read_error = if header_eof {
+                pkt12_typed_error()
+            } else {
+                IoError::new(ErrorKind::InvalidData, PktLineError::TruncatedPayload)
+            };
+            let error =
+                wrap_ssh_discovery_read_error(read_error, "SSH read failed", Some(Ok(output)));
+            assert!(!is_ssh_connection_failed(&error), "{stderr}");
+        }
+    }
+
     fn pkt12_assert_wrapper(context: &'static str) {
         for output in [
             Ok(pkt12_output_with_code(0)),
@@ -3669,11 +4064,22 @@ pub(crate) mod tests {
             (b"".as_slice(), Some("Permission denied (publickey).")),
             (
                 b"".as_slice(),
+                Some("ssh: connect to host fixture.invalid port 22: Connection timed out"),
+            ),
+            (
+                b"".as_slice(),
+                Some("kex_exchange_identification: Connection closed by remote host"),
+            ),
+            (
+                b"".as_slice(),
                 Some("SSH fixture failed without authentication diagnostic."),
             ),
         ]) {
             let public_key_rejection = native_stderr
                 .is_some_and(|message| message.contains("Permission denied (publickey)"));
+            let expected_connection_failure = native_stderr.and_then(|message| {
+                ssh_connection_failure_line(message.as_bytes()).map(SshConnectionFailed::new)
+            });
             let expected_reason = if matches!(malformed, b"0001" | b"0002" | b"0003") {
                 PktLineError::InvalidFrameLength(
                     crate::git_protocol::PktFrameError::LengthBelowHeader,
@@ -3749,6 +4155,8 @@ pub(crate) mod tests {
                 .expect("malformed SSH command must terminate");
                 let expected_code = if public_key_rejection {
                     StableErrorCode::AuthPermissionDenied
+                } else if expected_connection_failure.is_some() {
+                    StableErrorCode::NetworkUnavailable
                 } else {
                     StableErrorCode::NetworkProtocol
                 };
@@ -3757,6 +4165,13 @@ pub(crate) mod tests {
                 if public_key_rejection {
                     assert_eq!(error.stable_code().as_str(), "LBR-AUTH-002");
                     assert_eq!(error.message(), SSH_PUBLIC_KEY_AUTHENTICATION_MESSAGE);
+                } else if let Some(connection_failure) = expected_connection_failure {
+                    assert_eq!(error.stable_code().as_str(), "LBR-NET-001");
+                    assert_eq!(error.message(), connection_failure.message());
+                    assert!(
+                        !error.message().contains(PKT_LINE_PROTOCOL_ERROR_PREFIX),
+                        "{command}: {error:?}"
+                    );
                 } else {
                     assert_eq!(error.stable_code().as_str(), "LBR-NET-002");
                     assert!(
@@ -3776,6 +4191,8 @@ pub(crate) mod tests {
                 }
                 let hint = if public_key_rejection {
                     SSH_PUBLIC_KEY_AUTHENTICATION_HINT
+                } else if let Some(connection_failure) = expected_connection_failure {
+                    connection_failure.hint()
                 } else if command == "push" {
                     "check the remote Git service or proxy response and retry"
                 } else {
@@ -3807,7 +4224,7 @@ pub(crate) mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 60);
+        assert_eq!(checked, 70);
     }
 
     pub(crate) async fn read_test_stream<R: AsyncRead + Unpin>(
