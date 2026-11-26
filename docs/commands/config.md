@@ -1079,3 +1079,5 @@ corrupt config stores keep the migration classification.
 replace-all rewrites every matching value.
 
 color list and json emit ansi.
+
+expiry-date shortcut matches the type value.
