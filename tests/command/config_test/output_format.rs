@@ -488,3 +488,43 @@ fn test_cf_50_predicates() {
         );
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_52_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    for (key, value) in [("up.one", "1"), ("up.empty", ""), ("up.two", "2")] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", key, value], repo.path()),
+            "set",
+        );
+    }
+    let regexp = run_libra_command(
+        &["config", "--local", "--get-regexp", "^up\\."],
+        repo.path(),
+    );
+    assert_cli_success(&regexp, "get-regexp");
+    assert_eq!(
+        String::from_utf8_lossy(&regexp.stdout).trim_end(),
+        "up.one 1\nup.empty \nup.two 2"
+    );
+    let name_only = run_libra_command(
+        &["config", "--local", "--name-only", "--get-regexp", "^up\\."],
+        repo.path(),
+    );
+    assert_cli_success(&name_only, "name-only");
+    assert_eq!(
+        String::from_utf8_lossy(&name_only.stdout).trim(),
+        "up.one\nup.empty\nup.two"
+    );
+    let null = run_libra_command(
+        &["config", "--local", "-z", "--get-regexp", "^up\\."],
+        repo.path(),
+    );
+    assert_cli_success(&null, "null get-regexp");
+    assert_eq!(null.stdout, b"up.one\n1\0up.empty\n\0up.two\n2\0");
+}
