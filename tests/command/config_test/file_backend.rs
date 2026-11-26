@@ -235,3 +235,28 @@ fn test_file_read_matrix() {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "c", "{flag}");
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_89_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let cfg = repo.path().join("cfg");
+    fs::write(&cfg, "[a]\nb = c\n").unwrap();
+    fs::write(repo.path().join("cfg.lock"), b"").unwrap();
+    let out = run_libra_command(
+        &["config", "--file", "cfg", "set", "a.b", "new"],
+        repo.path(),
+    );
+    assert_eq!(out.status.code(), Some(128), "existing lock fails");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("could not lock config file"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&cfg).unwrap(),
+        "[a]\nb = c\n",
+        "no write"
+    );
+}
