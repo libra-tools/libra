@@ -2045,3 +2045,5 @@ value pattern replaces one matching value.
 invalid set pattern exits 6.
 
 replace-all refuses upgrade.mode.
+
+bool-or-str shortcut matches the type value.
