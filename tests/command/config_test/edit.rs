@@ -232,3 +232,48 @@ fn test_cf_95_predicates() {
     assert_cli_success(&reveal, "reveal encrypted");
     assert_eq!(String::from_utf8_lossy(&reveal.stdout).trim(), SENTINEL);
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_97_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], &repo),
+        "init",
+    );
+    let script = editor_script(
+        temp.path(),
+        "core-editor.sh",
+        r#"printf '\n[core "editor"]\n\tran = yes\n' >> "$1""#,
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "core.editor", &script], &repo),
+        "set core.editor",
+    );
+    let out = run_libra_command_with_env(
+        &["config", "--edit"],
+        &repo,
+        &[("GIT_EDITOR", "/definitely/missing-editor")],
+    );
+    assert_cli_success(&out, "core.editor takes precedence");
+    let value = run_libra_command(&["config", "--local", "--get", "core.editor.ran"], &repo);
+    assert_cli_success(&value, "core.editor script ran");
+    assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "yes");
+
+    let before = run_libra_command(&["config", "--local", "--list"], &repo);
+    let missing = run_libra_command_with_env(
+        &["config", "--edit"],
+        &repo,
+        &[
+            ("GIT_EDITOR", ""),
+            ("VISUAL", ""),
+            ("EDITOR", ""),
+            ("PATH", "/definitely/missing"),
+        ],
+    );
+    assert!(!missing.status.success(), "no editor fails closed");
+    let after = run_libra_command(&["config", "--local", "--list"], &repo);
+    assert_eq!(before.stdout, after.stdout, "no editor writes nothing");
+}
