@@ -946,3 +946,5 @@ json envelope mirrors the no-section exit.
 name-only prints keys.
 
 fixed-value get matches the whole value.
+
+encrypted get stays redacted.

@@ -7882,4 +7882,49 @@ mod value_pattern {
         );
         assert_eq!(miss.status.code(), Some(1), "fixed get miss");
     }
+
+    #[test]
+    #[serial(env)]
+    fn test_cf_46_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "config",
+                    "set",
+                    "--local",
+                    "--encrypt",
+                    "secret.k",
+                    "plain-one",
+                ],
+                repo.path(),
+            ),
+            "seed encrypted",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "config",
+                    "set",
+                    "--local",
+                    "--add",
+                    "--encrypt",
+                    "secret.k",
+                    "plain-two",
+                ],
+                repo.path(),
+            ),
+            "seed second",
+        );
+        let matched =
+            run_libra_command(&["config", "--get", "secret.k", "^plain-one$"], repo.path());
+        assert_cli_success(&matched, "plaintext match");
+        assert_eq!(
+            String::from_utf8_lossy(&matched.stdout).trim(),
+            "<REDACTED>"
+        );
+        let miss = run_libra_command(&["config", "--get", "secret.k", "^absent$"], repo.path());
+        assert_eq!(miss.status.code(), Some(1), "no plaintext match exits 1");
+    }
 }

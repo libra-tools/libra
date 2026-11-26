@@ -2737,6 +2737,22 @@ async fn render_get_value(
     Ok(decrypted)
 }
 
+/// Match a value-pattern against an entry. Encrypted values match by their
+/// plaintext even though normal rendering keeps them redacted.
+async fn entry_matches_value_pattern(
+    entry: &ConfigKvEntry,
+    scope: ConfigScope,
+    matcher: &ValueMatcher,
+    use_cascade: bool,
+) -> CliResult<bool> {
+    let value = if entry.encrypted {
+        render_get_value(entry, true, scope, use_cascade).await?
+    } else {
+        entry.value.clone()
+    };
+    Ok(matcher.matches(&value))
+}
+
 /// Value type for `--type`/`--bool`/`--int`/`--path` canonicalization on read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConfigValueType {
@@ -3021,7 +3037,13 @@ async fn handle_get(
             None => None,
         };
         if let Some(matcher) = &value_matcher {
-            entries.retain(|(e, _)| matcher.matches(&e.value));
+            let mut filtered = Vec::with_capacity(entries.len());
+            for (entry, scope) in entries {
+                if entry_matches_value_pattern(&entry, scope, matcher, use_cascade).await? {
+                    filtered.push((entry, scope));
+                }
+            }
+            entries = filtered;
         }
 
         // Git exits 1 when a `--get-regexp` pattern matches nothing.
@@ -3115,11 +3137,16 @@ async fn handle_get(
             None => None,
         };
         let entries: Vec<(ConfigKvEntry, ConfigScope)> = match &value_matcher {
-            Some(matcher) => entries
-                .into_iter()
-                .filter(|(e, _)| matcher.matches(&e.value))
-                .collect(),
-            None => entries,
+            Some(matcher) => {
+                let mut filtered = Vec::with_capacity(entries.len());
+                for (entry, scope) in entries {
+                    if entry_matches_value_pattern(&entry, scope, matcher, use_cascade).await? {
+                        filtered.push((entry, scope));
+                    }
+                }
+                filtered
+            }
+            _ => entries,
         };
 
         if entries.is_empty() {
@@ -3205,9 +3232,14 @@ async fn handle_get(
                     }
                 }
             };
-            candidates
-                .into_iter()
-                .rfind(|(e, _)| matcher.matches(&e.value))
+            let mut selected = None;
+            for (entry, entry_scope) in candidates.into_iter().rev() {
+                if entry_matches_value_pattern(&entry, entry_scope, &matcher, use_cascade).await? {
+                    selected = Some((entry, entry_scope));
+                    break;
+                }
+            }
+            selected
         } else if use_cascade {
             get_cascaded(key).await.map_err(config_read_cli_error)?
         } else {
