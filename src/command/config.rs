@@ -3667,7 +3667,11 @@ async fn handle_get(
                 }
                 return Ok(());
             }
-            return Err(CliError::silent_exit(1));
+            return Err(
+                CliError::failure(format!("key '{key}' not found in any scope"))
+                    .with_stable_code(StableErrorCode::CliInvalidTarget)
+                    .with_exit_code(1),
+            );
         }
 
         // Build display values with decryption support

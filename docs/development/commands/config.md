@@ -354,3 +354,5 @@ config --file writes through a lock and rename.
 invalid key pattern exits 6.
 
 key without a section exits 1.
+
+missing key get-all exits 1.

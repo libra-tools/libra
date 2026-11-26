@@ -484,3 +484,23 @@ fn test_cf_28_predicates() {
         assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_30_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for args in [
+        vec!["config", "--get-all", "no.such"],
+        vec!["config", "get", "--all", "no.such"],
+    ] {
+        let out = run_libra_command(&args, repo.path());
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
