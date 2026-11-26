@@ -4142,6 +4142,22 @@ async fn handle_unset(
     let count = if let Some(pattern) = value_pattern {
         // Git `--unset <key> <value-pattern>`: remove only the matching values.
         let matcher = compile_value_matcher(pattern, fixed_value)?;
+        if !all {
+            // A single unset must be unambiguous: more than one matching value
+            // is refused before any mutation (Git exits 5).
+            let existing = ScopedConfig::get_all(scope, key)
+                .await
+                .map_err(CliError::from_legacy_string)?;
+            let matches = existing
+                .iter()
+                .filter(|entry| matcher.matches(&entry.value))
+                .count();
+            if matches > 1 {
+                return Err(CliError::failure(format!("{key} has multiple values"))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_exit_code(5));
+            }
+        }
         ScopedConfig::unset_matching(scope, key, |value| matcher.matches(value))
             .await
             .map_err(CliError::from_legacy_string)?

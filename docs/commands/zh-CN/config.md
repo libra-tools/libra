@@ -897,3 +897,5 @@ config list matches unscoped list.
 config --file reads a git-style file.
 
 regexp no-match exits 1 with empty stdout.
+
+single unset of multiple matches exits 5.

@@ -7622,6 +7622,31 @@ mod value_pattern {
     }
 
     #[test]
+    fn test_cf_39_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "other"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        let out = run_libra_command(&["config", "--unset", "multi.k", "o"], repo.path());
+        assert_eq!(out.status.code(), Some(5), "ambiguous single unset exits 5");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("has multiple values"),
+            "warning text: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let all = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(
+            String::from_utf8_lossy(&all.stdout).trim(),
+            "one\nother",
+            "no value removed on ambiguity"
+        );
+    }
+
+    #[test]
     fn test_cf_38_predicates() {
         let repo = tempdir().unwrap();
         assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
