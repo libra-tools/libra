@@ -911,3 +911,5 @@ multiline values stay literal and secrets stay redacted.
 cascade get skips an unreadable system store.
 
 missing global store follows the recorded git result.
+
+corrupt config stores keep the migration classification.

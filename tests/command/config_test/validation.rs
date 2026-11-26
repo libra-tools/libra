@@ -283,3 +283,61 @@ fn test_cf_60_predicates() {
     assert_eq!(get.status.code(), Some(1), "missing global store get");
     assert!(get.stdout.is_empty());
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_61_predicates() {
+    use std::process::Command;
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("xdg");
+    let global = temp.path().join("global.db");
+    let system = temp.path().join("system.db");
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", global.to_str().unwrap()),
+        ("LIBRA_CONFIG_SYSTEM_DB", system.to_str().unwrap()),
+    ];
+    for scope in ["--global", "--system"] {
+        assert_cli_success(
+            &run_libra_command_with_env(&["config", scope, "user.name", "X"], &repo, &envs),
+            "initialize store",
+        );
+    }
+    let query = |db: &std::path::Path, sql: &str| {
+        Command::new("sqlite3")
+            .arg(db)
+            .arg(sql)
+            .output()
+            .expect("sqlite3 available")
+    };
+    let make_future = |db: &std::path::Path| {
+        let out = query(db, "SELECT MAX(version) FROM configuration_schema_versions");
+        let latest: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let future = latest + 1;
+        let sql = format!(
+            "INSERT INTO configuration_schema_versions(version,name,applied_at) VALUES({future},'future','x')"
+        );
+        assert!(query(db, &sql).status.success());
+    };
+    for (scope, db) in [("--global", &global), ("--system", &system)] {
+        make_future(db.as_path());
+        let out = run_libra_command_with_env(&["config", scope, "--list"], &repo, &envs);
+        assert_eq!(out.status.code(), Some(128), "{scope} future schema");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("schema is newer"), "{scope}: {stderr}");
+        assert!(stderr.contains("LBR-INTERNAL-001"), "{scope}: {stderr}");
+        fs::remove_file(db).unwrap();
+        fs::write(db, b"not a sqlite database").unwrap();
+        let out = run_libra_command_with_env(&["config", scope, "--list"], &repo, &envs);
+        assert_eq!(out.status.code(), Some(128), "{scope} corrupt");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("LBR-IO-001"), "{scope}: {stderr}");
+        assert!(!stderr.contains("schema is newer"), "{scope}: {stderr}");
+    }
+}
