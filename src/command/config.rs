@@ -1467,6 +1467,10 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
 
     // `--file <path>` reads/writes a Git-style INI file instead of the stores
     // (Git's one-off script form). Writes never touch the SQLite store.
+    if args.file.is_some() && (args.global || args.system || args.blob.is_some()) {
+        return Err(CliError::command_usage("only one config file at a time")
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
     if let Some(blob) = args.blob.as_deref() {
         if matches!(cmd, ResolvedCommand::Edit) {
             return Err(CliError::command_usage("editing blobs is not supported")

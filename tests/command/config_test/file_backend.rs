@@ -409,3 +409,23 @@ fn test_cf_81_predicates() {
     assert_cli_success(&patterned, "value pattern");
     assert_eq!(String::from_utf8_lossy(&patterned.stdout).trim(), "a.two 2");
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_83_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    fs::write(repo.path().join("cfg"), "[a]\nb = c\n").unwrap();
+    for args in [
+        vec!["config", "--file", "cfg", "--global", "--list"],
+        vec!["config", "--file", "cfg", "--blob", "HEAD:cfg", "--list"],
+    ] {
+        let out = run_libra_command(&args, repo.path());
+        assert_eq!(out.status.code(), Some(129), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("only one config file at a time"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
