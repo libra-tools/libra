@@ -12,8 +12,10 @@ use git_internal::internal::index::Index;
 use super::{IgnorePolicy, should_ignore_with_matcher};
 use crate::{
     internal::layer::ExclusionSnapshot,
-    utils::io_deadline::with_io_deadline_bounded,
-    utils::util::{self, SecureIgnoreWalkGuard},
+    utils::{
+        io_deadline::with_io_deadline_bounded,
+        util::{self, SecureIgnoreWalkGuard},
+    },
 };
 
 /// One caller-owned ignore epoch with immutable worktree/layer context.

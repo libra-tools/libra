@@ -22,9 +22,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    internal::config_scope::{ConfigScope, ScopedConfig},
-    internal::{config::ConfigKv, vault},
+use crate::internal::{
+    config::ConfigKv,
+    config_scope::{ConfigScope, ScopedConfig},
+    vault,
 };
 
 /// Namespace prefix in the global config store (locked away from `libra

@@ -18,10 +18,9 @@ use git_internal::{
 use sea_orm::{ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, QueryFilter, Set};
 
 use crate::{
-    internal::object_io::load_object,
     internal::{
         branch::BranchStoreError, config::ConfigKv, db::get_db_conn_instance, head::Head,
-        model::reference,
+        model::reference, object_io::load_object,
     },
     utils::{client_storage::ClientStorage, path, util},
 };

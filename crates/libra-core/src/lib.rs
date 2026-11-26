@@ -28,7 +28,9 @@ mod build_version_tests {
             Some("1.2.3-rc.1+build.007".to_string())
         );
         assert_eq!(
-            extract_package_version("[dependencies]\nversion = \"9.9.9\"\n[package]\nversion = \"0.0.1-alpha.0\"\n"),
+            extract_package_version(
+                "[dependencies]\nversion = \"9.9.9\"\n[package]\nversion = \"0.0.1-alpha.0\"\n"
+            ),
             Some("0.0.1-alpha.0".to_string())
         );
 

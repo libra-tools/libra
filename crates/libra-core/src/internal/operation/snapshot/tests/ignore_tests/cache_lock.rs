@@ -11,7 +11,8 @@ use std::{
 
 use super::{Fixture, fs, ready, source_path};
 use crate::{
-    internal::layer::ExclusionSnapshot, utils::io_deadline::with_io_deadline_bounded, utils::util,
+    internal::layer::ExclusionSnapshot,
+    utils::{io_deadline::with_io_deadline_bounded, util},
 };
 
 #[test]

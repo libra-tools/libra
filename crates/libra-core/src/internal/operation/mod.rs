@@ -18,10 +18,9 @@ pub use facet::{
     FacetRestoreCtx, RestorePolicy, StateFacet,
 };
 pub use facets::{RawIndexFacet, SequencerFacet, SparseFacet, registry_for_scope};
-pub use middleware::current_operation_id;
 pub use middleware::{
     ClassificationError, MutationClass, OperationError, OperationFuture, OperationResult,
-    OperationTxn, classify_command, run_with_operation,
+    OperationTxn, classify_command, current_operation_id, run_with_operation,
 };
 pub use reconcile::{ReconcileEngine, ReconcileError, ReconcileOutcome, RefConflict};
 pub use restore::{

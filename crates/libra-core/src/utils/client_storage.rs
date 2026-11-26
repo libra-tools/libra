@@ -55,12 +55,13 @@ use crate::{
     internal::{
         branch::Branch,
         config::{ConfigKv, decrypt_value},
+        config_scope::ConfigScope,
         db,
         db::{DatabaseRole, establish_connection_with_lock_timeout, schema},
         head::Head,
         model::object_index,
+        object_io::load_object,
     },
-    internal::{config_scope::ConfigScope, object_io::load_object},
     utils::{
         storage::{Storage, local::LocalStorage, remote::RemoteStorage, tiered::TieredStorage},
         util::{DATABASE, try_get_storage_path},

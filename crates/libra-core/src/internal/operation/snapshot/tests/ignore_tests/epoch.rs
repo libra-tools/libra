@@ -10,9 +10,9 @@ use std::{
 use super::Fixture;
 use crate::{
     internal::layer::ExclusionSnapshot,
-    utils::io_deadline::with_io_deadline_bounded,
     utils::{
         ignore::{BoundedIgnoreWalk, IgnorePolicy},
+        io_deadline::with_io_deadline_bounded,
         util,
     },
 };

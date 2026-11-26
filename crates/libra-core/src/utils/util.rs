@@ -29,12 +29,12 @@ use path_absolutize::*;
 use regex::RegexBuilder;
 
 use crate::{
-    internal::object_io::load_object,
     internal::{
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
         db::get_db_conn_instance,
         head::Head,
+        object_io::load_object,
         reflog::Reflog,
         tag,
     },

@@ -15,15 +15,14 @@ use std::fs;
 
 use clap::Parser;
 use git_internal::hash::ObjectHash;
+pub(crate) use libra_core::internal::replace::{
+    load_replace_map, replace_dir, resolve, with_suppressed_peel,
+};
 
 use crate::utils::{
     error::{CliError, CliResult, StableErrorCode},
     output::OutputConfig,
     util,
-};
-
-pub(crate) use libra_core::internal::replace::{
-    load_replace_map, replace_dir, resolve, with_suppressed_peel,
 };
 
 pub const REPLACE_EXAMPLES: &str = "\
