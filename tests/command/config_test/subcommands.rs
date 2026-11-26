@@ -348,3 +348,86 @@ fn test_cf_101_predicates() {
         assert_eq!(legacy.stdout, sub.stdout, "{flag} parity");
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_99_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "--local", "legacy.k", "one"],
+            repo.path(),
+        ),
+        "legacy all seed",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--add", "legacy.k", "two"], repo.path()),
+        "legacy all add",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--replace-all", "legacy.k", "three"],
+            repo.path(),
+        ),
+        "legacy replace",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "--local", "sub.k", "one"], repo.path()),
+        "sub all seed",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "--local", "--append", "sub.k", "two"],
+            repo.path(),
+        ),
+        "append",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "--local", "--all", "sub.k", "three"],
+            repo.path(),
+        ),
+        "set all",
+    );
+    for key in ["legacy.k", "sub.k"] {
+        let values = run_libra_command(&["config", "--get-all", key], repo.path());
+        assert_eq!(
+            String::from_utf8_lossy(&values.stdout).trim(),
+            "three",
+            "{key}"
+        );
+    }
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--add", "sub.k", "four"], repo.path()),
+        "add four",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "--local",
+                "--value=^three$",
+                "sub.k",
+                "five",
+            ],
+            repo.path(),
+        ),
+        "set value",
+    );
+    let values = run_libra_command(&["config", "--get-all", "sub.k"], repo.path());
+    assert_eq!(String::from_utf8_lossy(&values.stdout).trim(), "five\nfour");
+
+    let ambiguous = run_libra_command(&["config", "set", "--local", "sub.k", "six"], repo.path());
+    assert_eq!(ambiguous.status.code(), Some(5), "multi set exits 5");
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr)
+            .contains("Use --value=<pattern>, --append or --all"),
+        "hint: {}",
+        String::from_utf8_lossy(&ambiguous.stderr)
+    );
+}

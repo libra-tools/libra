@@ -2798,7 +2798,9 @@ async fn handle_set(
         ScopedConfig::get_all(scope, key).await
     }
     .map_err(|e| {
-        if assignment_selection && e.contains("values exist") {
+        if assignment_selection
+            && (e.contains("values exist") || e.contains("multi-valued config key"))
+        {
             // Git refuses a single-value overwrite of a multi-valued key and
             // names the escapes; the stable code stays CLI-class (the failure
             // is user-correctable), with Git's exit 5.
@@ -2806,9 +2808,11 @@ async fn handle_set(
                 "cannot overwrite multiple values with a single value".to_string(),
             )
             .with_stable_code(StableErrorCode::CliInvalidArguments)
-            .with_hint(format!(
-                "Use a regexp, --add or --replace-all to change {key}."
-            ))
+            .with_hint(if explicit_set {
+                format!("Use --value=<pattern>, --append or --all to change {key}.")
+            } else {
+                format!("Use a regexp, --add or --replace-all to change {key}.")
+            })
             .with_exit_code(5);
         }
         config_read_cli_error(format!(
@@ -3073,12 +3077,14 @@ async fn handle_set(
                     return err;
                 }
                 let err = CliError::from_legacy_string(&e);
-                if e.contains("values exist") {
+                if e.contains("values exist") || e.contains("multi-valued config key") {
                     CliError::failure("cannot overwrite multiple values with a single value")
                         .with_stable_code(StableErrorCode::CliInvalidArguments)
-                        .with_hint(format!(
-                            "Use a regexp, --add or --replace-all to change {key}."
-                        ))
+                        .with_hint(if explicit_set {
+                            format!("Use --value=<pattern>, --append or --all to change {key}.")
+                        } else {
+                            format!("Use a regexp, --add or --replace-all to change {key}.")
+                        })
                         .with_exit_code(5)
                 } else {
                     err
