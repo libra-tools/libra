@@ -2193,3 +2193,5 @@ file and another source together exit 129.
 writing stdin or a blob fails.
 
 config blob read resolves a revision.
+
+file origin labels distinguish file blob and stdin.
