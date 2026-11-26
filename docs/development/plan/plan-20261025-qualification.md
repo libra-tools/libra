@@ -1011,7 +1011,7 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `in-progress` / 空（已推送 main `e728736`；family child 无独立发布，所以不是 done。session `986c352a-927e-4f3f-855e-f9879764e9e7` 已准入这四个生产文件；实现审查 `02aa713c-60c8-4b6a-b5c6-7e09cf2096af` VERDICT PASS。前一轮 `de5171c1` 的 Windows 测试模块 P1 已用 `cfg(all(test, unix))` 关闭）
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：实现已在 main `e728736`；`am_unreadable_object_dir_is_not_a_missing_base` 复跑 1/1；本卡不 bump、不打 tag，D 组按 family child 继承。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** `Storage::search_checked` 在本地对象目录或 pack 索引读失败时返回 `Err`。对象目录不存在仍是空的 loose 结果。`am` 的三方基线解析使用这条路径。没有唯一匹配时仍留下该 id。读失败是 `StableErrorCode::IoReadFailed`，不说成缺失。`Storage::search` 的 `Vec` 行为保持不变。
 
@@ -1021,12 +1021,12 @@ FIX05 前需要只读的 `DEP-QUAL-F2-ATTRIB` 决定与当前本地Claude ER03�
 
 **Acceptance criteria:**
 
-- [ ] AC-1: 本地对象目录不可读时，`search_checked` 返回 `Err`。目录不存在仍是空结果。
-- [ ] AC-2: `am` 把该错误显示为 `IoReadFailed`，正文不是 missing、absent 或 not found。没有唯一匹配时仍不解析该 id。
+- [x] AC-1: 本地对象目录不可读时，`search_checked` 返回 `Err`。目录不存在仍是空结果（`am_unreadable_object_dir_is_not_a_missing_base`）。
+- [x] AC-2: `am` 把该错误显示为 `IoReadFailed`，正文不是 missing、absent 或 not found。没有唯一匹配时仍不解析该 id（同一测试）。
 
 **Verification:**
 
-- [ ] VER-1: `source .env.test && source .env.live-test && cargo nextest run --lib -E 'test(am_unreadable_object_dir_is_not_a_missing_base)' --no-fail-fast --retries 0`
+- [x] VER-1: 同上命令（1/1 passed，2026-11-25 复跑）。
 
 **Full-suite trigger:** `N/A`（本卡不改 `sql/**`、`src/cli.rs`、稳定错误码表或版本面）。
 
