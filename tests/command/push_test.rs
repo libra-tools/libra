@@ -3932,3 +3932,60 @@ fn push_force_with_lease_empty_expectation() {
         "AC3: the remote refs are unchanged"
     );
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_local_delete_flag_and_missing_ref() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+    assert_cli_success(&run_libra_command(&["tag", "v1"], &repo_dir), "tag v1");
+
+    let target = tempfile::tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare"], target.path()),
+        "init bare target",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "push",
+                "--tags",
+                target.path().to_str().unwrap(),
+                branch.as_str(),
+            ],
+            &repo_dir,
+        ),
+        "push --tags",
+    );
+
+    // O5: `--delete <tag>` removes the tag on the local target.
+    let del = run_libra_command(
+        &["push", "--delete", target.path().to_str().unwrap(), "v1"],
+        &repo_dir,
+    );
+    assert_cli_success(&del, "push --delete v1");
+    let ls = run_libra_command(&["ls-remote", target.path().to_str().unwrap()], &repo_dir);
+    assert_cli_success(&ls, "ls-remote after --delete");
+    assert!(!String::from_utf8_lossy(&ls.stdout).contains("refs/tags/v1"));
+
+    // O5: deleting a missing ref fails with the remote-ref-not-exist diagnostic.
+    let missing = run_libra_command(
+        &[
+            "push",
+            "--delete",
+            target.path().to_str().unwrap(),
+            "no-such-ref",
+        ],
+        &repo_dir,
+    );
+    assert!(!missing.status.success(), "missing ref delete must fail");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("remote ref does not exist"),
+        "missing ref diagnostic: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
