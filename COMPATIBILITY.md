@@ -2051,3 +2051,5 @@ bool-or-str shortcut matches the type value.
 conflicting type switches exit 129.
 
 config --file - reads stdin.
+
+section subcommands match the legacy flags.

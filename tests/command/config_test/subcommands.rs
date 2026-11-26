@@ -222,3 +222,49 @@ fn test_legacy_and_subcommand_parity_table() {
         );
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_102_predicates() {
+    let temp = tempdir().unwrap();
+    let sub = temp.path().join("sub");
+    let legacy = temp.path().join("legacy");
+    for repo in [&sub, &legacy] {
+        fs::create_dir_all(repo).unwrap();
+        assert_cli_success(
+            &run_libra_command(&["init", "--vault", "false"], repo),
+            "init",
+        );
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", "old.k", "v"], repo),
+            "set old.k",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["config", "rename-section", "--local", "old", "new"], &sub),
+        "rename-section subcommand",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "--rename-section", "old", "new"],
+            &legacy,
+        ),
+        "rename-section legacy",
+    );
+    for repo in [&sub, &legacy] {
+        let out = run_libra_command(&["config", "--local", "--get", "new.k"], repo);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v");
+    }
+    assert_cli_success(
+        &run_libra_command(&["config", "remove-section", "--local", "new"], &sub),
+        "remove-section subcommand",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "--remove-section", "new"], &legacy),
+        "remove-section legacy",
+    );
+    for repo in [&sub, &legacy] {
+        let out = run_libra_command(&["config", "--local", "--get", "new.k"], repo);
+        assert_eq!(out.status.code(), Some(1));
+    }
+}
