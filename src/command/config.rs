@@ -463,6 +463,54 @@ impl ScopedConfig {
             .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
+    /// Git `--replace-all <key> <value> <pattern>`: replace the first matching
+    /// value in place and drop any later matches, leaving other values in order.
+    pub async fn replace_matching(
+        scope: ConfigScope,
+        key: &str,
+        matcher: impl Fn(&str) -> bool,
+        value: &str,
+        encrypted: bool,
+    ) -> Result<usize, String> {
+        if scope == ConfigScope::Local && is_core_objectformat_key(key) {
+            return Err(
+                "core.objectformat cannot be changed after init; the object format is fixed at fresh init"
+                    .to_string(),
+            );
+        }
+        let txn = Self::begin_mutation(scope).await?;
+        let entries = ConfigKv::get_all_with_conn(&txn, key)
+            .await
+            .map_err(|e| format!("failed to read config '{key}': {e}"))?;
+        ConfigKv::unset_all_with_conn(&txn, key)
+            .await
+            .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+        let mut replaced = 0;
+        for entry in entries {
+            if matcher(&entry.value) {
+                if replaced == 0 {
+                    ConfigKv::add_with_conn(&txn, key, value, encrypted)
+                        .await
+                        .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+                }
+                replaced += 1;
+            } else {
+                ConfigKv::add_with_conn(&txn, key, &entry.value, entry.encrypted)
+                    .await
+                    .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+            }
+        }
+        if replaced == 0 {
+            ConfigKv::add_with_conn(&txn, key, value, encrypted)
+                .await
+                .map_err(|e| format!("failed to replace config '{key}': {e}"))?;
+        }
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))?;
+        Ok(replaced)
+    }
+
     pub async fn unset_all(scope: ConfigScope, key: &str) -> Result<usize, String> {
         if scope == ConfigScope::Local && is_core_objectformat_key(key) {
             return Err(
@@ -621,6 +669,9 @@ pub struct ConfigArgs {
     /// Value or value pattern
     #[clap(value_name = "value")]
     pub valuepattern: Option<String>,
+    /// Value pattern for `--replace-all` (Git's third positional)
+    #[clap(value_name = "value-pattern")]
+    pub value_pattern: Option<String>,
     /// Default value when key not found
     #[clap(long, short = 'd')]
     pub default: Option<String>,
@@ -1996,6 +2047,14 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
         return Ok(ResolvedCommand::Path);
     }
 
+    if args.value_pattern.is_some() && !args.replace_all {
+        return Err(
+            CliError::failure("value pattern is only accepted with --replace-all")
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_exit_code(2),
+        );
+    }
+
     // All remaining modes need a key
     let key = args.key.as_deref().ok_or_else(|| {
         CliError::from_legacy_string("error: missing required argument: <key>").with_exit_code(2)
@@ -2118,7 +2177,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
         value: args.valuepattern.clone(),
         add: false,
         replace_all: args.replace_all,
-        value_pattern: None,
+        value_pattern: args.value_pattern.clone(),
         fixed_value: args.fixed_value,
         encrypt: false,
         plaintext: false,
@@ -2452,7 +2511,7 @@ async fn handle_set(
                 }
             })?;
         emit_set_ack("add", scope, key, should_encrypt, output)?;
-    } else if replace_all {
+    } else if replace_all && value_pattern.is_none() {
         // Git `--replace-all`: every existing value is replaced by this one.
         ScopedConfig::replace_all(scope, key, &store_value)
             .await
@@ -2468,18 +2527,21 @@ async fn handle_set(
         // Git `config <key> <value> <value-pattern>`: replace only the entries
         // whose value matches, leaving the others alone.
         let matcher = compile_value_matcher(pattern, fixed_value)?;
-        ScopedConfig::unset_matching(scope, key, |value| matcher.matches(value))
-            .await
-            .map_err(CliError::from_legacy_string)?;
-        ScopedConfig::add(scope, key, &store_value, should_encrypt)
-            .await
-            .map_err(|e| {
-                if e.contains("core.objectformat cannot be changed") {
-                    core_objectformat_mutation_error("config set")
-                } else {
-                    CliError::from_legacy_string(e)
-                }
-            })?;
+        ScopedConfig::replace_matching(
+            scope,
+            key,
+            |value| matcher.matches(value),
+            &store_value,
+            should_encrypt,
+        )
+        .await
+        .map_err(|e| {
+            if e.contains("core.objectformat cannot be changed") {
+                core_objectformat_mutation_error("config set")
+            } else {
+                CliError::from_legacy_string(e)
+            }
+        })?;
         emit_set_ack("set", scope, key, should_encrypt, output)?;
     } else {
         ScopedConfig::set(scope, key, &store_value, should_encrypt)

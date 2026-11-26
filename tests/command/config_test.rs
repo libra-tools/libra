@@ -7676,6 +7676,47 @@ mod value_pattern {
     }
 
     #[test]
+    fn test_cf_63_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["five", "six"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        let all = run_libra_command(&["config", "--replace-all", "multi.k", "five"], repo.path());
+        assert_cli_success(&all, "replace-all without pattern");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &run_libra_command(&["config", "--get-all", "multi.k"], repo.path()).stdout
+            )
+            .trim(),
+            "five"
+        );
+
+        for value in ["five", "six"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "re-add",
+            );
+        }
+        let matched = run_libra_command(
+            &["config", "--replace-all", "multi.k", "seven", "fiv"],
+            repo.path(),
+        );
+        assert_cli_success(&matched, "replace-all with pattern");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &run_libra_command(&["config", "--get-all", "multi.k"], repo.path()).stdout
+            )
+            .trim(),
+            "seven\nsix",
+            "pattern replaces only matching values"
+        );
+    }
+
+    #[test]
     fn test_cf_38_predicates() {
         let repo = tempdir().unwrap();
         assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");

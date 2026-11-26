@@ -1075,3 +1075,5 @@ cascade get skips an unreadable system store.
 missing global store follows the recorded git result.
 
 corrupt config stores keep the migration classification.
+
+replace-all rewrites every matching value.
