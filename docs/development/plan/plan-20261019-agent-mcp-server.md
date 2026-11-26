@@ -3807,7 +3807,7 @@ Libra现行v2.14粒度规范止于G-11（含G-07a），不引入Mega G-12/G-13�
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：有界工作树读取 4 个具名单测全部复跑通过（TooLarge、≤ limit+1、并发增长、符号链接目标字节）；文档按卡 N/A，版本 patch +1。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；T-1 全量未运行。
 
 **Description:** 自 MC-32 拆出（R29）。在 `src/command/mod.rs` 的 `read_worktree_blob_bytes`（`:359`）旁新增 `read_worktree_blob_bytes_bounded(path, limit)`，与现有函数**同一 blob 语义**：路径为符号链接时返回链接目标字节、绝不跟随（Unix 以 `O_NOFOLLOW` 打开、遇链接改为 `read_link`；Windows 以 `FILE_FLAG_OPEN_REPARSE_POINT`）；其余情形先以不跟随方式**打开一次**句柄，此后分类（`fstat` 判定普通文件）与普通文件正文读取都只使用**这同一个句柄**（LFS 跟踪路径的句柄交给 MC-39 的指针生成）：普通文件从该句柄读取至多 `limit + 1` 字节，超过即返回 `TooLarge`。因此打开之后路径被替换（含替换为指向外部的符号链接）不会改变读取的对象，消除增长/替换竞态。上限对实际返回的那种表示（链接目标、指针或正文）生效。现有 `read_worktree_blob_bytes` 与 CLI 不变。唯一行为轴：「工作树 blob 有界读取」。
 
