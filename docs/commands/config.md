@@ -1047,3 +1047,5 @@ replace-all refuses upgrade.mode.
 bool-or-str shortcut matches the type value.
 
 conflicting type switches exit 129.
+
+config --file - reads stdin.

@@ -204,3 +204,21 @@ fn test_file_write_roundtrip_through_reader() {
     assert_cli_success(&list, "list");
     assert!(String::from_utf8_lossy(&list.stdout).contains("user.name=Jane Doe"));
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_84_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let out = crate::command::run_libra_command_with_stdin(
+        &["config", "--file", "-", "--list"],
+        repo.path(),
+        "[sec]\nkey=value\n",
+    );
+    assert_cli_success(&out, "config --file - --list");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("sec.key=value"),
+        "stdin config parsed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

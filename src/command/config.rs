@@ -3364,11 +3364,30 @@ fn serve_config_file(
     output: &OutputConfig,
 ) -> CliResult<()> {
     if let Some(mutation) = config_file_write_mutation(cmd)? {
+        if path == "-" {
+            return Err(CliError::command_usage(
+                "writing to standard input ('--file -') is not supported",
+            ));
+        }
         return write_config_file(path, &mutation, args, output);
     }
     let show_origin = args.show_origin;
     let show_scope = args.show_scope;
-    let entries = read_git_config_file(Path::new(path))?;
+    let entries = if path == "-" {
+        let mut text = String::new();
+        use std::io::Read as _;
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to read config from standard input: {error}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+        parse_git_config_text(&text)
+    } else {
+        read_git_config_file(Path::new(path))?
+    };
     let origin = format!("file:{path}");
     let prefix = if show_scope {
         "command line".to_string()
@@ -3550,6 +3569,10 @@ fn read_git_config_file(path: &Path) -> CliResult<Vec<(String, String)>> {
         ))
         .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
+    Ok(parse_git_config_text(&text))
+}
+
+fn parse_git_config_text(text: &str) -> Vec<(String, String)> {
     let mut entries = Vec::new();
     let mut section = String::new();
     for raw in text.lines() {
@@ -3575,7 +3598,7 @@ fn read_git_config_file(path: &Path) -> CliResult<Vec<(String, String)>> {
             unquote_ini_value(value.trim()),
         ));
     }
-    Ok(entries)
+    entries
 }
 
 fn parse_ini_section(inner: &str) -> String {
