@@ -362,3 +362,48 @@ fn test_cf_98_predicates() {
     assert_cli_success(&mode, "mode unchanged");
     assert_eq!(String::from_utf8_lossy(&mode.stdout).trim(), "auto");
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_93_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.as_path()),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "edit.change", "old"], repo.as_path()),
+        "seed change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "edit.remove", "gone"],
+            repo.as_path(),
+        ),
+        "seed remove",
+    );
+    let script = editor_script(
+        temp.path(),
+        "writeback.sh",
+        "sed -i 's/old/new/' \"$1\"; printf '\\n[edit]\\n\\tadded = yes\\n\\tmulti = one\\n\\tmulti = two\\n' >> \"$1\"; sed -i '/remove/d' \"$1\"",
+    );
+    let out = run_libra_command_with_env(
+        &["config", "--edit"],
+        repo.as_path(),
+        &[("GIT_EDITOR", script.as_str())],
+    );
+    assert_cli_success(&out, "edit writeback");
+    let changed = run_libra_command(
+        &["config", "--local", "--get", "edit.change"],
+        repo.as_path(),
+    );
+    assert_eq!(String::from_utf8_lossy(&changed.stdout).trim(), "new");
+    let listed = run_libra_command(&["config", "--local", "--list"], repo.as_path());
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains("edit.added=yes"), "{text}");
+    assert!(!text.contains("edit.remove"), "{text}");
+    let multi = run_libra_command(&["config", "--get-all", "edit.multi"], repo.as_path());
+    assert_eq!(String::from_utf8_lossy(&multi.stdout).trim(), "one\ntwo");
+}
