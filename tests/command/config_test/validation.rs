@@ -236,3 +236,28 @@ fn test_cf_26_predicates() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty(), "no-match stdout must be empty");
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_59_predicates() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "local-user"], &repo),
+        "set local user.name",
+    );
+    let unreadable = temp.path().join("unreadable.db");
+    fs::write(&unreadable, b"placeholder").unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = run_libra_command_with_env(
+        &["config", "get", "user.name"],
+        &repo,
+        &[("LIBRA_CONFIG_SYSTEM_DB", unreadable.to_str().unwrap())],
+    );
+    assert_cli_success(&out, "cascade skips unreadable system store");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "local-user");
+    let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+}
