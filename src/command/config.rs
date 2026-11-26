@@ -3262,10 +3262,11 @@ fn parse_value_type_name(name: &str) -> CliResult<ConfigValueType> {
         "bool-or-int" => Ok(ConfigValueType::BoolOrInt),
         "color" => Ok(ConfigValueType::Color),
         "expiry-date" => Ok(ConfigValueType::ExpiryDate),
-        other => Err(CliError::command_usage(format!(
-            "error: unsupported --type '{other}' (expected bool, int, path, bool-or-str, bool-or-int, color, or expiry-date)"
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidArguments)),
+        other => Err(
+            CliError::fatal(format!("unrecognized --type argument: {other}"))
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_exit_code(128),
+        ),
     }
 }
 

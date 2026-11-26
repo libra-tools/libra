@@ -986,3 +986,5 @@ invalid key without a section writes nothing.
 encrypted unset matches plaintext.
 
 removed_count equals deleted values.
+
+config unrecognized type exit-code exception.

@@ -710,3 +710,22 @@ fn test_cf_79_predicates() {
     assert!(text.contains("exp.never=0"), "{text}");
     assert!(!text.contains("exp.bad"), "{text}");
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_72_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    let out = run_libra_command(
+        &["config", "--type=bogus", "--get", "user.name"],
+        repo.path(),
+    );
+    assert_eq!(out.status.code(), Some(128), "unknown type exits 128");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unrecognized --type argument"), "{stderr}");
+    assert!(!stderr.contains("error: error:"), "{stderr}");
+    assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+}
