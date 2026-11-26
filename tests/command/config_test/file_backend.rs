@@ -366,3 +366,46 @@ fn test_cf_92_predicates() {
     );
     assert!(!fs::read_to_string(&cfg).unwrap().contains("note"));
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_81_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let cfg = repo.path().join("order.cfg");
+    fs::write(&cfg, "[a]\n\tone = 1\n\ttwo = 2\n[b]\n\tthree = 3\n").unwrap();
+    let list = run_libra_command(&["config", "--file", "order.cfg", "--list"], repo.path());
+    assert_cli_success(&list, "list");
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout).trim(),
+        "a.one=1\na.two=2\nb.three=3"
+    );
+    let regexp = run_libra_command(
+        &["config", "--file", "order.cfg", "--get-regexp", "^[ab]\\."],
+        repo.path(),
+    );
+    assert_cli_success(&regexp, "regexp");
+    assert_eq!(
+        String::from_utf8_lossy(&regexp.stdout).trim(),
+        "a.one 1\na.two 2\nb.three 3"
+    );
+    let all = run_libra_command(
+        &["config", "--file", "order.cfg", "--get-all", "a.two"],
+        repo.path(),
+    );
+    assert_cli_success(&all, "get-all");
+    assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "2");
+    let patterned = run_libra_command(
+        &[
+            "config",
+            "--file",
+            "order.cfg",
+            "--get-regexp",
+            "^a\\.",
+            "2",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&patterned, "value pattern");
+    assert_eq!(String::from_utf8_lossy(&patterned.stdout).trim(), "a.two 2");
+}
