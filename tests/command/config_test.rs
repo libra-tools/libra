@@ -8085,4 +8085,51 @@ mod value_pattern {
         let after = run_libra_command_with_env(&["config", "--local", "--list"], &repo, &envs);
         assert_eq!(before.stdout, after.stdout, "vault failure writes nothing");
     }
+
+    #[test]
+    fn test_unset_json_removed_count() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two", "three"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "rm.k", value], repo.path()),
+                "add",
+            );
+        }
+        let patterned = run_libra_command(
+            &["--json", "config", "--unset", "rm.k", "^one$"],
+            repo.path(),
+        );
+        assert_cli_success(&patterned, "json unset pattern");
+        let parsed: serde_json::Value = serde_json::from_slice(&patterned.stdout).expect("json");
+        assert_eq!(parsed["data"]["removed_count"], 1);
+        let all = run_libra_command(&["--json", "config", "--unset-all", "rm.k"], repo.path());
+        assert_cli_success(&all, "json unset-all");
+        let parsed: serde_json::Value = serde_json::from_slice(&all.stdout).expect("json");
+        assert_eq!(parsed["data"]["removed_count"], 2);
+    }
+
+    #[test]
+    fn test_t1300_multiple_unset() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two", "three"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "up.k", value], repo.path()),
+                "add",
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(&["config", "--unset", "up.k", "^one$"], repo.path()),
+            "unset one",
+        );
+        let left = run_libra_command(&["config", "--get-all", "up.k"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "two\nthree");
+        assert_cli_success(
+            &run_libra_command(&["config", "--unset-all", "up.k"], repo.path()),
+            "unset all",
+        );
+        let missing = run_libra_command(&["config", "--get-all", "up.k"], repo.path());
+        assert_eq!(missing.status.code(), Some(1));
+    }
 }

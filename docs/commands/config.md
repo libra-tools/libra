@@ -1183,3 +1183,5 @@ invalid unset pattern exits 6.
 invalid key without a section writes nothing.
 
 encrypted unset matches plaintext.
+
+removed_count equals deleted values.
