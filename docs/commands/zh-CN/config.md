@@ -954,3 +954,5 @@ explicit scope list prints one scope.
 missing system list exits 128.
 
 unreadable system get exits 1.
+
+fixed-value set replaces the literal value.

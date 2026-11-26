@@ -7927,4 +7927,42 @@ mod value_pattern {
         let miss = run_libra_command(&["config", "--get", "secret.k", "^absent$"], repo.path());
         assert_eq!(miss.status.code(), Some(1), "no plaintext match exits 1");
     }
+
+    #[test]
+    fn test_cf_66_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["six", "six.extra"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        let fixed = run_libra_command(
+            &[
+                "config",
+                "--fixed-value",
+                "--replace-all",
+                "multi.k",
+                "seven",
+                "six",
+            ],
+            repo.path(),
+        );
+        assert_cli_success(&fixed, "fixed replace");
+        let left = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(
+            String::from_utf8_lossy(&left.stdout).trim(),
+            "seven\nsix.extra"
+        );
+
+        let before = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        let invalid = run_libra_command(
+            &["config", "--fixed-value", "--add", "multi.k", "eight"],
+            repo.path(),
+        );
+        assert_eq!(invalid.status.code(), Some(129), "--add with fixed-value");
+        let after = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(before.stdout, after.stdout, "usage error writes nothing");
+    }
 }

@@ -2151,20 +2151,28 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 encrypt,
                 plaintext,
                 stdin,
-            } => ResolvedCommand::Set {
-                key: key.clone(),
-                value: value.clone(),
-                add: *add,
-                replace_all: *all,
-                value_pattern: value_pattern.clone(),
-                fixed_value: *fixed_value,
-                encrypt: *encrypt,
-                plaintext: *plaintext,
-                stdin: *stdin,
-                value_type,
-                explicit_set: true,
-                null: args.null,
-            },
+            } => {
+                if *add && *fixed_value {
+                    return Err(CliError::command_usage(
+                        "--fixed-value cannot be combined with --add",
+                    )
+                    .with_stable_code(StableErrorCode::CliInvalidArguments));
+                }
+                ResolvedCommand::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                    add: *add,
+                    replace_all: *all,
+                    value_pattern: value_pattern.clone(),
+                    fixed_value: *fixed_value,
+                    encrypt: *encrypt,
+                    plaintext: *plaintext,
+                    stdin: *stdin,
+                    value_type,
+                    explicit_set: true,
+                    null: args.null,
+                }
+            }
             ConfigCommand::Get {
                 key,
                 all,
@@ -2512,6 +2520,12 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
         });
     }
     if args.add {
+        if args.fixed_value {
+            return Err(
+                CliError::command_usage("--fixed-value cannot be combined with --add")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments),
+            );
+        }
         let value = args.valuepattern.as_deref().ok_or_else(|| {
             CliError::from_legacy_string("error: missing required argument: <value>")
                 .with_exit_code(2)
