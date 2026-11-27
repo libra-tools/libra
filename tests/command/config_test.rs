@@ -8332,4 +8332,44 @@ mod value_pattern {
         let miss = run_libra_command(&["config", "--get", "up.k", "^absent$"], repo.path());
         assert_eq!(miss.status.code(), Some(1));
     }
+
+    #[test]
+    fn test_unset_with_value_pattern_matrix() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two", "three"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "--unset-all", "multi.k", "^(two|three)$"],
+                repo.path(),
+            ),
+            "unset matching",
+        );
+        let left = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "one");
+        assert_cli_success(
+            &run_libra_command(&["config", "--unset", "multi.k", "^one$"], repo.path()),
+            "unset one",
+        );
+        let gone = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(gone.status.code(), Some(1));
+
+        for value in ["one", "two", "three"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "neg.k", value], repo.path()),
+                "add neg",
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(&["config", "--unset-all", "neg.k", "!one"], repo.path()),
+            "negated unset",
+        );
+        let left = run_libra_command(&["config", "--get-all", "neg.k"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "one");
+    }
 }

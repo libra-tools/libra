@@ -1261,3 +1261,5 @@ config --file does not follow include or includeIf.
 git config syntax parses like git.
 
 file mutations match git bytes.
+
+unset-all deletes only matching values.
