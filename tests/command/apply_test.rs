@@ -836,3 +836,42 @@ fn apply_binary_flag_and_creation_roundtrip() {
     assert_eq!(check_binary.stderr, check_plain.stderr);
     assert!(!target2.path().join("binary").exists());
 }
+
+#[test]
+#[serial(cwd)]
+fn apply_full_index_binary_without_payload() {
+    use std::fs;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    assert_cli_success(&run_libra_command(&["init", "--vault=false"], root), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "T"], root),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t.io"], root),
+        "email",
+    );
+    let post = b"\0\x01full-index-post\0";
+    fs::write(root.join("binary"), post).unwrap();
+    let stored = run_libra_command(&["hash-object", "-w", "binary"], root);
+    assert_cli_success(&stored, "hash post");
+    let post_oid = String::from_utf8_lossy(&stored.stdout).trim().to_string();
+    let pre = b"\0\x01full-index-pre\0";
+    fs::write(root.join("binary"), pre).unwrap();
+    let pre_hash = run_libra_command(&["hash-object", "binary"], root);
+    assert_cli_success(&pre_hash, "hash pre");
+    let pre_oid = String::from_utf8_lossy(&pre_hash.stdout).trim().to_string();
+    let patch = format!(
+        "diff --git a/binary b/binary\nindex {pre_oid}..{post_oid} 100644\nBinary files a/binary and b/binary differ\n"
+    );
+    let applied = run_libra_command_with_stdin(&["apply"], root, &patch);
+    assert_cli_success(&applied, "apply full index binary");
+    assert_eq!(fs::read(root.join("binary")).unwrap(), post);
+
+    fs::write(root.join("binary"), b"wrong preimage").unwrap();
+    let rejected = run_libra_command_with_stdin(&["apply"], root, &patch);
+    assert!(!rejected.status.success(), "mismatched preimage rejected");
+    assert_eq!(fs::read(root.join("binary")).unwrap(), b"wrong preimage");
+}

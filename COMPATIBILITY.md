@@ -2315,3 +2315,5 @@ merge --no-commit still fast-forwards.
 merge combines --strategy with --strategy-option.
 
 merge rejects squash with no-ff and allows squash ff-only.
+
+apply rebuilds full-index binary patches without payload.

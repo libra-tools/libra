@@ -1288,12 +1288,53 @@ pub(crate) fn prepare_patch_opts(
         let headers = parse_section_headers(&section, strip).map_err(invalid)?;
 
         if headers.binary_marker && headers.binary.is_none() {
-            return Err(invalid(format!(
-                "binary patch for '{}' carries no content (regenerate the diff with --binary)",
-                headers
-                    .display_target()
-                    .unwrap_or_else(|| "<unknown>".to_string())
-            )));
+            let target = headers.single_target(&section, strip).map_err(invalid)?;
+            let absolute = validate_patch_target(&target, workdir).map_err(invalid)?;
+            let (current, permissions) = load_base(&results, &target, &absolute)?;
+            let (Some(pre), Some(post)) =
+                (headers.index_old.as_deref(), headers.index_new.as_deref())
+            else {
+                return Err(invalid(format!(
+                    "binary patch for '{target}' carries no payload and lacks a full index line"
+                )));
+            };
+            let pre_oid = crate::internal::object_format::parse_repo_oid(pre)
+                .map_err(|error| invalid(error.to_string()))?;
+            let post_oid = crate::internal::object_format::parse_repo_oid(post)
+                .map_err(|error| invalid(error.to_string()))?;
+            let current_oid =
+                git_internal::internal::object::blob::Blob::from_content_bytes(current).id;
+            if current_oid != pre_oid {
+                return Err(PatchPreparationError::DoesNotApply(format!(
+                    "binary patch preimage for '{target}' does not match the current file"
+                )));
+            }
+            let kind = git_internal::hash::get_hash_kind();
+            let content = if post_oid.to_string() == git_internal::hash::ObjectHash::zero_str(kind)
+            {
+                None
+            } else {
+                let blob: git_internal::internal::object::blob::Blob =
+                    crate::command::load_object(&post_oid).map_err(|error| {
+                        PatchPreparationError::DoesNotApply(format!(
+                            "binary patch postimage for '{target}' is not available: {error}"
+                        ))
+                    })?;
+                Some(blob.data)
+            };
+            if !results.contains_key(&target) {
+                order.push(target.clone());
+            }
+            results.insert(
+                target,
+                SectionEntry {
+                    absolute,
+                    content,
+                    permissions,
+                    mode: headers.new_mode.or(headers.old_mode),
+                },
+            );
+            continue;
         }
 
         // ---- Rename / copy sections (optional content hunks or binary). ----
@@ -1751,6 +1792,8 @@ pub(crate) struct SectionHeaders {
     /// `index <old>..<new>[ <mode>]` blob ids (possibly abbreviated) —
     /// the three-way fallback's base/theirs anchors (PD-09 ③).
     index_old: Option<String>,
+    /// The `index` line's post-image id.
+    index_new: Option<String>,
     /// A content-less `Binary files … differ` marker.
     binary_marker: bool,
     /// The section carries `--- `/`+++ ` unified content hunks.
@@ -1870,6 +1913,15 @@ fn parse_section_headers(section: &str, strip: u32) -> Result<SectionHeaders, St
             && !old_id.bytes().all(|b| b == b'0')
         {
             headers.index_old = Some(old_id.to_string());
+            if let Some((_, new_id)) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|ids| ids.split_once(".."))
+                && !new_id.is_empty()
+                && new_id.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                headers.index_new = Some(new_id.to_string());
+            }
         }
         // `index`, `similarity index`, `dissimilarity index`, mail noise —
         // ignored.

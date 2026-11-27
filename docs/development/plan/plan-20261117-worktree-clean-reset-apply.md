@@ -1098,7 +1098,7 @@ PY
 ### Task WC-09a: 支持 `libra apply` 直接应用无载荷 full-index 二进制补丁（#838 / `t4108#17`）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：无载荷 full-index 二进制补丁直接按 pre/post 校验并从对象库重建，post 零 OID 视为删除，缺 payload/缺 index/pre 不匹配均拒绝且零写；新增测试；apply 24/24、am 46/46。C 组 patch +1。偏差：`--3way` 回退由 WC-09b 承接；用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 对齐 Git `apply.c:3301-3346`（`git@750f5de7` `apply_binary`）的直接应用语义：修复 `src/command/apply.rs:1283`（`prepare_patch_opts`）在 `headers.binary_marker && headers.binary.is_none()` 时无条件拒绝的问题；当无载荷二进制补丁携带完整 `index <pre>..<post>` OID 时：（1）缺完整 OID 即拒绝（`apply.c:3301-3306`）；（2）当前目标必须匹配 `pre`（`apply.c:3308-3326`），不匹配即拒绝；（3）`post` 为全零时按删除补丁处理，不要求对象库存在 post blob（`apply.c:3328-3332`）；（4）对象库已有 `post` blob 时直接重建（`apply.c:3334-3346`），没有则拒绝。普通应用与 `--3way` 在上述直接路径上行为一致（上游 `t4108#17` 即 pre 匹配、post 已在库的直接重建）；`--3way` 在 pre 不匹配时的三方回退拆出 `WC-09b`（G-09）。所有拒绝都不得修改工作区或索引。该语义位于 `apply` 与 `am` 共享的 `prepare_patch_opts`（`src/command/am.rs:466`），`am` 随之获得与 Git 一致的无载荷 full-index 判定（Git 的 am 同样经 `apply_binary`）；本卡不改 `am.rs` 代码，以 `compat_mail_am_basic` 防退化，`docs/commands/am.md` 只描述带载荷的 `GIT binary patch` 故无需改动。（注：`t4108#17` 等价测试需先预置上游 `#16` 遗留的 post blob。）
 **Out of scope:** `--binary` 标志解析（`WC-09`）；`--3way` 在 pre 不匹配时的二进制三方回退（拆出 `WC-09b` 承接）；`is_locked_revision` 修复（`WC-10`）。
 
@@ -1132,9 +1132,9 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::apply_test::apply_full_index_binary_without_payload)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC8）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::apply_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test compat_mail_am_basic`（按「验证执行协议」第 5 条，过滤为整个 target；`am` 经 `src/command/am.rs:466` 共享 `prepare_patch_opts`；不计卡特有 AC 证据）
+- [x] 具名测试：`apply_full_index_binary_without_payload`（通过）
+- [x] 共享回归组：`command::apply_test`（24/24）
+- [x] 共享回归组：`compat_mail_am_basic`（46/46）
 
 **Full-suite trigger:** `T-1: 修改 apply 与 am 共享的 prepare_patch_opts（src/command/am.rs:466 调用）`
 **Dependencies:** `WC-09`, `DEP-WC-05`
