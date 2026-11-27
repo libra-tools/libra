@@ -724,3 +724,74 @@ fn test_cf_33_predicates() {
     );
     assert_eq!(system_miss.status.code(), Some(1));
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_37_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for value in ["one", "two"] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--add", "reg.multi", value], repo.path()),
+            "add",
+        );
+    }
+    let get = run_libra_command(&["config", "--get", "reg.multi"], repo.path());
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "two");
+    let all = run_libra_command(&["config", "--get-all", "reg.multi"], repo.path());
+    assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "one\ntwo");
+    let null = run_libra_command(&["config", "-z", "--get", "reg.multi"], repo.path());
+    assert_eq!(null.stdout, b"two\0");
+    let null_list = run_libra_command(&["config", "--local", "-z", "--list"], repo.path());
+    assert!(
+        null_list
+            .stdout
+            .windows(b"reg.multi\none\0".len())
+            .any(|window| window == b"reg.multi\none\0")
+    );
+    let json = run_libra_command(
+        &["--json", "config", "--unset-all", "reg.multi"],
+        repo.path(),
+    );
+    assert_cli_success(&json, "unset-all json");
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(parsed["data"]["removed_count"], 2);
+
+    for (key, value) in [("sec.a", "1"), ("sec.b", "2"), ("ren.a", "3")] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", key, value], repo.path()),
+            "seed",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["config", "--remove-section", "sec"], repo.path()),
+        "remove section",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--rename-section", "ren", "ren2"], repo.path()),
+        "rename section",
+    );
+    let list = run_libra_command(&["config", "--local", "--list"], repo.path());
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert!(!text.contains("sec."), "{text}");
+    assert!(text.contains("ren2.a=3"), "{text}");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "typed.bool", "yes"], repo.path()),
+        "bool seed",
+    );
+    let bool_out = run_libra_command(
+        &["config", "--local", "--bool", "--get", "typed.bool"],
+        repo.path(),
+    );
+    assert_eq!(String::from_utf8_lossy(&bool_out.stdout).trim(), "true");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "typed.int", "1k"], repo.path()),
+        "int seed",
+    );
+    let int_out = run_libra_command(
+        &["config", "--local", "--int", "--get", "typed.int"],
+        repo.path(),
+    );
+    assert_eq!(String::from_utf8_lossy(&int_out.stdout).trim(), "1024");
+}
