@@ -14836,3 +14836,35 @@ fn no_commit_fast_forwards() {
     let status = run_libra_command(&["status", "--porcelain"], root);
     assert!(!String::from_utf8_lossy(&status.stdout).contains("UU"));
 }
+
+#[test]
+fn strategy_with_strategy_option() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["-s", "recursive", "-Xtheirs", "feature"], "FEATURE"),
+        (&["-s", "ort", "-Xours", "feature"], "MAIN"),
+        (
+            &["--strategy=recursive", "-X", "theirs", "feature"],
+            "FEATURE",
+        ),
+        (&["-s", "recursive", "-X", "ours", "feature"], "MAIN"),
+    ];
+    for (args, expected) in cases {
+        let repo = create_diverged_repo_for_conflict();
+        let root = repo.path();
+        let mut full = vec!["merge"];
+        full.extend_from_slice(args);
+        full.extend_from_slice(&["-m", "merge"]);
+        let output = run_libra_command(&full, root);
+        assert_cli_success(&output, &format!("{args:?}"));
+        let content = std::fs::read_to_string(root.join("shared.txt")).expect("shared.txt");
+        assert!(content.contains(expected), "{args:?}: {content}");
+        let parents = run_libra_command(&["log", "-1", "--format=%P"], root);
+        assert_eq!(
+            String::from_utf8_lossy(&parents.stdout)
+                .split_whitespace()
+                .count(),
+            2,
+            "{args:?} should create a merge commit"
+        );
+    }
+}

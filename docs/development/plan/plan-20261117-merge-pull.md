@@ -638,7 +638,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-28: 允许 `merge --strategy` 与 `--strategy-option` 同时使用（#1015）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：移除 `--strategy` 与 `--strategy-option` 互斥，recursive/ort + theirs/ours 组合可用；merge 316/317，唯一失败为既有 crisscross GC 用例。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 自 `MP-01` 拆出：移除 `MergeArgs` 中 `strategy` 与 `strategy_option` 的互斥，使 `-s recursive -Xtheirs` 等组合把 `-X` 选项透传给所选内置策略。
 
@@ -672,7 +672,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC6）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::strategy_with_strategy_option)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::strategy_with_strategy_option)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`strategy_with_strategy_option`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `MP-27`, `DEP-MP-10`

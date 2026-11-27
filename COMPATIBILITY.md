@@ -2311,3 +2311,5 @@ commit rejects -m with fixup amend or reword and unknown prefixes.
 merge and pull ff-only print git's diverging advice.
 
 merge --no-commit still fast-forwards.
+
+merge combines --strategy with --strategy-option.

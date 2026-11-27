@@ -323,12 +323,12 @@ pub struct MergeArgs {
 
     /// Select one or more merge strategies in fallback order. `recursive` is
     /// an alias for `ort`; `resolve` disables recursive bases and renames.
-    #[arg(short = 's', long = "strategy", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy_option"])]
+    #[arg(short = 's', long = "strategy", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub strategy: Vec<MergeStrategy>,
 
     /// Pass an option to the default three-way merge. Favor and renormalize
     /// toggles use their last value; whitespace comparison flags compose.
-    #[arg(short = 'X', long = "strategy-option", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart", "strategy"])]
+    #[arg(short = 'X', long = "strategy-option", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub strategy_option: Vec<MergeStrategyOption>,
 
     /// Permit a merge when the histories have no common ancestor.
