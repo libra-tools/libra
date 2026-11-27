@@ -14868,3 +14868,51 @@ fn strategy_with_strategy_option() {
         );
     }
 }
+
+#[test]
+fn squash_no_ff_rejected_and_ff_only_allowed() {
+    for args in [
+        vec!["merge", "--squash", "--no-ff", "feature"],
+        vec!["merge", "--no-ff", "--squash", "feature"],
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let root = repo.path();
+        create_branch_commit(root, "feature", "feature.txt", "feature\n");
+        let before = head_commit(root);
+        let out = run_libra_command(&args, root);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("options '--squash' and '--no-ff.' cannot be used together"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(head_commit(root), before);
+    }
+
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    create_branch_commit(root, "feature", "feature.txt", "feature\n");
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.ff", "false"], root),
+        "merge.ff=false",
+    );
+    let before = head_commit(root);
+    let rejected = run_libra_command(&["merge", "--squash", "feature"], root);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("options '--squash' and '--no-ff.' cannot be used together")
+    );
+    assert_eq!(head_commit(root), before);
+
+    let squash_repo = create_committed_repo_via_cli();
+    let root = squash_repo.path();
+    create_branch_commit(root, "feature", "feature.txt", "feature\n");
+    let before = head_commit(root);
+    let squash = run_libra_command(&["merge", "--squash", "--ff-only", "feature"], root);
+    assert_cli_success(&squash, "squash ff-only");
+    assert_eq!(head_commit(root), before);
+    let status = run_libra_command(&["status", "--porcelain"], root);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("feature.txt"));
+}

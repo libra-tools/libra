@@ -1234,6 +1234,8 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         }
         merge::PullMergeError::InvalidTarget(..) => CliError::command_usage(error.to_string())
             .with_stable_code(StableErrorCode::CliInvalidTarget),
+        merge::PullMergeError::InvalidOptions(_) => CliError::command_usage(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
         merge::PullMergeError::TargetLoad { .. }
         | merge::PullMergeError::CurrentLoad { .. }
         | merge::PullMergeError::History(..)

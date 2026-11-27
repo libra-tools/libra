@@ -806,6 +806,8 @@ pub(crate) enum PullMergeError {
     InvalidAutostashConfig(String),
     #[error("{0} - not something we can merge")]
     InvalidTarget(String),
+    #[error("{0}")]
+    InvalidOptions(String),
     #[error("failed to load merge target '{commit_id}': {detail}")]
     TargetLoad { commit_id: String, detail: String },
     #[error("failed to load current commit '{commit_id}': {detail}")]
@@ -956,6 +958,8 @@ impl From<PullMergeError> for CliError {
             }
             PullMergeError::InvalidTarget(..) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget),
+            PullMergeError::InvalidOptions(_) => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
             PullMergeError::TargetLoad { .. }
             | PullMergeError::CurrentLoad { .. }
             | PullMergeError::History(..)
@@ -1298,6 +1302,11 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                     Some(crate::command::history_config::MergeFastForward::Only) => (true, false),
                 }
             };
+            if args.squash && no_ff {
+                return Err(PullMergeError::InvalidOptions(
+                    "options '--squash' and '--no-ff.' cannot be used together".to_string(),
+                ));
+            }
             let verify_signatures = if args.verify_signatures {
                 true
             } else if args.no_verify_signatures {

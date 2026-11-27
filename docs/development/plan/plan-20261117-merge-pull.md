@@ -580,7 +580,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-27: 对齐 `merge --squash` 与 `--no-ff` 组合拒绝及 `--squash --ff-only`（#985）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--squash` 与最终生效的 `--no-ff`/`merge.ff=false` 在任何写入前以 Git 文案拒绝；`--squash --ff-only` 暂存且不移动 HEAD；merge 317/318，唯一失败为既有 crisscross GC 用例。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 自 `MP-01` 拆出：`--squash` 与最终生效的 `--no-ff`（命令行或 `merge.ff=false`）组合以 Git 文案 `options '--squash' and '--no-ff.' cannot be used together` 在任何写入前拒绝；`--squash --ff-only` 在可快进时照常暂存 squash 结果且不移动 HEAD。
 
@@ -619,7 +619,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC8）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::squash_no_ff_rejected_and_ff_only_allowed)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::squash_no_ff_rejected_and_ff_only_allowed)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`squash_no_ff_rejected_and_ff_only_allowed`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `MP-33`, `DEP-MP-06`, `DEP-MP-10`
