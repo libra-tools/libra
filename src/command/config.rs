@@ -3854,8 +3854,14 @@ async fn handle_get(
             let prefix = origin_scope
                 .map(|s| read_record_prefix(s, show_origin, show_scope))
                 .unwrap_or_else(|| {
-                    if default_applied && show_origin {
-                        "command line:".to_string()
+                    if default_applied {
+                        if show_scope {
+                            "command".to_string()
+                        } else if show_origin {
+                            "command line:".to_string()
+                        } else {
+                            String::new()
+                        }
                     } else {
                         String::new()
                     }
@@ -4498,7 +4504,11 @@ fn quote_origin_path(path: &Path) -> String {
 
 fn read_record_prefix(scope: ConfigScope, show_origin: bool, show_scope: bool) -> String {
     if show_scope {
-        return scope_name(scope).to_string();
+        let name = scope_name(scope);
+        if show_origin && let Some(path) = scope_origin_path(scope) {
+            return format!("{name}\tfile:{}", quote_origin_path(&path));
+        }
+        return name.to_string();
     }
     if show_origin && let Some(path) = scope_origin_path(scope) {
         return format!("file:{}", quote_origin_path(&path));

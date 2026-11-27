@@ -330,3 +330,123 @@ fn test_show_origin_matrix() {
         }
     }
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_show_scope_matrix() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], &repo),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "scope.key", "local"], &repo),
+        "local",
+    );
+    let get = run_libra_command(
+        &["config", "--local", "--show-scope", "--get", "scope.key"],
+        &repo,
+    );
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "local\tlocal");
+    let default = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--show-scope",
+            "--default",
+            "d",
+            "--get",
+            "scope.missing",
+        ],
+        &repo,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&default.stdout).trim(),
+        "command\td"
+    );
+
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("xdg");
+    let global = temp.path().join("global-dir").join("config.db");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    let global_envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", global.to_str().unwrap()),
+    ];
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["config", "--global", "scope.key", "global"],
+            &repo,
+            &global_envs,
+        ),
+        "global",
+    );
+    let list =
+        run_libra_command_with_env(&["config", "--show-scope", "--list"], &repo, &global_envs);
+    assert_cli_success(&list, "show-scope list");
+    let list_text = String::from_utf8_lossy(&list.stdout);
+    let lines: Vec<&str> = list_text.lines().collect();
+    let global_idx = lines
+        .iter()
+        .position(|line| line.contains("scope.key=global"))
+        .expect("global line");
+    let local_idx = lines
+        .iter()
+        .position(|line| line.contains("scope.key=local"))
+        .expect("local line");
+    assert!(global_idx < local_idx, "global before local: {lines:?}");
+    assert!(lines.iter().all(|line| line.contains('\t')));
+    let combined = run_libra_command_with_env(
+        &[
+            "config",
+            "--local",
+            "--show-scope",
+            "--show-origin",
+            "--get",
+            "scope.key",
+        ],
+        &repo,
+        &global_envs,
+    );
+    let combined_text = String::from_utf8_lossy(&combined.stdout);
+    let fields: Vec<&str> = combined_text.trim().split('\t').collect();
+    assert_eq!(fields.len(), 3, "{combined_text}");
+    assert_eq!(fields[0], "local");
+    assert!(fields[1].starts_with("file:"));
+    assert_eq!(fields[2], "local");
+    let nul = run_libra_command_with_env(
+        &["config", "-z", "--show-scope", "--list"],
+        &repo,
+        &global_envs,
+    );
+    assert!(
+        nul.stdout
+            .windows(b"global\0scope.key\nglobal\0".len())
+            .any(|window| window == b"global\0scope.key\nglobal\0"),
+        "{:?}",
+        nul.stdout
+    );
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_t1300_show_scope() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "t.k", "v"], repo.path()),
+        "set",
+    );
+    let out = run_libra_command(
+        &["config", "--local", "--show-scope", "--get", "t.k"],
+        repo.path(),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "local\tv");
+}

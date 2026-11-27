@@ -384,3 +384,5 @@ validation JSON envelope keeps the overridden exit code.
 get --default prints the default when the pattern misses.
 
 show-origin prefixes file colon and a TAB.
+
+show-scope prints the scope name and a TAB.
