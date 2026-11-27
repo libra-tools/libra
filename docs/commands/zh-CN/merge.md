@@ -271,7 +271,7 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 | `--continue` | 在冲突已解决并暂存后完成进行中的非 squash 合并，使用 merge 状态记录的 parent 集合。squash 没有可继续的 merge 状态。 |
 | `--abort` | 恢复进行中的非 squash 合并开始前的 HEAD、索引和工作树。`--squash` 后不可用。 |
 | `--quit` | 忘记进行中的非 squash merge，但不重置 HEAD、索引或工作树。它只删除 merge state，故冲突 stage 与 marker 文件保持原样。held autostash 会转存为可见 stash，不会回贴；`--quit` 不接受分支或其它 merge 选项。 |
-| `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；非 squash 冲突期间 held 在 `stash list` 之外，直到 `--continue`/`--abort`，或由 `--quit` 转存进可见 stash list。干净的 squash 在命令返回时尝试恢复；冲突 squash 则直接把 autostash 保存进 `stash list`，不执行回贴，保留未解决的索引和工作树。解决并提交 squash 后再运行 `libra stash pop`；保存失败时警告并保留 held sidecar 对原改动的引用。恢复冲突会先保存到普通 stash list 并提示，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
+| `--autostash` / `--no-autostash` | 合并前保存本地 tracked 变更，并在结束时分别恢复 staged index 与 unstaged worktree 层；非 squash 冲突期间 held 在 `stash list` 之外，直到 `--continue`/`--abort`，或由 `--quit` 转存进可见 stash list。干净的 squash 在命令返回时尝试恢复；冲突 squash 则直接把 autostash 保存进 `stash list`，不执行回贴，保留未解决的索引和工作树。解决并提交 squash 后再运行 `libra stash pop`；保存失败时警告并保留 held sidecar 对原改动的引用。恢复冲突会输出 `Your local changes are stashed, however applying them resulted in conflicts.`，先保存到普通 stash list，变更不会丢失。配置项为 `merge.autostash`（布尔；无效值硬错误）；不保存 untracked 文件。`--json` 增加 `autostash: applied\|stashed\|kept`。 |
 | `--dry-run` | Libra 扩展：预演合并结果而不写任何东西（见上文）。干净预演退出 0，会冲突退出 1。与 `--continue`/`--abort`/`--quit`/`--restart`/`--squash`/`--no-commit`/`--edit` 互斥。 |
 | `--restart` | Libra 扩展：对有冲突的非 squash 合并，像 `--abort` 一样恢复合并前状态（丢弃解决工作）后，立刻对记录的目标提交与所选策略重跑同一合并（见上文）。不接受分支与合并选项。 |
 | `--json` | 输出结构化成功信封。实际运行了后端时，`selected_strategy` 指明具体后端；既有 `strategy` 仍是结果类别。 |
