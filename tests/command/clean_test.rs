@@ -1488,3 +1488,44 @@ fn clean_double_force_nested_repo() {
     assert_cli_success(&compact, "-ffd");
     assert!(!root.join("foo").exists());
 }
+
+#[test]
+#[serial(cwd)]
+fn clean_require_force_config() {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    let repo = tempdir().unwrap();
+    let root = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], root), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "clean.requireForce", "false"], root),
+        "set false",
+    );
+    fs::write(root.join("untracked.txt"), "x").unwrap();
+    let allowed = run_libra_command(&["clean"], root);
+    assert_cli_success(&allowed, "clean without force when config false");
+    assert!(!root.join("untracked.txt").exists());
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "clean.requireForce", "true"], root),
+        "set true",
+    );
+    fs::write(root.join("untracked.txt"), "x").unwrap();
+    let rejected = run_libra_command(&["clean"], root);
+    assert_eq!(rejected.status.code(), Some(129));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("clean requires -f or -n"));
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "clean.requireForce", "maybe"], root),
+        "set invalid",
+    );
+    let invalid = run_libra_command(&["clean", "-f"], root);
+    assert_eq!(invalid.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        stderr.contains("bad boolean config value 'maybe' for 'clean.requireforce'"),
+        "{stderr}"
+    );
+}

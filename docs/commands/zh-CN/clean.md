@@ -187,3 +187,5 @@ clean honors core.excludesfile case-insensitively.
 clean skips untracked directories without -d.
 
 clean -ff removes nested repositories with -d.
+
+clean honors clean.requireForce.

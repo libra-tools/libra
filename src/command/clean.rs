@@ -71,6 +71,8 @@ enum CleanError {
     MissingMode,
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
+    #[error("{0}")]
+    Config(String),
     #[error("failed to load index: {0}")]
     LoadIndex(String),
     #[error("{0}")]
@@ -164,7 +166,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
             )))
         })?;
 
-    let clean_output = run_clean(args, pathspecs).map_err(clean_cli_error)?;
+    let clean_output = run_clean(args, pathspecs).await.map_err(clean_cli_error)?;
 
     if output.is_json() {
         emit_json_data("clean", &clean_output, output)?;
@@ -186,8 +188,27 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
     Ok(())
 }
 
-fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOutput, CleanError> {
-    if args.force == 0 && !args.dry_run {
+async fn run_clean(
+    args: CleanArgs,
+    pathspecs: Option<PathspecSet>,
+) -> Result<CleanOutput, CleanError> {
+    let require_force = match crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        "clean.requireForce",
+    )
+    .await
+    {
+        Ok(Some(value)) => {
+            crate::internal::config::parse_git_config_bool(&value).ok_or_else(|| {
+                CleanError::Config(format!(
+                    "bad boolean config value '{value}' for 'clean.requireforce'"
+                ))
+            })?
+        }
+        Ok(None) => true,
+        Err(error) => return Err(CleanError::Config(error.to_string())),
+    };
+    if require_force && args.force == 0 && !args.dry_run {
         return Err(CleanError::MissingMode);
     }
 
@@ -556,6 +577,9 @@ fn clean_cli_error(error: CleanError) -> CliError {
             CliError::fatal(format!("invalid arguments: {message}"))
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
         }
+        CleanError::Config(message) => CliError::fatal(message)
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_exit_code(128),
         CleanError::LoadIndex(message) => {
             CliError::fatal(format!("failed to load index: {message}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)

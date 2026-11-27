@@ -739,7 +739,7 @@ PY
 ### Task WC-05: 支持 `clean.requireForce` 配置（#736）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：clean 级联读取 `clean.requireForce`（默认 true），false/true/非法值行为与 Git 对齐；新增 `clean_require_force_config`；clean 40/40。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 在 `clean` 执行前级联读取 `clean.requireForce`（默认 `true`）；当显式设为 `false`/`no`/`off` 时允许不带 `-f`/`-n` 执行清理。已拆出 `WC-05a`。
 **Out of scope:** `-e` 目录前缀匹配（`WC-05a`）。
 
@@ -751,12 +751,12 @@ PY
 | Git 以规范化小写键比较（`strcmp(var, "clean.requireforce")`），非法值报 `fatal: bad boolean config value 'maybe' for 'clean.requireforce'`（2026-11-18 以 git 2.54.0 实测，exit 128）；Libra 既有 `core.filemode` 诊断同样输出小写键名 | 上游 `git@750f5de7` `builtin/clean.c:132`、`config.c:1331`；`src/internal/config.rs:1829` |
 
 **Acceptance criteria:**
-- [ ] AC1：`clean.requireForce` 为 `no`、`off` 或 `0`（各值分别验证）时 `libra clean`（无 `-f`/`-n`）按 `clean -f` 语义清理未跟踪文件。
-- [ ] AC2：`clean.requireForce=false` 时结果同 AC1。
-- [ ] AC3：未设置时 `libra clean` 按既有契约拒绝（exit 129、`fatal: clean requires -f or -n`、`Error-Code: LBR-CLI-002`；上游 `t7300#23`）。
-- [ ] AC4：`clean.requireForce=true` 时结果同 AC3（上游 `t7300#24`）。
-- [ ] AC5：非法布尔值（`clean.requireForce=maybe`）时非零退出且 stderr 含 `bad boolean config value 'maybe' for 'clean.requireforce'`，同时未跟踪文件保留（fail-closed；键名按 Git 输出规范化小写形式）。
-- [ ] AC6：`clean.requireForce=false` 且不带 `-f`/`-n` 时按单 force 处理嵌套仓库：`libra clean -d` 与 `libra clean nested/` 两种形态都保留嵌套仓库内全部文件且内容不变（配置豁免不等同双 force）。
+- [x] AC1：`clean.requireForce` 为 `no`、`off` 或 `0`（各值分别验证）时 `libra clean`（无 `-f`/`-n`）按 `clean -f` 语义清理未跟踪文件。（`clean_require_force_config`）
+- [x] AC2：`clean.requireForce=false` 时结果同 AC1。（`clean_require_force_config`）
+- [x] AC3：未设置时 `libra clean` 按既有契约拒绝（exit 129、`fatal: clean requires -f or -n`、`Error-Code: LBR-CLI-002`；上游 `t7300#23`）。（`clean_require_force_config`）
+- [x] AC4：`clean.requireForce=true` 时结果同 AC3（上游 `t7300#24`）。（`clean_require_force_config`）
+- [x] AC5：非法布尔值（`clean.requireForce=maybe`）时非零退出且 stderr 含 `bad boolean config value 'maybe' for 'clean.requireforce'`，同时未跟踪文件保留（fail-closed；键名按 Git 输出规范化小写形式）。（`clean_require_force_config`）
+- [x] AC6：`clean.requireForce=false` 且不带 `-f`/`-n` 时按单 force 处理嵌套仓库：`libra clean -d` 与 `libra clean nested/` 两种形态都保留嵌套仓库内全部文件且内容不变（配置豁免不等同双 force）。（`clean_require_force_config`）
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -770,8 +770,8 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::clean_test::clean_require_force_config)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC6）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::clean_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`clean_require_force_config`（通过）
+- [x] 共享回归组：`command::clean_test`（40/40）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-04a`, `DEP-WC-05`
