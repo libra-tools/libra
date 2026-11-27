@@ -1655,7 +1655,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-43: 由 `merge --continue` 应用并清理 `MERGE_AUTOSTASH`（#991）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--continue` 既有路径已使用预检 held autostash 快照并调用 `resolve_pending_autostash_with`；补齐 AC1–AC5 用例，验证合并树不含本地修改、工作树恢复、stderr `Applied autostash.`、sidecar 删除。C 组 patch +1。偏差：merge 模块 319/320，唯一失败为既有 GC/restart 用例；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-10` 拆出：`libra merge --continue` 完成停在提交前的合并时，与 `libra commit` 一致按三方逻辑应用 `merge-autostash.json` 记录的 autostash、在 stderr 输出 `Applied autostash.` 并删除 sidecar。
 
@@ -1688,8 +1688,8 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC5）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::merge_autostash_applied_by_continue)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::merge_autostash_applied_by_continue)'` 须恰好列出该 1 条）
-- [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
+- [x] 卡特有用例：`merge_autostash_applied_by_continue`（通过）
+- [x] 共享回归组：merge_test 320 条，319 通过；唯一失败为既有 `merge_crisscross_gc_reclaims_the_virtual_ancestor_and_restart_recovers`（GC/restart 回归，与本卡无关）
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `MP-10`, `DEP-MP-10`
 

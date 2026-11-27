@@ -297,3 +297,5 @@ merge --no-commit still fast-forwards.
 merge combines --strategy with --strategy-option.
 
 merge rejects squash with no-ff and allows squash ff-only.
+
+merge --continue applies and clears a held MERGE_AUTOSTASH.

@@ -14933,3 +14933,24 @@ fn merge_autostash_rev_parse_pseudo_ref() {
     let missing = run_libra_command(&["rev-parse", "MERGE_AUTOSTASH"], root);
     assert!(!missing.status.success());
 }
+
+#[test]
+fn merge_autostash_applied_by_continue() {
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    std::fs::write(p.join("base.txt"), "local dirty\n").unwrap();
+    let started = run_libra_command(&["merge", "--no-commit", "--autostash", "feature"], p);
+    assert_cli_success(&started, "no-commit merge");
+    assert!(p.join(".libra/merge-autostash.json").exists());
+    let continued = run_libra_command(&["merge", "--continue", "-m", "done"], p);
+    assert_cli_success(&continued, "merge --continue");
+    assert!(String::from_utf8_lossy(&continued.stderr).contains("Applied autostash."));
+    assert_eq!(commit_parents(p).len(), 2);
+    let tree = run_libra_command(&["show", "--format=", "HEAD:base.txt"], p);
+    assert_eq!(String::from_utf8_lossy(&tree.stdout), "base\n");
+    assert_eq!(
+        std::fs::read_to_string(p.join("base.txt")).unwrap(),
+        "local dirty\n"
+    );
+    assert!(!p.join(".libra/merge-autostash.json").exists());
+}
