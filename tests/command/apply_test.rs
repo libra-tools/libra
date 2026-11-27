@@ -715,3 +715,69 @@ fn apply_numstat_t4012() {
     assert_eq!(fs::read(root.join("a")).unwrap(), b"new-a\n");
     assert_eq!(fs::read(root.join("b")).unwrap(), b"\0\x01binary-new\0");
 }
+
+#[test]
+#[serial(cwd)]
+fn apply_stat_summary_binary_stdin() {
+    use std::fs;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    assert_cli_success(&run_libra_command(&["init", "--vault=false"], root), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "T"], root),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t.io"], root),
+        "email",
+    );
+    fs::write(root.join("a"), "old-a\nkeep-a\n").unwrap();
+    fs::write(root.join("b"), b"\0\x01old-b\0").unwrap();
+    fs::write(root.join("c"), "old-c\nkeep-c\n").unwrap();
+    fs::write(root.join("d"), b"\0\x02old-d\0").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "a", "b", "c", "d"], root),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init"], root),
+        "commit",
+    );
+    fs::write(root.join("a"), "new-a\nkeep-a\n").unwrap();
+    fs::write(root.join("b"), b"\0\x01new-b\0").unwrap();
+    fs::write(root.join("c"), "new-c\nkeep-c\n").unwrap();
+    fs::write(root.join("d"), b"\0\x02new-d\0").unwrap();
+    let diff = run_libra_command(&["diff", "--binary"], root);
+    assert_cli_success(&diff, "diff --binary");
+    let before = run_libra_command(&["status", "--porcelain"], root);
+    let stat = run_libra_command_with_stdin(
+        &["apply", "--stat", "--summary"],
+        root,
+        &String::from_utf8_lossy(&diff.stdout),
+    );
+    assert_cli_success(&stat, "apply --stat --summary");
+    assert_eq!(
+        String::from_utf8_lossy(&stat.stdout),
+        " a |    2 +-\n b |  Bin\n c |    2 +-\n d |  Bin\n 4 files changed, 2 insertions(+), 2 deletions(-)\n"
+    );
+    let after = run_libra_command(&["status", "--porcelain"], root);
+    assert_eq!(before.stdout, after.stdout, "stat/summary must not apply");
+
+    fs::write(root.join("e"), "new-file\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-N", "e"], root), "intent add");
+    let new_diff = run_libra_command(&["diff", "--binary", "--", "e"], root);
+    assert_cli_success(&new_diff, "new file diff");
+    fs::remove_file(root.join("e")).unwrap();
+    let applied = run_libra_command_with_stdin(
+        &["apply", "--summary", "--apply"],
+        root,
+        &String::from_utf8_lossy(&new_diff.stdout),
+    );
+    assert_cli_success(&applied, "apply summary --apply");
+    assert_eq!(
+        String::from_utf8_lossy(&applied.stdout),
+        " create mode 100644 e\n"
+    );
+    assert_eq!(fs::read(root.join("e")).unwrap(), b"new-file\n");
+}

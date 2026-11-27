@@ -2287,3 +2287,5 @@ clean -e matches directory and basename prefixes.
 mv renames a directory to a new nonexistent path.
 
 apply --numstat matches t4012 binary and text output.
+
+apply --stat --summary aligns binary entries with git.

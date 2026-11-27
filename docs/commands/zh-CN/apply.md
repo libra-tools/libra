@@ -63,3 +63,5 @@ git format-patch -1 --stdout | libra apply --check
 仍未实现：`--unidiff-zero`、部分 `--whitespace`/`--reject` 细节。
 
 apply --numstat matches t4012 binary and text output.
+
+apply --stat --summary aligns binary entries with git.

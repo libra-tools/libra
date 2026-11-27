@@ -705,9 +705,11 @@ fn format_apply_stat(patch_text: &str, strip: u32) -> String {
         files += 1;
         if entry.binary {
             out.push_str(&format!(
-                " {:<name_width$} | Bin\n",
+                " {:<name_width$} | {:>count_width$}\n",
                 entry.target,
-                name_width = name_width
+                "Bin",
+                name_width = name_width,
+                count_width = count_width
             ));
             continue;
         }

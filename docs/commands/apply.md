@@ -101,3 +101,5 @@ does not pre-check that the index matches (Git refuses first), and conflict
 markers are written with a warning + exit 1 like Git.
 
 apply --numstat matches t4012 binary and text output.
+
+apply --stat --summary aligns binary entries with git.

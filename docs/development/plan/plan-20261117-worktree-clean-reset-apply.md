@@ -995,7 +995,7 @@ PY
 ### Task WC-08: 核对并补全 `libra apply --stat --summary` 二进制输入兼容（#831）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--stat --summary` 的二进制条目按 Git 宽度右对齐；新增 stdin 二进制组合与新建文件 summary/apply 测试；apply 22/22。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 核对 `apply.rs` 在同时传入 `--stat --summary` 且从 stdin 读取二进制补丁（`t/t4012-diff-binary.sh#2`）时的合并输出格式，修复与 Git 预期输出的任何偏差并补齐回归用例，按 `implementation` 卡完成代码核验/修复、测试与文档同步。
 **Out of scope:** `--binary`（`WC-09`）。
 
@@ -1007,10 +1007,10 @@ PY
 | `libra diff --no-index /dev/null <file>` 把 `/dev/null` 当作存在的空文件，输出不含 `new file mode` 的修改补丁，故 AC3 的创建补丁以字面量构造 | `src/command/diff.rs:970-975,1099-1104` |
 
 **Acceptance criteria:**
-- [ ] AC1：同一 `t4012` fixture 下 `libra apply --stat --summary < diff` 输出恰为 ` a |    2 +-`、` b |  Bin`、` c |    2 +-`、` d |  Bin`、` 4 files changed, 2 insertions(+), 2 deletions(-)` 五行（即上游 `t4012#2` / `TC-1163`）。
-- [ ] AC2：AC1 的执行不修改工作区与索引。
-- [ ] AC3：对新建文件 `e` 的补丁，`libra apply --summary --apply` 先输出 ` create mode 100644 e`。
-- [ ] AC4：AC3 的执行随后应用补丁使 `e` 存在且内容为 post 内容。
+- [x] AC1：同一 `t4012` fixture 下 `libra apply --stat --summary < diff` 输出恰为 ` a |    2 +-`、` b |  Bin`、` c |    2 +-`、` d |  Bin`、` 4 files changed, 2 insertions(+), 2 deletions(-)` 五行（即上游 `t4012#2` / `TC-1163`）（`apply_test::apply_stat_summary_binary_stdin`）。
+- [x] AC2：AC1 的执行不修改工作区与索引（`apply_test::apply_stat_summary_binary_stdin`）。
+- [x] AC3：对新建文件 `e` 的补丁，`libra apply --summary --apply` 先输出 ` create mode 100644 e`（`apply_test::apply_stat_summary_binary_stdin`）。
+- [x] AC4：AC3 的执行随后应用补丁使 `e` 存在且内容为 post 内容（`apply_test::apply_stat_summary_binary_stdin`）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -1022,8 +1022,8 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::apply_test::apply_stat_summary_binary_stdin)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC4）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::apply_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`apply_stat_summary_binary_stdin`（通过）
+- [x] 共享回归组：`command::apply_test`（22/22）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-07`, `DEP-WC-05`
