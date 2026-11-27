@@ -418,3 +418,5 @@ D-empty-message 已由 HF-06 实现
 放行的只读命令允许 JSON/机器输出；`branch` 仅无参数列表、`alternates` 仅 `list` 放行。被拒绝命令的写入能力等待 `DEFER-CL-02` 的真实指针布局适配，不做静默降级。
 
 - **PM-01 / GC-13 `symbolic_ref`**: migration `2026111702_symbolic_ref.sql` adds the Repository-only `symbolic_ref` table and four exclusivity triggers (`symbolic_ref_entity_{insert,update}_guard`, `reference_symbolic_{insert,update}_guard`). `reference` keeps `HEAD`/`refs/remotes/<remote>/HEAD` as `Head` rows; the `reference` UPDATE trigger is declared without an `OF` column list so any-column updates are judged on the updated row. Regression: `db_migration_test::symbolic_ref_migration_upgrade_contract` (AC1, AC7, AC8) and `db_migration_test::symbolic_ref_triggers_enforce_exclusivity` (AC2–AC6).
+
+#475 CF-07 explicit system list on a missing store exits 128.

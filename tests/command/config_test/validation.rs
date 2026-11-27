@@ -106,7 +106,9 @@ fn test_explicit_scope_missing_or_unreadable_store() {
     // ─────────────────────────────────────────────────────────────────────────
     // Y3: system store unreadable -> --system --get emits warning to stderr and exits 1
     // ─────────────────────────────────────────────────────────────────────────
-    let unreadable_sys = temp.path().join("unreadable_sys.db");
+    let system_dir = temp.path().join("system-dir");
+    fs::create_dir_all(&system_dir).unwrap();
+    let unreadable_sys = system_dir.join("unreadable_sys.db");
     fs::write(&unreadable_sys, b"placeholder").unwrap();
     fs::set_permissions(&unreadable_sys, fs::Permissions::from_mode(0o000)).unwrap();
     let unreadable_sys_str = unreadable_sys.to_str().unwrap();
@@ -249,7 +251,9 @@ fn test_cf_59_predicates() {
         &run_libra_command(&["config", "user.name", "local-user"], &repo),
         "set local user.name",
     );
-    let unreadable = temp.path().join("unreadable.db");
+    let system_dir = temp.path().join("system-dir");
+    fs::create_dir_all(&system_dir).unwrap();
+    let unreadable = system_dir.join("unreadable.db");
     fs::write(&unreadable, b"placeholder").unwrap();
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
     let out = run_libra_command_with_env(
@@ -395,7 +399,9 @@ fn test_cf_57_predicates() {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     assert_cli_success(&run_libra_command(&["init"], &repo), "init");
-    let missing = temp.path().join("missing-system.db");
+    let system_dir = temp.path().join("system-dir");
+    fs::create_dir_all(&system_dir).unwrap();
+    let missing = system_dir.join("missing-system.db");
     let out = run_libra_command_with_env(
         &["config", "--system", "--list"],
         &repo,
@@ -415,7 +421,9 @@ fn test_cf_58_predicates() {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     assert_cli_success(&run_libra_command(&["init"], &repo), "init");
-    let unreadable = temp.path().join("unreadable.db");
+    let system_dir = temp.path().join("system-dir");
+    fs::create_dir_all(&system_dir).unwrap();
+    let unreadable = system_dir.join("unreadable.db");
     fs::write(&unreadable, b"placeholder").unwrap();
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
     let out = run_libra_command_with_env(

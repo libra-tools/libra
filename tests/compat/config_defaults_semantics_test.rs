@@ -93,6 +93,7 @@ impl Fixture {
             .env("LIBRA_CONFIG_GLOBAL_DB", &global_db)
             .env("LIBRA_CONFIG_SYSTEM_DB", &system_db)
             .env("LIBRA_TEST", "1")
+            .env("LIBRA_STORAGE_BACKEND", "sqlite")
             .env("LANG", "C")
             .env("LC_ALL", "C");
         if let Some(profile_file) = std::env::var_os("LLVM_PROFILE_FILE") {

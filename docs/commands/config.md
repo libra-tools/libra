@@ -1275,3 +1275,5 @@ type=color prints an ANSI sequence.
 config get --value matches the legacy value pattern.
 
 legacy and subcommand config entries match.
+
+explicit system list on a missing store exits 128.
