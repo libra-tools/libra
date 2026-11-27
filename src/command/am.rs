@@ -139,19 +139,35 @@ struct AmPayload {
 #[derive(Clone, Debug)]
 struct AmState {
     head_name: String,
-    head_orig: ObjectHash,
-    expected_head: ObjectHash,
+    head_orig: Option<ObjectHash>,
+    expected_head: Option<ObjectHash>,
     payload: AmPayload,
 }
 
 impl AmState {
+    fn head_orig(&self) -> CliResult<ObjectHash> {
+        self.head_orig
+            .ok_or_else(|| am_state_error("saved am original HEAD is missing".to_string()))
+    }
+
+    fn expected_head(&self) -> CliResult<ObjectHash> {
+        self.expected_head
+            .ok_or_else(|| am_state_error("saved am expected HEAD is missing".to_string()))
+    }
+
     fn to_sequence(&self) -> CliResult<AmSequenceState> {
         let payload = serde_json::to_string(&self.payload)
             .map_err(|error| am_state_error(format!("failed to serialize am state: {error}")))?;
         Ok(AmSequenceState {
             head_name: self.head_name.clone(),
-            head_orig: self.head_orig.to_string(),
-            current_oid: self.expected_head.to_string(),
+            head_orig: crate::internal::sequencer::encode_optional_oid(
+                git_internal::hash::get_hash_kind(),
+                self.head_orig,
+            ),
+            current_oid: crate::internal::sequencer::encode_optional_oid(
+                git_internal::hash::get_hash_kind(),
+                self.expected_head,
+            ),
             todo: self.payload.patches[self.payload.current.saturating_add(1)..]
                 .iter()
                 .map(|mail| mail.source.clone())
@@ -161,11 +177,13 @@ impl AmState {
     }
 
     fn from_sequence(sequence: AmSequenceState) -> CliResult<Self> {
-        let head_orig = crate::internal::object_format::parse_repo_oid(sequence.head_orig.trim())
-            .map_err(|error| {
-            am_state_error(format!("saved am original HEAD is invalid: {error}"))
-        })?;
-        let expected_head = crate::internal::object_format::parse_repo_oid(
+        let head_orig = crate::internal::sequencer::decode_optional_oid(
+            git_internal::hash::get_hash_kind(),
+            sequence.head_orig.trim(),
+        )
+        .map_err(|error| am_state_error(format!("saved am original HEAD is invalid: {error}")))?;
+        let expected_head = crate::internal::sequencer::decode_optional_oid(
+            git_internal::hash::get_hash_kind(),
             sequence.current_oid.trim(),
         )
         .map_err(|error| am_state_error(format!("saved am expected HEAD is invalid: {error}")))?;
@@ -291,8 +309,8 @@ async fn start_am(paths: &[String], three_way: bool, output: &OutputConfig) -> C
         })?;
     let mut state = AmState {
         head_name,
-        head_orig,
-        expected_head: head_orig,
+        head_orig: Some(head_orig),
+        expected_head: Some(head_orig),
         payload: AmPayload {
             patches,
             current: 0,
@@ -390,9 +408,9 @@ async fn abort_am(output: &OutputConfig) -> CliResult<AmOutput> {
         .await
         .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?
         .ok_or_else(|| am_state_error("HEAD disappeared during am".to_string()))?;
-    if current_head != state.expected_head
-        && crate::internal::merge_base::is_ancestor(&state.expected_head, &current_head)
-            .unwrap_or(false)
+    let expected_head = state.expected_head()?;
+    if current_head != expected_head
+        && crate::internal::merge_base::is_ancestor(&expected_head, &current_head).unwrap_or(false)
     {
         return Err(CliError::fatal(
             "the branch gained commits since am paused; refusing to discard them with a \
@@ -401,12 +419,12 @@ async fn abort_am(output: &OutputConfig) -> CliResult<AmOutput> {
         .with_stable_code(StableErrorCode::RepoStateInvalid)
         .with_hint(format!(
             "keep them: move the branch back to the paused tip first ('libra reset --hard {}'), then re-run 'libra am --abort' or '--skip'",
-            short_display_hash(&state.expected_head.to_string())
+            short_display_hash(&expected_head.to_string())
         ))
         .with_hint("the new commits stay reachable via the reflog either way"));
     }
     let current_targets = state.payload.patches[state.payload.current].targets.clone();
-    let restored = state.head_orig.to_string();
+    let restored = state.head_orig()?.to_string();
     reset_hard(&restored, output).await?;
     cleanup_untracked_patch_targets(&current_targets)?;
     sequencer::clear_am()
@@ -543,7 +561,7 @@ async fn commit_current(state: &mut AmState, mail: MailPatch) -> CliResult<Appli
         .await
         .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?
         .ok_or_else(|| am_state_error("HEAD disappeared during am".to_string()))?;
-    if parent != state.expected_head {
+    if parent != state.expected_head()? {
         return Err(am_head_moved(state, parent));
     }
     let (author, committer, _) =
@@ -566,7 +584,7 @@ async fn commit_current(state: &mut AmState, mail: MailPatch) -> CliResult<Appli
 
     let mut next = state.clone();
     next.payload.current += 1;
-    next.expected_head = commit.id;
+    next.expected_head = Some(commit.id);
     let next_sequence = if next.payload.current < next.payload.patches.len() {
         Some(next.to_sequence()?)
     } else {
@@ -1299,7 +1317,7 @@ async fn ensure_expected_head(state: &AmState) -> CliResult<()> {
         .await
         .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?
         .ok_or_else(|| am_state_error("HEAD disappeared during am".to_string()))?;
-    if current != state.expected_head {
+    if current != state.expected_head()? {
         return Err(am_head_moved(state, current));
     }
     Ok(())
@@ -1309,7 +1327,11 @@ fn am_head_moved(state: &AmState, current: ObjectHash) -> CliError {
     CliError::conflict(format!(
         "branch '{}' moved during am (expected {}, found {})",
         state.head_name,
-        short_display_hash(&state.expected_head.to_string()),
+        short_display_hash(
+            &state
+                .expected_head
+                .map_or_else(|| "<missing>".to_string(), |oid| oid.to_string()),
+        ),
         short_display_hash(&current.to_string())
     ))
     .with_hint("restore the expected branch tip before continuing or skipping")
@@ -1456,7 +1478,7 @@ mod tests {
 
     use serial_test::serial;
 
-    use super::resolve_three_way_bases;
+    use super::*;
     use crate::utils::{
         error::StableErrorCode,
         test::{ChangeDirGuard, setup_with_new_libra_in},
@@ -1526,5 +1548,48 @@ index abcdef01..0123456789abcdef0123456789abcdef01234567 100644
                 && !rendered.contains("not found"),
             "{rendered}"
         );
+    }
+    #[test]
+    fn am_state_unborn_encoding_wiring() {
+        let payload = AmPayload {
+            patches: vec![MailPatch {
+                source: "0001.patch".to_string(),
+                author: "A <a@b>".to_string(),
+                author_date: "0 +0000".to_string(),
+                message: "m".to_string(),
+                patch: "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+x\n".to_string(),
+                targets: vec!["f".to_string()],
+            }],
+            current: 0,
+            three_way: false,
+            paused_in_conflict: false,
+        };
+        let unborn = AmState {
+            head_name: "main".to_string(),
+            head_orig: None,
+            expected_head: None,
+            payload: payload.clone(),
+        };
+        let sequence = unborn.to_sequence().expect("encode unborn");
+        assert!(sequence.head_orig.bytes().all(|b| b == b'0'));
+        assert!(sequence.current_oid.bytes().all(|b| b == b'0'));
+        let decoded = AmState::from_sequence(sequence).expect("decode unborn");
+        assert_eq!(decoded.head_orig, None);
+        assert_eq!(decoded.expected_head, None);
+
+        let oid = crate::internal::object_format::digest(
+            git_internal::hash::get_hash_kind(),
+            b"am-state-test",
+        );
+        let born = AmState {
+            head_name: "main".to_string(),
+            head_orig: Some(oid),
+            expected_head: Some(oid),
+            payload,
+        };
+        let decoded =
+            AmState::from_sequence(born.to_sequence().expect("encode born")).expect("decode born");
+        assert_eq!(decoded.head_orig, Some(oid));
+        assert_eq!(decoded.expected_head, Some(oid));
     }
 }

@@ -1704,7 +1704,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-09b: `am` 状态字段接入全零编解码（#907 前置）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`AmState.head_orig`/`expected_head` 改为 `Option<ObjectHash>`，to/from_sequence 接入共享全零编解码；新增 unborn/出生 wiring 单测；am 单测 2/2、compat am 46/46。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 自 `SA-09` 拆出（`REL-SA-02` 家族子卡 2/8，只做本地签名+DCO 提交）：按 `ADR-SA-02` 把 `AmState.head_orig`、`AmState.expected_head` 改为 `Option<ObjectHash>`，`to_sequence`/`from_sequence` 改为调用 `SA-09f` 在 `src/internal/sequencer/mod.rs` 新增的共享编解码函数（`None` ↔ `ObjectHash::zero_str(kind)`，非零值经 `parse_hex_for_kind(kind, …)` 严格解析），不改变用户可见行为（unborn 拒绝由 `SA-09` 移除）。`am` 每次开始都先以 `claim_start` 持久化状态（`src/command/am.rs:303-304`），故 unborn 上的成功路径也需要本卡的全零编码。
 **Out of scope:** unborn 分支上的 `am` 行为（由 `SA-09`、`SA-09a`、`SA-09e`、`SA-09g` 承接）；共享编解码函数本身与其两种长度、非法输入覆盖（由 `SA-09f` 承接）。
 
@@ -1731,7 +1731,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 
 **Verification:**（按「验证执行协议」执行：nextest 精确过滤按第 1 条、发布点聚合守卫按第 1b 条；每项为 1 个独立门）
 
-- [ ] VER1 `source .env.test && cargo nextest run --lib --no-tests=fail -E 'test(=command::am::tests::am_state_unborn_encoding_wiring)'`（new；AC1–AC8）
+- [x] VER1 `am_state_unborn_encoding_wiring`（通过）
 
 **共享回归组（不计入 VER）:** `source .env.test && cargo nextest run --lib --no-tests=fail -E 'test(/^command::am::/)'`；`source .env.test && cargo nextest run --no-tests=fail --test compat_mail_am_basic`。
 **D 组:** 继承 `REL-SA-02` 的 D 组登记表（D5 由 `REL-SA-02` 的网站交付承担）。
