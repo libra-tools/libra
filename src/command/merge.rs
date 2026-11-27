@@ -9089,7 +9089,6 @@ fn ensure_no_overlapping_unstaged(
         .modified
         .into_iter()
         .chain(unstaged.deleted)
-        .map(PathBuf::from)
         .collect();
     let mut overlap: Vec<PathBuf> = dirty
         .into_iter()
