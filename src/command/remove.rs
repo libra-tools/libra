@@ -471,7 +471,7 @@ fn handle_broken_pipe() -> CliResult<()> {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             libc::raise(libc::SIGPIPE);
         }
-        return Err(CliError::silent_exit(broken_pipe_exit_code()));
+        Err(CliError::silent_exit(broken_pipe_exit_code()))
     }
     #[cfg(not(unix))]
     {
