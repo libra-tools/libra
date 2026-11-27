@@ -3322,16 +3322,19 @@ pub async fn resolve_object_spec_typed(name: &str) -> Result<ObjectHash, CommitB
 pub async fn resolve_object_spec_with_auto_merge_typed(
     name: &str,
 ) -> Result<ObjectHash, CommitBaseError> {
-    let auto_merge = crate::internal::pseudo_ref::PseudoRef::AutoMerge.name();
-    let suffix = name.strip_prefix(auto_merge);
-    if let Some(suffix) = suffix.filter(|suffix| {
-        suffix.is_empty() || matches!(suffix.as_bytes().first(), Some(b'^' | b'~' | b':'))
-    }) {
+    for pseudo in [
+        crate::internal::pseudo_ref::PseudoRef::AutoMerge,
+        crate::internal::pseudo_ref::PseudoRef::MergeAutostash,
+    ] {
+        let spelling = pseudo.name();
+        let Some(suffix) = name.strip_prefix(spelling) else {
+            continue;
+        };
+        if !(suffix.is_empty() || matches!(suffix.as_bytes().first(), Some(b'^' | b'~' | b':'))) {
+            continue;
+        }
         let refs = crate::internal::pseudo_ref::WorktreePseudoRefs::for_request();
-        return match refs
-            .resolve(crate::internal::pseudo_ref::PseudoRef::AutoMerge)
-            .await
-        {
+        return match refs.resolve(pseudo).await {
             Ok(Some(value)) => {
                 let projected_spec = format!("{}{suffix}", value.oid);
                 resolve_object_spec_typed(&projected_spec).await

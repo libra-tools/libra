@@ -1925,7 +1925,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-30: `rev-parse MERGE_AUTOSTASH` 伪引用接入（#991）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `MERGE_AUTOSTASH` 伪引用，按 sidecar 解析且仅 rev-parse 等 opt-in 读取；compat pseudo-ref 3/3、rev_parse 67/67；新增 merge 用例。C 组 patch +1。偏差：lib pseudo_ref 9/10，唯一失败为旧 SQLite fixture 遇默认 redb；用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 自 `MP-10` 拆出：按 `ADR-MP-04` 在 `src/internal/pseudo_ref.rs` 新增 `MergeAutostash` 变体（按需读取 `merge-autostash.json` 的 `stash_commit`，不另存状态），在 `rev-parse` 的显式 opt-in 解析（`src/utils/util.rs` 中与 `AUTO_MERGE` 并列）接入 `MERGE_AUTOSTASH`，并同步 `tests/compat/pseudo_ref_surface.rs` 的 `DECLARED`、`COMPATIBILITY.md` 第 277 行与 `rev-parse` 文档。（按 G-09 自本卡拆出 `MP-44`。）
 
@@ -1956,7 +1956,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC2）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::merge_autostash_rev_parse_pseudo_ref)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::merge_autostash_rev_parse_pseudo_ref)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`merge_autostash_rev_parse_pseudo_ref`（通过）
 - [ ] 卡特有判据（AC3，非 nextest 门）：`awk '/^const DECLARED/,/^\];/' tests/compat/pseudo_ref_surface.rs | rg -F -- '"MERGE_AUTOSTASH"'` 退出 0（1 = 缺失 → STOP；>1 = 命令失败 → STOP）。
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_pseudo_ref_surface`（整 target，伪引用声明面，本卡同步修改其 `DECLARED`（「验证执行协议」第 5 条）；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_pseudo_ref_surface` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::rev_parse_test::/)'`（`command::rev_parse_test` 模块族，守护 `rev-parse` 解析；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）

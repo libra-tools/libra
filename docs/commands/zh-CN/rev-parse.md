@@ -155,3 +155,5 @@ main
 | 无效工作树状态 | `LBR-REPO-003` | 128 |
 | 无法读取仓库元数据 | `LBR-IO-001` | 128 |
 | 存储的引用/配置损坏 | `LBR-REPO-002` | 128 |
+
+rev-parse resolves MERGE_AUTOSTASH while held.

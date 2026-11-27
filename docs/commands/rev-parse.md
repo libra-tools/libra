@@ -200,3 +200,5 @@ A short object name that matches multiple **distinct** objects fails with `error
 | Invalid work tree state | `LBR-REPO-003` | 128 |
 | Failed to read repository metadata | `LBR-IO-001` | 128 |
 | Corrupt stored refs/config | `LBR-REPO-002` | 128 |
+
+rev-parse resolves MERGE_AUTOSTASH while held.

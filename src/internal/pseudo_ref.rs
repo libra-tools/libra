@@ -54,6 +54,7 @@ pub enum PseudoRef {
     RebaseHead,
     FetchHead,
     AutoMerge,
+    MergeAutostash,
 }
 
 impl PseudoRef {
@@ -67,12 +68,13 @@ impl PseudoRef {
             Self::RebaseHead => "REBASE_HEAD",
             Self::FetchHead => "FETCH_HEAD",
             Self::AutoMerge => "AUTO_MERGE",
+            Self::MergeAutostash => "MERGE_AUTOSTASH",
         }
     }
 
     /// Every name this service answers for — the contract `rev-parse`'s
     /// refusal and the compatibility row are both derived from.
-    pub const ALL: [PseudoRef; 7] = [
+    pub const ALL: [PseudoRef; 8] = [
         PseudoRef::OrigHead,
         PseudoRef::MergeHead,
         PseudoRef::CherryPickHead,
@@ -80,6 +82,7 @@ impl PseudoRef {
         PseudoRef::RebaseHead,
         PseudoRef::FetchHead,
         PseudoRef::AutoMerge,
+        PseudoRef::MergeAutostash,
     ];
 
     /// Resolve a Git-spelled name, case-sensitively as Git does.
@@ -174,6 +177,7 @@ impl WorktreePseudoRefs {
             PseudoRef::RebaseHead => self.rebase_stopped().await,
             PseudoRef::FetchHead => Ok(self.fetch_head()?),
             PseudoRef::AutoMerge => Ok(self.auto_merge()?),
+            PseudoRef::MergeAutostash => Ok(self.merge_autostash()?),
         }
     }
 
@@ -269,6 +273,19 @@ impl WorktreePseudoRefs {
                     source: "merge-state.json",
                 })
             }),
+        )
+    }
+
+    /// `MERGE_AUTOSTASH` — the held autostash commit, available only while
+    /// `merge-autostash.json` exists for this worktree.
+    fn merge_autostash(&self) -> Result<Option<ResolvedPseudoRef>, String> {
+        Ok(
+            crate::command::merge::MergeAutostash::load_optional_sync_in_gitdir(self.gitdir()?)?
+                .map(|state| ResolvedPseudoRef {
+                    name: PseudoRef::MergeAutostash.name(),
+                    oid: state.stash_commit,
+                    source: "merge-autostash.json",
+                }),
         )
     }
 
@@ -1049,7 +1066,8 @@ mod tests {
                 "REVERT_HEAD",
                 "REBASE_HEAD",
                 "FETCH_HEAD",
-                "AUTO_MERGE"
+                "AUTO_MERGE",
+                "MERGE_AUTOSTASH"
             ]
         );
     }

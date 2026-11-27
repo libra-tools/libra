@@ -14916,3 +14916,20 @@ fn squash_no_ff_rejected_and_ff_only_allowed() {
     let status = run_libra_command(&["status", "--porcelain"], root);
     assert!(String::from_utf8_lossy(&status.stdout).contains("feature.txt"));
 }
+
+#[test]
+fn merge_autostash_rev_parse_pseudo_ref() {
+    use std::fs;
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    let head = run_libra_command(&["rev-parse", "HEAD"], root);
+    let oid = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let sidecar = root.join(".libra/merge-autostash.json");
+    fs::write(&sidecar, format!("{{\"stash_commit\":\"{oid}\"}}")).unwrap();
+    let out = run_libra_command(&["rev-parse", "MERGE_AUTOSTASH"], root);
+    assert_cli_success(&out, "rev-parse MERGE_AUTOSTASH");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), oid);
+    fs::remove_file(&sidecar).unwrap();
+    let missing = run_libra_command(&["rev-parse", "MERGE_AUTOSTASH"], root);
+    assert!(!missing.status.success());
+}

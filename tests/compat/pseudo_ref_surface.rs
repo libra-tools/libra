@@ -10,7 +10,7 @@ use std::process::Command;
 /// Every name the service declares, from `src/internal/pseudo_ref.rs`'s own
 /// table. Kept here as a literal on purpose: a guard that imported the list
 /// from the code under test could not notice the list changing.
-const DECLARED: [&str; 7] = [
+const DECLARED: [&str; 8] = [
     "ORIG_HEAD",
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
@@ -18,6 +18,7 @@ const DECLARED: [&str; 7] = [
     "REBASE_HEAD",
     "FETCH_HEAD",
     "AUTO_MERGE",
+    "MERGE_AUTOSTASH",
 ];
 
 const REJECTED: [&str; 6] = [
