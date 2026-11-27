@@ -2263,3 +2263,5 @@ config unset missing key exits 5.
 scoped regexp keeps upgrade.mode fail-closed only for global.
 
 already compatible config surface still passes.
+
+type=color prints an ANSI sequence.
