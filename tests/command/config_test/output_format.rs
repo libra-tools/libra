@@ -552,3 +552,67 @@ fn test_cf_106_predicates() {
         "zz.key 1\naa.key 2\naa.key 4\nmm.key 3"
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_04_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], &repo),
+        "init",
+    );
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("xdg");
+    let global = temp.path().join("global-dir").join("config.db");
+    let system = temp.path().join("system-dir").join("config.db");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::create_dir_all(system.parent().unwrap()).unwrap();
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", global.to_str().unwrap()),
+        ("LIBRA_CONFIG_SYSTEM_DB", system.to_str().unwrap()),
+    ];
+    assert_cli_success(
+        &run_libra_command_with_env(&["config", "--local", "order.k", "local"], &repo, &envs),
+        "local",
+    );
+    assert_cli_success(
+        &run_libra_command_with_env(&["config", "--local", "order.k2", "local2"], &repo, &envs),
+        "local2",
+    );
+    assert_cli_success(
+        &run_libra_command_with_env(&["config", "--global", "order.k", "global"], &repo, &envs),
+        "global",
+    );
+    let system_repo = temp.path().join("system-repo");
+    fs::create_dir_all(&system_repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], &system_repo),
+        "system init",
+    );
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["config", "--system", "order.k", "system"],
+            &system_repo,
+            &envs,
+        ),
+        "system",
+    );
+    // A no-scope list from the local repository reads all three stores.
+    let list = run_libra_command_with_env(&["config", "--list"], &repo, &envs);
+    assert_cli_success(&list, "no-scope list");
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert!(text.contains("order.k=local"), "{text}");
+    assert!(text.contains("order.k=global"), "{text}");
+    assert!(text.contains("order.k=system"), "{text}");
+    let local_pos = text.find("order.k=local").unwrap();
+    let local2_pos = text.find("order.k2=local2").unwrap();
+    assert!(local_pos < local2_pos, "insertion order: {text}");
+    for line in text.lines().filter(|line| line.contains("order.")) {
+        assert!(line.contains('='), "{line}");
+    }
+}
