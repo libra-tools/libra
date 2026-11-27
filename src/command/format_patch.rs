@@ -3178,20 +3178,15 @@ async fn resolve_from_identity(
 /// Returns an error when either key is missing so that `--signoff` never
 /// silently writes a false DCO trailer with a fallback identity.
 async fn resolve_signoff_identity() -> Result<(String, String), FormatPatchError> {
-    let name = read_format_config("user.name")
-        .await?
-        .filter(|value| !value.trim().is_empty());
-    let email = read_format_config("user.email")
-        .await?
-        .filter(|value| !value.trim().is_empty());
-
-    let detail = match (name, email) {
-        (Some(name), Some(email)) => return Ok((name, email)),
-        (None, Some(_)) => "user.name is not configured".to_string(),
-        (Some(_), None) => "user.email is not configured".to_string(),
-        (None, None) => "user.name and user.email are not configured".to_string(),
-    };
-    Err(FormatPatchError::IdentityMissing(detail))
+    let (_, identity) = crate::command::commit::create_committer_signature()
+        .await
+        .map_err(|error| FormatPatchError::IdentityMissing(error.to_string()))?;
+    if identity.name.trim().is_empty() || identity.email.trim().is_empty() {
+        return Err(FormatPatchError::IdentityMissing(
+            "user.name and user.email are not configured".to_string(),
+        ));
+    }
+    Ok((identity.name, identity.email))
 }
 
 #[cfg(test)]

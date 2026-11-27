@@ -749,6 +749,17 @@ pub(crate) async fn resolve_committer_identity() -> Result<UserIdentity, CommitE
         return Err(missing_identity_error(name_missing, email_missing));
     }
 
+    // An explicitly empty Git committer identity is a failure, not a signal to
+    // fall back to config (Git's environment overrides configuration).
+    if std::env::var_os("GIT_COMMITTER_NAME").is_some_and(|value| value.is_empty())
+        || std::env::var_os("GIT_COMMITTER_EMAIL").is_some_and(|value| value.is_empty())
+    {
+        return Err(missing_identity_error(
+            std::env::var_os("GIT_COMMITTER_NAME").is_some_and(|value| value.is_empty()),
+            std::env::var_os("GIT_COMMITTER_EMAIL").is_some_and(|value| value.is_empty()),
+        ));
+    }
+
     // Step 3: Git env vars override config; Libra-specific env vars remain a
     // lower-priority fallback for older automation.
     let (env_name, env_email) = committer_env_identity();

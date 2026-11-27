@@ -248,3 +248,5 @@ stdout follows Libra's normal quiet BrokenPipe behavior.
 ## Blake3 repositories
 
 When `core.objectformat` is `blake3`, `--base` prerequisite patch-ids are BLAKE3 digests (64 hex), not the SHA-1 Git-stable combiner used for SHA-1 repositories.
+
+format-patch signoff identity failures exit LBR-CLI-003.

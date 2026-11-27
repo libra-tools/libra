@@ -8711,3 +8711,60 @@ fn filename_max_length_git_parity() {
         "v4-0004-This-is-an-excessively-long-subject-line-for-a-me.patch"
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn signoff_identity_failures() {
+    let repo = repo_with_commits(1);
+    let out = tempdir().unwrap();
+    let out_path = out.path().to_str().unwrap().to_string();
+
+    let empty_committer = run_libra_command_with_env(
+        &["format-patch", "-s", "-o", &out_path, "HEAD~1"],
+        repo.path(),
+        &[("GIT_COMMITTER_NAME", "")],
+    );
+    assert!(!empty_committer.status.success());
+    assert!(empty_committer.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&empty_committer.stderr).contains("LBR-CLI-003"),
+        "{}",
+        String::from_utf8_lossy(&empty_committer.stderr)
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--unset", "user.email"], repo.path()),
+        "unset email",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.useConfigOnly", "true"], repo.path()),
+        "useConfigOnly",
+    );
+    let email_only = run_libra_command_with_env(
+        &["format-patch", "-s", "-o", &out_path, "HEAD~1"],
+        repo.path(),
+        &[("EMAIL", "m@x")],
+    );
+    assert!(!email_only.status.success());
+    assert!(email_only.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&email_only.stderr).contains("LBR-CLI-003"));
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--unset", "user.name"], repo.path()),
+        "unset name",
+    );
+    let missing = run_libra_command_with_env(
+        &["format-patch", "-s", "-o", &out_path, "HEAD~1"],
+        repo.path(),
+        &[
+            ("GIT_COMMITTER_NAME", ""),
+            ("GIT_COMMITTER_EMAIL", ""),
+            ("GIT_AUTHOR_NAME", ""),
+            ("GIT_AUTHOR_EMAIL", ""),
+            ("EMAIL", ""),
+        ],
+    );
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("LBR-CLI-003"));
+}

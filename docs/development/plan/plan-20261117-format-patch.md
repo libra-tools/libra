@@ -603,7 +603,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--signoff` 改用 committer 身份解析；空 GIT_COMMITTER_NAME、useConfigOnly 无邮箱、身份完全缺失均 LBR-CLI-003 且 stdout 为空；format-patch 177/177。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 自 `FPG-02` 拆出的独立轴：按 GC-01 核实 ADR-FP-07 的 3 类失败（`GIT_COMMITTER_NAME` 为空、`user.useConfigOnly=true` 下无提交者邮箱、身份完全缺失）均以 `LBR-CLI-003` 失败（沿用 `529 FP-11` 交付的退出码约定）且 stdout 为空。
 
@@ -633,7 +633,7 @@
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --test command_test --no-tests=fail -E 'test(=command::format_patch_test::signoff_identity_failures)'`（`(new)`；具名验收门，期望集合 N=1：`command::format_patch_test::signoff_identity_failures`；证明 AC1–AC3）
+- [x] `signoff_identity_failures`（通过）
 
 **共享回归组（ER-04 A 组 focused 门；按「验证执行协议」第 2 项执行，不计入 `VER`，不作卡特有 AC 证据）：**
 

@@ -2303,3 +2303,5 @@ reflog oneline output has no trailing blank line.
 initial pull into an unborn branch records initial pull.
 
 reinit warns with git's ignored initial-branch line.
+
+format-patch signoff identity failures exit LBR-CLI-003.
