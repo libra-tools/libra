@@ -431,3 +431,42 @@ fn test_cf_99_predicates() {
         String::from_utf8_lossy(&ambiguous.stderr)
     );
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_103_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "parity.k", "v"], repo.path()),
+        "seed",
+    );
+    let legacy_get = run_libra_command(&["config", "--get", "parity.k"], repo.path());
+    let sub_get = run_libra_command(&["config", "get", "parity.k"], repo.path());
+    assert_eq!(legacy_get.status.code(), sub_get.status.code());
+    assert_eq!(legacy_get.stdout, sub_get.stdout);
+
+    let legacy_list = run_libra_command(&["config", "--local", "--list"], repo.path());
+    let sub_list = run_libra_command(&["config", "list", "--local"], repo.path());
+    assert_eq!(legacy_list.status.code(), sub_list.status.code());
+    assert_eq!(legacy_list.stdout, sub_list.stdout);
+
+    let legacy_set = run_libra_command(&["config", "--local", "parity.k", "v2"], repo.path());
+    let sub_set = run_libra_command(&["config", "set", "--local", "parity.k", "v2"], repo.path());
+    assert_eq!(legacy_set.status.code(), sub_set.status.code());
+    assert_eq!(legacy_set.stdout, sub_set.stdout);
+    assert_eq!(legacy_set.stderr, sub_set.stderr);
+
+    let legacy_unset = run_libra_command(&["config", "--unset", "parity.k"], repo.path());
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "parity.sub", "v"], repo.path()),
+        "seed sub",
+    );
+    let sub_unset = run_libra_command(&["config", "unset", "parity.sub"], repo.path());
+    assert_eq!(legacy_unset.status.code(), sub_unset.status.code());
+    let normalize = |text: &[u8]| String::from_utf8_lossy(text).replace("parity.k", "parity.sub");
+    assert_eq!(
+        normalize(&legacy_unset.stdout),
+        String::from_utf8_lossy(&sub_unset.stdout)
+    );
+}

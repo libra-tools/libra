@@ -3503,6 +3503,26 @@ async fn handle_get(
         )));
     }
 
+    if !use_cascade
+        && scope != ConfigScope::Local
+        && let Some(path) = scope.get_config_path()
+        && path.exists()
+        && let Err(error) = std::fs::File::open(&path)
+    {
+        emit_warning(format!("unable to access '{}': {error}", path.display()));
+        if let Some(d) = default {
+            let d = apply_value_type(d.to_string(), value_type)?;
+            if !output.quiet {
+                if null {
+                    print!("{d}\0");
+                } else {
+                    println!("{d}");
+                }
+            }
+            return Ok(());
+        }
+        return Err(CliError::silent_exit(1));
+    }
     if regexp {
         regex::Regex::new(key).map_err(|error| {
             CliError::failure(format!("invalid key pattern '{key}': {error}"))
@@ -4645,6 +4665,19 @@ async fn handle_list(
     value_type: Option<ConfigValueType>,
     output: &OutputConfig,
 ) -> CliResult<()> {
+    if !use_cascade
+        && scope != ConfigScope::Local
+        && let Some(path) = scope.get_config_path()
+        && path.exists()
+        && let Err(error) = std::fs::File::open(&path)
+    {
+        emit_warning(format!("unable to access '{}': {error}", path.display()));
+        return Err(CliError::fatal(format!(
+            "unable to read config file '{}': {error}",
+            path.display()
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed));
+    }
     // `-z` defines NUL records for standard config key/value output only. The
     // `--ssh-keys` / `--gpg-keys` / `--vault` views are Libra-only formatted
     // summaries with no `key\nvalue\0` mapping, so reject the combination rather

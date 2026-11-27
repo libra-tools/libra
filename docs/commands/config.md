@@ -1273,3 +1273,5 @@ already compatible config surface still passes.
 type=color prints an ANSI sequence.
 
 config get --value matches the legacy value pattern.
+
+legacy and subcommand config entries match.
