@@ -1296,3 +1296,52 @@ fn clean_single_force_pathspec_keeps_nested_repos() {
         );
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn clean_relative_pathspec_prefix() {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    let repo = tempdir().unwrap();
+    let root = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], root), "init");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/part3.c"), "x").unwrap();
+    fs::write(root.join("src/local.c"), "x").unwrap();
+    fs::write(root.join("docs/here.c"), "x").unwrap();
+
+    let preview = run_libra_command(&["clean", "-n", "../src"], &root.join("docs"));
+    assert_cli_success(&preview, "clean -n ../src");
+    let text = String::from_utf8_lossy(&preview.stdout);
+    assert!(text.contains("Would remove ../src/part3.c"), "{text}");
+    assert!(text.contains("Would remove ../src/local.c"), "{text}");
+    assert!(!text.contains("here.c"), "{text}");
+
+    let local = run_libra_command(&["clean", "-n"], &root.join("src"));
+    assert_cli_success(&local, "clean -n cwd");
+    let text = String::from_utf8_lossy(&local.stdout);
+    assert!(text.contains("Would remove part3.c"), "{text}");
+    assert!(!text.contains("src/"), "{text}");
+
+    let force = run_libra_command(&["clean", "-f", "../src/part3.c"], &root.join("docs"));
+    assert_cli_success(&force, "clean -f");
+    assert!(String::from_utf8_lossy(&force.stdout).contains("Removing ../src/part3.c"));
+    let json = run_libra_command(
+        &["--json", "clean", "-n", "../src/local.c"],
+        &root.join("docs"),
+    );
+    assert_cli_success(&json, "json clean");
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    assert_eq!(parsed["data"]["removed"][0], "src/local.c");
+
+    fs::remove_file(root.join("src/local.c")).unwrap();
+    fs::write(root.join("src/part3.c"), "x").unwrap();
+    let directory = run_libra_command(&["clean", "-f", "../src"], &root.join("docs"));
+    assert_cli_success(&directory, "clean -f ../src");
+    let text = String::from_utf8_lossy(&directory.stdout);
+    assert!(text.contains("Removing ../src/part3.c"), "{text}");
+    assert!(!root.join("src/part3.c").exists());
+}

@@ -2271,3 +2271,5 @@ config get --value matches the legacy value pattern.
 legacy and subcommand config entries match.
 
 explicit system list on a missing store exits 128.
+
+clean prints cwd-relative paths while JSON stays repo-root-relative.

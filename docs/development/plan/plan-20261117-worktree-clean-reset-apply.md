@@ -379,7 +379,7 @@ PY
 ### Task WC-01: 修复 `libra clean` 打印 cwd 相对路径（#732）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：clean 预览/删除按 cwd 相对路径，JSON 保持仓库根相对；无 pathspec 限定 cwd 子树；新增 `clean_test::clean_relative_pathspec_prefix`；clean 36/36。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 使 `libra clean -n`（`Would remove ...`）与实际清理（`Removing ...`）在子目录运行：传入相对 pathspec 如 `../src` 时保留 `../` 前缀输出 cwd 相对路径，无 pathspec 时限定当前目录及子目录（不带 `../`）输出，而 `--json` 的 `removed` 数组保持确定性的仓库根相对路径契约。
 **Out of scope:** `core.excludesfile`（`WC-02`）与 `-d` 行为（`WC-03`）。
 
@@ -390,11 +390,11 @@ PY
 | `run_clean` 直接使用 `path.display().to_string()`（仓库根相对路径）构造输出列表 | `src/command/clean.rs:297-305` |
 
 **Acceptance criteria:**
-- [ ] AC1：在子目录 `docs/` 下运行 `libra clean -n ../src`，输出 `Would remove ../src/part3.c`（保留 `../` 前缀；即上游 `t7300#7` / `TC-0533`）。
-- [ ] AC2：在含已跟踪文件的子目录 `src/` 下运行无 pathspec 的 `libra clean -n`，只列出 `src/` 内的未跟踪文件，且路径相对 cwd 输出、不带 `../` 前缀。
-- [ ] AC3：在 `src/` 下运行 `libra clean -f`，`Removing ...` 行同样按 cwd 相对路径打印。
-- [ ] AC4：`--json` 模式下 `removed` 数组保持仓库根相对路径（机器契约不随 cwd 变化）。
-- [ ] AC5：在 `docs/` 下运行 `libra clean -f ../src`，`Removing` 行同样保留 `../` 前缀（`Removing ../src/part3.c`）。
+- [x] AC1：在子目录 `docs/` 下运行 `libra clean -n ../src`，输出 `Would remove ../src/part3.c`（保留 `../` 前缀；即上游 `t7300#7` / `TC-0533`）（`clean_test::clean_relative_pathspec_prefix`）。
+- [x] AC2：在含已跟踪文件的子目录 `src/` 下运行无 pathspec 的 `libra clean -n`，只列出 `src/` 内的未跟踪文件，且路径相对 cwd 输出、不带 `../` 前缀（`clean_test::clean_relative_pathspec_prefix`）。
+- [x] AC3：在 `src/` 下运行 `libra clean -f`，`Removing ...` 行同样按 cwd 相对路径打印（`clean_test::clean_relative_pathspec_prefix`）。
+- [x] AC4：`--json` 模式下 `removed` 数组保持仓库根相对路径（机器契约不随 cwd 变化）（`clean_test::clean_relative_pathspec_prefix`）。
+- [x] AC5：在 `docs/` 下运行 `libra clean -f ../src`，`Removing` 行同样保留 `../` 前缀（`Removing ../src/part3.c`）（`clean_test::clean_relative_pathspec_prefix`）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -407,8 +407,8 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::clean_test::clean_relative_pathspec_prefix)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC5）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::clean_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`source .env.test && cargo nextest run --features storage-sqlite --test command_test -E 'test(=command::clean_test::clean_relative_pathspec_prefix)'`（通过）
+- [x] 共享回归组：`source .env.test && cargo nextest run --features storage-sqlite --test command_test -E 'test(/^command::clean_test::/)'`（36/36）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-04R`, `DEP-WC-05`

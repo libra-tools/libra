@@ -179,3 +179,5 @@ Git 的交互式 clean 模式会显示菜单来选择文件。Libra 面向 AI �
 | 索引损坏或未跟踪扫描失败 | `LBR-IO-001` | 128 |
 | 路径解析到工作树外部 | `LBR-CONFLICT-002` | 128 |
 | 文件删除失败 | `LBR-IO-002` | 128 |
+
+clean prints cwd-relative paths while JSON stays repo-root-relative.

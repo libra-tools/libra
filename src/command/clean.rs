@@ -169,11 +169,16 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
     if output.is_json() {
         emit_json_data("clean", &clean_output, output)?;
     } else if !output.quiet {
+        let workdir = util::working_dir();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| workdir.clone());
         for path in &clean_output.removed {
+            let display = pathdiff::diff_paths(workdir.join(path), &cwd)
+                .map(|relative| relative.display().to_string())
+                .unwrap_or_else(|| path.clone());
             if clean_output.dry_run {
-                println!("Would remove {path}");
+                println!("Would remove {display}");
             } else {
-                println!("Removing {path}");
+                println!("Removing {display}");
             }
         }
     }
@@ -291,6 +296,18 @@ fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOut
                 candidate == root || candidate.starts_with(root) || root.starts_with(candidate)
             })
         });
+    }
+
+    // Without an explicit pathspec, Git confines `clean` to the current
+    // directory and its descendants. JSON keeps repository-root-relative paths.
+    if pathspecs.is_none() {
+        let workdir = util::working_dir();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| workdir.clone());
+        if let Some(cwd_rel) = pathdiff::diff_paths(&cwd, &workdir)
+            && !cwd_rel.as_os_str().is_empty()
+        {
+            untracked.retain(|path| path.starts_with(&cwd_rel));
+        }
     }
 
     // PD-07: apply <pathspec>... limiting through the shared engine. The

@@ -241,3 +241,5 @@ the jj data model.
 | Corrupted index or untracked scan failure | `LBR-IO-001` | 128 |
 | Path resolves outside the worktree | `LBR-CONFLICT-002` | 128 |
 | File deletion failed | `LBR-IO-002` | 128 |
+
+clean prints cwd-relative paths while JSON stays repo-root-relative.
