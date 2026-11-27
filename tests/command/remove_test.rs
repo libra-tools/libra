@@ -1388,3 +1388,42 @@ fn test_rm_cached_intent_to_add_entry() {
         "rm --cached keeps the worktree file untracked: {status}"
     );
 }
+
+#[test]
+#[serial(cwd)]
+fn remove_pathspec_from_file_stdin_and_validation() {
+    use std::fs;
+
+    let repo = create_committed_repo_via_cli();
+    for name in ["a", "b"] {
+        create_file(repo.path().join(name).to_str().unwrap(), name);
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "a", "b"], repo.path()),
+        "add a b",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "add a b"], repo.path()),
+        "commit a b",
+    );
+    let stdin =
+        run_libra_command_with_stdin(&["rm", "--pathspec-from-file=-"], repo.path(), "a\nb\n");
+    assert_cli_success(&stdin, "rm from stdin");
+    assert!(!repo.path().join("a").exists());
+    assert!(!repo.path().join("b").exists());
+
+    fs::write(repo.path().join("c"), "c").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "c"], repo.path()), "add c");
+    let nul = run_libra_command_with_stdin(
+        &["rm", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        repo.path(),
+        "c\0",
+    );
+    assert_cli_success(&nul, "rm nul stdin");
+    assert!(!repo.path().join("c").exists());
+
+    let conflict = run_libra_command(&["rm", "--pathspec-from-file=-", "a"], repo.path());
+    assert!(!conflict.status.success());
+    let bare_nul = run_libra_command(&["rm", "--pathspec-file-nul", "a"], repo.path());
+    assert!(!bare_nul.status.success());
+}

@@ -154,15 +154,35 @@ async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
         }
     };
 
+    if args.pathspec_from_file.is_some() && !args.pathspec.is_empty() {
+        return Err(CliError::command_usage(
+            "fatal: --pathspec-from-file and <pathspec> are mutually exclusive",
+        ));
+    }
+    if args.pathspec_file_nul && args.pathspec_from_file.is_none() {
+        return Err(CliError::command_usage(
+            "fatal: --pathspec-file-nul requires --pathspec-from-file",
+        ));
+    }
+
     // Build effective pathspec list
     let pathspecs: Vec<String> = if let Some(file) = &args.pathspec_from_file {
-        let data = match std::fs::read(file) {
-            Ok(d) => d,
-            Err(e) => {
-                return Err(CliError::fatal(format!(
-                    "cannot read pathspec file '{}': {}",
-                    file, e
-                )));
+        let data = if file == "-" {
+            let mut buffer = Vec::new();
+            use std::io::Read as _;
+            std::io::stdin()
+                .read_to_end(&mut buffer)
+                .map_err(|e| CliError::fatal(format!("cannot read pathspec from stdin: {e}")))?;
+            buffer
+        } else {
+            match std::fs::read(file) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Err(CliError::fatal(format!(
+                        "cannot read pathspec file '{}': {}",
+                        file, e
+                    )));
+                }
             }
         };
 

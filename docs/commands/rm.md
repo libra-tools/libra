@@ -227,3 +227,5 @@ change is deliberately deferred (DEFER-03).
 | Staged changes differ from HEAD | Error: file has staged changes, use `--cached` or `-f` | non-zero |
 | Both staged and local changes | Error: file has staged content different from both the file and HEAD, use `-f` | non-zero |
 | Not inside a repository | Error: repository not found | non-zero |
+
+rm reads pathspecs from stdin and validates source flags.

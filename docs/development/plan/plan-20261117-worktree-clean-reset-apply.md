@@ -1502,7 +1502,7 @@ PY
 ### Task WC-12: 支持 `libra rm --pathspec-from-file=-` 与参数互斥校验（#1038）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--pathspec-from-file=-` 从 stdin 读取、NUL 分隔、与位置 pathspec 互斥、孤立 `--pathspec-file-nul` 拒绝；新增 stdin/校验测试；remove 24/24。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 在 `src/command/remove.rs` 中支持 `--pathspec-from-file=-` 从 stdin 读取 pathspec（覆盖 `TC-2675`..`TC-2678`），并补齐 `--pathspec-from-file` 与位置 `<pathspec>` 互斥、`--pathspec-file-nul` 缺少 `--pathspec-from-file` 的错误拒绝及空列表固定报错。
 **Out of scope:** `rm -n` 短标志与 SIGPIPE 边界（`WC-13`）。
 
@@ -1513,13 +1513,13 @@ PY
 | `remove.rs` 直接 `std::fs::read(file)` 导致 `"-"` 报错，且未检查 `--pathspec-from-file` 与 `args.pathspec` 互斥；空列表报 `No pathspec was given...` | `src/command/remove.rs:158-200` |
 
 **Acceptance criteria:**
-- [ ] AC1：`printf 'a\nb\n' | libra rm --pathspec-from-file=-` exit 0，`a`、`b` 从索引与工作区移除（`TC-2675`、`TC-2676`）。
-- [ ] AC2：`printf 'a\0b\0' | libra rm --pathspec-from-file=- --pathspec-file-nul` 同样移除（`TC-2677`）。
-- [ ] AC3：`libra rm --pathspec-from-file=list -- a` 非零退出且 stderr 含 `'--pathspec-from-file' and pathspec arguments cannot be used together`（`TC-2678`）。
-- [ ] AC4：AC3 的执行不改变全量快照（工作区任何文件均未删除或修改，索引不变）。
-- [ ] AC5：`libra rm --pathspec-file-nul a` 非零退出且 stderr 含 `the option '--pathspec-file-nul' requires '--pathspec-from-file'`。
-- [ ] AC6：空 pathspec 列表（`printf '' | libra rm --pathspec-from-file=-`）非零退出。
-- [ ] AC7：AC6 的 stderr 含固定诊断 `No pathspec was given. Which files should I remove?`。
+- [x] AC1：`printf 'a\nb\n' | libra rm --pathspec-from-file=-` exit 0，`a`、`b` 从索引与工作区移除（`TC-2675`、`TC-2676`）。（`remove_pathspec_from_file_stdin_and_validation`）
+- [x] AC2：`printf 'a\0b\0' | libra rm --pathspec-from-file=- --pathspec-file-nul` 同样移除（`TC-2677`）。（`remove_pathspec_from_file_stdin_and_validation`）
+- [x] AC3：`libra rm --pathspec-from-file=list -- a` 非零退出且 stderr 含 `'--pathspec-from-file' and pathspec arguments cannot be used together`（`TC-2678`）。（`remove_pathspec_from_file_stdin_and_validation`）
+- [x] AC4：AC3 的执行不改变全量快照（工作区任何文件均未删除或修改，索引不变）。（`remove_pathspec_from_file_stdin_and_validation`）
+- [x] AC5：`libra rm --pathspec-file-nul a` 非零退出且 stderr 含 `the option '--pathspec-file-nul' requires '--pathspec-from-file'`。（`remove_pathspec_from_file_stdin_and_validation`）
+- [x] AC6：空 pathspec 列表（`printf '' | libra rm --pathspec-from-file=-`）非零退出。（`remove_pathspec_from_file_stdin_and_validation`）
+- [x] AC7：AC6 的 stderr 含固定诊断 `No pathspec was given. Which files should I remove?`。（`remove_pathspec_from_file_stdin_and_validation`）
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -1534,8 +1534,8 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::remove_test::remove_pathspec_from_file_stdin_and_validation)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC7）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::remove_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`remove_pathspec_from_file_stdin_and_validation`（通过）
+- [x] 共享回归组：`command::remove_test`（24/24）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-10`, `DEP-WC-05`

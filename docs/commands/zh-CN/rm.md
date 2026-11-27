@@ -205,3 +205,5 @@ Git 对这三类拒绝返回 `1`；退出码对齐按 DEFER-03 有意延后。
 | 暂存更改与 HEAD 不同 | 错误：文件有已暂存更改，使用 `--cached` 或 `-f` | 非零 |
 | 同时有已暂存和本地更改 | 错误：文件有与文件和 HEAD 都不同的已暂存内容，使用 `-f` | 非零 |
 | 不在仓库内 | 错误：找不到仓库 | 非零 |
+
+rm reads pathspecs from stdin and validates source flags.
