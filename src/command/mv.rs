@@ -283,12 +283,16 @@ fn validate_source_directory(
     destination_is_dir: bool,
     index: &Index,
 ) -> Result<MovePlan, String> {
-    // For directory move, we require the destination to be an existing directory
     if !destination_is_dir {
-        return Err(format!(
-            "fatal: destination '{}' is not a directory",
-            util::to_workdir_path(destination).display()
-        ));
+        // A single directory source may be renamed to a new, nonexistent path
+        // (`mv dir folder`). Only an existing non-directory target is invalid.
+        if destination.exists() {
+            return Err(format!(
+                "fatal: destination '{}' is not a directory",
+                util::to_workdir_path(destination).display()
+            ));
+        }
+        return plan_case_only_directory_rename(src, destination, index);
     }
 
     let src_name = src.file_name().ok_or_else(|| {

@@ -1110,3 +1110,37 @@ fn test_mv_dry_run_writes_no_objects() {
     assert!(p.join("f").exists(), "dry run keeps the source");
     assert!(!p.join("g").exists(), "dry run creates no destination");
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn mv_rename_directory_to_new_path() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = ChangeDirGuard::new(temp_path.path());
+
+    stage_file("dir/a.txt", "a").await;
+    stage_file("dir/sub/b.txt", "b").await;
+    test::ensure_file("dir/sub/modified.txt", Some("m"));
+    let result = mv::execute_safe(
+        MvArgs {
+            paths: vec!["dir".to_string(), "folder".to_string()],
+            verbose: false,
+            dry_run: false,
+            force: false,
+            skip_errors: false,
+            sparse: false,
+        },
+        &OutputConfig::default(),
+    )
+    .await;
+    assert!(result.is_ok(), "directory rename should succeed");
+    assert!(!temp_path.path().join("dir").exists());
+    assert!(temp_path.path().join("folder/a.txt").exists());
+    assert!(temp_path.path().join("folder/sub/b.txt").exists());
+    assert!(temp_path.path().join("folder/sub/modified.txt").exists());
+
+    let index = Index::load(path::index()).unwrap();
+    assert!(!index.tracked("dir/a.txt", 0));
+    assert!(index.tracked("folder/a.txt", 0));
+    assert!(index.tracked("folder/sub/b.txt", 0));
+}

@@ -293,3 +293,5 @@ Note: jj does not have a dedicated mv command. File renames are detected automat
 | Invalid source with `-k` | Source is skipped; command succeeds if no fatal repository-boundary or destination-shape error occurs |
 | Filesystem rename failed | `fatal: failed to move, source=<src>, destination=<dst>, error=<err>` |
 | Index save failed | `fatal: failed to save index after mv: <err>` |
+
+mv renames a directory to a new nonexistent path.

@@ -837,7 +837,7 @@ PY
 ### Task WC-06: 修复 `libra mv` 将目录重命名为不存在的新路径（#755）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：单源目录可重命名到不存在路径，索引前缀同步；既有文件目标与多源非目录拒绝保持；新增 `mv_rename_directory_to_new_path`；mv 34/34。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 修复 `validate_source_directory`：当单个源目录重命名为不存在的目标路径（`libra mv dir folder`）时直接将 `dir/` 下已跟踪条目重命名为 `folder/`，仅当多源移动且目标非目录时才报 `destination is not a directory`。
 **Out of scope:** 跨文件系统符号链接/submodule 移动（永久非目标，本计划不涉及）；`t6421#1`（`TC-0733`）下游 partial-clone 缺失对象按需拉取与 merge 端到端闭环（拆出 `WC-06a` 承接，本卡仅覆盖 `libra mv dir folder` 目录重命名阶段）。
 
@@ -848,11 +848,11 @@ PY
 | `validate_source_directory` 无条件要求 `if !destination_is_dir { return Err("fatal: destination ... is not a directory") }` | `src/command/mv.rs:280-292` |
 
 **Acceptance criteria:**
-- [ ] AC1：单源目录移到不存在的目标：`libra mv dir folder` 把工作区 `dir/` 整体重命名为 `folder/`。
-- [ ] AC2：同一操作把索引中原 `dir/...` 条目改名为 `folder/...`（blob OID 与模式不变）。
-- [ ] AC3：目标为已存在的常规文件（非大小写重命名）时拒绝执行（非零退出，不改动工作区与索引）。
-- [ ] AC4：多源移动且目标不是目录时以 `fatal: destination '<dst>' is not a directory` 拒绝（不改动工作区与索引）。
-- [ ] AC5：上游 `t6421#1`（`TC-0733`）setup 中 A 分支的目录重命名步骤等价场景通过：在含嵌套子目录与已修改文件的 `dir/` 上执行 `libra mv dir folder` 并提交后，提交树只含 `folder/` 布局（下游 partial-clone 对象拉取由 `WC-06a` 承接）。
+- [x] AC1：单源目录移到不存在的目标：`libra mv dir folder` 把工作区 `dir/` 整体重命名为 `folder/`（`mv_test::mv_rename_directory_to_new_path` / 既有拒绝测试）。
+- [x] AC2：同一操作把索引中原 `dir/...` 条目改名为 `folder/...`（blob OID 与模式不变）（`mv_test::mv_rename_directory_to_new_path` / 既有拒绝测试）。
+- [x] AC3：目标为已存在的常规文件（非大小写重命名）时拒绝执行（非零退出，不改动工作区与索引）（`mv_test::mv_rename_directory_to_new_path` / 既有拒绝测试）。
+- [x] AC4：多源移动且目标不是目录时以 `fatal: destination '<dst>' is not a directory` 拒绝（不改动工作区与索引）（`mv_test::mv_rename_directory_to_new_path` / 既有拒绝测试）。
+- [x] AC5：上游 `t6421#1`（`TC-0733`）setup 中 A 分支的目录重命名步骤等价场景通过：在含嵌套子目录与已修改文件的 `dir/` 上执行 `libra mv dir folder` 并提交后，提交树只含 `folder/` 布局（下游 partial-clone 对象拉取由 `WC-06a` 承接）（`mv_test::mv_rename_directory_to_new_path` / 既有拒绝测试）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -864,8 +864,8 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::mv_test::mv_rename_directory_to_new_path)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC5）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::mv_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`mv_rename_directory_to_new_path`（通过）
+- [x] 共享回归组：`command::mv_test`（34/34）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-05a`, `DEP-WC-05`

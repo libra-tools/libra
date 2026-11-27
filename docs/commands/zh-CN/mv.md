@@ -281,3 +281,5 @@ Libra 提供显式 `mv` 命令（类似 Git），因为其基于索引的模型�
 | 使用 `-k` 时来源无效 | 跳过该来源；只要未发生仓库边界或目标形态致命错误，命令成功 |
 | 文件系统 rename 失败 | `fatal: failed to move, source=<src>, destination=<dst>, error=<err>` |
 | 索引保存失败 | `fatal: failed to save index after mv: <err>` |
+
+mv renames a directory to a new nonexistent path.

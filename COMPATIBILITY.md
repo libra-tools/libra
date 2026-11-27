@@ -2283,3 +2283,5 @@ clean -ff removes nested repositories with -d.
 clean honors clean.requireForce.
 
 clean -e matches directory and basename prefixes.
+
+mv renames a directory to a new nonexistent path.
