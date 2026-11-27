@@ -635,3 +635,26 @@ fn test_config_missing_key_unset_and_reserved_regexp_scope() {
     );
     assert_eq!(global.status.code(), Some(129));
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_32_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let before = run_libra_command(&["config", "--local", "--list"], repo.path());
+    for args in [
+        vec!["config", "unset", "no.such"],
+        vec!["config", "unset", "--all", "no.such"],
+    ] {
+        let out = run_libra_command(&args, repo.path());
+        assert_eq!(out.status.code(), Some(5), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let after = run_libra_command(&["config", "--local", "--list"], repo.path());
+        assert_eq!(before.stdout, after.stdout, "{args:?}");
+    }
+}

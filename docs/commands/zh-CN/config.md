@@ -1064,3 +1064,5 @@ git config syntax parses like git.
 file mutations match git bytes.
 
 unset-all deletes only matching values.
+
+config unset missing key exits 5.
