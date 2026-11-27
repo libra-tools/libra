@@ -627,7 +627,7 @@ fn pull_ff_only_config_rejects_diverged_history() {
     assert_eq!(output.status.code(), Some(128));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("LBR-CONFLICT-002"), "{stderr}");
-    assert!(stderr.contains("non-fast-forward"), "{stderr}");
+    assert!(stderr.contains("Not possible to fast-forward"), "{stderr}");
 }
 
 #[test]
@@ -723,13 +723,21 @@ fn pull_cli_ff_flags_override_configured_ff_modes() {
         "--no-ff must override pull.ff=true"
     );
 
-    fixture.push_remote_commit(&work_dir, &branch, "ff-only.txt", "reject non-fast-forward");
+    fixture.push_remote_commit(
+        &work_dir,
+        &branch,
+        "ff-only.txt",
+        "reject Not possible to fast-forward",
+    );
     fixture.success(&repo, &["config", "pull.ff", "false"]);
     let output = fixture.run(&repo, &["pull", "--ff-only"]);
     assert_eq!(output.status.code(), Some(128));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("LBR-CONFLICT-002"), "stderr: {stderr}");
-    assert!(stderr.contains("non-fast-forward"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("Not possible to fast-forward"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]

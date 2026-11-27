@@ -759,7 +759,7 @@ async fn test_pull_ff_only_diverged_remote_rejects_without_changing_head_or_work
     assert!(
         report["message"]
             .as_str()
-            .is_some_and(|text| text.contains("non-fast-forward")),
+            .is_some_and(|text| text.contains("Not possible to fast-forward")),
         "pull --ff-only should explain the rejected merge: {report}"
     );
     assert!(

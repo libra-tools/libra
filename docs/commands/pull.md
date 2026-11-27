@@ -553,3 +553,5 @@ refuses a local upstream (`branch.<name>.remote=.`)
 > `completions` run in that layout.
 
 initial pull into an unborn branch records initial pull.
+
+merge and pull ff-only print git's diverging advice.

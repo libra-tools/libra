@@ -1646,10 +1646,11 @@ fn merge_octopus_ff_only_refuses_without_mutation() {
 
     let output = run_libra_command(&["merge", "--ff-only", "alpha", "beta"], root);
     assert_eq!(output.status.code(), Some(128), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Not possible to fast-forward"), "{stderr}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("non-fast-forward merge refused"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("Diverging branches can't be fast-forwarded"),
+        "{stderr}"
     );
     assert_eq!(head_commit(root), before);
     assert!(!root.join("alpha.txt").exists());
@@ -2273,7 +2274,7 @@ fn test_merge_help_lists_examples_banner() {
     );
     assert!(
         stdout.contains("NOTES:"),
-        "merge --help should call out the non-fast-forward limitation, stdout: {stdout}"
+        "merge --help should call out the Not possible to fast-forward limitation, stdout: {stdout}"
     );
     for invocation in [
         "libra merge feature-x",
@@ -6491,14 +6492,14 @@ fn merge_crisscross_more_bases_than_the_width_ceiling_is_refused_before_loading(
     assert!(!p.join("theirs.txt").exists(), "worktree untouched");
 
     // `--ff-only` never folds either: a diverged history is refused as
-    // non-fast-forward (LBR-CONFLICT-002), exactly as with one merge base —
+    // Not possible to fast-forward (LBR-CONFLICT-002), exactly as with one merge base —
     // the width ceiling must not pre-empt that verdict.
     let ff_only = run_libra_command(&["merge", "--ff-only", "y"], p);
     let (ff_stderr, ff_report) = parse_cli_error_stderr(&ff_only.stderr);
     assert_eq!(ff_only.status.code(), Some(128), "refused: {ff_stderr}");
     assert_eq!(
         ff_report.error_code, "LBR-CONFLICT-002",
-        "--ff-only reports non-fast-forward, not the width ceiling: {ff_stderr}"
+        "--ff-only reports Not possible to fast-forward, not the width ceiling: {ff_stderr}"
     );
     assert!(
         !ff_stderr.contains("merge bases"),

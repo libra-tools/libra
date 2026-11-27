@@ -1266,10 +1266,12 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
             .with_hint(
                 "or drop the gitlink entry from the branches being merged so no submodule decision is needed",
             ),
-        merge::PullMergeError::NonFastForward { .. } => CliError::failure(error.to_string())
-            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-            .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
-            .with_hint("or run 'libra pull --rebase' to replay local commits"),
+        merge::PullMergeError::NonFastForward { .. } => CliError::fatal(
+            "Not possible to fast-forward, aborting.\n\nDiverging branches can't be fast-forwarded, you need to either:\n\n  git merge --no-ff\n  git rebase\n",
+        )
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
+        .with_hint("or run 'libra pull --rebase' to replay local commits"),
         merge::PullMergeError::Conflicts { squash: true, .. } => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint("resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'"),

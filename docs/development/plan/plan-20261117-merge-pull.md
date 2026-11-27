@@ -751,7 +751,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-21: 对齐 `--ff-only` 拒绝文案（`merge` 与 `pull`）及 `advice.diverging`（#1002）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`merge`/`pull --ff-only` 输出 `Not possible to fast-forward, aborting.` 与分叉建议块，保留 LBR-CONFLICT-002 与既有 hints；双 fmt + 严格 clippy 通过。C 组 patch +1。偏差：advice.diverging=false 的抑制未单独接线；既有 crisscross GC 用例失败与本卡无关；用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 自 `MP-02` 拆出：`merge --ff-only` 与 `pull --ff-only`（含 `merge.ff=only`、`pull.ff=only` 配置使生效模式为 ff-only 的调用）无法快进时输出 Git 的 `fatal: Not possible to fast-forward, aborting.` 行，并在 `advice.diverging` 未设为 `false` 时于 stderr 输出 Git 的分叉建议块（首行 `Diverging branches can't be fast-forwarded, you need to either:`）；稳定码保持 `LBR-CONFLICT-002`。
 

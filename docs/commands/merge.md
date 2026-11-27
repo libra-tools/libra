@@ -603,3 +603,5 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 > `completions` run in that layout.
 
 initial pull into an unborn branch records initial pull.
+
+merge and pull ff-only print git's diverging advice.

@@ -1031,10 +1031,12 @@ impl From<PullMergeError> for CliError {
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("set GIT_EDITOR, core.editor, VISUAL, or EDITOR")
                 .with_hint("or omit --edit to accept the resolved merge message"),
-            PullMergeError::NonFastForward { .. } => CliError::failure(error.to_string())
-                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
-                .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
-                .with_hint("or run 'libra pull --rebase' to replay local commits"),
+            PullMergeError::NonFastForward { .. } => CliError::fatal(
+                "Not possible to fast-forward, aborting.\n\nDiverging branches can't be fast-forwarded, you need to either:\n\n  git merge --no-ff\n  git rebase\n",
+            )
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("run 'libra pull' without --ff-only to allow a merge commit")
+            .with_hint("or run 'libra pull --rebase' to replay local commits"),
             PullMergeError::Conflicts { squash: true, .. } => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'"),

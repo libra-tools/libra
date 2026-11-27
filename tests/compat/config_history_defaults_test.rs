@@ -342,7 +342,7 @@ fn merge_ff_only_config_allows_fast_forwardable_squash() {
     let rejected = fixture.run(&diverged, &["merge", "--squash", "feature"]);
     assert!(!rejected.status.success());
     assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("non-fast-forward"),
+        String::from_utf8_lossy(&rejected.stderr).contains("Not possible to fast-forward"),
         "diverged squash must still be refused under merge.ff=only"
     );
 }
@@ -388,7 +388,7 @@ fn merge_cli_ff_only_combines_with_squash_and_no_commit() {
         Some(129),
         "divergence must be a merge failure, not an argument-parsing conflict"
     );
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("non-fast-forward"));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("Not possible to fast-forward"));
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn history_defaults_accept_git_numeric_booleans_and_keep_only() {
     let rejected = fixture.run(&repo, &["merge", "feature"]);
     assert!(!rejected.status.success());
     assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("non-fast-forward"),
+        String::from_utf8_lossy(&rejected.stderr).contains("Not possible to fast-forward"),
         "merge.ff=only must still reject a diverged merge"
     );
 
