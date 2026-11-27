@@ -3600,7 +3600,7 @@ async fn handle_get(
                         "key": e.key,
                         "value": val,
                         "scope": scope_name(**s),
-                        "origin": scope_name(**s),
+                        "origin": read_record_prefix(**s, true, false),
                         "encrypted": e.encrypted,
                     })).collect::<Vec<_>>(),
                 }),
@@ -3715,7 +3715,7 @@ async fn handle_get(
                     "key": key,
                     "entries": display_entries.iter().map(|(e, s, val)| serde_json::json!({
                         "value": val,
-                        "origin": scope_name(**s),
+                        "origin": read_record_prefix(**s, true, false),
                         "encrypted": e.encrypted,
                     })).collect::<Vec<_>>(),
                     "default_applied": false,
@@ -3845,7 +3845,10 @@ async fn handle_get(
                     "action": "get",
                     "key": key,
                     "value": display_value,
-                    "origin": origin_scope.map(scope_name),
+                    "origin": origin_scope
+                        .map(|scope| read_record_prefix(scope, true, false))
+                        .or_else(|| default_applied.then(|| "command line:".to_string())),
+                    "scope": origin_scope.map(scope_name),
                     "default_applied": default_applied,
                 }),
                 output,

@@ -450,3 +450,91 @@ fn test_t1300_show_scope() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "local\tv");
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_show_origin_json_and_upgrade_mode() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "json.key", "v"], repo.path()),
+        "set",
+    );
+    let get = run_libra_command(
+        &[
+            "--json",
+            "config",
+            "--local",
+            "--show-origin",
+            "--get",
+            "json.key",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&get, "json get");
+    let parsed: serde_json::Value = serde_json::from_slice(&get.stdout).expect("json");
+    assert!(
+        parsed["data"]["origin"]
+            .as_str()
+            .unwrap()
+            .starts_with("file:"),
+        "{parsed}"
+    );
+    assert_eq!(parsed["data"]["scope"], "local");
+
+    let list = run_libra_command(
+        &["--json", "config", "--local", "--show-origin", "--list"],
+        repo.path(),
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&list.stdout).expect("json");
+    let entry = parsed["data"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == "json.key")
+        .expect("json.key entry");
+    assert!(entry["origin"].as_str().unwrap().starts_with("file:"));
+    assert_eq!(entry["scope"], "local");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--global", "upgrade.mode", "auto"], repo.path()),
+        "upgrade mode",
+    );
+    let mode = run_libra_command(
+        &["--json", "config", "get", "--global", "upgrade.mode"],
+        repo.path(),
+    );
+    assert_cli_success(&mode, "upgrade mode get");
+    let parsed: serde_json::Value = serde_json::from_slice(&mode.stdout).expect("json");
+    assert!(
+        parsed["data"]["origin"]
+            .as_str()
+            .unwrap()
+            .starts_with("file:"),
+        "{parsed}"
+    );
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_t1300_show_origin() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "t.key", "v"], repo.path()),
+        "set",
+    );
+    let get = run_libra_command(&["config", "--show-origin", "--get", "t.key"], repo.path());
+    assert_cli_success(&get, "show origin");
+    assert!(
+        String::from_utf8_lossy(&get.stdout)
+            .trim_end()
+            .ends_with("\tv")
+    );
+}
