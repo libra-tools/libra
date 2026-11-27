@@ -5065,14 +5065,17 @@ async fn handle_unset(
     // Git reports "no such key" (exit 5) when a value-pattern matches nothing
     // and when a plain unset finds no entry; Libra keeps its existing lenient
     // unset for the plain form but must not claim a patterned removal happened.
-    if count == 0
-        && let Some(pattern) = value_pattern
-    {
-        return Err(
-            CliError::failure(format!("no value of '{key}' matches '{pattern}'"))
-                .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_exit_code(5),
-        );
+    if count == 0 {
+        if let Some(pattern) = value_pattern {
+            return Err(
+                CliError::failure(format!("no value of '{key}' matches '{pattern}'"))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_exit_code(5),
+            );
+        }
+        return Err(CliError::failure(format!("no such key: {key}"))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_exit_code(5));
     }
 
     if output.is_json() {

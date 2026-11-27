@@ -605,3 +605,33 @@ fn test_config_already_compatible_surface() {
     let list = run_libra_command(&["config", "--local", "--list"], repo.path());
     assert!(String::from_utf8_lossy(&list.stdout).contains("surface.k=v"));
 }
+
+#[test]
+#[serial(cwd)]
+fn test_config_missing_key_unset_and_reserved_regexp_scope() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let before = run_libra_command(&["config", "--local", "--list"], repo.path());
+    for flag in ["--unset", "--unset-all"] {
+        let out = run_libra_command(&["config", flag, "no.such"], repo.path());
+        assert_eq!(out.status.code(), Some(5), "{flag}");
+        assert!(out.stdout.is_empty(), "{flag} no success line");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let after = run_libra_command(&["config", "--local", "--list"], repo.path());
+        assert_eq!(before.stdout, after.stdout, "{flag} writes nothing");
+    }
+    let local = run_libra_command(
+        &["config", "--local", "--get-regexp", "^upgrade\\."],
+        repo.path(),
+    );
+    assert_eq!(local.status.code(), Some(1));
+    let global = run_libra_command(
+        &["config", "--global", "--get-regexp", "^upgrade\\."],
+        repo.path(),
+    );
+    assert_eq!(global.status.code(), Some(129));
+}
