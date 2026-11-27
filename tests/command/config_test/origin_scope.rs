@@ -296,3 +296,37 @@ fn test_cf_56_predicates() {
         "system\tsystem"
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_show_origin_matrix() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], &repo),
+        "init",
+    );
+    for value in ["one", "two"] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--add", "origin.multi", value], &repo),
+            "add",
+        );
+    }
+    for args in [
+        vec!["config", "--get", "origin.multi", "two"],
+        vec!["config", "--get-all", "origin.multi"],
+        vec!["config", "--get-regexp", "^origin\\."],
+        vec!["config", "--list"],
+    ] {
+        let mut full: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        full.insert(2, "--show-origin".to_string());
+        let refs: Vec<&str> = full.iter().map(String::as_str).collect();
+        let out = run_libra_command(&refs, &repo);
+        assert_cli_success(&out, &format!("{full:?}"));
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            assert!(line.starts_with("file:"), "{line}");
+            assert!(line.contains('\t'), "{line}");
+        }
+    }
+}
