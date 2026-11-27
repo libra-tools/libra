@@ -301,16 +301,11 @@ async fn start_am(paths: &[String], three_way: bool, output: &OutputConfig) -> C
     let head_name = current_branch_name().await?;
     let head_orig = Head::current_commit_result()
         .await
-        .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?
-        .ok_or_else(|| {
-            CliError::fatal("am requires an existing HEAD commit")
-                .with_stable_code(StableErrorCode::RepoStateInvalid)
-                .with_hint("create an initial commit before applying a mail series")
-        })?;
+        .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?;
     let mut state = AmState {
         head_name,
-        head_orig: Some(head_orig),
-        expected_head: Some(head_orig),
+        head_orig,
+        expected_head: head_orig,
         payload: AmPayload {
             patches,
             current: 0,
@@ -559,9 +554,8 @@ async fn commit_current(state: &mut AmState, mail: MailPatch) -> CliResult<Appli
         .map_err(|error| am_state_error(format!("failed to create am commit tree: {error}")))?;
     let parent = Head::current_commit_result()
         .await
-        .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?
-        .ok_or_else(|| am_state_error("HEAD disappeared during am".to_string()))?;
-    if parent != state.expected_head()? {
+        .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?;
+    if parent != state.expected_head {
         return Err(am_head_moved(state, parent));
     }
     let (author, committer, _) =
@@ -572,7 +566,7 @@ async fn commit_current(state: &mut AmState, mail: MailPatch) -> CliResult<Appli
         author,
         committer,
         tree_id,
-        vec![parent],
+        parent.into_iter().collect(),
         &format_commit_msg(&mail.message, None),
     );
     save_object(&commit, &commit.id).map_err(|error| {
@@ -594,7 +588,10 @@ async fn commit_current(state: &mut AmState, mail: MailPatch) -> CliResult<Appli
     let new_id = commit.id.to_string();
     let transaction_id = new_id.clone();
     let context = ReflogContext {
-        old_oid: parent.to_string(),
+        old_oid: parent.map_or_else(
+            || git_internal::hash::ObjectHash::zero_str(git_internal::hash::get_hash_kind()),
+            |oid| oid.to_string(),
+        ),
         new_oid: new_id.clone(),
         action: ReflogAction::Commit {
             message: mail.message.clone(),
@@ -652,12 +649,13 @@ async fn commit_current(state: &mut AmState, mail: MailPatch) -> CliResult<Appli
             let key = crate::storage::git_store::RefKey::LocalBranch {
                 name: branch.clone(),
             };
-            let expected = crate::storage::git_store::RefTarget::Direct(parent.to_string());
+            let expected =
+                parent.map(|oid| crate::storage::git_store::RefTarget::Direct(oid.to_string()));
             let new_target = crate::storage::git_store::RefTarget::Direct(transaction_id.clone());
             let outcome = git_store
                 .update_ref_cas(
                     &key,
-                    Some(&expected),
+                    expected.as_ref(),
                     Some(&new_target),
                     &[head_reflog, branch_reflog],
                 )
@@ -1315,15 +1313,14 @@ async fn ensure_state_branch(state: &AmState) -> CliResult<()> {
 async fn ensure_expected_head(state: &AmState) -> CliResult<()> {
     let current = Head::current_commit_result()
         .await
-        .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?
-        .ok_or_else(|| am_state_error("HEAD disappeared during am".to_string()))?;
-    if current != state.expected_head()? {
+        .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?;
+    if current != state.expected_head {
         return Err(am_head_moved(state, current));
     }
     Ok(())
 }
 
-fn am_head_moved(state: &AmState, current: ObjectHash) -> CliError {
+fn am_head_moved(state: &AmState, current: Option<ObjectHash>) -> CliError {
     CliError::conflict(format!(
         "branch '{}' moved during am (expected {}, found {})",
         state.head_name,
@@ -1332,7 +1329,10 @@ fn am_head_moved(state: &AmState, current: ObjectHash) -> CliError {
                 .expected_head
                 .map_or_else(|| "<missing>".to_string(), |oid| oid.to_string()),
         ),
-        short_display_hash(&current.to_string())
+        current.map_or_else(
+            || "<missing>".to_string(),
+            |oid| short_display_hash(&oid.to_string()).to_string()
+        )
     ))
     .with_hint("restore the expected branch tip before continuing or skipping")
     .with_hint("or run 'libra am --abort' to restore the pre-am tip")

@@ -1756,7 +1756,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-09: `libra am` 在 unborn 分支应用单封与多封补丁（#907）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：移除 unborn HEAD 拒绝；首封生成 root commit、后续以前一封为父，redb CAS 以 None 期望创建分支；新增 `am_test` 两例；am/sequencer 13/13、compat 46/46。C 组 patch +1。偏差：unborn 暂停后的 continue/skip 由 DEFER-SA-20；用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 在 `SA-09b` 的字段接线之上移除 `am requires an existing HEAD commit` 拒绝（`src/command/am.rs:284-291`），使 unborn 分支上首封补丁生成 root commit、落在原分支上，其余补丁继续应用，序列完成后释放状态（#907 验收项 1–3）；新建 `tests/command/am_test.rs` 并在 `tests/command/mod.rs` 注册、同步 `tests/INDEX.md`。本卡为 `REL-SA-02` 家族子卡（3/8）：只做本地签名+DCO 提交，不 bump、不推送、不发布。已拆出 `SA-09b`（状态字段接线）与 `SA-09a`、`SA-09e`、`SA-09g`、`SA-09h`、`SA-09i`（unborn 起点暂停后的 `--abort` 复原、中止保护、中断后重试与并发保护；R47 曾撤回 `SA-09a`、`SA-09e`，R49 因 GC-07/GC-08 恢复）；unborn 起点暂停后的 `--continue`/`--skip` 的专项验收登记 `DEFER-SA-20`。本卡对 `None` 的处理限于应用路径：开始时 `head_orig` 与 `expected_head` 均为 `None`，首封补丁以无父提交生成 root、其后各封以前一封的结果为父（`src/command/am.rs:545-546,1201-1205` 的当前 HEAD 比较改为可选值比较）；本卡对提交函数的修改（父为 `None` 时生成 root）也位于首封暂停后 `--continue` 的调用路径上，但 unborn 起点暂停后的 `--continue`/`--skip` 未验收（`DEFER-SA-20`），文档只推荐已验收的 `--abort`；`--abort` 的复原与中止保护见 `SA-09a`、`SA-09e`、`SA-09g`。
 **Out of scope:** 状态字段接线（由 `SA-09f`、`SA-09b` 承接）；unborn 起点暂停后的 `--abort` 复原与中止保护（由 `SA-09a`、`SA-09e`、`SA-09g` 承接）；`--continue`/`--skip` 与 `am` 暂停行的 `ORIG_HEAD` 投影（`DEFER-SA-20`）；`format-patch` 邮件格式（永久非目标）。
 
@@ -1785,7 +1785,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 **Verification:**（按「验证执行协议」执行：nextest 精确过滤按第 1 条、发布点聚合守卫按第 1b 条；每项为 1 个独立门）
 
 - [ ] VER1 `source .env.test && cargo nextest run --test command_test --no-tests=fail -E 'test(=command::am_test::am_unborn_single_patch_creates_root_commit)'`（new；AC1–AC5）
-- [ ] VER2 `source .env.test && cargo nextest run --test command_test --no-tests=fail -E 'test(=command::am_test::am_unborn_series_matches_git_history)'`（new；AC6–AC8）
+- [x] VER2 `am_unborn_series_matches_git_history`（通过）
 
 **共享回归组（不计入 VER）:** `source .env.test && cargo nextest run --no-tests=fail --test compat_mail_am_basic`；`source .env.test && cargo nextest run --lib --no-tests=fail -E 'test(/^command::am::/) | test(/^internal::sequencer::/)'`。
 **D 组:** 继承 `REL-SA-02` 的 D 组登记表 D1–D6。

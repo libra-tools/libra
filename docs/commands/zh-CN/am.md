@@ -109,3 +109,5 @@ libra am --abort
 ## 当前限制
 
 尚未达到完整 Git `am` parity。当前不公开 Git 的完整 flag 集（`--signoff`、`--keep`、`--scissors` 等）。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。
+
+am applies mail series to an unborn branch.

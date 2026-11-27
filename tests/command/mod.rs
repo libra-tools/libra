@@ -1000,6 +1000,7 @@ mod agent_run_admission_test;
 mod agent_skill_search_test;
 mod agent_workspace_test;
 mod alternates_test;
+mod am_test;
 mod apply_test;
 mod archive_test;
 mod auth_test;

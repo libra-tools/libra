@@ -147,3 +147,5 @@ libra am --abort
 This is not yet full Git `am` parity. It does not expose Git's wider
 flag set (`--signoff`, `--keep`, `--scissors`, and others). The shared parser is also
 available as the standalone [`libra mailinfo`](mailinfo.md) command.
+
+am applies mail series to an unborn branch.
