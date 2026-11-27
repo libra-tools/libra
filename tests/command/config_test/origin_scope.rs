@@ -165,3 +165,134 @@ fn test_cf_54_predicates() {
         String::from_utf8_lossy(&file.stdout)
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_55_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "up.key", "value"], &repo),
+        "set",
+    );
+    let get = run_libra_command(
+        &["config", "--local", "--show-origin", "--get", "up.key"],
+        &repo,
+    );
+    assert_cli_success(&get, "get origin");
+    let line = String::from_utf8_lossy(&get.stdout);
+    assert!(line.starts_with("file:"), "{line}");
+    assert!(line.trim_end().ends_with("\tvalue"), "{line}");
+    let list = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--show-origin",
+            "--list",
+            "--name-only",
+        ],
+        &repo,
+    );
+    assert_cli_success(&list, "name-only origin");
+    assert!(
+        String::from_utf8_lossy(&list.stdout)
+            .lines()
+            .any(|line| line.starts_with("file:") && line.ends_with("\tup.key"))
+    );
+    let default = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--show-origin",
+            "--default",
+            "d",
+            "--get",
+            "up.missing",
+        ],
+        &repo,
+    );
+    assert_cli_success(&default, "default");
+    assert_eq!(
+        String::from_utf8_lossy(&default.stdout).trim(),
+        "command line:\td"
+    );
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_56_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "scope.key", "local"], &repo),
+        "local",
+    );
+    let local = run_libra_command(
+        &["config", "--local", "--show-scope", "--get", "scope.key"],
+        &repo,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&local.stdout).trim(),
+        "local\tlocal"
+    );
+
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let global = temp.path().join("global-dir").join("config.db");
+    let system = temp.path().join("system-dir").join("config.db");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::create_dir_all(system.parent().unwrap()).unwrap();
+    let home_env = ("HOME", home.to_str().unwrap());
+    let xdg = home.join("xdg");
+    let global_envs = [
+        home_env,
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", global.to_str().unwrap()),
+    ];
+    let system_envs = [
+        home_env,
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_SYSTEM_DB", system.to_str().unwrap()),
+    ];
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["config", "--global", "scope.key", "global"],
+            &repo,
+            &global_envs,
+        ),
+        "global",
+    );
+    let global_out = run_libra_command_with_env(
+        &["config", "--global", "--show-scope", "--get", "scope.key"],
+        &repo,
+        &global_envs,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&global_out.stdout).trim(),
+        "global\tglobal"
+    );
+    let system_repo = temp.path().join("system-repo");
+    fs::create_dir_all(&system_repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &system_repo), "system init");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["config", "--system", "scope.key", "system"],
+            &system_repo,
+            &system_envs,
+        ),
+        "system",
+    );
+    let system_out = run_libra_command_with_env(
+        &["config", "--system", "--show-scope", "--get", "scope.key"],
+        &system_repo,
+        &system_envs,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&system_out.stdout).trim(),
+        "system\tsystem"
+    );
+}
