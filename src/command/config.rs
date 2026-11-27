@@ -2297,6 +2297,13 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                     )
                     .with_stable_code(StableErrorCode::CliInvalidArguments));
                 }
+                if !key.contains('.') {
+                    return Err(CliError::failure(format!(
+                        "key does not contain a section: {key}"
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_exit_code(2));
+                }
                 ResolvedCommand::Set {
                     key: key.clone(),
                     value: value.clone(),
@@ -2381,6 +2388,13 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                         "--fixed-value requires a value pattern for unset",
                     )
                     .with_stable_code(StableErrorCode::CliInvalidArguments));
+                }
+                if !key.contains('.') {
+                    return Err(CliError::failure(format!(
+                        "key does not contain a section: {key}"
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_exit_code(2));
                 }
                 ResolvedCommand::Unset {
                     key: key.clone(),
@@ -2585,9 +2599,10 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 "\n\nhint: `{key}` is a top-level command. Try `libra {key}`."
             ));
         }
+        let exit_code = if args.get || args.get_all { 1 } else { 2 };
         return Err(CliError::failure(msg)
             .with_stable_code(StableErrorCode::CliInvalidArguments)
-            .with_exit_code(1));
+            .with_exit_code(exit_code));
     }
 
     // --default (-d) is only valid with --get, --get-all, or get-regexp

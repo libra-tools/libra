@@ -504,3 +504,24 @@ fn test_cf_30_predicates() {
         );
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_config_key_without_section_spellings() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for args in [
+        vec!["config", "--unset", "nosuchkey"],
+        vec!["config", "nosuchkey", "value"],
+        vec!["config", "set", "nosuchkey", "v"],
+        vec!["config", "unset", "nosuchkey"],
+    ] {
+        let out = run_libra_command(&args, repo.path());
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("key does not contain a section"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
