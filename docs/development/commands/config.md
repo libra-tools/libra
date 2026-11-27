@@ -378,3 +378,5 @@ multi-value overwrite is a conflict.
 extended upstream replace cases pass.
 
 get-regexp prints key space value in insertion order.
+
+validation JSON envelope keeps the overridden exit code.

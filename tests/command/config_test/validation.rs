@@ -569,3 +569,39 @@ fn test_get_regexp_reserved_rule_scoped() {
         "global reserved regexp is rejected"
     );
 }
+
+#[test]
+#[serial(cwd)]
+fn test_config_validation_json_envelope() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let undotted = run_libra_command(&["--json", "config", "--get", "nosuchkey"], repo.path());
+    assert_eq!(undotted.status.code(), Some(1));
+    let parsed: serde_json::Value = serde_json::from_slice(&undotted.stderr).expect("json");
+    assert_eq!(parsed["exit_code"], 1);
+    assert_eq!(parsed["error_code"], "LBR-CLI-002");
+
+    for pattern in ["(", "["] {
+        let invalid =
+            run_libra_command(&["--json", "config", "--get-regexp", pattern], repo.path());
+        assert_eq!(invalid.status.code(), Some(6));
+        let parsed: serde_json::Value = serde_json::from_slice(&invalid.stderr).expect("json");
+        assert_eq!(parsed["error_code"], "LBR-CLI-002");
+        assert_eq!(parsed["exit_code"], 6);
+    }
+}
+
+#[test]
+#[serial(cwd)]
+fn test_config_already_compatible_surface() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "surface.k", "v"], repo.path()),
+        "set",
+    );
+    let get = run_libra_command(&["config", "--get", "surface.k"], repo.path());
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "v");
+    let list = run_libra_command(&["config", "--local", "--list"], repo.path());
+    assert!(String::from_utf8_lossy(&list.stdout).contains("surface.k=v"));
+}
