@@ -598,3 +598,113 @@ fn test_file_include_not_followed() {
         "include must not be followed: {text}"
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_87_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    fs::write(
+        repo.path().join("syntax.cfg"),
+        "[remote \"origin\"]\n\turl = git://h/r\n[section.sub]\n\tkey = value ; comment\n[CoRe]\n\tNaMe = V\n\tflag\n\tquoted = \"a\\nb\\t\\\"c\\\"\"\n\tcontinued = one\\\n\t\ttwo\n",
+    )
+    .unwrap();
+    let list = run_libra_command(&["config", "--file", "syntax.cfg", "--list"], repo.path());
+    assert_cli_success(&list, "list");
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert!(text.contains("remote.origin.url=git://h/r"), "{text}");
+    assert!(text.contains("section.sub.key=value"), "{text}");
+    assert!(text.contains("core.name=V"), "{text}");
+    assert!(text.contains("core.flag=true"), "{text}");
+    assert!(text.contains("core.quoted=a\nb\t\"c\""), "{text}");
+    assert!(text.contains("core.continued=onetwo"), "{text}");
+    let quoted = run_libra_command(
+        &["config", "--file", "syntax.cfg", "--get", "core.quoted"],
+        repo.path(),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&quoted.stdout).trim(),
+        "a\nb\t\"c\""
+    );
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_88_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    let cfg = repo.path().join("mut.cfg");
+    fs::write(&cfg, "[a]\n\tone = 1\n\ttwo = 2\n[b]\n\tthree = 3\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "mut.cfg", "--unset", "a.two"],
+            repo.path(),
+        ),
+        "unset",
+    );
+    assert_eq!(
+        fs::read_to_string(&cfg).unwrap(),
+        "[a]\n\tone = 1\n[b]\n\tthree = 3\n"
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "mut.cfg", "--add", "a.multi", "1"],
+            repo.path(),
+        ),
+        "add1",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "mut.cfg", "--add", "a.multi", "2"],
+            repo.path(),
+        ),
+        "add2",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "mut.cfg", "--unset-all", "a.multi"],
+            repo.path(),
+        ),
+        "unset-all",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "mut.cfg", "--add", "a.r", "1"],
+            repo.path(),
+        ),
+        "r1",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "mut.cfg", "--add", "a.r", "2"],
+            repo.path(),
+        ),
+        "r2",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "mut.cfg", "--replace-all", "a.r", "9"],
+            repo.path(),
+        ),
+        "replace-all",
+    );
+    let text = fs::read_to_string(&cfg).unwrap();
+    assert_eq!(text.matches("r = 9").count(), 1, "{text}");
+    assert!(!text.contains("r = 1") && !text.contains("r = 2"), "{text}");
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "mut.cfg", "--rename-section", "b", "c"],
+            repo.path(),
+        ),
+        "rename",
+    );
+    assert!(fs::read_to_string(&cfg).unwrap().contains("[c]"));
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--file", "mut.cfg", "--remove-section", "c"],
+            repo.path(),
+        ),
+        "remove",
+    );
+    assert!(!fs::read_to_string(&cfg).unwrap().contains("[c]"));
+}

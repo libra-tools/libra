@@ -4410,7 +4410,25 @@ fn read_git_config_file(path: &Path) -> CliResult<Vec<(String, String)>> {
 fn parse_git_config_text(text: &str) -> Vec<(String, String)> {
     let mut entries = Vec::new();
     let mut section = String::new();
+    let mut logical_lines = Vec::new();
+    let mut pending = String::new();
     for raw in text.lines() {
+        let trimmed_end = raw.trim_end();
+        if let Some(prefix) = trimmed_end.strip_suffix('\\') {
+            pending.push_str(prefix);
+            continue;
+        }
+        if pending.is_empty() {
+            logical_lines.push(raw.to_string());
+        } else {
+            pending.push_str(raw.trim_start());
+            logical_lines.push(std::mem::take(&mut pending));
+        }
+    }
+    if !pending.is_empty() {
+        logical_lines.push(pending);
+    }
+    for raw in logical_lines {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
@@ -4422,15 +4440,19 @@ fn parse_git_config_text(text: &str) -> Vec<(String, String)> {
             section = parse_ini_section(inner);
             continue;
         }
-        let Some((name, value)) = line.split_once('=') else {
-            continue;
-        };
         if section.is_empty() {
             continue;
         }
+        let (name, value) = match line.split_once('=') {
+            Some((name, value)) => (name.trim(), value.trim()),
+            None => (line, "true"),
+        };
+        if name.is_empty() {
+            continue;
+        }
         entries.push((
-            format!("{}.{}", section, name.trim().to_ascii_lowercase()),
-            unquote_ini_value(value.trim()),
+            format!("{}.{}", section, name.to_ascii_lowercase()),
+            unquote_ini_value(value),
         ));
     }
     entries
@@ -4459,7 +4481,12 @@ fn unquote_ini_value(value: &str) -> String {
         let mut escaped = false;
         for ch in stripped.chars() {
             if escaped {
-                out.push(ch);
+                out.push(match ch {
+                    'n' => '\n',
+                    't' => '\t',
+                    'b' => '\u{8}',
+                    other => other,
+                });
                 escaped = false;
             } else if ch == '\\' {
                 escaped = true;
@@ -4471,11 +4498,21 @@ fn unquote_ini_value(value: &str) -> String {
         }
         return out;
     }
-    // Strip an unquoted trailing comment (`value ; comment`).
-    match value.find(['#', ';']) {
-        Some(index) => value[..index].trim_end().to_string(),
-        None => value.to_string(),
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if (ch == '#' || ch == ';') && out.ends_with(' ') {
+            break;
+        } else {
+            out.push(ch);
+        }
     }
+    out.trim_end().to_string()
 }
 
 /// `git config --show-origin`/`--show-scope` record prefix.
