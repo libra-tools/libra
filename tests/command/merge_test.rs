@@ -14979,3 +14979,43 @@ fn merge_autostash_applied_by_commit() {
     );
     assert!(!p.join(".libra/merge-autostash.json").exists());
 }
+
+#[test]
+fn merge_autostash_abort_and_ff_squash() {
+    let repo = create_diverged_repo_for_conflict();
+    let p = repo.path();
+    std::fs::write(p.join("unrelated.txt"), "precious\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "unrelated.txt"], p), "add");
+    let conflicted = run_libra_command(&["merge", "--autostash", "feature"], p);
+    assert_eq!(conflicted.status.code(), Some(128));
+    assert!(
+        !std::fs::read_to_string(p.join("shared.txt"))
+            .unwrap()
+            .contains("precious")
+    );
+    let aborted = run_libra_command(&["merge", "--abort"], p);
+    assert_cli_success(&aborted, "abort");
+    assert_eq!(
+        std::fs::read_to_string(p.join("unrelated.txt")).unwrap(),
+        "precious\n"
+    );
+    assert!(!p.join(".libra/merge-autostash.json").exists());
+    assert_eq!(stash_list_len(p), 0);
+
+    let ff_repo = create_committed_repo_via_cli();
+    let p = ff_repo.path();
+    std::fs::write(p.join("base.txt"), "local dirty\n").unwrap();
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(&run_libra_command(&["checkout", "feature"], p), "checkout");
+    commit_file(p, "feature.txt", "feature\n", "feature");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "back");
+    let squashed = run_libra_command(&["merge", "--squash", "--autostash", "feature"], p);
+    assert_cli_success(&squashed, "ff squash");
+    assert_eq!(
+        std::fs::read_to_string(p.join("base.txt")).unwrap(),
+        "local dirty\n"
+    );
+    let files = run_libra_command(&["diff", "--cached", "--name-only"], p);
+    assert_eq!(String::from_utf8_lossy(&files.stdout).trim(), "feature.txt");
+    assert!(!p.join(".libra/merge-autostash.json").exists());
+}
