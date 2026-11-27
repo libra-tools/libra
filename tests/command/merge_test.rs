@@ -14954,3 +14954,28 @@ fn merge_autostash_applied_by_continue() {
     );
     assert!(!p.join(".libra/merge-autostash.json").exists());
 }
+
+#[test]
+fn merge_autostash_applied_by_commit() {
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    std::fs::write(p.join("base.txt"), "local dirty\n").unwrap();
+    let diff_before = run_libra_command(&["diff"], p);
+    assert_cli_success(&diff_before, "diff before");
+    let started = run_libra_command(&["merge", "--no-commit", "--autostash", "feature"], p);
+    assert_cli_success(&started, "no-commit merge");
+    assert!(run_libra_command(&["stash", "list"], p).stdout.is_empty());
+    let sidecar = std::fs::read_to_string(p.join(".libra/merge-autostash.json")).unwrap();
+    assert!(sidecar.contains("stash_commit"));
+    let continued = run_libra_command(&["commit", "-m", "done"], p);
+    assert_cli_success(&continued, "commit merge");
+    assert!(String::from_utf8_lossy(&continued.stderr).contains("Applied autostash."));
+    assert_eq!(commit_parents(p).len(), 2);
+    let tree = run_libra_command(&["show", "--format=", "HEAD:base.txt"], p);
+    assert_eq!(String::from_utf8_lossy(&tree.stdout), "base\n");
+    assert_eq!(
+        std::fs::read_to_string(p.join("base.txt")).unwrap(),
+        "local dirty\n"
+    );
+    assert!(!p.join(".libra/merge-autostash.json").exists());
+}

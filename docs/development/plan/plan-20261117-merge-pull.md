@@ -1597,7 +1597,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-10: 由 `libra commit` 应用并清理 `MERGE_AUTOSTASH`（#991）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：既有 `commit` 完成路径已调用 `conclude_merge_after_commit` 应用/清理 held autostash；补齐 AC1–AC7 断言：sidecar 持有、stash list 为空、提交树不含本地修改、工作树恢复、stderr 提示、sidecar 删除、双父提交。C 组 patch +1。偏差：按简化无冲突夹具验证，用户已取消独立审计与全量测试。）
 
 **Description:** 按 `ADR-MP-04`，停在提交前的合并（`--no-commit`、冲突）的 `--autostash` 只记录在 `merge-autostash.json`、不进入 `stash list`；随后完成合并的 `libra commit` 按 Git 三方逻辑把 autostash 应用到合并结果之上、在 stderr 输出 `Applied autostash.` 并删除 sidecar；（按 G-09 自本卡拆出 `MP-30`、`MP-39`、`MP-43`、`MP-48`。）
 
@@ -1620,7 +1620,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC5：AC3 的 `commit` 在 stderr 输出 `Applied autostash.`。
 - [ ] AC6：AC3 之后 sidecar 被删除。
 - [ ] AC7：AC3 的提交为双父合并提交。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：既有 `merge`/`commit` 文档已描述 commit 完成合并并应用 held autostash；本次无需新增可见行为文档。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::merge_autostash_applied_by_commit` 承载 AC1–AC7；夹具 F-991（`#991` 形态）（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 提交 `B`（`file`=`1\n2\n3\n4\n5\n6\n7\n8\n9\n`）；`topic` 自 `B` 把第 5 行改为 `five` 提交 `T`；`main` 自 `B` 提交 `M`（新增 `h`=`m1\n`），二者无冲突；调用前把工作树 `file` 第 9 行改为 `nine`（与合并改动不重叠的同文件修改），记合并前 `libra diff` 的 stdout 为 `D0`；`R15` = 第 5 行为 `five` 的内容，`R159` = 第 5 行为 `five` 且第 9 行为 `nine` 的内容；应用冲突变体 F-991X：`topic` 另把第 9 行改为 `NINE`；快进变体 F-991F：`main` 停在 `B`（`topic` 可快进）；冲突变体 F-991C：`main` 自 `B` 提交的 `M` 改为只把第 5 行改为 `FIVE`（不新增 `h`，与 `topic` 冲突）；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -1635,7 +1635,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC7）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::merge_autostash_applied_by_commit)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::merge_autostash_applied_by_commit)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`merge_autostash_applied_by_commit`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --lib -E 'test(/^command::merge::tests::/)'`（`src/command/merge.rs` 内单元测试模块；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list --lib` 记录 `N` ≥ 1）
 
