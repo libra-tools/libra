@@ -528,3 +528,27 @@ fn test_cf_52_predicates() {
     assert_cli_success(&null, "null get-regexp");
     assert_eq!(null.stdout, b"up.one\n1\0up.empty\n\0up.two\n2\0");
 }
+
+#[test]
+#[serial(cwd)]
+fn test_cf_106_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    for (key, value) in [
+        ("zz.key", "1"),
+        ("aa.key", "2"),
+        ("aa.key", "4"),
+        ("mm.key", "3"),
+    ] {
+        assert_cli_success(
+            &run_libra_command(&["config", "--add", key, value], repo.path()),
+            "add",
+        );
+    }
+    let out = run_libra_command(&["config", "--get-regexp", "^(zz|aa|mm)\\."], repo.path());
+    assert_cli_success(&out, "get-regexp");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        "zz.key 1\naa.key 2\naa.key 4\nmm.key 3"
+    );
+}
