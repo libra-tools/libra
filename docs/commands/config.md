@@ -1259,3 +1259,5 @@ upgrade.mode origin is file colon and the settings path.
 config --file does not follow include or includeIf.
 
 git config syntax parses like git.
+
+file mutations match git bytes.
