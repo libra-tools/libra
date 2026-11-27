@@ -1651,7 +1651,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-09f: `sequence_state` 可选 OID 列的全零编解码函数（#907 前置）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增显式 `HashKind` 的可选 OID 编解码；SHA-1/SHA-256/BLAKE3 全零与错误长度覆盖；sequencer 11/11。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** R43 自原 `SA-05a` 改造（原卡撤回，编号不复用）：`REL-SA-02` 家族子卡 1/8，只做本地签名+DCO 提交。在 `src/internal/sequencer/mod.rs` 新增唯一的可选 OID 列编解码函数对（`ADR-SA-02`）：编码显式接收 `HashKind`，`None` → `ObjectHash::zero_str(kind)`、`Some(oid)` → 该 OID 的原字符串；解码只把恰为 `ObjectHash::zero_str(kind)` 的串视为 `None`（长度与 `kind` 不符的全零串按非法值报错），其它值经 `crate::internal::object_format::parse_hex_for_kind(kind, …)` 严格解析为 `Some`，解析失败（非十六进制或长度与 `kind` 不符）返回错误；两者都不读进程全局哈希类型。函数为 `pub`（`src/lib.rs:25` 的 `pub mod internal` 与 `src/internal/mod.rs:55` 的 `pub mod sequencer` 使其处于库的公开路径，接入前不触发 `dead_code`）；唯一消费者 `SA-09b` 在同一家族内接入，家族由 `REL-SA-02` 一次发布（G-02/G-08）。BLAKE3 与 SHA-256 的全零串相同（64 个 `0`），按 20/32 字节两种长度覆盖。
 **Out of scope:** `am` 字段接线（由 `SA-09b` 承接）；`cherry-pick` 状态的全零编码与 unborn 非快进 pick（`DEFER-SA-17`）；`ORIG_HEAD` 投影（`DEFER-SA-20`）。
 
@@ -1679,7 +1679,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 
 **Verification:**（按「验证执行协议」执行：nextest 精确过滤按第 1 条、发布点聚合守卫按第 1b 条；每项为 1 个独立门）
 
-- [ ] VER1 `source .env.test && cargo nextest run --lib --no-tests=fail -E 'test(=internal::sequencer::tests::optional_oid_column_zero_encoding_sha1_sha256)'`（new；AC1–AC8）
+- [x] VER1 `optional_oid_column_zero_encoding_sha1_sha256`（通过）
 
 **共享回归组（不计入 VER）:** `source .env.test && cargo nextest run --lib --no-tests=fail -E 'test(/^internal::sequencer::/)'`。
 **D 组:** 继承 `REL-SA-02` 的 D 组登记表（D5 由 `REL-SA-02` 的网站交付承担）。

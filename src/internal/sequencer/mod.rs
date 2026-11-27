@@ -2041,6 +2041,33 @@ async fn ensure_none_for(next: ActiveSequenceKind) -> CliResult<()> {
     .with_hint(how))
 }
 
+/// Encode an optional OID column for `sequence_state` without consulting the
+/// process-global hash kind. `None` is the kind's all-zero sentinel.
+pub fn encode_optional_oid(
+    kind: git_internal::hash::HashKind,
+    oid: Option<git_internal::hash::ObjectHash>,
+) -> String {
+    oid.map_or_else(
+        || git_internal::hash::ObjectHash::zero_str(kind),
+        |oid| oid.to_string(),
+    )
+}
+
+/// Decode an optional OID column for `sequence_state`. Only the exact
+/// all-zero sentinel for `kind` means `None`; everything else is strictly
+/// parsed as a `kind`-sized hexadecimal object id.
+pub fn decode_optional_oid(
+    kind: git_internal::hash::HashKind,
+    value: &str,
+) -> Result<Option<git_internal::hash::ObjectHash>, String> {
+    if value == git_internal::hash::ObjectHash::zero_str(kind) {
+        return Ok(None);
+    }
+    crate::internal::object_format::parse_hex_for_kind(kind, value)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2752,5 +2779,29 @@ mod tests {
             !dot_libra.join("libra.db").exists(),
             "pure redb sequencer must never create libra.db"
         );
+    }
+    #[test]
+    #[serial_test::serial(hash_kind)]
+    fn optional_oid_column_zero_encoding_sha1_sha256() {
+        use git_internal::hash::HashKind;
+        for kind in [HashKind::Sha1, HashKind::Sha256, HashKind::Blake3] {
+            let encoded_none = encode_optional_oid(kind, None);
+            assert_eq!(encoded_none, git_internal::hash::ObjectHash::zero_str(kind));
+            assert_eq!(
+                decode_optional_oid(kind, &encoded_none).expect("zero decode"),
+                None
+            );
+            let oid = crate::internal::object_format::digest(kind, b"sequence-optional-oid");
+            let encoded = encode_optional_oid(kind, Some(oid));
+            assert_eq!(
+                decode_optional_oid(kind, &encoded).expect("oid decode"),
+                Some(oid)
+            );
+            let wrong_length = "0".repeat(match kind {
+                HashKind::Sha1 => 64,
+                HashKind::Sha256 | HashKind::Blake3 => 40,
+            });
+            assert!(decode_optional_oid(kind, &wrong_length).is_err());
+        }
     }
 }
