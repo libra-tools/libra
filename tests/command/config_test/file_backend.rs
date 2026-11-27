@@ -540,3 +540,61 @@ fn test_cf_86_predicates() {
         "blob:HEAD:cfg\ta.b=c"
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_t1300_file_origin() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.name", "T"], repo.path()),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.email", "t@t.io"], repo.path()),
+        "email",
+    );
+    fs::write(repo.path().join("cfg"), "[a]\n\tb = c\n").unwrap();
+    let file = run_libra_command(
+        &["config", "--file", "cfg", "--show-origin", "--list"],
+        repo.path(),
+    );
+    assert!(String::from_utf8_lossy(&file.stdout).starts_with("file:cfg\ta.b=c"));
+    let stdin = run_libra_command_with_stdin(
+        &["config", "--file", "-", "--show-origin", "--list"],
+        repo.path(),
+        "[a]\n\tb = c\n",
+    );
+    assert!(String::from_utf8_lossy(&stdin.stdout).starts_with("standard input:\ta.b=c"));
+    assert_cli_success(&run_libra_command(&["add", "cfg"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "cfg"], repo.path()),
+        "commit",
+    );
+    let blob = run_libra_command(
+        &["config", "--blob", "HEAD:cfg", "--show-origin", "--list"],
+        repo.path(),
+    );
+    assert!(String::from_utf8_lossy(&blob.stdout).starts_with("blob:HEAD:cfg\ta.b=c"));
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_file_include_not_followed() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    fs::write(repo.path().join("included.cfg"), "[inc]\n\tkey = secret\n").unwrap();
+    fs::write(
+        repo.path().join("cfg"),
+        "[a]\n\tb = c\n[include]\n\tpath = included.cfg\n",
+    )
+    .unwrap();
+    let list = run_libra_command(&["config", "--file", "cfg", "--list"], repo.path());
+    assert_cli_success(&list, "list");
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert!(text.contains("a.b=c"), "{text}");
+    assert!(
+        !text.contains("inc.key"),
+        "include must not be followed: {text}"
+    );
+}

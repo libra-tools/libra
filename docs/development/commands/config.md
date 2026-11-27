@@ -390,3 +390,5 @@ show-scope prints the scope name and a TAB.
 missing key unset exits 5.
 
 upgrade.mode origin is file colon and the settings path.
+
+config --file does not follow include or includeIf.
