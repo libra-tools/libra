@@ -1245,3 +1245,5 @@ extended upstream replace cases pass.
 get-regexp prints key space value in insertion order.
 
 validation JSON envelope keeps the overridden exit code.
+
+get --default prints the default when the pattern misses.

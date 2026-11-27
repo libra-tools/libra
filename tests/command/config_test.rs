@@ -8290,4 +8290,46 @@ mod value_pattern {
         let values = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
         assert_eq!(String::from_utf8_lossy(&values.stdout).trim(), "only");
     }
+
+    #[test]
+    fn test_get_default_on_pattern_miss() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "def.k", value], repo.path()),
+                "add",
+            );
+        }
+        let get = run_libra_command(
+            &["config", "--get", "def.k", "^absent$", "--default", "d"],
+            repo.path(),
+        );
+        assert_cli_success(&get, "default get");
+        assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "d");
+        let all = run_libra_command(
+            &["config", "--get-all", "def.k", "^absent$", "--default", "d"],
+            repo.path(),
+        );
+        assert_cli_success(&all, "default get-all");
+        assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "d");
+    }
+
+    #[test]
+    fn test_t1300_get_value_pattern() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "up.k", value], repo.path()),
+                "add",
+            );
+        }
+        let get = run_libra_command(&["config", "--get", "up.k", "^two$"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "two");
+        let all = run_libra_command(&["config", "--get-all", "up.k", "o"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "one\ntwo");
+        let miss = run_libra_command(&["config", "--get", "up.k", "^absent$"], repo.path());
+        assert_eq!(miss.status.code(), Some(1));
+    }
 }
