@@ -1239,3 +1239,5 @@ expiry special words match the recorded git result.
 cannot overwrite multiple values with a single value.
 
 multi-value overwrite is a conflict.
+
+extended upstream replace cases pass.

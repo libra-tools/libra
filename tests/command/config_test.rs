@@ -8241,4 +8241,53 @@ mod value_pattern {
         let value = run_libra_command(&["config", "--get", "multi.k"], repo.path());
         assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "four");
     }
+
+    #[test]
+    fn test_cf_68_predicates() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two", "three"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "--replace-all", "multi.k", "new", "^one$"],
+                repo.path(),
+            ),
+            "replace single",
+        );
+        let values = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(
+            String::from_utf8_lossy(&values.stdout).trim(),
+            "new\ntwo\nthree"
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "--replace-all", "multi.k", "done", "^new$"],
+                repo.path(),
+            ),
+            "replace first",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "--replace-all", "multi.k", "last", "^three$"],
+                repo.path(),
+            ),
+            "replace last",
+        );
+        let values = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(
+            String::from_utf8_lossy(&values.stdout).trim(),
+            "done\ntwo\nlast"
+        );
+        assert_cli_success(
+            &run_libra_command(&["config", "--replace-all", "multi.k", "only"], repo.path()),
+            "replace all",
+        );
+        let values = run_libra_command(&["config", "--get-all", "multi.k"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&values.stdout).trim(), "only");
+    }
 }
