@@ -54,7 +54,7 @@ pub struct RemoveArgs {
     #[clap(short, long)]
     pub force: bool,
     /// show what would be removed without actually removing
-    #[clap(long)]
+    #[clap(long, short = 'n')]
     pub dry_run: bool,
     /// Exit with a zero status even if no files matched.
     #[clap(long)]
@@ -445,10 +445,50 @@ fn render_remove_output(result: &RemoveOutput, output: &OutputConfig) -> CliResu
     if output.quiet {
         return Ok(());
     }
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
     for path in &result.paths {
-        println!("rm '{}'", path.path.bright_yellow());
+        if let Err(error) = writeln!(writer, "rm '{}'", path.path.bright_yellow()) {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return handle_broken_pipe();
+            }
+            return Err(CliError::fatal(format!(
+                "failed to write rm output: {error}"
+            )));
+        }
     }
     Ok(())
+}
+
+fn handle_broken_pipe() -> CliResult<()> {
+    #[cfg(unix)]
+    {
+        // Remove's stdout contract follows Git: a closed pipe terminates the
+        // process with SIGPIPE (shell status 141), unlike the generic
+        // BrokenPipe→0 renderer used by other commands.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            libc::raise(libc::SIGPIPE);
+        }
+        return Err(CliError::silent_exit(broken_pipe_exit_code()));
+    }
+    #[cfg(not(unix))]
+    {
+        Err(CliError::fatal("failed to write rm output: broken pipe")
+            .with_stable_code(crate::utils::error::StableErrorCode::IoWriteFailed))
+    }
+}
+
+const fn broken_pipe_exit_code() -> i32 {
+    #[cfg(unix)]
+    {
+        128 + libc::SIGPIPE
+    }
+    #[cfg(not(unix))]
+    {
+        1
+    }
 }
 
 fn matched_directory_prefixes(pathspecs: &PathspecSet, workdir: &std::path::Path) -> Vec<PathBuf> {
@@ -470,4 +510,17 @@ fn plain_directory_prefixes_for_removal(
         .filter(|path| path != std::path::Path::new(".") && !path.as_os_str().is_empty())
         .filter(|path| workdir.join(path).is_dir())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::broken_pipe_exit_code;
+
+    #[test]
+    fn broken_pipe_policy_by_platform() {
+        #[cfg(unix)]
+        assert_eq!(broken_pipe_exit_code(), 141);
+        #[cfg(not(unix))]
+        assert_eq!(broken_pipe_exit_code(), 1);
+    }
 }

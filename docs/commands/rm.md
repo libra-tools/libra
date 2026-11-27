@@ -229,3 +229,5 @@ change is deliberately deferred (DEFER-03).
 | Not inside a repository | Error: repository not found | non-zero |
 
 rm reads pathspecs from stdin and validates source flags.
+
+rm -n uses the short flag and exits via SIGPIPE on a closed pipe.

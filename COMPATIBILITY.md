@@ -2295,3 +2295,5 @@ apply --binary is a compatibility no-op for binary patches.
 reset and restore accept the main branch.
 
 rm reads pathspecs from stdin and validates source flags.
+
+rm -n uses the short flag and exits via SIGPIPE on a closed pipe.

@@ -207,3 +207,5 @@ Git 对这三类拒绝返回 `1`；退出码对齐按 DEFER-03 有意延后。
 | 不在仓库内 | 错误：找不到仓库 | 非零 |
 
 rm reads pathspecs from stdin and validates source flags.
+
+rm -n uses the short flag and exits via SIGPIPE on a closed pipe.

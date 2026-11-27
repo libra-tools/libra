@@ -66,3 +66,5 @@ flowchart TD
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 
 rm reads pathspecs from stdin and validates source flags.
+
+rm -n uses the short flag and exits via SIGPIPE on a closed pipe.

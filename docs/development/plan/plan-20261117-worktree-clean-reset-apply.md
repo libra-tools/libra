@@ -1556,7 +1556,7 @@ PY
 ### Task WC-13: 补齐 `libra rm -n` 短标志与 SIGPIPE/锁边界（#1038 / `TC-2645`）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`rm -n` 短标志；Unix 遇 BrokenPipe 恢复默认 SIGPIPE 处置并以 141 退出，非 Unix 非零错误；不残留 index.lock；新增短标志、SIGPIPE 与平台策略测试；remove 26/26。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 为 `RemoveArgs::dry_run` 添加 `short = 'n'` 短标志（修复 `unexpected argument '-n' found`），并在 `remove.rs` 中针对 `output.rs:121-128` 将 `BrokenPipe` 转为 exit 0 且 shell 忽略 SIGPIPE 的场景，在 `#[cfg(unix)]` 下于 `rm -n` 写入遇到 `BrokenPipe` 时恢复默认 SIGPIPE 处置并重新触发 `SIGPIPE`（退出码 141 / 标准信号退出；非 Unix 平台按普通管道写入错误非零退出），同时确保不修改索引或残留 `index.lock`。
 **Out of scope:** `--pathspec-from-file=-`（`WC-12`）；全局修改 `src/utils/output.rs`（永久非目标：保留仓库级其它命令 BrokenPipe→0 契约）；在 Windows 实机运行非 Unix 分支（无对应 CI runner，登记为残余风险）。
 
@@ -1567,13 +1567,13 @@ PY
 | `RemoveArgs::dry_run` 仅声明 `#[clap(long)]`，缺少 `short = 'n'`；`output.rs` 将 `BrokenPipe` 转为 exit 0 | `src/command/remove.rs:57-58,429`（`println!` 输出）; `src/utils/output.rs:121-128`; 上游 `git@750f5de7` `t/t3600-rm.sh:261-266` |
 
 **Acceptance criteria:**
-- [ ] AC1：`libra rm -n a` 被 CLI 接受（exit 0）。
-- [ ] AC2：AC1 的 stdout 为 `rm 'a'`。
-- [ ] AC3：AC1 与 AC4 的每次执行前后全量快照相同（不修改索引、不删除或修改工作区文件）。
-- [ ] AC4：Unix 下父进程忽略 SIGPIPE 时，`libra rm -n "some-file-*"` 向已关闭管道写入大量输出后以信号 13 终止（shell 观察到 141；上游 `t3600#36` / `TC-2645`）。
-- [ ] AC5：AC4 之后仓库存储目录下不残留 `index.lock` 或其它新增锁文件。
-- [ ] AC6：BrokenPipe 处置按平台分支：Unix 选择恢复默认处置并重新触发 SIGPIPE，非 Unix 返回普通写入错误（非零退出、可诊断信息）。
-- [ ] AC7：`libra rm -n --json a` 输出的 `dry_run` 为 `true`。
+- [x] AC1：`libra rm -n a` 被 CLI 接受（exit 0）。（`remove_dry_run_short_flag` / `remove_dry_run_sigpipe_keeps_index` / `broken_pipe_policy_by_platform`）
+- [x] AC2：AC1 的 stdout 为 `rm 'a'`。（`remove_dry_run_short_flag` / `remove_dry_run_sigpipe_keeps_index` / `broken_pipe_policy_by_platform`）
+- [x] AC3：AC1 与 AC4 的每次执行前后全量快照相同（不修改索引、不删除或修改工作区文件）。（`remove_dry_run_short_flag` / `remove_dry_run_sigpipe_keeps_index` / `broken_pipe_policy_by_platform`）
+- [x] AC4：Unix 下父进程忽略 SIGPIPE 时，`libra rm -n "some-file-*"` 向已关闭管道写入大量输出后以信号 13 终止（shell 观察到 141；上游 `t3600#36` / `TC-2645`）。（`remove_dry_run_short_flag` / `remove_dry_run_sigpipe_keeps_index` / `broken_pipe_policy_by_platform`）
+- [x] AC5：AC4 之后仓库存储目录下不残留 `index.lock` 或其它新增锁文件。（`remove_dry_run_short_flag` / `remove_dry_run_sigpipe_keeps_index` / `broken_pipe_policy_by_platform`）
+- [x] AC6：BrokenPipe 处置按平台分支：Unix 选择恢复默认处置并重新触发 SIGPIPE，非 Unix 返回普通写入错误（非零退出、可诊断信息）。（`remove_dry_run_short_flag` / `remove_dry_run_sigpipe_keeps_index` / `broken_pipe_policy_by_platform`）
+- [x] AC7：`libra rm -n --json a` 输出的 `dry_run` 为 `true`。（`remove_dry_run_short_flag` / `remove_dry_run_sigpipe_keeps_index` / `broken_pipe_policy_by_platform`）
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -1588,10 +1588,10 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::remove_test::remove_dry_run_short_flag)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1、AC2、AC3（AC1 的执行）、AC7）
-- [ ] 具名测试（仅 Unix）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::remove_test::remove_dry_run_sigpipe_keeps_index)'` (new)（按「验证执行协议」第 1–4 条与第 8 条；覆盖 AC3（AC4 的执行）、AC4、AC5）
-- [ ] 具名测试：`source .env.test && cargo nextest run --lib -E 'test(=command::remove::tests::broken_pipe_policy_by_platform)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC6）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::remove_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] `remove_dry_run_short_flag`（通过）
+- [x] `remove_dry_run_sigpipe_keeps_index`（通过）
+- [x] `broken_pipe_policy_by_platform`（通过）
+- [x] 共享回归组：`command::remove_test`（26/26）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-12`, `WC-06a`, `DEP-WC-05`

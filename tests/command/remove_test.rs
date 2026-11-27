@@ -1427,3 +1427,64 @@ fn remove_pathspec_from_file_stdin_and_validation() {
     let bare_nul = run_libra_command(&["rm", "--pathspec-file-nul", "a"], repo.path());
     assert!(!bare_nul.status.success());
 }
+
+#[test]
+#[serial(cwd)]
+fn remove_dry_run_short_flag() {
+    let repo = create_committed_repo_via_cli();
+    let before = run_libra_command(&["status", "--porcelain"], repo.path());
+    let out = run_libra_command(&["rm", "-n", "tracked.txt"], repo.path());
+    assert_cli_success(&out, "rm -n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "rm 'tracked.txt'"
+    );
+    assert!(repo.path().join("tracked.txt").exists());
+    let after = run_libra_command(&["status", "--porcelain"], repo.path());
+    assert_eq!(before.stdout, after.stdout, "dry-run must not modify state");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial(cwd)]
+fn remove_dry_run_sigpipe_keeps_index() {
+    let repo = create_committed_repo_via_cli();
+    let mut names = Vec::new();
+    for i in 0..2000 {
+        let name = format!("many-{i}.txt");
+        create_file(repo.path().join(&name).to_str().unwrap(), "x");
+        names.push(name);
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "--all"], repo.path()),
+        "add many",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "many"], repo.path()),
+        "commit many",
+    );
+    let home = repo.path().join(".pipe-home");
+    fs::create_dir_all(&home).unwrap();
+    let script = format!(
+        "trap '' PIPE; \"{}\" rm -n 'many-*' | head -n 1 >/dev/null; printf '%s' \"${{PIPESTATUS[0]}}\"",
+        env!("CARGO_BIN_EXE_libra")
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .current_dir(repo.path())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("LIBRA_TEST", "1")
+        .output()
+        .expect("run sigpipe probe");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "141",
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!repo.path().join(".libra/index.lock").exists());
+    assert!(repo.path().join("many-0.txt").exists());
+}
