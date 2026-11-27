@@ -613,3 +613,5 @@ merge combines --strategy with --strategy-option.
 merge rejects squash with no-ff and allows squash ff-only.
 
 merge --continue applies and clears a held MERGE_AUTOSTASH.
+
+If the editor exits non-zero or cannot be started, Libra applies the merge to the index and working tree, keeps merge state, and reports `Not committing merge; use 'libra commit' to complete the merge.`. `libra commit`, `merge --continue`, or `merge --abort` can then finish or undo it.

@@ -990,7 +990,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-03: 修复 `merge --edit` 编辑器失败后的可恢复性（#994）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：编辑器非 0 退出及无法启动（不存在程序 / PATH 无 sh）均输出 Git 提示，已合并索引/工作树与 merge state 保留；`commit`、`--continue`、`--abort` 均可恢复。由 `edit_failure_keeps_resumable_merge` 覆盖。与 MP-03/MP-52 合并为一个补丁版本。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** `merge --edit` 的编辑器以非 0 退出时，与 Git 一致输出 `Not committing merge; use 'libra commit' to complete the merge.`、HEAD 不动并保留可恢复的待决合并（`merge-state.json` 与已合并的索引/工作树），使 `libra commit`、`libra merge --continue` 或 `libra merge --abort` 均可继续。（按 G-09 自本卡拆出 `MP-52` 承接编辑器无法运行的情形。）
 
@@ -1013,7 +1013,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC6：AC1 之后 `libra merge --continue` 创建合并提交。
 - [ ] AC7：AC6 的提交树为完整的合并结果。
 - [ ] AC8：AC1 之后 `libra merge --abort` 恢复合并前状态。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：`merge` 中英文档已记录编辑器失败的可恢复状态与提示；网站同步。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::edit_failure_keeps_resumable_merge` 承载 AC1–AC8；夹具 F-DIV（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 上提交 `B`（`f`=`base\n`）；自 `B` 建分支 `topic` 并提交 `T`（新增 `g`=`t1\n`）；`main` 自 `B` 再提交 `M`（新增 `h`=`m1\n`），与 `topic` 分叉且无冲突；编辑器失败以子进程环境 `GIT_EDITOR=false` 注入（用例 `#[cfg(unix)]`）；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -1029,7 +1029,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC8）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::edit_failure_keeps_resumable_merge)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::edit_failure_keeps_resumable_merge)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`edit_failure_keeps_resumable_merge`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_noninteractive_history_controls`（整 target，非交互历史控制；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_noninteractive_history_controls` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 
@@ -1049,7 +1049,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-52: `merge --edit` 编辑器无法运行时同样保留可恢复合并（#994）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：编辑器非 0 退出及无法启动（不存在程序 / PATH 无 sh）均输出 Git 提示，已合并索引/工作树与 merge state 保留；`commit`、`--continue`、`--abort` 均可恢复。由 `edit_spawn_failure_keeps_resumable_merge` 覆盖。与 MP-03/MP-52 合并为一个补丁版本。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-03` 拆出：Libra 经 `sh -c` 启动编辑器（`src/command/editor.rs:120-149`），因此「编辑器无法运行」有两种形态：`GIT_EDITOR` 指向不存在的程序时 shell 以 127 退出；`sh` 本身无法创建（子进程 `PATH` 中没有 `sh`）时 `Command::status()` 返回错误。两种形态都与编辑器以非 0 退出走同一可恢复路径：输出 `Not committing merge; use 'libra commit' to complete the merge.`、HEAD 不动并保留待决合并与已合并的索引，使 `libra commit` 可完成合并（`#994`：编辑器 "cannot be run" 与非 0 退出同属该 issue）。
 
@@ -1072,7 +1072,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC6：AC5 之后 HEAD 不动。
 - [ ] AC7：AC5 之后索引保留已合并结果。
 - [ ] AC8：AC5 之后 `libra commit --no-edit` 完成为 `M` 与 `T` 的合并提交（含完整合并结果）。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：`merge` 中英文档已记录编辑器失败的可恢复状态与提示；网站同步。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::edit_spawn_failure_keeps_resumable_merge` 承载 AC1–AC8；夹具 F-DIV（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 上提交 `B`（`f`=`base\n`）；自 `B` 建分支 `topic` 并提交 `T`（新增 `g`=`t1\n`）；`main` 自 `B` 再提交 `M`（新增 `h`=`m1\n`），与 `topic` 分叉且无冲突；形态 A：子进程环境 `GIT_EDITOR=/nonexistent/editor`（绝对路径，不存在）；形态 B：夹具建立完成后，被测 `merge` 子进程的环境 `PATH` 设为一个空的临时目录 `<nosh>`（其中没有 `sh`；`libra` 以绝对路径调用），`GIT_EDITOR=true`；用例 `#[cfg(unix)]`；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -1088,7 +1088,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC8）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::edit_spawn_failure_keeps_resumable_merge)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::edit_spawn_failure_keeps_resumable_merge)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`edit_spawn_failure_keeps_resumable_merge`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `MP-03`, `DEP-MP-10`

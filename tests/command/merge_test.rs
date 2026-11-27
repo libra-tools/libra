@@ -18,7 +18,7 @@ use serial_test::serial;
 use super::{
     assert_cli_success, configure_identity_via_cli, create_committed_repo_via_cli,
     init_repo_via_cli, parse_cli_error_stderr, parse_json_stdout, run_libra_command,
-    run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
+    run_libra_command_with_env, run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
 };
 
 mod auto_merge;
@@ -15177,4 +15177,92 @@ fn verify_signatures_min_trust_level() {
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("LBR-CLI-002"));
     let after = run_libra_command(&["rev-parse", "HEAD"], p);
     assert_eq!(before.stdout, after.stdout);
+}
+
+#[test]
+fn edit_failure_keeps_resumable_merge() {
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    let head = run_libra_command(&["rev-parse", "HEAD"], p);
+    let failed = run_libra_command_with_env(
+        &["merge", "--edit", "feature"],
+        p,
+        &[("GIT_EDITOR", "false")],
+    );
+    assert_ne!(failed.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&failed.stderr)
+            .contains("Not committing merge; use 'libra commit' to complete the merge.")
+    );
+    assert_eq!(
+        run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+        head.stdout
+    );
+    assert!(p.join(".libra/merge-state.json").exists());
+    let index = run_libra_command(&["ls-files", "--stage"], p);
+    assert!(String::from_utf8_lossy(&index.stdout).contains("feature.txt"));
+
+    let committed = run_libra_command(&["commit", "--no-edit"], p);
+    assert_cli_success(&committed, "commit after edit failure");
+    assert_eq!(commit_parents(p).len(), 2);
+    let tree = run_libra_command(&["ls-tree", "-r", "--name-only", "HEAD"], p);
+    assert!(String::from_utf8_lossy(&tree.stdout).contains("feature.txt"));
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    let failed = run_libra_command_with_env(
+        &["merge", "--edit", "feature"],
+        p,
+        &[("GIT_EDITOR", "false")],
+    );
+    assert_ne!(failed.status.code(), Some(0));
+    let continued = run_libra_command(&["merge", "--continue", "-m", "done"], p);
+    assert_cli_success(&continued, "continue after edit failure");
+    assert_eq!(commit_parents(p).len(), 2);
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    let head = run_libra_command(&["rev-parse", "HEAD"], p);
+    let failed = run_libra_command_with_env(
+        &["merge", "--edit", "feature"],
+        p,
+        &[("GIT_EDITOR", "false")],
+    );
+    assert_ne!(failed.status.code(), Some(0));
+    let aborted = run_libra_command(&["merge", "--abort"], p);
+    assert_cli_success(&aborted, "abort after edit failure");
+    assert_eq!(
+        run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+        head.stdout
+    );
+    assert!(!p.join(".libra/merge-state.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn edit_spawn_failure_keeps_resumable_merge() {
+    for env in [
+        vec![("GIT_EDITOR", "/nonexistent/editor")],
+        vec![("GIT_EDITOR", "true"), ("PATH", "")],
+    ] {
+        let repo = create_diverged_repo_clean();
+        let p = repo.path();
+        let head = run_libra_command(&["rev-parse", "HEAD"], p);
+        let failed = run_libra_command_with_env(&["merge", "--edit", "feature"], p, &env);
+        assert_ne!(failed.status.code(), Some(0), "{env:?}");
+        assert!(
+            String::from_utf8_lossy(&failed.stderr)
+                .contains("Not committing merge; use 'libra commit' to complete the merge.")
+        );
+        assert_eq!(
+            run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+            head.stdout
+        );
+        assert!(p.join(".libra/merge-state.json").exists());
+        let committed = run_libra_command(&["commit", "--no-edit"], p);
+        assert_cli_success(&committed, "commit after spawn failure");
+        assert_eq!(commit_parents(p).len(), 2);
+        let tree = run_libra_command(&["ls-tree", "-r", "--name-only", "HEAD"], p);
+        assert!(String::from_utf8_lossy(&tree.stdout).contains("feature.txt"));
+    }
 }

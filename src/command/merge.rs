@@ -932,7 +932,7 @@ pub(crate) enum PullMergeError {
         "invalid merge message cleanup mode '{0}' (expected strip/whitespace/verbatim/scissors/default)"
     )]
     InvalidCleanup(String),
-    #[error("failed to edit merge commit message: {0}")]
+    #[error("Not committing merge; use 'libra commit' to complete the merge.")]
     Editor(String),
     #[error(transparent)]
     HistoryConfig(#[from] crate::command::history_config::HistoryConfigError),
@@ -3685,14 +3685,61 @@ async fn perform_three_way_merge(
     // and `--no-commit` states persist it and `merge --continue` replays it
     // instead of regenerating a plain message (which would drop `-m` and the
     // configured shortlog).
-    let resolved_message = resolve_merge_message(
+    let message_settings = MergeMessageSettings::from_three_way_options(&options);
+    let resolved_message = match resolve_merge_message(
         current_commit.id,
         target_commit.id,
         upstream,
         &head_name,
-        MergeMessageSettings::from_three_way_options(&options),
+        message_settings,
     )
-    .await?;
+    .await
+    {
+        Ok(message) => message,
+        Err(error @ PullMergeError::Editor(_)) => {
+            // Git applies the merge to the index/worktree before it opens the
+            // editor. If the editor fails on a clean, non-squash merge, leave
+            // that result plus merge state behind so `commit`, `--continue`,
+            // or `--abort` can finish it.
+            if merge_result.conflicts.is_empty() && !options.squash && !options.no_commit {
+                let fallback = resolve_merge_message(
+                    current_commit.id,
+                    target_commit.id,
+                    upstream,
+                    &head_name,
+                    MergeMessageSettings {
+                        edit: false,
+                        ..message_settings
+                    },
+                )
+                .await?;
+                let tree_id = create_tree_from_items_map(&merge_result.merged_items)
+                    .map_err(PullMergeError::TreeCreate)?;
+                reset_index_and_workdir_to_tree(&tree_id)?;
+                MergeState {
+                    head_name: head_name.clone(),
+                    orig_head: current_commit.id.to_string(),
+                    target: target_commit.id.to_string(),
+                    target_ref: upstream.to_string(),
+                    targets: Vec::new(),
+                    target_refs: Vec::new(),
+                    base: recorded_merge_base(&base_commits).map(|base| base.to_string()),
+                    strategy: options.strategy,
+                    allow_unrelated_histories: options.allow_unrelated_histories,
+                    skip_hooks: options.skip_hooks,
+                    signing_policy: Some(options.signing_policy),
+                    signoff: options.signoff,
+                    rerere_autoupdate: options.rerere_autoupdate,
+                    conflicted_paths: Vec::new(),
+                    message: Some(fallback),
+                    auto_merge: None,
+                }
+                .save()?;
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
 
     if !merge_result.conflicts.is_empty() {
         if let Some(error) = deferred_conflict_style_error.take() {
@@ -9300,14 +9347,57 @@ async fn perform_incremental_three_way_merge(
         }));
     }
 
-    let resolved_message = resolve_merge_message(
+    let message_settings = MergeMessageSettings::from_three_way_options(&options);
+    let resolved_message = match resolve_merge_message(
         current_commit.id,
         target_commit.id,
         upstream,
         &head_name,
-        MergeMessageSettings::from_three_way_options(&options),
+        message_settings,
     )
-    .await?;
+    .await
+    {
+        Ok(message) => message,
+        Err(error @ PullMergeError::Editor(_)) => {
+            if conflicts.is_empty() && !options.squash && !options.no_commit {
+                let fallback = resolve_merge_message(
+                    current_commit.id,
+                    target_commit.id,
+                    upstream,
+                    &head_name,
+                    MergeMessageSettings {
+                        edit: false,
+                        ..message_settings
+                    },
+                )
+                .await?;
+                let tree_id = create_tree_from_items_map(&merged_items)
+                    .map_err(PullMergeError::TreeCreate)?;
+                reset_index_and_workdir_to_tree(&tree_id)?;
+                MergeState {
+                    head_name: head_name.clone(),
+                    orig_head: current_commit.id.to_string(),
+                    target: target_commit.id.to_string(),
+                    target_ref: upstream.to_string(),
+                    targets: Vec::new(),
+                    target_refs: Vec::new(),
+                    base: recorded_base.map(|base| base.to_string()),
+                    strategy: options.strategy,
+                    allow_unrelated_histories: options.allow_unrelated_histories,
+                    skip_hooks: options.skip_hooks,
+                    signing_policy: Some(options.signing_policy),
+                    signoff: options.signoff,
+                    rerere_autoupdate: options.rerere_autoupdate,
+                    conflicted_paths: Vec::new(),
+                    message: Some(fallback),
+                    auto_merge: None,
+                }
+                .save()?;
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
 
     if !conflicts.is_empty() {
         // The conflict path writes per-file index entries and worktree files,
