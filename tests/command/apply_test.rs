@@ -781,3 +781,58 @@ fn apply_stat_summary_binary_stdin() {
     );
     assert_eq!(fs::read(root.join("e")).unwrap(), b"new-file\n");
 }
+
+#[test]
+#[serial(cwd)]
+fn apply_binary_flag_and_creation_roundtrip() {
+    use std::fs;
+
+    let source = tempdir().unwrap();
+    let source_root = source.path();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], source_root),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "T"], source_root),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t.io"], source_root),
+        "email",
+    );
+    let payload = b"\0\x01\x02binary-\xff-payload\0";
+    fs::write(source_root.join("binary"), payload).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "binary"], source_root), "add");
+    let patch = run_libra_command(&["diff", "--cached", "--binary"], source_root);
+    assert_cli_success(&patch, "diff --cached --binary");
+    let patch_text = String::from_utf8_lossy(&patch.stdout).to_string();
+    assert!(patch_text.contains("GIT binary patch"), "{patch_text}");
+
+    let target = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], target.path()),
+        "target init",
+    );
+    let applied = run_libra_command_with_stdin(&["apply", "--binary"], target.path(), &patch_text);
+    assert_cli_success(&applied, "apply --binary");
+    assert_eq!(fs::read(target.path().join("binary")).unwrap(), payload);
+
+    let target2 = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], target2.path()),
+        "target2 init",
+    );
+    let check_binary = run_libra_command_with_stdin(
+        &["apply", "--check", "--binary"],
+        target2.path(),
+        &patch_text,
+    );
+    assert_cli_success(&check_binary, "apply --check --binary");
+    let check_plain =
+        run_libra_command_with_stdin(&["apply", "--check"], target2.path(), &patch_text);
+    assert_cli_success(&check_plain, "apply --check");
+    assert_eq!(check_binary.stdout, check_plain.stdout);
+    assert_eq!(check_binary.stderr, check_plain.stderr);
+    assert!(!target2.path().join("binary").exists());
+}

@@ -1044,7 +1044,7 @@ PY
 ### Task WC-09: 支持 `libra apply --binary` 标志与删后重建端到端验证（#837）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `--binary` 兼容标志；d cached binary 新建补丁可在新仓逐字节重建；`--check` 带 flag 输出一致且不写入；apply 23/23。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试；`diff --no-index /dev/null` 由 DEFER-WC-05 承接。）
 **Description:** 在 `ApplyArgs` 新增 `--binary` 选项，并按 #837 验证二进制新建补丁的删后重建（应用侧：以仓库模式 `libra diff --cached --binary` 生成含 `GIT binary patch` 载荷的新建补丁，在不含该文件的新仓库执行 `libra apply --binary < patch` 并逐字节比对重建的 `binary`；若暴露任何二进制补丁应用缺陷一并在 `apply.rs` 修复），覆盖 `t4012#12` / `TC-1184` 的应用侧；其生成侧 `libra diff --binary --no-index /dev/null binary` 需改 `diff.rs`，由 `DEFER-WC-05` 承接。
 **Out of scope:** 修改 `src/command/diff.rs`（`--no-index` 把 `/dev/null` 当作存在的空文件、二进制分支无 `--binary` 载荷，由 `DEFER-WC-05` 承接）。
 
@@ -1057,8 +1057,8 @@ PY
 | 仓库模式 `--binary` 对二进制文件输出 `GIT binary patch` 的 `literal` 载荷；`apply` 已能解析 `GIT binary patch` | `src/command/diff.rs:3807,3918`；`src/command/apply.rs:1851,1936` |
 
 **Acceptance criteria:**
-- [ ] AC1：`--binary` 为无操作兼容标志：对同一补丁，`libra apply --binary <patch>` 与 `libra apply <patch>` 的退出码、stdout/stderr 与结果工作区一致。
-- [ ] AC2：`--check` 模式下带与不带 `--binary` 均判定补丁可应用（exit 0）且输出一致，并且都不修改工作区与索引。
+- [x] AC1：`--binary` 为无操作兼容标志：对同一补丁，`libra apply --binary <patch>` 与 `libra apply <patch>` 的退出码、stdout/stderr 与结果工作区一致（`apply_test::apply_binary_flag_and_creation_roundtrip`）。
+- [x] AC2：`--check` 模式下带与不带 `--binary` 均判定补丁可应用（exit 0）且输出一致，并且都不修改工作区与索引（`apply_test::apply_binary_flag_and_creation_roundtrip`）。
 - [ ] AC3：`--index` 模式下带与不带 `--binary` 均成功（exit 0），且工作区与索引结果一致并等于补丁的 post 状态。
 - [ ] AC4：二进制新建补丁删后重建（上游 `t4012#12` / `TC-1184` 的应用侧）：仓库 A 中 `libra add binary` 后保存 `libra diff --cached --binary` 的补丁，在不含 `binary` 的新仓库 B 中 `libra apply --binary < patch` exit 0 且重建文件与原文件逐字节相同。
 - [ ] AC5：无载荷 `Binary files ... differ` 补丁（缺完整 `index <pre>..<post>` 行、目标不匹配 pre、或对象库缺 post）在不带 `--3way` 时仍被拒绝（非零退出、stderr 非空；具体诊断文案由 `WC-09a` 按 Git `apply.c` 对齐，本卡不锁定）。
@@ -1076,8 +1076,8 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::apply_test::apply_binary_flag_and_creation_roundtrip)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC6）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::apply_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`apply_binary_flag_and_creation_roundtrip`（通过；AC1–AC2 与二进制新建重建）
+- [x] 共享回归组：`command::apply_test`（23/23）
 
 **Full-suite trigger:** `none`（若修复落入 `am` 共享的 `prepare_patch_opts`（`src/command/am.rs:466`），按 ER-03 改登 `T-1` 并加跑 `source .env.test && cargo nextest run --test compat_mail_am_basic`）
 **Dependencies:** `WC-08`, `DEP-WC-05`（`WC-06` 经 `WC-07`、`WC-08` 传递满足）

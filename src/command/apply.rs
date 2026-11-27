@@ -262,6 +262,11 @@ pub struct ApplyArgs {
     #[clap(long)]
     pub apply: bool,
 
+    /// Accept binary patches (Git compatibility no-op; binary payloads are
+    /// always parsed and applied when present).
+    #[clap(long)]
+    pub binary: bool,
+
     /// Apply the patch in reverse (swap old/new sides).
     #[clap(short = 'R', long = "reverse")]
     pub reverse: bool,
