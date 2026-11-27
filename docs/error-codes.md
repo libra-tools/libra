@@ -731,3 +731,5 @@ key without a section exits 1 or 2.
 config set exit-code exception.
 
 missing key unset exits 5.
+
+scoped regexp keeps upgrade.mode fail-closed only for global.

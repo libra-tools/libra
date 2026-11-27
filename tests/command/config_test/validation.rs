@@ -658,3 +658,69 @@ fn test_cf_32_predicates() {
         assert_eq!(before.stdout, after.stdout, "{args:?}");
     }
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_33_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "env.key", "v"], &repo),
+        "local set",
+    );
+    let local = run_libra_command(&["config", "--local", "--get-regexp", "e"], &repo);
+    assert_cli_success(&local, "local regexp");
+    let local_miss = run_libra_command(&["config", "--local", "--get-regexp", "nomatch"], &repo);
+    assert_eq!(local_miss.status.code(), Some(1));
+
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("xdg");
+    let global_db = temp.path().join("global-dir").join("config.db");
+    fs::create_dir_all(global_db.parent().unwrap()).unwrap();
+    let global_envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", global_db.to_str().unwrap()),
+    ];
+    let global = run_libra_command_with_env(
+        &["config", "--global", "--get-regexp", "upgrade."],
+        &repo,
+        &global_envs,
+    );
+    assert_eq!(global.status.code(), Some(129));
+    assert!(String::from_utf8_lossy(&global.stderr).contains("LBR-CLI-002"));
+
+    let system_repo = temp.path().join("system-repo");
+    fs::create_dir_all(&system_repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &system_repo), "system init");
+    let system_db = temp.path().join("system-dir").join("config.db");
+    fs::create_dir_all(system_db.parent().unwrap()).unwrap();
+    let system_envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_SYSTEM_DB", system_db.to_str().unwrap()),
+    ];
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["config", "--system", "env.key", "system"],
+            &system_repo,
+            &system_envs,
+        ),
+        "system set",
+    );
+    let system = run_libra_command_with_env(
+        &["config", "--system", "--get-regexp", "."],
+        &system_repo,
+        &system_envs,
+    );
+    assert_cli_success(&system, "system regexp");
+    let system_miss = run_libra_command_with_env(
+        &["config", "--system", "--get-regexp", "nomatch"],
+        &system_repo,
+        &system_envs,
+    );
+    assert_eq!(system_miss.status.code(), Some(1));
+}

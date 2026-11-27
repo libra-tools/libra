@@ -1066,3 +1066,5 @@ file mutations match git bytes.
 unset-all deletes only matching values.
 
 config unset missing key exits 5.
+
+scoped regexp keeps upgrade.mode fail-closed only for global.
