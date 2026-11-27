@@ -2309,3 +2309,5 @@ format-patch signoff identity failures exit LBR-CLI-003.
 commit rejects -m with fixup amend or reword and unknown prefixes.
 
 merge and pull ff-only print git's diverging advice.
+
+merge --no-commit still fast-forwards.

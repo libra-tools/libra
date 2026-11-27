@@ -2597,7 +2597,6 @@ fn merge_is_fast_forward(
         && options.strategy != Some(MergeStrategy::Ours)
         && !options.no_ff
         && !options.squash
-        && !options.no_commit
 }
 
 /// Sparse-checkout / promisor gate for the merge WRAPPER.

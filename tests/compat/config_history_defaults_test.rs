@@ -293,6 +293,7 @@ fn no_commit_continue_replays_resolved_message() {
     let fixture = Fixture::new();
     let repo = fixture.repo("no-commit-continue");
     fixture.feature_with_commits(&repo, &["feature tip"]);
+    write_and_commit(&fixture, &repo, "main-div.txt", "div", "diverge main");
 
     fixture.success(
         &repo,
@@ -368,13 +369,11 @@ fn merge_cli_ff_only_combines_with_squash_and_no_commit() {
         &no_commit,
         &["merge", "--ff-only", "--no-commit", "feature"],
     );
-    fixture.success(&no_commit, &["merge", "--continue"]);
-    let parents = fixture.success(&no_commit, &["log", "-1", "--format=%P"]);
+    let head = fixture.success(&no_commit, &["rev-parse", "HEAD"]);
+    let feature = fixture.success(&no_commit, &["rev-parse", "feature"]);
     assert_eq!(
-        String::from_utf8_lossy(&parents.stdout)
-            .split_whitespace()
-            .count(),
-        2
+        head.stdout, feature.stdout,
+        "--no-commit still fast-forwards"
     );
 
     // A diverged history is refused by the merge itself, not by clap.

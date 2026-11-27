@@ -691,7 +691,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-02: 修复 `merge --no-commit` 在可 fast-forward 时的行为（#992）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--no-commit` 在可快进时仍直接快进；compat 两处夹具按卡修订；merge 315/316，唯一失败为既有 crisscross GC 用例，与本卡无关。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 使 `merge --no-commit` 在目标可 fast-forward 时与 Git 一致直接快进（更新 HEAD、索引与工作树，不留待决合并），只有 `--no-ff`（或 `merge.ff=false`）时才停在待提交的合并状态。（按 G-09 自本卡拆出 `MP-21`、`MP-22`。）
 
@@ -730,7 +730,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC8）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::no_commit_fast_forwards)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::no_commit_fast_forwards)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`no_commit_fast_forwards`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_noninteractive_history_controls`（整 target，非交互历史控制（含 `--no-commit`）；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_noninteractive_history_controls` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_config_history_defaults`（整 target，本卡同步改写其中两个 `--no-commit` 用例的夹具；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_config_history_defaults` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）

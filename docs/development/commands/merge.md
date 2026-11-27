@@ -291,3 +291,5 @@ single conflict-label helper
 initial pull into an unborn branch records initial pull.
 
 merge and pull ff-only print git's diverging advice.
+
+merge --no-commit still fast-forwards.

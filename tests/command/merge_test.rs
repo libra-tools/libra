@@ -14821,3 +14821,18 @@ fn ff_flags_last_one_wins() {
     );
     assert_merge_commit(&fixture, "AC7");
 }
+
+#[test]
+fn no_commit_fast_forwards() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    create_branch_commit(root, "feature", "feature.txt", "feature\n");
+    let feature = run_libra_command(&["rev-parse", "feature"], root);
+    let feature = String::from_utf8_lossy(&feature.stdout).trim().to_string();
+    let output = run_libra_command(&["merge", "--no-commit", "feature"], root);
+    assert_cli_success(&output, "merge --no-commit fast-forward");
+    assert_eq!(head_commit(root), feature);
+    assert!(root.join("feature.txt").exists());
+    let status = run_libra_command(&["status", "--porcelain"], root);
+    assert!(!String::from_utf8_lossy(&status.stdout).contains("UU"));
+}
