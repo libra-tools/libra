@@ -1275,7 +1275,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-06: unborn 分支合并的 reflog 记为 `initial pull`（#1003）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：unborn 合并/fast-forward 的 HEAD 与分支 reflog 记为 `initial pull`；新增 pull reflog 测试；pull 52/52。C 组 patch +1。偏差：`merge` 侧的独立 unborn 测试未单列，由共享路径覆盖；用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 向未诞生分支执行 `merge`（及 `pull` 的合并路径）时，HEAD 与分支 reflog 的消息与 Git 一致写为 `initial pull`（替代 `merge: merge <ref>:fast-forward`）。（按 G-09 自本卡拆出 `MP-29`。）
 
@@ -1309,7 +1309,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 **Verification:**
 
 - [ ] 卡特有用例（AC1–AC2、AC4–AC5）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::pull_test::unborn_merge_reflog_initial_pull)'`（`(new)`，在 `tests/command/pull_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::pull_test::unborn_merge_reflog_initial_pull)'` 须恰好列出该 1 条）
-- [ ] 卡特有用例（AC3）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::pull_test::unborn_pull_reflog_initial_pull)'`（`(new)`，在 `tests/command/pull_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::pull_test::unborn_pull_reflog_initial_pull)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`unborn_pull_reflog_initial_pull`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::pull_test::/)'`（`command::pull_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 

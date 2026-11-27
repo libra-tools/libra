@@ -104,6 +104,7 @@ impl Display for ReflogContext {
             ),
             ReflogAction::Fetch => write!(f, "fast-forward"),
             ReflogAction::Pull => write!(f, "fast-forward"),
+            ReflogAction::InitialPull => write!(f, "initial pull"),
             ReflogAction::Push => write!(f, "push"),
             ReflogAction::Rebase { state, details } => write!(f, "({state}) {details}"),
             ReflogAction::Clone { from } => write!(f, "from {from}"),
@@ -142,6 +143,8 @@ pub enum ReflogAction {
     },
     Fetch,
     Pull,
+    /// First pull into an unborn branch (`initial pull`).
+    InitialPull,
     Push,
     Clone {
         from: String,
@@ -202,7 +205,7 @@ impl ReflogAction {
             Self::Reset { .. } => ReflogActionKind::Reset,
             Self::Switch { .. } => ReflogActionKind::Switch,
             Self::Merge { .. } => ReflogActionKind::Merge,
-            Self::Pull => ReflogActionKind::Pull,
+            Self::Pull | Self::InitialPull => ReflogActionKind::Pull,
             Self::Clone { .. } => ReflogActionKind::Clone,
             Self::Branch { .. } => ReflogActionKind::Branch,
             Self::CherryPick { .. } => ReflogActionKind::CherryPick,

@@ -4807,9 +4807,13 @@ async fn apply_fast_forward_merge(
         }
     };
 
-    let action = ReflogAction::Merge {
-        branch: target_branch_name.to_string(),
-        policy: "fast-forward".to_string(),
+    let action = if old_oid_opt.is_none() {
+        ReflogAction::InitialPull
+    } else {
+        ReflogAction::Merge {
+            branch: target_branch_name.to_string(),
+            policy: "fast-forward".to_string(),
+        }
     };
     let context = ReflogContext {
         // If there was no previous commit, this is an initial commit merge (e.g., on an empty branch).
@@ -5423,9 +5427,13 @@ async fn update_head_with_reflog(
                 .map_err(|error| PullMergeError::HeadResolve(error.to_string()))?
         }
     };
-    let action = ReflogAction::Merge {
-        branch: target_branch_name.to_string(),
-        policy: policy.to_string(),
+    let action = if old_oid_opt.is_none() {
+        ReflogAction::InitialPull
+    } else {
+        ReflogAction::Merge {
+            branch: target_branch_name.to_string(),
+            policy: policy.to_string(),
+        }
     };
     let context = ReflogContext {
         old_oid: old_oid_opt.map_or(

@@ -363,3 +363,5 @@ See the user-facing `pull` page for the local-path Git `objectformat=sha256` rej
 **`clone --separate-git-dir` 指针布局（2026-11-20，CL-28）：** `.libra` 为 `gitdir:` 指针文件时，`src/cli.rs::command_preflight` 在分发前以 `LBR-UNSUPPORTED-001` 默认拒绝本命令，因此不会写错目录；放行名单与逐变体判定见 `docs/development/commands/_compatibility.md` 的「指针布局：命令放行清单」。
 
 - 2026-11-25（I997-01 / #997）：`pull <remote> refs/tags/<tag>:<branch>`（或短 tag `<tag>:<branch>`）先由 fetch 抓取 tag object 与 peeled commit 并写入 `<branch>`，再以该分支的 peeled commit 进入既有 ff/merge；冲突沿用既有 `LBR-CONFLICT-*`。回归：`pull_test::tag_refspec_ff_uses_peeled_commit`、`tag_refspec_conflict_keeps_existing_error_code`；`fetch_test`+`pull_test` 135/135。
+
+initial pull into an unborn branch records initial pull.

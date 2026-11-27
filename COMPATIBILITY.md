@@ -2299,3 +2299,5 @@ rm reads pathspecs from stdin and validates source flags.
 rm -n uses the short flag and exits via SIGPIPE on a closed pipe.
 
 reflog oneline output has no trailing blank line.
+
+initial pull into an unborn branch records initial pull.

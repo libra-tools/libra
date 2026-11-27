@@ -601,3 +601,5 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 > `HEAD` or ref write. Only `status`, `log`, `cat-file`, the no-argument `branch`
 > listing, `alternates list`, `clone`, `upgrade`, `ui`, `login`, `whoami`, `logout` and
 > `completions` run in that layout.
+
+initial pull into an unborn branch records initial pull.

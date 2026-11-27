@@ -2224,3 +2224,29 @@ fn tag_refspec_conflict_keeps_existing_error_code() {
     );
     assert!(!peeled.is_empty());
 }
+
+#[tokio::test]
+#[serial(cwd)]
+async fn unborn_pull_reflog_initial_pull() {
+    let (_temp_root, remote_dir, _work_dir, branch) = create_remote_fixture();
+    let local_repo = tempdir().expect("failed to create local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+    let pull = run_libra_command(&["pull"], local_repo.path());
+    assert_cli_success(&pull, "unborn pull");
+    let head = run_libra_command(&["reflog", "-1"], local_repo.path());
+    assert_cli_success(&head, "head reflog");
+    assert!(
+        String::from_utf8_lossy(&head.stdout).contains(": initial pull"),
+        "{}",
+        String::from_utf8_lossy(&head.stdout)
+    );
+    let branch_log = run_libra_command(&["reflog", "-1", "main"], local_repo.path());
+    assert_cli_success(&branch_log, "branch reflog");
+    assert!(
+        String::from_utf8_lossy(&branch_log.stdout).contains(": initial pull"),
+        "{}",
+        String::from_utf8_lossy(&branch_log.stdout)
+    );
+}
