@@ -1032,3 +1032,5 @@ show-origin list honors the selected scope.
 show-origin quotes paths and marks command-line defaults.
 
 upstream show-origin cases pass.
+
+upstream show-scope cases pass.
