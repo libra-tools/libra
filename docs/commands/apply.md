@@ -99,3 +99,5 @@ git format-patch -1 --stdout | libra apply --check
 Deferred: `--unidiff-zero`, `--recount`, and `--allow-empty`. Libra's `--3way`
 does not pre-check that the index matches (Git refuses first), and conflict
 markers are written with a warning + exit 1 like Git.
+
+apply --numstat matches t4012 binary and text output.

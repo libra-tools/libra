@@ -61,3 +61,5 @@ git format-patch -1 --stdout | libra apply --check
 （否则 `<path>: does not match index` 且零写入），成功后同时更新索引与工作树；`--cached`
 只更新索引。`--include`/`--exclude` 按命令行顺序首个匹配决定是否使用该路径。`-R` 反向应用。
 仍未实现：`--unidiff-zero`、部分 `--whitespace`/`--reject` 细节。
+
+apply --numstat matches t4012 binary and text output.

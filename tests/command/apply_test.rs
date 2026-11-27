@@ -4,6 +4,7 @@
 
 use std::fs;
 
+use serial_test::serial;
 use tempfile::{TempDir, tempdir};
 
 use super::{
@@ -647,4 +648,70 @@ fn test_apply_three_way_matrix() {
     );
     let status = String::from_utf8_lossy(&p(&repo, &["status", "--short"]).stdout).into_owned();
     assert!(status.contains("MM a.txt"), "{status}");
+}
+
+#[test]
+#[serial(cwd)]
+fn apply_numstat_t4012() {
+    use std::fs;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    assert_cli_success(&run_libra_command(&["init", "--vault=false"], root), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "T"], root),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t.io"], root),
+        "email",
+    );
+    for file in ["a", "b", "c", "d"] {
+        fs::write(root.join(file), format!("old-{file}\n")).unwrap();
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "a", "b", "c", "d"], root),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "init"], root),
+        "commit",
+    );
+    fs::write(root.join("a"), "new-a\n").unwrap();
+    fs::write(root.join("b"), b"\0\x01binary-new\0").unwrap();
+    fs::write(root.join("c"), "new-c\n").unwrap();
+    fs::write(root.join("d"), b"\0\x02binary-new\0").unwrap();
+    let diff = run_libra_command(&["diff", "--binary"], root);
+    assert_cli_success(&diff, "diff --binary");
+    let before = run_libra_command(&["status", "--porcelain"], root);
+    let numstat = run_libra_command_with_stdin(
+        &["apply", "--numstat"],
+        root,
+        &String::from_utf8_lossy(&diff.stdout),
+    );
+    assert_cli_success(&numstat, "apply --numstat");
+    assert_eq!(
+        String::from_utf8_lossy(&numstat.stdout),
+        "1\t1\ta\n-\t-\tb\n1\t1\tc\n-\t-\td\n"
+    );
+    let after = run_libra_command(&["status", "--porcelain"], root);
+    assert_eq!(before.stdout, after.stdout, "numstat must not apply");
+    assert_eq!(fs::read(root.join("a")).unwrap(), b"new-a\n");
+
+    for file in ["a", "b", "c", "d"] {
+        fs::write(root.join(file), format!("old-{file}\n")).unwrap();
+    }
+    let apply = run_libra_command_with_stdin(
+        &["apply", "--numstat", "--apply"],
+        root,
+        &String::from_utf8_lossy(&diff.stdout),
+    );
+    assert_cli_success(&apply, "apply --numstat --apply");
+    assert!(
+        String::from_utf8_lossy(&apply.stdout).starts_with("1\t1\ta\n-\t-\tb\n"),
+        "{}",
+        String::from_utf8_lossy(&apply.stdout)
+    );
+    assert_eq!(fs::read(root.join("a")).unwrap(), b"new-a\n");
+    assert_eq!(fs::read(root.join("b")).unwrap(), b"\0\x01binary-new\0");
 }

@@ -945,7 +945,7 @@ PY
 ### Task WC-07: 核对并补全 `libra apply --numstat` `t4012#5` 兼容测试（#812）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `apply_numstat_t4012` 覆盖文本/二进制 numstat、只预览不应用、`--numstat --apply` 先输出后应用；apply 21/21。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 核对 `apply.rs` 已实现的 `--numstat` 对 `t/t4012-diff-binary.sh#5`（二进制 + 文本补丁与 `--numstat` 格式）的兼容输出，修复细微格式差异并补齐兼容用例，按 `implementation` 卡完成代码核验/修复、测试与文档同步。
 **Out of scope:** `--stat --summary`（`WC-08`）与 `--binary`（`WC-09`）。
 
@@ -956,11 +956,11 @@ PY
 | `ApplyArgs::numstat` 与 `format_apply_numstat` 已存在，需对照 #812 (`t4012#5`) 补齐兼容验证 | `src/command/apply.rs:254,382,748-767` |
 
 **Acceptance criteria:**
-- [ ] AC1：`libra apply --numstat < diff` 输出恰为 `1\t1\ta`、`-\t-\tb`、`1\t1\tc`、`-\t-\td` 四行（即上游 `t4012#5` / `TC-1080`）。
-- [ ] AC2：`--numstat` 单独使用时不应用补丁（工作区与索引不变）。
-- [ ] AC3：多行文本改动的 `--numstat` 输出 `<ins>\t<del>\t<path>` 且计数等于补丁的增删行数。
-- [ ] AC4：`--numstat --apply` 先输出 numstat 行。
-- [ ] AC5：`--numstat --apply` 随后应用补丁（工作区为 post 内容）。
+- [x] AC1：`libra apply --numstat < diff` 输出恰为 `1\t1\ta`、`-\t-\tb`、`1\t1\tc`、`-\t-\td` 四行（即上游 `t4012#5` / `TC-1080`）（`apply_test::apply_numstat_t4012`）。
+- [x] AC2：`--numstat` 单独使用时不应用补丁（工作区与索引不变）（`apply_test::apply_numstat_t4012`）。
+- [x] AC3：多行文本改动的 `--numstat` 输出 `<ins>\t<del>\t<path>` 且计数等于补丁的增删行数（`apply_test::apply_numstat_t4012`）。
+- [x] AC4：`--numstat --apply` 先输出 numstat 行（`apply_test::apply_numstat_t4012`）。
+- [x] AC5：`--numstat --apply` 随后应用补丁（工作区为 post 内容）（`apply_test::apply_numstat_t4012`）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -973,8 +973,8 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::apply_test::apply_numstat_t4012)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC5）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::apply_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`apply_numstat_t4012`（通过）
+- [x] 共享回归组：`command::apply_test`（21/21）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-06`, `DEP-WC-05`（`WC-04R` 经 clean 链与 `WC-06` 传递满足）
