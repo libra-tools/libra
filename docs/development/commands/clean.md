@@ -69,3 +69,5 @@ flowchart TD
 - 2026-11-23（WC-04b / #735）：显式 pathspec 路径复用 WC-04 的嵌套仓库剔除谓词（`candidate == root || candidate.starts_with(root) || root.starts_with(candidate)`），因此指向嵌套仓库目录、其内文件或包含它的父目录的单 force 都不会删除嵌套文件。回归：`clean_single_force_pathspec_keeps_nested_repos`（AC1–AC5）；`clean_test` 35/35。
 
 clean prints cwd-relative paths while JSON stays repo-root-relative.
+
+clean honors core.excludesfile case-insensitively.

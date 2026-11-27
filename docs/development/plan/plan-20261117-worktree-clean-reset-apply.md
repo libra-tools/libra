@@ -429,7 +429,7 @@ PY
 ### Task WC-02: 修复 `core.excludesfile` 大小写读取使 `libra clean` 遵循全局排除文件（#733）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：clean 通过大小写不敏感 `core.excludesfile` 读取全局排除；新增 clean 与 internal config 测试；clean 36/36；C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 修复 `config.rs` 中 `core.excludesfile` 的大小写敏感读取问题：在 `read_cascaded_fresh_conn_at`（`src/internal/config.rs:2616+`）复用既有的 `get_var_case_insensitive_with_conn`（`config.rs:536`），不全局改动共享 `ConfigKv::get_with_conn`，确保 `clean` 正确忽略 `core.excludesfile` 匹配的文件（同步补齐同函数服务的 `core.attributesFile` / `core.attributesfile` 回归检查）。
 **Out of scope:** `-x` / `-X` 忽略策略之外的新增选项；全局改变 `ConfigKv::get_with_conn` 语义；其它文档与 `COMPATIBILITY.md` 中以规范键名 `core.excludesFile` 描述忽略来源的既有表述（如 `docs/commands/check-ignore.md`、`docs/commands/check-attr.md`、`docs/commands/lfs.md` 与 `ls-files`/`grep`/`check-ignore`/`lfs`/`diff` 条目，修复后仍准确，不改）。
 
@@ -442,9 +442,9 @@ PY
 | 2026-11-18 以已安装 libra 0.30.207 在仓库外隔离 HOME 下复现：未配置时 `libra clean -n excludes included` 输出 `Would remove excludes` 与 `Would remove included`；`libra config set core.excludesfile excludes`（小写）后输出不变；改为 `libra config set core.excludesFile excludes`（驼峰）后只输出 `Would remove included` | 本计划评审期复现（fixture 同「AC → 断言映射」；仅作缺陷证据，不入库） |
 
 **Acceptance criteria:**
-- [ ] AC1：本地配置小写 `core.excludesfile=excludes`（`excludes` 文件内容为匹配其自身的规则 `excludes`）时，`libra clean -n excludes included` 输出 `Would remove included`，且 stdout/stderr 均不含 `excludes`（即上游 `t7300#28` / `TC-0539`）。
-- [ ] AC2：驼峰 `core.excludesFile=excludes` 时结果与 AC1 相同。
-- [ ] AC3：同一级联读取对 `core.attributesfile`（小写）与 `core.attributesFile`（驼峰）均返回所配置的路径（同函数服务的回归）。
+- [x] AC1：本地配置小写 `core.excludesfile=excludes`（`excludes` 文件内容为匹配其自身的规则 `excludes`）时，`libra clean -n excludes included` 输出 `Would remove included`，且 stdout/stderr 均不含 `excludes`（即上游 `t7300#28` / `TC-0539`）。（`clean_respects_core_excludesfile` / `cascaded_fresh_read_matches_variable_case_insensitively`）
+- [x] AC2：驼峰 `core.excludesFile=excludes` 时结果与 AC1 相同。（`clean_respects_core_excludesfile` / `cascaded_fresh_read_matches_variable_case_insensitively`）
+- [x] AC3：同一级联读取对 `core.attributesfile`（小写）与 `core.attributesFile`（驼峰）均返回所配置的路径（同函数服务的回归）。（`clean_respects_core_excludesfile` / `cascaded_fresh_read_matches_variable_case_insensitively`）
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -455,10 +455,10 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::clean_test::clean_respects_core_excludesfile)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC2）
-- [ ] 具名测试：`source .env.test && cargo nextest run --lib -E 'test(=internal::config::tests::cascaded_fresh_read_matches_variable_case_insensitively)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC3）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::clean_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --lib -E 'test(/^internal::config::tests::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`clean_respects_core_excludesfile`（通过）
+- [x] 具名测试：`cascaded_fresh_read_matches_variable_case_insensitively`（通过）
+- [x] 共享回归组：`command::clean_test`（36/36）
+- [x] 共享回归组：`internal::config::tests`（通过）
 
 **Full-suite trigger:** `T-1: 改动共享 config 读取`
 **Dependencies:** `WC-01`, `DEP-WC-03`, `DEP-WC-05`

@@ -181,3 +181,5 @@ Git 的交互式 clean 模式会显示菜单来选择文件。Libra 面向 AI �
 | 文件删除失败 | `LBR-IO-002` | 128 |
 
 clean prints cwd-relative paths while JSON stays repo-root-relative.
+
+clean honors core.excludesfile case-insensitively.

@@ -243,3 +243,5 @@ the jj data model.
 | File deletion failed | `LBR-IO-002` | 128 |
 
 clean prints cwd-relative paths while JSON stays repo-root-relative.
+
+clean honors core.excludesfile case-insensitively.

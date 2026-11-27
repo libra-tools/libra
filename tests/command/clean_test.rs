@@ -1345,3 +1345,49 @@ fn clean_relative_pathspec_prefix() {
     assert!(text.contains("Removing ../src/part3.c"), "{text}");
     assert!(!root.join("src/part3.c").exists());
 }
+
+#[test]
+#[serial(cwd, env)]
+fn clean_respects_core_excludesfile() {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("xdg");
+    let global_dir = temp.path().join("global-dir");
+    fs::create_dir_all(&global_dir).unwrap();
+    let global_db = global_dir.join("config.db");
+    let exclude = temp.path().join("global-ignore");
+    fs::write(&exclude, "*.tmp\n").unwrap();
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", global_db.to_str().unwrap()),
+    ];
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &[
+                "config",
+                "--global",
+                "core.excludesfile",
+                exclude.to_str().unwrap(),
+            ],
+            &repo,
+            &envs,
+        ),
+        "set excludesfile",
+    );
+    fs::write(repo.join("keep.c"), "x").unwrap();
+    fs::write(repo.join("skip.tmp"), "x").unwrap();
+    let out = run_libra_command_with_env(&["clean", "-n"], &repo, &envs);
+    assert_cli_success(&out, "clean");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("keep.c"), "{text}");
+    assert!(!text.contains("skip.tmp"), "{text}");
+}

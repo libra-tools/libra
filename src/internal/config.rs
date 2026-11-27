@@ -5273,6 +5273,25 @@ mod tests {
     /// value falls through, and nothing on this READ path may mutate the
     /// store (no migration on open).
     #[tokio::test]
+    async fn cascaded_fresh_read_matches_variable_case_insensitively() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let local = temp.path().join("local.db");
+        let global = temp.path().join("global.db");
+        write_config_db(&local, "core.attributesfile", "/local/attributes", false).await;
+        write_config_db(&global, "core.attributesFile", "/global/attributes", false).await;
+        assert_eq!(
+            read_cascaded_fresh_conn_at(Some(&local), Some(&global), "core.attributesFile").await,
+            Some("/local/attributes".to_string()),
+            "case-insensitive local key wins"
+        );
+        assert_eq!(
+            read_cascaded_fresh_conn_at(None, Some(&global), "core.attributesFile").await,
+            Some("/global/attributes".to_string()),
+            "case-insensitive global key"
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_conn_cascade_pins_precedence_and_failure_isolation() {
         let temp = tempfile::tempdir().expect("create tempdir");
         let key = "core.excludesFile";
