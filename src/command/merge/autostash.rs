@@ -468,7 +468,9 @@ pub(super) async fn resolve_pending_autostash_with(
             // All-or-nothing apply: the merge result is intact. Promote the
             // stash into the visible list so nothing is lost.
             if !output.quiet {
-                eprintln!("Applying autostash resulted in conflicts.");
+                eprintln!(
+                    "Your local changes are stashed, however applying them resulted in conflicts."
+                );
             }
             store_pending_autostash(output, &snapshot, &oid).await
         }

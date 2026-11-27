@@ -15019,3 +15019,73 @@ fn merge_autostash_abort_and_ff_squash() {
     assert_eq!(String::from_utf8_lossy(&files.stdout).trim(), "feature.txt");
     assert!(!p.join(".libra/merge-autostash.json").exists());
 }
+
+fn create_overlap_autostash_conflict_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(
+        p,
+        "shared.txt",
+        "top\nl1\nORIG\nl3\nbottom\n",
+        "base shared",
+    );
+    commit_file(p, "overlap.txt", "orig\n", "base overlap");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(
+        p,
+        "shared.txt",
+        "top\nl1\nFEATURE\nl3\nbottom\n",
+        "feature shared",
+    );
+    commit_file(p, "overlap.txt", "FEATURE\n", "feature overlap");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    commit_file(
+        p,
+        "shared.txt",
+        "top\nl1\nMAIN\nl3\nbottom\n",
+        "main shared",
+    );
+    std::fs::write(p.join("overlap.txt"), "LOCAL\n").unwrap();
+    repo
+}
+
+#[test]
+fn merge_autostash_apply_conflict_stored() {
+    let repo = create_overlap_autostash_conflict_repo();
+    let p = repo.path();
+    let started = run_libra_command(&["merge", "--no-commit", "--autostash", "feature"], p);
+    assert_eq!(started.status.code(), Some(128));
+    std::fs::write(p.join("shared.txt"), "top\nl1\nFEATURE\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "resolve");
+    let committed = run_libra_command(&["commit", "-m", "done"], p);
+    assert_cli_success(&committed, "commit");
+    assert!(
+        String::from_utf8_lossy(&committed.stderr)
+            .contains("Your local changes are stashed, however applying them")
+    );
+    assert!(!p.join(".libra/merge-autostash.json").exists());
+    let stash = run_libra_command(&["stash", "show", "-p", "stash@{0}"], p);
+    assert_cli_success(&stash, "stash show");
+    assert!(String::from_utf8_lossy(&stash.stdout).contains("LOCAL"));
+
+    let repo = create_overlap_autostash_conflict_repo();
+    let p = repo.path();
+    let started = run_libra_command(&["merge", "--no-commit", "--autostash", "feature"], p);
+    assert_eq!(started.status.code(), Some(128));
+    std::fs::write(p.join("shared.txt"), "top\nl1\nFEATURE\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "resolve");
+    let continued = run_libra_command(&["merge", "--continue", "-m", "done"], p);
+    assert_cli_success(&continued, "continue");
+    assert!(
+        String::from_utf8_lossy(&continued.stderr)
+            .contains("Your local changes are stashed, however applying them")
+    );
+    assert!(!p.join(".libra/merge-autostash.json").exists());
+    let stash = run_libra_command(&["stash", "show", "-p", "stash@{0}"], p);
+    assert_cli_success(&stash, "stash show");
+    assert!(String::from_utf8_lossy(&stash.stdout).contains("LOCAL"));
+}
