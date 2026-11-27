@@ -166,7 +166,7 @@ pub struct CommitArgs {
         not(doc),
         doc = " Create a fixup commit targeting the specified commit. The message becomes \"fixup! <subject>\"."
     )]
-    #[arg(long, value_name = "COMMIT", conflicts_with_all = ["message", "file", "squash", "reuse_message", "reedit_message"])]
+    #[arg(long, value_name = "COMMIT", conflicts_with_all = ["squash", "reuse_message", "reedit_message"])]
     pub fixup: Option<String>,
 
     #[cfg_attr(
@@ -3122,6 +3122,21 @@ fn classify_nothing_to_commit() -> Result<CommitError, CommitError> {
 /// nothing to commit, identity/signing setup fails, object writes fail, or HEAD
 /// cannot be updated.
 pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<()> {
+    if let Some(spec) = args.fixup.as_deref()
+        && let Some((prefix, _)) = spec.split_once(':')
+    {
+        if matches!(prefix, "amend" | "reword") {
+            if args.message.is_some() || args.file.is_some() {
+                return Err(CliError::failure(format!(
+                    "options '-m' and '--fixup:{prefix}' cannot be used together"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+        } else {
+            return Err(CliError::failure(format!("unknown option: --fixup={spec}"))
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+    }
     // Partial commit (`commit <path>…`, `--only`, `--pathspec-from-file`) needs
     // a temporary tree built from HEAD + the selected paths; Libra commits the
     // whole index. Classify the request instead of failing as an unknown

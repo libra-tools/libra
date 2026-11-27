@@ -5,6 +5,7 @@
 
 use std::{fs, path::Path, process::Command};
 
+use serial_test::serial;
 use tempfile::tempdir;
 
 fn run_libra(args: &[&str], cwd: &Path) -> std::process::Output {
@@ -460,4 +461,33 @@ fn test_commit_squash_then_rebase_i_autosquash() {
         !log.contains("squash!"),
         "Q3 must fold the squash commit: {log}"
     );
+}
+
+#[test]
+#[serial(cwd)]
+fn commit_fixup_message_and_prefix_errors() {
+    let repo = tempdir().unwrap();
+    init_repo(repo.path());
+    write_and_add(repo.path(), "a", "a\n");
+    commit(repo.path(), "target subject");
+    let target = head_commit(repo.path());
+    write_and_add(repo.path(), "s", "s\n");
+
+    for prefix in ["amend", "reword"] {
+        let out = run_libra(
+            &["commit", "-m", "x", &format!("--fixup={prefix}:{target}")],
+            repo.path(),
+        );
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "options '-m' and '--fixup:{prefix}' cannot be used together"
+            )),
+            "{stderr}"
+        );
+    }
+    let unknown = run_libra(&["commit", &format!("--fixup=bogus:{target}")], repo.path());
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown option: --fixup=bogus:"));
 }

@@ -2852,7 +2852,7 @@
 ### Task CS-07b: 补齐 `-m` 与 `--fixup=amend:/reword:` 冲突及未知前缀诊断（#789, #790）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`-m` 与 `--fixup=amend/reword` 的 Git 文案冲突、未知 fixup 前缀诊断；autosquash 12/12。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 自 `CS-07a` 拆出：按 Git `builtin/commit.c:853` 拒绝 `-m` 与 `amend:`/`reword:` 同用（`options '-m' and '--fixup:<prefix>' cannot be used together`），按 `:1404-1406` 拒绝未知前缀（`unknown option: --fixup=<x>:<c>`）；无前缀 `--fixup=<c>` 与 `-m` 的组合保持 `CS-05` 的拼接语义。
 **Out of scope:** reword 与暂存类选项冲突（由 `CS-07a` 承接）。
 
@@ -2865,16 +2865,16 @@
 **夹具（FX-BASE 之外的差异化条件）:** 目标提交 t 的主题为 `target subject`、正文为 `body`，位于 HEAD 之前；工作区有已暂存修改 `s` 与跟踪文件 `a`。
 
 **Acceptance criteria:**（每条为一个独立谓词，计入 G-03；文档门不计数）
-- [ ] AC1：`-m x --fixup=amend:<t>` 以 stderr 含 `options '-m' and '--fixup:amend' cannot be used together` 的错误失败。
-- [ ] AC2：`-m x --fixup=reword:<t>` 以 stderr 含 `options '-m' and '--fixup:reword' cannot be used together` 的错误失败。
-- [ ] AC3：`--fixup=bogus:<t>` 以 stderr 含 `unknown option: --fixup=bogus:` 的错误失败。
+- [x] AC1：`-m x --fixup=amend:<t>` 以 stderr 含 `options '-m' and '--fixup:amend' cannot be used together` 的错误失败（`commit_autosquash_test::commit_fixup_message_and_prefix_errors`）。
+- [x] AC2：`-m x --fixup=reword:<t>` 以 stderr 含 `options '-m' and '--fixup:reword' cannot be used together` 的错误失败（`commit_autosquash_test::commit_fixup_message_and_prefix_errors`）。
+- [x] AC3：`--fixup=bogus:<t>` 以 stderr 含 `unknown option: --fixup=bogus:` 的错误失败（`commit_autosquash_test::commit_fixup_message_and_prefix_errors`）。
 - [ ] 文档门（ER-06/ER-06a，不计入 G-03）：按 D-1 逐文件交付并验收 `Docs and compatibility impact` 所列仓库内文件；所列网站文件按 W-1..W-6 及其时序交付。
 
 **Verification:**（卡特有判据，计入 G-03；按 V-1..V-6 执行并按 V-4 记录）
-- [ ] V1 `source .env.test && cargo nextest run --test command_test -E 'test(=command::commit_autosquash_test::commit_fixup_message_and_prefix_errors)'`（V-2；new；覆盖 AC1–AC3）
+- [x] V1 `commit_fixup_message_and_prefix_errors`（通过）
 
 **A 组 focused 门（ER-04 A 组强制门，不计入 G-03）:**
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(/^command::commit_autosquash_test::/)'`（V-3 共享回归组）
+- [x] 共享回归组 `command::commit_autosquash_test`（12/12）
 
 **Full-suite trigger:** N/A（`family child`；C 组全量由 `REL-CS-09` 的 `T-2` 覆盖）
 **Dependencies:** `CS-07a`（A/B 通过、ER-05 PASS 与本地签名提交后即可开工，不等待 `REL-CS-09`）, `DEP-CS-07`
