@@ -727,3 +727,5 @@ key without a section exits 1.
 missing key get-all exits 1.
 
 key without a section exits 1 or 2.
+
+config set exit-code exception.

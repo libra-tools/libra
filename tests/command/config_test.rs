@@ -8196,4 +8196,49 @@ mod value_pattern {
         let all = run_libra_command(&["config", "--get-all", "multi.k", "two"], repo.path());
         assert_eq!(String::from_utf8_lossy(&all.stdout).trim(), "two");
     }
+
+    #[test]
+    fn test_set_with_value_pattern_and_replace_all_matrix() {
+        let repo = tempdir().unwrap();
+        assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+        for value in ["one", "two"] {
+            assert_cli_success(
+                &run_libra_command(&["config", "--add", "multi.k", value], repo.path()),
+                "add",
+            );
+        }
+        let conflict = run_libra_command(&["config", "--local", "multi.k", "three"], repo.path());
+        assert_eq!(conflict.status.code(), Some(5));
+        let stderr = String::from_utf8_lossy(&conflict.stderr);
+        assert!(
+            stderr.contains("warning: multi.k has multiple values"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("cannot overwrite multiple values with a single value"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("Use a regexp, --add or --replace-all"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("LBR-CONFLICT-002"), "{stderr}");
+
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "--replace-all", "multi.k", "three"],
+                repo.path(),
+            ),
+            "replace all",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "--replace-all", "multi.k", "four", "^three$"],
+                repo.path(),
+            ),
+            "replace matching",
+        );
+        let value = run_libra_command(&["config", "--get", "multi.k"], repo.path());
+        assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "four");
+    }
 }

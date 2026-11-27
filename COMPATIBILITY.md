@@ -2229,3 +2229,7 @@ upstream show-origin cases pass.
 upstream show-scope cases pass.
 
 expiry special words match the recorded git result.
+
+cannot overwrite multiple values with a single value.
+
+multi-value overwrite is a conflict.
