@@ -16,7 +16,7 @@ libra rev-parse [OPTIONS] [SPEC]...
 - a short object ID with `--short`
 - a symbolic branch name with `--abbrev-ref`
 
-It also supports `--show-toplevel` to print the absolute repository root for a working tree. When no `<SPEC>` is provided, the command defaults to `HEAD`; multiple `<SPEC>` arguments are each resolved on their own line. The output-filter flags (`--flags`/`--no-flags`/`--revs-only`/`--no-revs`) instead classify each argument as a flag, revision, or path and print a filtered subset.
+It also supports `--show-toplevel` to print the absolute repository root for a working tree. When no `<SPEC>` is provided and no `--default` is given, nothing is resolved and nothing is printed, matching Git; multiple `<SPEC>` arguments are each resolved on their own line. The output-filter flags (`--flags`/`--no-flags`/`--revs-only`/`--no-revs`) instead classify each argument as a flag, revision, or path and print a filtered subset.
 
 The shared strict object-spec parser supports `@` as `HEAD`, full tag refs,
 `^N`/`~N`, `^{commit|tree|blob|tag|object}` and recursive `^{}` peeling,
@@ -98,12 +98,12 @@ suffix). The `refs/`-qualified forms (`refs/tags/`, `refs/heads/`,
 | `--is-shallow-repository` | Print `true` when `.libra/shallow` contains at least one shallow boundary, `false` otherwise. |
 | `--git-dir` | Print the path to the `.libra` directory (Libra's `$GIT_DIR`). In Libra this is always absolute. |
 | `--absolute-git-dir` | Like `--git-dir`, but always the canonicalized absolute path. (In Libra `--git-dir` is already absolute, so the two coincide.) |
-| `<SPEC>` | Object/revision spec to resolve. Supports typed peel, numeric reflog selectors, `REV:path`, index paths (`:<path>`, `:<n>:<path>`), and commit-message search (`:/<regex>`, `<rev>^{/<regex>}`); defaults to `HEAD` when omitted. |
+| `<SPEC>` | Object/revision spec to resolve. Supports typed peel, numeric reflog selectors, `REV:path`, index paths (`:<path>`, `:<n>:<path>`), and commit-message search (`:/<regex>`, `<rev>^{/<regex>}`); when omitted together with `--default`, nothing is resolved and nothing is printed. |
 
 ## Common Commands
 
 ```bash
-libra rev-parse
+libra rev-parse HEAD
 libra rev-parse HEAD~1
 libra rev-parse 'HEAD^{tree}'
 libra rev-parse 'HEAD:src/main.rs'
@@ -163,7 +163,7 @@ With `--show-toplevel`:
 
 `mode` is one of `resolve`, `short`, `abbrev_ref`, `symbolic_full_name`, `symbolic`, `show_toplevel`, `show_prefix`, `show_cdup`, `is_inside_work_tree`, `is_inside_git_dir`, `is_bare_repository`, `is_shallow_repository`, `git_dir`, or `absolute_git_dir`.
 
-With a **single** `<SPEC>`, `data` is one such object (the shape above). With **multiple** `<SPEC>` arguments, `data` is a JSON **array** of those objects, one per spec, in order. In an **output-filter** mode (`--flags`/`--no-flags`/`--revs-only`/`--no-revs`), `data` is a JSON **array of strings** — the filtered tokens (resolved object names for revisions, verbatim for kept flags/paths).
+With a **single** `<SPEC>`, `data` is one such object (the shape above). With **multiple** `<SPEC>` arguments, `data` is a JSON **array** of those objects, one per spec, in order. With **no** `<SPEC>` and no `--default`, `data` is an empty array. In an **output-filter** mode (`--flags`/`--no-flags`/`--revs-only`/`--no-revs`), `data` is a JSON **array of strings** — the filtered tokens (resolved object names for revisions, verbatim for kept flags/paths).
 
 ## Parameter Comparison: Libra vs Git vs jj
 

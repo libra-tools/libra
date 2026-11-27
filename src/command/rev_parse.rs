@@ -171,7 +171,8 @@ pub struct RevParseArgs {
     pub no_revs: bool,
 
     /// Revisions / arguments to parse (everything BEFORE a `--` separator).
-    /// Defaults to HEAD when omitted. Multiple arguments are each resolved (and,
+    /// With no SPEC and no `--default`, nothing is resolved and nothing prints,
+    /// matching Git. Multiple arguments are each resolved (and,
     /// with the output-filter flags above, classified as flag / rev / path).
     /// `allow_hyphen_values` lets unknown `-`-prefixed arguments (e.g. `-x`) be
     /// captured for classification, like `git rev-parse`. (Defined options must
@@ -304,6 +305,7 @@ pub async fn execute_safe(args: RevParseArgs, output: &OutputConfig) -> CliResul
     let is_query_mode = args.show_toplevel
         || args.git_dir
         || args.absolute_git_dir
+        || args.show_object_format.is_some()
         || args.is_inside_work_tree
         || args.is_inside_git_dir
         || args.is_bare_repository
@@ -316,16 +318,14 @@ pub async fn execute_safe(args: RevParseArgs, output: &OutputConfig) -> CliResul
     //   * a query mode runs exactly once with a placeholder it ignores;
     //   * explicit `--default <arg>` supplies the revision whenever there are no
     //     revision args before the separator — even when paths follow a `--`;
-    //   * the implicit HEAD default applies only when there is no SPEC and no `--`
-    //     at all (`rev-parse` alone).
+    //   * otherwise nothing is resolved: bare `rev-parse` prints nothing at all
+    //     (Git has no implicit HEAD default here).
     let specs: Vec<String> = if is_query_mode {
         vec!["HEAD".to_string()]
     } else if !rev_specs.is_empty() {
         rev_specs
     } else if let Some(default) = &args.default {
         vec![default.clone()]
-    } else if !saw_dashdash {
-        vec!["HEAD".to_string()]
     } else {
         Vec::new()
     };
@@ -669,7 +669,7 @@ async fn resolve_rev_parse(spec: &str, args: &RevParseArgs) -> CliResult<RevPars
     }
 
     // The revision to resolve is supplied by the caller (one per positional SPEC,
-    // defaulting to HEAD / `--default`).
+    // or the explicit `--default` argument).
     if args.abbrev_ref {
         let value = resolve_abbrev_ref(spec).await?;
         return Ok(RevParseOutput {
