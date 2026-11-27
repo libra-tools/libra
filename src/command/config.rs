@@ -3845,7 +3845,13 @@ async fn handle_get(
         } else if !output.quiet {
             let prefix = origin_scope
                 .map(|s| read_record_prefix(s, show_origin, show_scope))
-                .unwrap_or_default();
+                .unwrap_or_else(|| {
+                    if default_applied && show_origin {
+                        "command line:".to_string()
+                    } else {
+                        String::new()
+                    }
+                });
             if null {
                 if !prefix.is_empty() && show_origin {
                     print!("{prefix}\0");
@@ -4199,7 +4205,7 @@ async fn serve_config_file(
     } else if path == "-" {
         "standard input:".to_string()
     } else {
-        format!("file:{path}")
+        format!("file:{}", quote_origin_path(Path::new(path)))
     };
     let prefix = if show_scope {
         "command".to_string()
@@ -4460,12 +4466,34 @@ fn unquote_ini_value(value: &str) -> String {
 /// `origin` renders `file:<database path>` (Libra stores config in SQLite, and
 /// the `upgrade.*` reserved entry already used this form); `scope` renders the
 /// bare scope name. Both are omitted when neither flag is set.
+fn quote_origin_path(path: &Path) -> String {
+    let value = path.display().to_string();
+    if !value
+        .chars()
+        .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '"' | '\\'))
+    {
+        return value;
+    }
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn read_record_prefix(scope: ConfigScope, show_origin: bool, show_scope: bool) -> String {
     if show_scope {
         return scope_name(scope).to_string();
     }
     if show_origin && let Some(path) = scope_origin_path(scope) {
-        return format!("file:{}", path.display());
+        return format!("file:{}", quote_origin_path(&path));
     }
     String::new()
 }

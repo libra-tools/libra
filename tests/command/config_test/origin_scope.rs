@@ -90,3 +90,78 @@ fn test_cf_53_predicates() {
             .any(|line| line.starts_with("file:") && line.contains("origin.key=v"))
     );
 }
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_54_predicates() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo space");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "space.key", "value"], &repo),
+        "set",
+    );
+    let get = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "-z",
+            "--show-origin",
+            "--get",
+            "space.key",
+        ],
+        &repo,
+    );
+    assert_cli_success(&get, "nul get");
+    assert!(get.stdout.starts_with(b"file:\""), "{:?}", get.stdout);
+    assert!(get.stdout.ends_with(b"\0value\0"), "{:?}", get.stdout);
+    let list = run_libra_command(
+        &["config", "--local", "-z", "--show-origin", "--list"],
+        &repo,
+    );
+    assert_cli_success(&list, "nul list");
+    assert!(
+        list.stdout
+            .windows(b"\0space.key\nvalue\0".len())
+            .any(|window| window == b"\0space.key\nvalue\0"),
+        "{:?}",
+        list.stdout
+    );
+    let default = run_libra_command(
+        &[
+            "config",
+            "--local",
+            "--show-origin",
+            "--default",
+            "fallback",
+            "--get",
+            "no.such",
+        ],
+        &repo,
+    );
+    assert_cli_success(&default, "default origin");
+    assert_eq!(
+        String::from_utf8_lossy(&default.stdout).trim(),
+        "command line:\tfallback"
+    );
+
+    let quoted = repo.join("a\"b.cfg");
+    fs::write(&quoted, "[a]\n\tb = c\n").unwrap();
+    let file = run_libra_command(
+        &[
+            "config",
+            "--file",
+            quoted.to_str().unwrap(),
+            "--show-origin",
+            "--list",
+        ],
+        &repo,
+    );
+    assert_cli_success(&file, "quoted file origin");
+    assert!(
+        String::from_utf8_lossy(&file.stdout).contains("a\\\"b.cfg\""),
+        "{}",
+        String::from_utf8_lossy(&file.stdout)
+    );
+}

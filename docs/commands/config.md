@@ -1227,3 +1227,5 @@ key without a section exits 1 or 2.
 regexp success lists matches.
 
 show-origin list honors the selected scope.
+
+show-origin quotes paths and marks command-line defaults.
