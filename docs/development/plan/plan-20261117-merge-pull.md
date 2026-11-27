@@ -2313,7 +2313,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-55: 支持 `-s octopus` 显式选择（单/多目标）并沿用 `ADR-MP-05` 的待决状态表示（#1025）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--strategy` 接受 `octopus`；多目标执行既有八爪鱼，单目标仅快进/平凡索引内合并，否则 `Merge with strategy octopus failed.` 且快照不变；`--no-commit` 不进入平凡路径。新增 AC1–AC8 用例。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-14` 拆出并前置：把 `octopus` 加入 `--strategy` 可选值——两个及以上目标时执行既有 octopus 引擎，单个目标时与 Git 一样：目标是 HEAD 的后代时先按快进处理（与策略无关，`--no-commit` 也快进，见 `MP-02`；`git@6de20f6092` `builtin/merge.c:1655-1692`）；非快进时只尝试平凡的索引内合并（`read_tree_trivial`，`git@6de20f6092` `builtin/merge.c:743-770,1699-1735`）——要创建提交且平凡合并能处理时完成普通双父合并；平凡合并无法处理（例如两侧把同一文件改成不同内容，需要文件级合并）或带 `--no-commit`（Git 此时不走平凡合并路径）时输出 `Merge with strategy octopus failed.` 并保持合并前状态（两侧把同一文件改成相同内容属平凡合并可处理的情形，不拒绝）（不像默认 `ort` 那样进入内容合并、冲突或待提交状态）；因此只有多目标的显式 octopus 会停在提交前，其待决状态仍以 `strategy=None` + 非空 `targets` 表示（`ADR-MP-05`），不向 `strategy` 写入新的枚举变体。多个 `-s`（含 `-s ort -s octopus`）的逐个尝试、回绕与退出 `2` 由随后的 `MP-14` 承接。
 
@@ -2337,7 +2337,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC6：非快进的单目标 `libra merge --no-commit -s octopus b1`（在与 `b1` 分叉的 `M` 上）与 Git 一样以 octopus 拒绝（`--no-commit` 不走平凡合并路径，单目标 octopus 无法处理），因而单目标显式 octopus 不会产生待决状态。
 - [ ] AC7：AC6 的拒绝不改变仓库快照。
 - [ ] AC8：可快进的单目标 `libra merge --no-commit -s octopus b1` 与 Git 一样快进（快进判定先于策略，`--no-commit` 不阻止快进）。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：`merge` 中英文档记录显式 octopus 与单目标平凡规则；网站同步。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::octopus_explicit_strategy_selection` 承载 AC1–AC8；夹具 F-OCT（`t6424` 形态）（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 提交 `B`（`a`=`a0\n`、`f`=`f0\n`），再提交 `M`（新增 `m`）；`b1` 自 `B` 新增 `x`；`b2` 自 `B` 新增 `y`；`C` 自 `B` 把 `f` 改为 `fC\n`；脏索引场景先 `echo st > a && libra add a`（已暂存、未提交）；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -2353,7 +2353,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC8）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::octopus_explicit_strategy_selection)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::octopus_explicit_strategy_selection)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`octopus_explicit_strategy_selection`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --lib -E 'test(/^command::merge::tests::/)'`（`src/command/merge.rs` 内单元测试模块；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list --lib` 记录 `N` ≥ 1）
 

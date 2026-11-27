@@ -478,3 +478,5 @@ merge --continue applies and clears a held MERGE_AUTOSTASH.
 `--no-commit` 允许无关的未暂存修改并原样保留；只有与本次合并实际重写路径重叠的修改才会被拒绝并列出路径。合并写入会跳过结果已与 HEAD 相同的路径，保留其 mtime 与无关工作树内容。
 
 `-s resolve` 先输出 `Trying really trivial in-index merge...`；若每个路径至多一侧修改，则输出 `Wonderful.` 并以 `In-index merge` 完成，否则输出 `Nope.` 后继续普通三方合并。`-q` 与 `--json` 抑制这些诊断。
+
+`-s octopus` 可显式选择八爪鱼策略：多目标逐个暂存；单目标只接受快进或真正平凡索引内合并，否则输出 `Merge with strategy octopus failed.` 且不改变仓库；`--no-commit` 不进入单目标平凡路径。

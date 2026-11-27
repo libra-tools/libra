@@ -137,6 +137,8 @@ pub enum MergeStrategy {
     Resolve,
     /// Record the merge relationship while retaining the current HEAD tree.
     Ours,
+    /// Git's octopus driver: multi-head staging, or a trivial single-head merge.
+    Octopus,
 }
 
 impl MergeStrategy {
@@ -146,6 +148,7 @@ impl MergeStrategy {
             Self::Recursive => "recursive",
             Self::Resolve => "resolve",
             Self::Ours => "ours",
+            Self::Octopus => "octopus",
         }
     }
 
@@ -826,6 +829,8 @@ pub(crate) enum PullMergeError {
         "merge strategy '{strategy}' handles one target only; omit '-s' to use the automatic octopus strategy, or use '-s ours'"
     )]
     OctopusStrategyUnsupported { strategy: String },
+    #[error("Merge with strategy octopus failed.")]
+    OctopusMergeFailed,
     /// A three-way merge input carries a gitlink the merge would have to
     /// arbitrate. Refused before any index/worktree write (ADR-MG-01) rather
     /// than silently dropped from the merge result the way it used to be.
@@ -989,7 +994,8 @@ impl From<PullMergeError> for CliError {
                 CliError::failure(format!("{error}: {detail}"))
                     .with_stable_code(StableErrorCode::IoReadFailed)
             }
-            PullMergeError::OctopusStrategyUnsupported { .. } => {
+            PullMergeError::OctopusStrategyUnsupported { .. }
+            | PullMergeError::OctopusMergeFailed => {
                 CliError::failure(error.to_string())
                     .with_stable_code(StableErrorCode::Unsupported)
             }
@@ -1392,6 +1398,9 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
                     [MergeStrategy::Ours] => run_octopus_merge(branches, output, options)
                         .await
                         .map(|summary| attach_selected_strategy(summary, "ours")),
+                    [MergeStrategy::Octopus] => run_octopus_merge(branches, output, options)
+                        .await
+                        .map(|summary| attach_selected_strategy(summary, "octopus")),
                     [strategy] => Err(PullMergeError::OctopusStrategyUnsupported {
                         strategy: strategy.name().to_string(),
                     }),
@@ -2929,7 +2938,13 @@ async fn run_merge_for_pull_inner(
         Some(MergeStrategy::Ours) => {
             perform_ours_merge(current_commit, target_commit, upstream, merge_options).await
         }
-        None | Some(MergeStrategy::Ort | MergeStrategy::Recursive | MergeStrategy::Resolve) => {
+        None
+        | Some(
+            MergeStrategy::Ort
+            | MergeStrategy::Recursive
+            | MergeStrategy::Resolve
+            | MergeStrategy::Octopus,
+        ) => {
             perform_three_way_merge(
                 current_commit,
                 target_commit,
@@ -3463,6 +3478,18 @@ async fn perform_three_way_merge(
     }
 
     let head_name = current_head_name().await?;
+    if options.strategy == Some(MergeStrategy::Octopus) {
+        // Git's single-head octopus only tries `read_tree_trivial`, and never
+        // with `--no-commit`. A fast-forward was already handled above.
+        let trivial = !options.no_commit
+            && match base_commits.first() {
+                Some(base) => resolve_in_index_is_trivial(base, &current_commit, &target_commit)?,
+                None => true,
+            };
+        if !trivial {
+            return Err(PullMergeError::OctopusMergeFailed);
+        }
+    }
     let in_index_trivial = if options.strategy == Some(MergeStrategy::Resolve)
         && !options.no_commit
         && !options.dry_run

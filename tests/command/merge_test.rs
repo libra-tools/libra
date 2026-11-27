@@ -15478,3 +15478,86 @@ fn resolve_trivial_in_index_diagnostics() {
         "{stdout}"
     );
 }
+
+#[test]
+fn octopus_explicit_strategy_selection() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "a", "a0\n", "base a");
+    commit_file(p, "f", "f0\n", "base f");
+    assert_cli_success(&run_libra_command(&["branch", "b1"], p), "b1");
+    assert_cli_success(&run_libra_command(&["branch", "b2"], p), "b2");
+    assert_cli_success(&run_libra_command(&["branch", "bad"], p), "bad");
+    assert_cli_success(&run_libra_command(&["checkout", "b1"], p), "co b1");
+    commit_file(p, "b1", "b1\n", "b1");
+    assert_cli_success(&run_libra_command(&["checkout", "b2"], p), "co b2");
+    commit_file(p, "b2", "b2\n", "b2");
+    assert_cli_success(&run_libra_command(&["checkout", "bad"], p), "co bad");
+    commit_file(p, "f", "fBAD\n", "bad");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    commit_file(p, "m", "m\n", "M");
+
+    let multi = run_libra_command(&["merge", "-s", "octopus", "b1", "b2", "-m", "oct"], p);
+    assert_cli_success(&multi, "multi octopus");
+    assert_eq!(commit_parents(p).len(), 3);
+    assert!(p.join("b1").exists() && p.join("b2").exists());
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "a", "a0\n", "base a");
+    commit_file(p, "f", "f0\n", "base f");
+    assert_cli_success(&run_libra_command(&["branch", "b1"], p), "b1");
+    assert_cli_success(&run_libra_command(&["branch", "bad"], p), "bad");
+    assert_cli_success(&run_libra_command(&["checkout", "b1"], p), "co b1");
+    commit_file(p, "b1", "b1\n", "b1");
+    assert_cli_success(&run_libra_command(&["checkout", "bad"], p), "co bad");
+    commit_file(p, "f", "fBAD\n", "bad");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    commit_file(p, "m", "m\n", "M");
+    let single = run_libra_command(&["merge", "-s", "octopus", "b1", "-m", "oct"], p);
+    assert_cli_success(&single, "single octopus");
+    assert_eq!(commit_parents(p).len(), 2);
+    assert!(p.join("b1").exists());
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "f", "f0\n", "base f");
+    assert_cli_success(&run_libra_command(&["branch", "bad"], p), "branch bad");
+    assert_cli_success(&run_libra_command(&["checkout", "bad"], p), "co bad");
+    commit_file(p, "f", "fBAD\n", "bad");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    commit_file(p, "f", "fMAIN\n", "main edit");
+    let head = run_libra_command(&["rev-parse", "HEAD"], p);
+    let rejected = run_libra_command(&["merge", "-s", "octopus", "bad"], p);
+    assert_ne!(rejected.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("Merge with strategy octopus failed.")
+    );
+    assert_eq!(
+        run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+        head.stdout
+    );
+    assert!(!p.join(".libra/merge-state.json").exists());
+
+    let no_commit = run_libra_command(&["merge", "--no-commit", "-s", "octopus", "bad"], p);
+    assert_ne!(no_commit.status.code(), Some(0));
+    assert_eq!(
+        run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+        head.stdout
+    );
+    assert!(!p.join(".libra/merge-state.json").exists());
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["branch", "ff"], p), "branch ff");
+    assert_cli_success(&run_libra_command(&["checkout", "ff"], p), "co ff");
+    commit_file(p, "ff", "ff\n", "ff");
+    let ff_oid = run_libra_command(&["rev-parse", "HEAD"], p);
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    let fast = run_libra_command(&["merge", "--no-commit", "-s", "octopus", "ff"], p);
+    assert_cli_success(&fast, "octopus ff");
+    assert_eq!(
+        run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+        ff_oid.stdout
+    );
+}

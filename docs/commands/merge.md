@@ -26,7 +26,7 @@ During a non-squash merge stopped on conflicts, Libra records an `AUTO_MERGE` tr
 
 If the current branch can be fast-forwarded, Libra moves the branch pointer to the target commit and restores the index and working tree. If the branches have diverged, Libra performs a single-head three-way merge using the merge base — or, when the history leaves more than one merge base, using a recursive virtual ancestor built from all of them (see below).
 
-The default single-head strategy is `ort`. The default for two or more targets remains the automatic `octopus` path. The selected backend is named in human success output and, for JSON consumers, in the additive `selected_strategy` field; the historical `strategy` field remains an outcome category such as `three-way`, `ours`, or `octopus`.
+The default single-head strategy is `ort`. The default for two or more targets remains the automatic `octopus` path; `-s octopus` selects it explicitly, using Git's trivial-only rule for a single target. The selected backend is named in human success output and, for JSON consumers, in the additive `selected_strategy` field; the historical `strategy` field remains an outcome category such as `three-way`, `ours`, or `octopus`.
 
 ### Strategy selection
 
@@ -37,6 +37,7 @@ The default single-head strategy is `ort`. The default for two or more targets r
 | `ort` | The default single-head three-way backend: all merge bases are recursively folded when needed, and rename detection is enabled. |
 | `recursive` | A compatibility alias for `ort`; behavior is identical, while output records the requested name. |
 | `resolve` | A conservative single-head three-way backend: it takes the first object-id-ordered merge base, never builds a recursive virtual ancestor, and disables rename handling. A rename therefore degrades deterministically to delete/add (and can leave a modify/delete conflict); human output prints a notice naming the old and new paths. |
+| `octopus` | Git's octopus driver. With several targets it stages them one at a time. With one target it only accepts a fast-forward or a really trivial in-index merge; otherwise it fails with `Merge with strategy octopus failed.` and changes nothing. `--no-commit` disables the single-target trivial path. |
 | `ours` | Records `HEAD` and every surviving target as parents while retaining the complete current `HEAD` tree. This is distinct from `-X ours`. |
 
 For a single target, `-s` is repeatable. Libra probes the names in command-line order without repository writes, prints `Trying merge strategy <name>...` in human mode, and executes the first clean result. If every strategy conflicts, it replays the best result using Git's `evaluate_result` score (worktree/index differences plus unmerged index entries); the later strategy wins a tie. The selected backend is persisted in non-squash merge state, so `--continue` reports it and `--restart` reproduces it instead of silently returning to the default.
@@ -350,7 +351,7 @@ Libra is a monorepo client and never merges submodule content. A three-way merge
 
 `libra rebase` and `libra cherry-pick` share the same guard and the same wording, with `rebase` / `cherry-pick` in place of `merge`.
 
-Libra still does not implement external merge strategies, `subtree`, explicit `-s octopus`, or strategy options outside the values listed above. Commit signing and signature verification are limited to the local vault PGP key; external GPG keyrings and SSH signing are not supported. Verification accepts any certificate in the repository allowlist (active key, generated fallback, archived `vault.gpg.history.<FPR>.pubkey` entries) and evaluates revocation and expiry at the **signature's own creation time**.
+Libra still does not implement external merge strategies, `subtree`, or strategy options outside the values listed above. Commit signing and signature verification are limited to the local vault PGP key; external GPG keyrings and SSH signing are not supported. Verification accepts any certificate in the repository allowlist (active key, generated fallback, archived `vault.gpg.history.<FPR>.pubkey` entries) and evaluates revocation and expiry at the **signature's own creation time**.
 
 Worktree materialization is mode-aware (plan issues/470 FM-02): files are created with the entry mode's permission bits (`100755` -> `0777`, `100644` -> `0666`) under the process `umask`, replaced atomically through a same-directory temp file, and the index/tree entries keep the mode (`100755`/`100644`/`120000`).
 
@@ -369,7 +370,7 @@ When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-
 | `--ff` | Allow fast-forwarding when possible, overriding `merge.ff=false|only`. |
 | `--ff-only` | Refuse unless a single-head merge can fast-forward. A non-up-to-date octopus merge is never a fast-forward and is refused. |
 | `--no-ff` | Always create a merge commit even when a single-head fast-forward is possible. Octopus already always creates one. |
-| `-s <strategy>`, `--strategy=<strategy>` | Select `ort` (single-head default), its `recursive` alias, conservative `resolve`, or `ours`. Repeatable for a single target: try in order, first clean result wins, otherwise replay the lowest Git `evaluate_result` score (later tie wins). With several targets only automatic octopus (no `-s`) or one `-s ours` is supported. Cannot be combined with `-X`. |
+| `-s <strategy>`, `--strategy=<strategy>` | Select `ort` (single-head default), its `recursive` alias, conservative `resolve`, `ours`, or explicit `octopus`. Repeatable for a single target: try in order, first clean result wins, otherwise replay the lowest Git `evaluate_result` score (later tie wins). With several targets automatic octopus (no `-s`), one `-s ours`, or one `-s octopus` is supported. Cannot be combined with `-X`. |
 | `-X <option>`, `--strategy-option=<option>` | Accepts `ours`, `theirs`, `ignore-space-change`, `ignore-all-space`, `ignore-space-at-eol`, `ignore-cr-at-eol`, `renormalize`, or `no-renormalize`. Repeatable; favor and renormalize toggles are last-one-wins, while whitespace modes select the strongest requested comparison. Cannot be combined with `-s`. |
 | `--allow-unrelated-histories` | Permit histories with no common ancestor by using a virtual empty merge base. The permission is persisted for non-squash conflict `--restart`. |
 | `--log[=<N>]` | Append up to N target-side subjects to the merge message; bare `--log` uses 20. Overrides `merge.log`, and also appends to an explicit `-m` message. Last-one-wins with `--no-log`. |
