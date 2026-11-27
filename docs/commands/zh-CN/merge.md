@@ -474,3 +474,5 @@ merge --continue applies and clears a held MERGE_AUTOSTASH.
 编辑器以非 0 退出或无法启动时，Libra 已把合并结果写入索引与工作树并保留 merge state，输出 `Not committing merge; use 'libra commit' to complete the merge.`；随后可用 `libra commit`、`merge --continue` 或 `merge --abort` 完成或撤销。
 
 内容冲突进度（`Auto-merging <path>`、`CONFLICT (content): Merge conflict in <path>`、`Automatic merge failed; fix conflicts and then commit the result.`）与 autostash 提示（`Created autostash: <oid>`、`When finished, apply stashed changes with `libra stash pop``）写到 stdout；`--json`/`-q` 抑制。
+
+`--no-commit` 允许无关的未暂存修改并原样保留；只有与本次合并实际重写路径重叠的修改才会被拒绝并列出路径。合并写入会跳过结果已与 HEAD 相同的路径，保留其 mtime 与无关工作树内容。

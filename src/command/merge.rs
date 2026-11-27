@@ -934,6 +934,8 @@ pub(crate) enum PullMergeError {
     InvalidCleanup(String),
     #[error("Not committing merge; use 'libra commit' to complete the merge.")]
     Editor(String),
+    #[error("Your local changes to the following files would be overwritten by merge:\n  {0}")]
+    DirtyOverlap(String),
     #[error(transparent)]
     HistoryConfig(#[from] crate::command::history_config::HistoryConfigError),
 }
@@ -1046,6 +1048,7 @@ impl From<PullMergeError> for CliError {
                 .with_hint("resolve conflicts, stage the resolved paths with 'libra add', then run 'libra commit'"),
             PullMergeError::Conflicts { squash: false, .. }
             | PullMergeError::DirtyWorktree
+            | PullMergeError::DirtyOverlap(..)
             | PullMergeError::UntrackedOverwrite { .. }
             | PullMergeError::MergeInProgress
             | PullMergeError::UnresolvedConflicts => CliError::failure(error.to_string())
@@ -3300,7 +3303,7 @@ async fn perform_ours_merge(
     upstream: &str,
     options: ThreeWayMergeOptions<'_>,
 ) -> Result<PullMergeSummary, PullMergeError> {
-    if !options.dry_run {
+    if !options.dry_run && !options.no_commit {
         switch::ensure_clean_status(options.output)
             .await
             .map_err(merge_worktree_check_error)?;
@@ -3450,7 +3453,7 @@ async fn perform_three_way_merge(
     // `--dry-run` never writes, so it may preview on a dirty tree (documented:
     // the preview does not validate worktree cleanliness — a real merge may
     // still refuse). Every other path must start clean.
-    if !options.dry_run {
+    if !options.dry_run && !options.no_commit {
         switch::ensure_clean_status(options.output)
             .await
             .map_err(merge_worktree_check_error)?;
@@ -3862,6 +3865,7 @@ async fn perform_three_way_merge(
         // `libra merge --continue` finalizes the two-parent commit. (Unlike Git,
         // a plain `commit` would record only one parent, so the result must be
         // finalized via `merge --continue`.)
+        ensure_no_overlapping_unstaged(&current_index, &merge_result.merged_items, &flat_removals)?;
         reset_index_and_workdir_to_tree(&tree_id)?;
         MergeState {
             head_name: head_name.clone(),
@@ -9071,6 +9075,50 @@ fn announce_df_conflicts(
     }
 }
 
+/// Refuse only dirty paths the merge would actually rewrite. `--no-commit`
+/// has already refused staged changes; here unstaged edits are compared with
+/// the changed paths of the merged result so unrelated edits survive.
+fn ensure_no_overlapping_unstaged(
+    index: &Index,
+    merged_items: &HashMap<PathBuf, MergeTreeEntry>,
+    removals: &[PathBuf],
+) -> Result<(), PullMergeError> {
+    let unstaged = status::changes_to_be_staged()
+        .map_err(|error| PullMergeError::WorktreeCheck(error.to_string()))?;
+    let dirty: HashSet<PathBuf> = unstaged
+        .modified
+        .into_iter()
+        .chain(unstaged.deleted)
+        .map(PathBuf::from)
+        .collect();
+    let mut overlap: Vec<PathBuf> = dirty
+        .into_iter()
+        .filter(|path| {
+            removals.contains(path)
+                || merged_items.get(path).is_some_and(|entry| {
+                    index
+                        .get(path_to_index_key(path).unwrap_or(""), 0)
+                        .is_none_or(|current| {
+                            current.hash != entry.hash
+                                || current.mode
+                                    != tree_item_mode_to_index_mode(entry.mode).unwrap_or(0)
+                        })
+                })
+        })
+        .collect();
+    if overlap.is_empty() {
+        return Ok(());
+    }
+    overlap.sort();
+    Err(PullMergeError::DirtyOverlap(
+        overlap
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n  "),
+    ))
+}
+
 /// Git's human progress for ordinary content conflicts. Conflicts are an
 /// error outcome, so this runs before the typed error is returned rather than
 /// in `render_merge_output`; `--json`/`-q` stay silent.
@@ -9592,6 +9640,13 @@ async fn perform_incremental_three_way_merge(
     }
 
     if options.no_commit {
+        let removals: Vec<PathBuf> = current_index
+            .tracked_files()
+            .into_iter()
+            .filter(|path| !merged_items.contains_key(path))
+            .filter(|path| !is_gitlink_index_path(&current_index, path).unwrap_or(false))
+            .collect();
+        ensure_no_overlapping_unstaged(&current_index, &merged_items, &removals)?;
         report_incremental_walk_stats();
         reset_index_and_workdir_to_tree(&tree_id)?;
         MergeState {

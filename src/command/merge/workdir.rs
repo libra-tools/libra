@@ -435,6 +435,14 @@ pub(crate) fn reset_workdir_tracked_only(
             if entry.mode & 0o170000 == 0o160000 {
                 continue;
             }
+            // A path whose result already matches HEAD need not be rewritten;
+            // preserving its mtime also preserves unrelated working-tree edits.
+            if let Some(current) = current_index.get(path_to_index_key(&path_buf)?, 0)
+                && current.hash == entry.hash
+                && current.mode == entry.mode
+            {
+                continue;
+            }
             let blob: Blob = load_object(&entry.hash).map_err(|error| {
                 PullMergeError::WorkdirReset(format!(
                     "failed to load blob {} for '{}': {error}",

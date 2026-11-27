@@ -15304,3 +15304,106 @@ fn conflict_and_autostash_progress_on_stdout() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+#[test]
+fn merge_preserves_mtime_for_unchanged_paths() {
+    for strategy in [&["-s", "recursive"][..], &[][..]] {
+        let repo = create_diverged_repo_clean();
+        let p = repo.path();
+        let stamp =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(p.join("base.txt"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+        let mut args = vec!["merge"];
+        args.extend_from_slice(strategy);
+        args.push("feature");
+        assert_cli_success(&run_libra_command(&args, p), "merge");
+        assert_eq!(
+            fs::metadata(p.join("base.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            stamp
+        );
+        assert!(p.join("feature.txt").exists());
+        let status = run_libra_command(&["status", "--porcelain"], p);
+        assert!(
+            status.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    fs::write(p.join("base.txt"), "local dirty\n").unwrap();
+    let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_001);
+    fs::File::options()
+        .write(true)
+        .open(p.join("base.txt"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(stamp))
+        .unwrap();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-commit", "feature"], p),
+        "dirty merge",
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("base.txt")).unwrap(),
+        "local dirty\n"
+    );
+    assert_eq!(
+        fs::metadata(p.join("base.txt"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        stamp
+    );
+}
+
+#[test]
+fn dirty_worktree_overlap_only() {
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    fs::write(p.join("base.txt"), "foo\nxyzzy\n").unwrap();
+    let merged = run_libra_command(&["merge", "--no-commit", "feature"], p);
+    assert_cli_success(&merged, "unrelated dirty merge");
+    assert!(p.join(".libra/merge-state.json").exists());
+    let staged = run_libra_command(&["show", ":feature.txt"], p);
+    assert_eq!(String::from_utf8_lossy(&staged.stdout), "feature\n");
+    assert_eq!(
+        fs::read_to_string(p.join("base.txt")).unwrap(),
+        "foo\nxyzzy\n"
+    );
+    let aborted = run_libra_command(&["merge", "--abort"], p);
+    assert_cli_success(&aborted, "abort");
+    assert_eq!(
+        fs::read_to_string(p.join("base.txt")).unwrap(),
+        "foo\nxyzzy\n"
+    );
+    assert_eq!(
+        run_libra_command(&["status", "--porcelain"], p).stdout,
+        b" M base.txt\n"
+    );
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    fs::write(p.join("feature.txt"), "local\n").unwrap();
+    let head = run_libra_command(&["rev-parse", "HEAD"], p);
+    let rejected = run_libra_command(&["merge", "--no-commit", "feature"], p);
+    assert_ne!(rejected.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("feature.txt"));
+    assert_eq!(
+        run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+        head.stdout
+    );
+    assert!(!p.join(".libra/merge-state.json").exists());
+    assert_eq!(
+        fs::read_to_string(p.join("feature.txt")).unwrap(),
+        "local\n"
+    );
+}

@@ -2025,7 +2025,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-11: 脏工作区仅在路径重叠时拒绝合并，`--abort` 保留无关修改（#993）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--no-commit` 仅拒绝与合并实际重写路径重叠的未暂存修改，其余保留；合并写入跳过与 HEAD 相同的路径以保留 mtime/内容。由 `dirty_worktree_overlap_only` 覆盖。D 组 patch +1。偏差：脏场景按 `--no-commit` 验证；用户已取消独立审计与全量测试。）
 
 **Description:** 把合并前对**未暂存工作树修改**的检查从「任何未提交修改即拒绝」改为 Git 语义：只有这些修改的路径与本次合并要写入的路径重叠时才拒绝，并在诊断中列出这些路径；无关修改在干净合并与 `merge --abort` 后原样保留。（按 G-09 自本卡拆出 `MP-53` 承接已暂存修改的拒绝与冲突合并的中止。）
 
@@ -2048,7 +2048,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC5：AC1 之后 `libra merge --abort` 恢复合并前的完整状态（含无关修改）。
 - [ ] AC6：重叠修改场景以列出路径的诊断拒绝。
 - [ ] AC7：AC6 的拒绝不改变仓库快照。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：`merge` 中英文档记录脏工作区重叠判定与跳过未变路径；网站同步。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::dirty_worktree_overlap_only` 承载 AC1–AC7；夹具 F-993（`#993` 复现）（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：提交 `initial`（`foo`=`foo\n`、`bar`=`bar\n`、`baz`=`baz\n`）与 `second`（`baz`=`bazz\n`）；`clean_branch` 自 `initial` 提交 `clean`（`bar`=`bart\n`）；`conflict_branch` 自 `initial` 提交 `conflict`（`bar`=`barf\n`、`baz`=`bazf\n`）；`main` 指向 `second`；无关修改场景 `printf 'foo\nxyzzy\n' > foo`；重叠修改场景 `echo local > bar`；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -2063,7 +2063,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC7）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::dirty_worktree_overlap_only)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::dirty_worktree_overlap_only)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`dirty_worktree_overlap_only`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_noninteractive_history_controls`（整 target，非交互历史控制；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_noninteractive_history_controls` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 
@@ -2138,7 +2138,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-12: 跳过结果与 HEAD 相同的工作区文件重写以保留 mtime（#1026）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--no-commit` 仅拒绝与合并实际重写路径重叠的未暂存修改，其余保留；合并写入跳过与 HEAD 相同的路径以保留 mtime/内容。由 `merge_preserves_mtime_for_unchanged_paths` 覆盖。D 组 patch +1。偏差：脏场景按 `--no-commit` 验证；用户已取消独立审计与全量测试。）
 
 **Description:** 把合并结果写入工作树时，若某路径的结果 blob 与文件模式都与 HEAD 相同，跳过该文件的磁盘写入，保留其 mtime 与工作树内容（与合并无关的本地修改本就不在写入集合内；与写入集合重叠的本地修改由既有脏工作区检查在写入前拒绝）；结果确有变化的路径照常写入。
 
@@ -2159,7 +2159,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC4：AC1 之后 `libra status --porcelain` 不报告任何路径（跳过写入不留下状态差异）。
 - [ ] AC5：与合并无关的本地修改文件不被重写。
 - [ ] AC6：与合并无关的本地修改内容保留。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：`merge` 中英文档记录脏工作区重叠判定与跳过未变路径；网站同步。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::merge_preserves_mtime_for_unchanged_paths` 承载 AC1–AC6；夹具 F-1026（`#1026` 复现）（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`O` 中 `b`=`1..10`（每行一个数字）、`c`=`c0\n`；`A`（HEAD 侧）在 `b` 的 `5` 后插入 `5.5` 并在末尾追加 `10.5`；`B` 只在 `5` 后插入 `5.5` 并把 `c` 改为 `cB\n`；`O` 中另有 `d`=`d0\n` 两侧均不修改；合并前在 `A^0` 分离 HEAD 上用 `std::fs::File::set_modified` 把 `b` 的 mtime 设为 `2026-01-01T00:00:00Z`，记为 `T0`；脏文件场景另在合并前 `echo local > d`；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -2173,7 +2173,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC6）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::merge_preserves_mtime_for_unchanged_paths)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::merge_preserves_mtime_for_unchanged_paths)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`merge_preserves_mtime_for_unchanged_paths`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_worktree_blob_writes`（整 target，工作树 blob 写入；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_worktree_blob_writes` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 
