@@ -525,3 +525,47 @@ fn test_config_key_without_section_spellings() {
         );
     }
 }
+
+#[test]
+#[serial(cwd)]
+fn test_config_validation_exit_codes_matrix() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(&run_libra_command(&["init"], repo.path()), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.name", "Test"], repo.path()),
+        "seed",
+    );
+    for pattern in ["^user", "user", "name$"] {
+        let out = run_libra_command(&["config", "--get-regexp", pattern], repo.path());
+        assert_cli_success(&out, pattern);
+    }
+    let invalid = run_libra_command(&["config", "--get-regexp", "("], repo.path());
+    assert_eq!(invalid.status.code(), Some(6));
+    let undotted = run_libra_command(&["config", "--get", "nosuchkey"], repo.path());
+    assert_eq!(undotted.status.code(), Some(1));
+}
+
+#[test]
+#[serial(cwd)]
+fn test_get_regexp_reserved_rule_scoped() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    // The reserved-namespace matcher only applies to the global scope.
+    let local = run_libra_command(
+        &["config", "--local", "--get-regexp", "^upgrade\\."],
+        repo.path(),
+    );
+    assert_eq!(local.status.code(), Some(1), "local regexp has no matches");
+    let global = run_libra_command(
+        &["config", "--global", "--get-regexp", "^upgrade\\."],
+        repo.path(),
+    );
+    assert_eq!(
+        global.status.code(),
+        Some(129),
+        "global reserved regexp is rejected"
+    );
+}
