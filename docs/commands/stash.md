@@ -478,3 +478,5 @@ Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`stas
 ## Issue #477 notes
 
 remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
+
+stash show accepts MERGE_AUTOSTASH while held.

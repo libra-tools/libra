@@ -1978,7 +1978,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-44: `stash show` 接受 `MERGE_AUTOSTASH`（#991）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`stash show [-p] MERGE_AUTOSTASH` 读取 merge-autostash sidecar；无 held autostash 时 LBR-CLI-003/129；普通 stash 解析不变；stash 58/58。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 自 `MP-30` 拆出：`libra stash show [-p] MERGE_AUTOSTASH` 在待决合并持有 autostash 时显示该 autostash（经 `MP-30` 的 `MergeAutostash` 伪引用读取 sidecar），满足 `#991` AC1 与 `t7600` 对 `git stash show -p MERGE_AUTOSTASH` 的比较；没有持有的 autostash 时以 `LBR-CLI-003` 失败。普通 `stash@{n}` 解析不变。
 
@@ -2005,7 +2005,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC2）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::stash_show_merge_autostash)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::stash_show_merge_autostash)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`stash_show_merge_autostash`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::stash_test::/)'`（`command::stash_test` 模块族，守护 `stash show` 既有行为；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 

@@ -1194,8 +1194,15 @@ async fn run_show(
     name_status: bool,
     patch: bool,
 ) -> Result<StashOutput, StashError> {
-    let (index, stash_id_str, _raw_line) = resolve_stash_to_commit_hash(stash)?;
     let git_dir = util::request_storage_path();
+    let (index, stash_id_str, _raw_line) = if stash.as_deref() == Some("MERGE_AUTOSTASH") {
+        let sidecar = crate::command::merge::MergeAutostash::load_optional_sync_in_gitdir(&git_dir)
+            .map_err(StashError::ReadObject)?
+            .ok_or(StashError::NoStashFound)?;
+        (0, sidecar.stash_commit, String::new())
+    } else {
+        resolve_stash_to_commit_hash(stash)?
+    };
 
     let stash_hash = crate::internal::object_format::parse_repo_oid(&stash_id_str)
         .map_err(|e| StashError::ReadObject(e.to_string()))?;

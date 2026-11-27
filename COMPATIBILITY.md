@@ -2321,3 +2321,5 @@ apply rebuilds full-index binary patches without payload.
 am applies mail series to an unborn branch.
 
 rev-parse resolves MERGE_AUTOSTASH while held.
+
+stash show accepts MERGE_AUTOSTASH while held.

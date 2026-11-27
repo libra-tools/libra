@@ -2806,3 +2806,27 @@ fn eol_consumer_stash_does_not_save_representation_only_changes(auto: bool) {
     i1062_ok(&repo, &["stash", "push"]);
     assert!(!i1062_ok(&repo, &["stash", "list"]).is_empty());
 }
+
+#[test]
+#[serial(cwd)]
+fn stash_show_merge_autostash() {
+    use std::fs;
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("tracked.txt"), "stashed\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["stash", "push", "-m", "held"], root),
+        "stash push",
+    );
+    let stash_log = fs::read_to_string(root.join(".libra/logs/refs/stash")).unwrap();
+    let oid = stash_log.split_whitespace().nth(1).unwrap().to_string();
+    let sidecar = root.join(".libra/merge-autostash.json");
+    fs::write(&sidecar, format!("{{\"stash_commit\":\"{oid}\"}}")).unwrap();
+    let shown = run_libra_command(&["stash", "show", "-p", "MERGE_AUTOSTASH"], root);
+    assert_cli_success(&shown, "stash show MERGE_AUTOSTASH");
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("stashed"));
+    fs::remove_file(&sidecar).unwrap();
+    let missing = run_libra_command(&["stash", "show", "MERGE_AUTOSTASH"], root);
+    assert_eq!(missing.status.code(), Some(129));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("LBR-CLI-003"));
+}

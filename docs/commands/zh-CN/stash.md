@@ -453,3 +453,5 @@ Libra 保留 Git 的 `stash@{N}` 引用语法以保持熟悉度。从 Git 迁移
 ## Issue #477 notes
 
 仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`
+
+stash show accepts MERGE_AUTOSTASH while held.
