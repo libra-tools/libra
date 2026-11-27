@@ -1665,6 +1665,7 @@ async fn run_merge_message_hooks(
 async fn verify_merge_commit_signature(commit: &Commit) -> Result<String, MergeError> {
     use crate::command::commit::{CommitSignatureStatus, verify_commit_signature};
 
+    crate::command::history_config::validate_gpg_min_trust_level().await?;
     match verify_commit_signature(commit).await {
         Ok(CommitSignatureStatus::Good) => crate::internal::vault::configured_signing_user_id()
             .await

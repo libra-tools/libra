@@ -68,6 +68,27 @@ pub(crate) async fn merge_verify_signatures() -> Result<Option<bool>, HistoryCon
     read_bool("merge.verifySignatures").await
 }
 
+/// Validate `gpg.minTrustLevel` when signature verification is requested.
+/// Libra's vault key always verifies at `ultimate`, so every Git-defined
+/// threshold admits it; only the spelling can fail. Like the other history
+/// knobs this is checked on demand, not on every command.
+pub(crate) async fn validate_gpg_min_trust_level() -> Result<(), HistoryConfigError> {
+    if let Some(value) = read_value("gpg.minTrustLevel").await? {
+        let valid = matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "undefined" | "never" | "marginal" | "fully" | "ultimate"
+        );
+        if !valid {
+            return Err(invalid(
+                "gpg.minTrustLevel",
+                value,
+                "undefined, never, marginal, fully, or ultimate",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn commit_signing_policy(
     no_gpg_sign: bool,
 ) -> Result<CommitSigningPolicy, HistoryConfigError> {

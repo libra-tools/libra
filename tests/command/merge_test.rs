@@ -15143,3 +15143,38 @@ fn verify_signatures_good_line() {
     assert_cli_success(&out, "configured verify");
     assert!(String::from_utf8_lossy(&out.stdout).contains("has a good GPG signature by "));
 }
+
+#[test]
+fn verify_signatures_min_trust_level() {
+    for value in ["undefined", "never", "marginal", "fully", "ultimate"] {
+        let repo = create_signed_tip_repo();
+        assert_cli_success(
+            &run_libra_command(&["config", "gpg.minTrustLevel", value], repo.path()),
+            "config trust",
+        );
+        let merged = run_libra_command(&["merge", "--verify-signatures", "dev"], repo.path());
+        assert_cli_success(&merged, value);
+    }
+    for value in ["UNDEFINED", "Never", "MARGINAL", "Fully", "ULTIMATE"] {
+        let repo = create_signed_tip_repo();
+        assert_cli_success(
+            &run_libra_command(&["config", "gpg.minTrustLevel", value], repo.path()),
+            "config trust case",
+        );
+        let merged = run_libra_command(&["merge", "--verify-signatures", "dev"], repo.path());
+        assert_cli_success(&merged, value);
+    }
+
+    let repo = create_signed_tip_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "gpg.minTrustLevel", "bogus"], p),
+        "config bogus",
+    );
+    let before = run_libra_command(&["rev-parse", "HEAD"], p);
+    let rejected = run_libra_command(&["merge", "--verify-signatures", "dev"], p);
+    assert_ne!(rejected.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("LBR-CLI-002"));
+    let after = run_libra_command(&["rev-parse", "HEAD"], p);
+    assert_eq!(before.stdout, after.stdout);
+}

@@ -1486,7 +1486,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-32: `merge --verify-signatures` 读取并校验 `gpg.minTrustLevel`（#1004）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：验签读取 `gpg.minTrustLevel`，大小写不敏感接受五个 Git 阈值；仓库 vault 按 `ultimate` 计；非法值仅在请求验签时以 `LBR-CLI-002` fail-closed 且 HEAD 不变。新增 AC1–AC4 用例。C 组 patch +1。偏差：AC5 由既有 unsigned 拒绝覆盖；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-08` 拆出：验签时读取 `gpg.minTrustLevel`，按 Git 接受 `undefined`/`never`/`marginal`/`fully`/`ultimate`（大小写不敏感）；仓库 vault 密钥验签通过的签名按 `ultimate` 计，因而任一合法阈值都放行，非法值经 `HistoryConfigError::Invalid` 以 `LBR-CLI-002` fail-closed。Git 的「未受信任签名」分支在 Libra 不可达（无信任数据库），在 `COMPATIBILITY.md` 记为有意差异；与 Git 在每次读取配置时都拒绝非法值不同，Libra 只在请求验签时校验该键（同样记入有意差异）。
 
@@ -1507,7 +1507,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC3：非法阈值以 `LBR-CLI-002` 拒绝。
 - [ ] AC4：AC3 的拒绝不改变仓库快照。
 - [ ] AC5：阈值不放行无签名提交。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：`merge` 中英文档记录阈值集合、vault `ultimate` 语义与按需校验；网站同步。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::verify_signatures_min_trust_level` 承载 AC1–AC5；夹具 F-SIG：以子进程环境 `GIT_COMMITTER_NAME='A U Thor'`、`GIT_COMMITTER_EMAIL=author@example.com` 执行 `libra init`（vault 密钥以 init 时的身份生成，`src/command/init.rs:2446-2460`），再执行 `libra config user.name 'A U Thor'`、`libra config user.email author@example.com` 与 `libra config vault.signing true`；`main` 提交 `B`；`topic` 自 `B` 提交已签名的 `T`（可快进）；`unsigned` 自 `B` 以 `--no-gpg-sign` 提交 `U`；`<T7>` 为 `T` 前 7 位；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -1520,7 +1520,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC5）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::verify_signatures_min_trust_level)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::verify_signatures_min_trust_level)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`verify_signatures_min_trust_level`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_config_history_defaults`（整 target，历史默认配置；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_config_history_defaults` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 
