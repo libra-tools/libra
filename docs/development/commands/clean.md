@@ -73,3 +73,5 @@ clean prints cwd-relative paths while JSON stays repo-root-relative.
 clean honors core.excludesfile case-insensitively.
 
 clean skips untracked directories without -d.
+
+clean -ff removes nested repositories with -d.

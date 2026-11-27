@@ -1452,16 +1452,39 @@ fn clean_double_force_nested_repo() {
     let repo = tempdir().unwrap();
     let root = repo.path();
     assert_cli_success(&run_libra_command(&["init"], root), "init");
-    fs::create_dir_all(root.join("nested/.git")).unwrap();
-    fs::write(root.join("nested/inside.txt"), "x").unwrap();
+    for nested in ["foo", "baz/boo"] {
+        let git = root.join(nested).join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::create_dir_all(git.join("refs")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git.join("index"), "").unwrap();
+    }
+    fs::write(root.join("foo/hello.world"), "hello\n").unwrap();
+    fs::write(root.join("baz/boo/deeper.world"), "deeper\n").unwrap();
+    fs::create_dir_all(root.join("bar")).unwrap();
+    fs::write(root.join("bar/goodbye.people"), "").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "lib"], root),
+        "nested libra init",
+    );
+    fs::write(root.join("lib/notes.txt"), "notes\n").unwrap();
+
     let single = run_libra_command(&["clean", "-n", "-d"], root);
     let single_text = String::from_utf8_lossy(&single.stdout);
-    assert!(!single_text.contains("nested"), "{single_text}");
-    let double = run_libra_command(&["clean", "-n", "-f", "-f", "-d"], root);
-    assert_cli_success(&double, "double force preview");
-    let double_text = String::from_utf8_lossy(&double.stdout);
-    assert!(double_text.contains("Would remove nested"), "{double_text}");
-    let compact = run_libra_command(&["clean", "-n", "-ff", "-d"], root);
-    assert_cli_success(&compact, "-ff");
-    assert_eq!(compact.stdout, double.stdout);
+    assert!(!single_text.contains("foo"), "{single_text}");
+    assert!(!single_text.contains("baz"), "{single_text}");
+    assert!(!single_text.contains("lib"), "{single_text}");
+
+    let double = run_libra_command(&["clean", "-f", "-f", "-d"], root);
+    assert_cli_success(&double, "double force");
+    assert!(!String::from_utf8_lossy(&double.stderr).contains("cannot be used multiple times"));
+    for gone in ["foo", "bar", "baz", "lib"] {
+        assert!(!root.join(gone).exists(), "{gone} should be removed");
+    }
+
+    fs::create_dir_all(root.join("foo")).unwrap();
+    fs::write(root.join("foo/file.txt"), "x").unwrap();
+    let compact = run_libra_command(&["clean", "-ffd"], root);
+    assert_cli_success(&compact, "-ffd");
+    assert!(!root.join("foo").exists());
 }

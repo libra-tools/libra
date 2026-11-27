@@ -590,7 +590,7 @@ PY
 ### Task WC-04a: 支持 `libra clean -f -f`（双 `-f`）移除嵌套仓库（#735）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`force` 改为计数型，`-ff`/`-f -f` 接受；双 force 在 `-d`/显式目录 pathspec 下删除嵌套 Git/Libra 仓库；新增 `clean_double_force_nested_repo`；clean 39/39。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 自 `WC-04` 拆出：将 `CleanArgs::force` 改为计数型（`u8` + `ArgAction::Count`）以接受 `-f -f` / `-ff`；`force >= 2` 时取消 `WC-04` 的嵌套仓库排除（上游 `git@750f5de7` `builtin/clean.c:959` `if (force > 1)`），在 `-d` 或显式目录 pathspec（`WC-03` 引入的目录递归）下删除嵌套仓库。
 **Out of scope:** 单 force 嵌套仓库保护（`WC-04`）；`clean.requireForce`（`WC-05`，配置豁免不等同双 force）。
 
@@ -602,11 +602,11 @@ PY
 | 上游仅在 `force > 1` 时去掉 `REMOVE_DIR_KEEP_NESTED_GIT` | 上游 `git@750f5de7` `builtin/clean.c:927,959` |
 
 **Acceptance criteria:**
-- [ ] AC1：`libra clean -f -f -d` 被 CLI 接受（exit 0）。
-- [ ] AC2：`libra clean -ffd` 被 CLI 接受（exit 0）。
-- [ ] AC3：上游 `t7300#41`（`TC-0552`）等价场景通过：双 force `libra clean -f -f -d` 后上游该用例的全部 `test_path_is_missing` 断言成立。
-- [ ] AC4：双 force `libra clean -f -f -d` 删除嵌套 Libra 仓库 `lib/`。
-- [ ] AC5：显式目录 pathspec、无 `-d` 的双 force `libra clean -f -f foo/` 删除 `foo/`。
+- [x] AC1：`libra clean -f -f -d` 被 CLI 接受（exit 0）（`clean_test::clean_double_force_nested_repo`）。
+- [x] AC2：`libra clean -ffd` 被 CLI 接受（exit 0）（`clean_test::clean_double_force_nested_repo`）。
+- [x] AC3：上游 `t7300#41`（`TC-0552`）等价场景通过：双 force `libra clean -f -f -d` 后上游该用例的全部 `test_path_is_missing` 断言成立（`clean_test::clean_double_force_nested_repo`）。
+- [x] AC4：双 force `libra clean -f -f -d` 删除嵌套 Libra 仓库 `lib/`（`clean_test::clean_double_force_nested_repo`）。
+- [x] AC5：显式目录 pathspec、无 `-d` 的双 force `libra clean -f -f foo/` 删除 `foo/`（`clean_test::clean_double_force_nested_repo`）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -619,8 +619,8 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::clean_test::clean_double_force_nested_repo)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC5）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::clean_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`clean_double_force_nested_repo`（通过）
+- [x] 共享回归组：`command::clean_test`（39/39）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-03`, `DEP-WC-05`
