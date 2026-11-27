@@ -1356,7 +1356,7 @@ impl Display for ReflogFormatter<'_> {
                 };
 
                 let commit = find_commit(&log.new_oid);
-                let full_msg = format!("{}: {}", log.action, log.message);
+                let full_msg = format!("{}: {}", log.action, log.message.trim_end());
 
                 let author = format!("{} <{}>", commit.author.name, commit.author.email);
                 let committer = format!("{} <{}>", log.committer_name, log.committer_email);
@@ -1414,7 +1414,7 @@ impl Display for ReflogFormatter<'_> {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        writeln!(f, "{all}")
+        write!(f, "{}", all.trim_end_matches('\n'))
     }
 }
 

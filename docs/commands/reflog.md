@@ -370,3 +370,5 @@ Note: jj does not have a reflog. Instead, it maintains an operation log (`jj op 
 | `LBR-REPO-002` | Reflog entry points at a missing or invalid commit object |
 | `LBR-IO-001` | Failed to read reflog entries from database |
 | `LBR-IO-002` | Failed to delete reflog entries from database |
+
+reflog oneline output has no trailing blank line.

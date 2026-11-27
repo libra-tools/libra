@@ -709,3 +709,19 @@ fn test_reflog_expire_dry_run_writes_no_objects() {
     assert_cli_success(&out, "reflog expire --dry-run --all");
     assert_no_objects_written(p, &before, "reflog expire --dry-run");
 }
+
+#[test]
+#[serial(cwd)]
+fn reflog_limit_no_trailing_blank_line() {
+    let repo = create_committed_repo_via_cli();
+    let one = run_libra_command(&["reflog", "-1"], repo.path());
+    assert_cli_success(&one, "reflog -1");
+    let text = String::from_utf8_lossy(&one.stdout);
+    assert_eq!(text.lines().count(), 1, "{text:?}");
+    assert!(!text.ends_with("\n\n"), "{text:?}");
+
+    let two = run_libra_command(&["reflog", "show", "-n", "2"], repo.path());
+    assert_cli_success(&two, "reflog show -n 2");
+    let text = String::from_utf8_lossy(&two.stdout);
+    assert!(text.lines().all(|line| !line.is_empty()), "{text:?}");
+}

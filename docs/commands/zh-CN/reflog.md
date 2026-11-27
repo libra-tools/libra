@@ -316,3 +316,5 @@ Git 将 reflog 存储为 `.git/logs/` 下的追加文本文件。这很简单，
 | `LBR-REPO-002` | Reflog 条目指向缺失或无效提交对象 |
 | `LBR-IO-001` | 无法从数据库读取 reflog 条目 |
 | `LBR-IO-002` | 无法从数据库删除 reflog 条目 |
+
+reflog oneline output has no trailing blank line.

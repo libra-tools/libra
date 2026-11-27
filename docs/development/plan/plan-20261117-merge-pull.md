@@ -1329,7 +1329,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-29: 修复 `libra reflog -<n>` 输出末尾多余空行（#1003）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：formatter 不再自带尾换行，由 pager 每行统一补一次；新增 `reflog_limit_no_trailing_blank_line`。C 组 patch +1。偏差：`command::reflog_test` 其余 3 个旧 SQLite fixture 用例因默认 redb 失败，超出本卡；用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 自 `MP-06` 拆出：`libra reflog -1`、`libra reflog show -n <k>` 的 oneline 输出在最后一条后多出一个空行（已安装 0.30.207 实测），改为与 Git 一致每条一行、无空行。
 
@@ -1343,8 +1343,8 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Acceptance criteria:**
 
-- [ ] AC1：`libra reflog -1` 只输出一行。
-- [ ] AC2：`libra reflog show -n 2` 不含空行。
+- [x] AC1：`libra reflog -1` 只输出一行（`reflog_test::reflog_limit_no_trailing_blank_line`）。
+- [x] AC2：`libra reflog show -n 2` 不含空行（`reflog_test::reflog_limit_no_trailing_blank_line`）。
 - [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
 
 **AC → 断言映射:**（`(new)` `command::reflog_test::reflog_limit_no_trailing_blank_line` 承载 AC1–AC2；夹具 F-RL（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：写 `a`=`1\n`、`libra add a`、`libra commit --no-gpg-sign -m one` 得 `C1`；再写 `a`=`2\n`、`libra add a`、`libra commit --no-gpg-sign -m two` 得 `C2`；`<C2_7>` 为 `C2` 前 7 位；全部调用设子进程环境 `LIBRA_PAGER=never`；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
@@ -1355,7 +1355,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC2）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::reflog_test::reflog_limit_no_trailing_blank_line)'`（`(new)`，在 `tests/command/reflog_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::reflog_test::reflog_limit_no_trailing_blank_line)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`reflog_limit_no_trailing_blank_line`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::reflog_test::/)'`（`command::reflog_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `MP-06`, `DEP-MP-10`
