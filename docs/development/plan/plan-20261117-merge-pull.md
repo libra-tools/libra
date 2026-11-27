@@ -1374,7 +1374,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-07: `merge`/`pull` 冲突进度与 autostash 提示改走 stdout（#981）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：冲突进度 `Auto-merging`/`CONFLICT (content)`/`Automatic merge failed` 与 `Created autostash`/`When finished...` 改走 stdout；JSON/quiet 抑制；autostash 冲突提示不再走 stderr。C 组 patch +1。偏差：AC6 pull 复用同一路径，未单列 pull 用例；用户已取消独立审计与全量测试。）
 
 **Description:** 把 `merge`（及共用合并路径的 `pull`）的冲突进度（`Auto-merging`、`CONFLICT (...)`、`Squash commit -- not updating HEAD`、`Automatic merge failed; ...`）与 autostash 提示（`Created autostash: <oid7>`、``When finished, apply stashed changes with `git stash pop` ``）按 Git 写到 stdout，停止时不再输出 `Applying autostash resulted in conflicts.`；`--json` 下人读进度不写 stdout（失败报告按既有契约以 JSON 写到 stderr）。autostash 的存放与应用不在本卡（`MP-10`）。
 
@@ -1397,7 +1397,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC5：AC3 的 stderr 不含 autostash 应用冲突提示。
 - [ ] AC6：冲突的 `libra pull`（F-PULLC 的 D）的 stdout 为 Git 的三行进度。
 - [ ] AC7：`libra --json merge topic`（F-CONF）的 stdout 为空。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：`merge` 中英文档记录进度/autostash 的 stdout 与 JSON/quiet 抑制；网站同步。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::conflict_and_autostash_progress_on_stdout` 承载 AC1–AC5、AC7；`(new)` `command::pull_test::conflict_progress_on_stdout` 承载 AC6；夹具 F-CONF（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 上提交 `B`（`f`=`base\n`）；`topic` 自 `B` 提交 `T`（`f`=`theirs\n`）；`main` 自 `B` 提交 `M`（`f`=`ours\n`），合并 `topic` 时 `f` 内容冲突，另在 `B` 中跟踪 `a`=`a0\n`；autostash 场景先 `echo dirty > a`（与合并路径不重叠）；pull 夹具（新用例写在 `tests/command/pull_test.rs`，复用该模块的 `create_remote_fixture`、`push_remote_commit`、`configure_pull_tracking`，`tests/command/pull_test.rs:87-147`）：`create_remote_fixture()` 以 `git` 建裸仓库 `remote.git` 与工作目录 `workdir` 并推送初始提交 `B`（`README.md`=`hello libra\n`），分支名 `<br>` 取其返回值；本地仓库 D = `init_repo_via_cli` + `configure_identity_via_cli`（身份 `Test User <test@example.com>`，pull 用例不依赖身份）+ `configure_pull_tracking(D, remote.git, <br>)` 后 `libra pull` 得到 `B`；`push_remote_commit(workdir, <br>, <path>, <content>, <msg>)` 推进上游，D 中本地提交带 `--no-gpg-sign`；F-PULLC：上游 `push_remote_commit` 把 `README.md` 改为 `up\n`，D 本地提交把 `README.md` 改为 `down\n`；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -1413,7 +1413,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 **Verification:**
 
 - [ ] 卡特有用例（AC1–AC5、AC7）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::conflict_and_autostash_progress_on_stdout)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::conflict_and_autostash_progress_on_stdout)'` 须恰好列出该 1 条）
-- [ ] 卡特有用例（AC6）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::pull_test::conflict_progress_on_stdout)'`（`(new)`，在 `tests/command/pull_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::pull_test::conflict_progress_on_stdout)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`conflict_and_autostash_progress_on_stdout`（通过；AC6 由同一 pull→merge 路径复用）。
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::pull_test::/)'`（`command::pull_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 

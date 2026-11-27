@@ -578,8 +578,8 @@ pub(super) async fn prepare_merge_autostash(
                          (merge-autostash.json references stash commit {stash_commit})"
                     )));
                 }
-                if !output.quiet {
-                    eprintln!("Created autostash: {stash_commit}");
+                if !output.quiet && !output.is_json() {
+                    println!("Created autostash: {stash_commit}");
                 }
             }
             Ok(None) => {}

@@ -160,10 +160,27 @@ pub(crate) fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -
     } else if result.continued {
         info_println!(output, "Merge completed.");
     } else if !result.conflicted_paths.is_empty() {
+        for report in &result.conflict_kinds {
+            if report.kind != "content" {
+                continue;
+            }
+            info_println!(output, "Auto-merging {}", report.path);
+            info_println!(
+                output,
+                "CONFLICT (content): Merge conflict in {}",
+                report.path
+            );
+        }
         info_println!(
             output,
             "Automatic merge failed; fix conflicts and then commit the result."
         );
+        if result.autostash.is_some() {
+            info_println!(
+                output,
+                "When finished, apply stashed changes with `libra stash pop`"
+            );
+        }
     } else {
         match result.strategy.as_str() {
             "three-way" => info_println!(

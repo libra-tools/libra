@@ -615,3 +615,5 @@ merge rejects squash with no-ff and allows squash ff-only.
 merge --continue applies and clears a held MERGE_AUTOSTASH.
 
 If the editor exits non-zero or cannot be started, Libra applies the merge to the index and working tree, keeps merge state, and reports `Not committing merge; use 'libra commit' to complete the merge.`. `libra commit`, `merge --continue`, or `merge --abort` can then finish or undo it.
+
+Content-conflict progress (`Auto-merging <path>`, `CONFLICT (content): Merge conflict in <path>`, `Automatic merge failed; fix conflicts and then commit the result.`) and autostash notices (`Created autostash: <oid>`, `When finished, apply stashed changes with `libra stash pop``) go to stdout; `--json`/`-q` suppress them.

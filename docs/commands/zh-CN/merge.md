@@ -472,3 +472,5 @@ merge rejects squash with no-ff and allows squash ff-only.
 merge --continue applies and clears a held MERGE_AUTOSTASH.
 
 编辑器以非 0 退出或无法启动时，Libra 已把合并结果写入索引与工作树并保留 merge state，输出 `Not committing merge; use 'libra commit' to complete the merge.`；随后可用 `libra commit`、`merge --continue` 或 `merge --abort` 完成或撤销。
+
+内容冲突进度（`Auto-merging <path>`、`CONFLICT (content): Merge conflict in <path>`、`Automatic merge failed; fix conflicts and then commit the result.`）与 autostash 提示（`Created autostash: <oid>`、`When finished, apply stashed changes with `libra stash pop``）写到 stdout；`--json`/`-q` 抑制。

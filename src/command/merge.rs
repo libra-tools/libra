@@ -3783,6 +3783,7 @@ async fn perform_three_way_merge(
             options.output,
         );
         announce_df_conflicts(&placements, upstream, options.output);
+        announce_content_conflicts(&placements, options.output);
         // rerere: record the preimage of each merge conflict just written and
         // replay a recorded resolution if one matches. A no-op unless
         // `rerere.enabled`; an explicit per-invocation choice overrides config.
@@ -9070,6 +9071,43 @@ fn announce_df_conflicts(
     }
 }
 
+/// Git's human progress for ordinary content conflicts. Conflicts are an
+/// error outcome, so this runs before the typed error is returned rather than
+/// in `render_merge_output`; `--json`/`-q` stay silent.
+fn announce_content_conflicts(
+    placements: &[(PathBuf, ConflictKind, Option<PathBuf>)],
+    output: &OutputConfig,
+) {
+    if output.quiet || output.is_json() {
+        return;
+    }
+    for (path, kind, _) in placements {
+        if conflict_kind_name(kind) != "content" {
+            continue;
+        }
+        info_println!(output, "Auto-merging {}", path.display());
+        info_println!(
+            output,
+            "CONFLICT (content): Merge conflict in {}",
+            path.display()
+        );
+    }
+    info_println!(
+        output,
+        "Automatic merge failed; fix conflicts and then commit the result."
+    );
+    let held = MergeAutostash::load_optional_sync_in_gitdir(&util::request_storage_path())
+        .ok()
+        .flatten()
+        .is_some();
+    if held {
+        info_println!(
+            output,
+            "When finished, apply stashed changes with `libra stash pop`"
+        );
+    }
+}
+
 /// ADR-MG-01 over three trees WITHOUT flattening them: the read-only gate the
 /// preflight and the engine both run.
 ///
@@ -9486,6 +9524,7 @@ async fn perform_incremental_three_way_merge(
             options.output,
         );
         announce_df_conflicts(&placements, upstream, options.output);
+        announce_content_conflicts(&placements, options.output);
         if let Err(error) = crate::command::rerere::auto_update(options.rerere_autoupdate).await {
             tracing::warn!("rerere auto-update after merge conflict failed: {error}");
         }

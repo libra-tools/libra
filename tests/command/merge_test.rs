@@ -15266,3 +15266,41 @@ fn edit_spawn_failure_keeps_resumable_merge() {
         assert!(String::from_utf8_lossy(&tree.stdout).contains("feature.txt"));
     }
 }
+
+#[test]
+fn conflict_and_autostash_progress_on_stdout() {
+    let repo = create_diverged_repo_for_conflict();
+    let p = repo.path();
+    std::fs::write(p.join("unrelated.txt"), "precious\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "unrelated.txt"], p), "add");
+    let out = run_libra_command(&["merge", "--squash", "--autostash", "feature"], p);
+    assert_ne!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .next()
+            .unwrap()
+            .starts_with("Created autostash: "),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Auto-merging shared.txt"), "{stdout}");
+    assert!(
+        stdout.contains("CONFLICT (content): Merge conflict in shared.txt"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Automatic merge failed; fix conflicts and then commit the result."));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("Created autostash:"));
+    assert!(!stderr.contains("CONFLICT (content):"));
+
+    let repo = create_diverged_repo_for_conflict();
+    let p = repo.path();
+    let out = run_libra_command(&["--json", "merge", "feature"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
