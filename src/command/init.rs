@@ -1554,9 +1554,7 @@ async fn reinitialize_existing(
     if let Some(requested) = args.initial_branch.as_deref()
         && requested != initial_branch
     {
-        warnings.push(format!(
-            "ignoring --initial-branch '{requested}' on re-initialization; keeping '{initial_branch}'"
-        ));
+        warnings.push(format!("re-init: ignored --initial-branch={requested}"));
     }
 
     let path = root_dir

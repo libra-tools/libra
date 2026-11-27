@@ -11,6 +11,7 @@ use std::{
 use libra::internal::{config::ConfigKv, db::get_db_conn_instance_for_path, model::config};
 use pgp::composed::{Deserializable, SignedPublicKey};
 use sea_orm::EntityTrait;
+use serial_test::serial;
 use tempfile::tempdir;
 
 use super::{assert_cli_success, run_libra_command};
@@ -559,7 +560,7 @@ fn init_reinit_ignored_flag_warning_triggers_exit_code_on_warning() {
     );
     let stderr = String::from_utf8_lossy(&warned.stderr);
     assert!(
-        stderr.contains("ignoring --initial-branch"),
+        stderr.contains("re-init: ignored --initial-branch"),
         "expected an ignored-flag warning, got: {stderr}"
     );
     assert_ne!(
@@ -2263,7 +2264,10 @@ fn test_t0001_initial_branch_ports() {
     );
     assert_cli_success(&reinit, "reinit with different initial-branch");
     let stderr = String::from_utf8_lossy(&reinit.stderr);
-    assert!(stderr.contains("ignoring --initial-branch"));
+    assert!(
+        stderr.contains("re-init: ignored --initial-branch=ignore"),
+        "{stderr}"
+    );
     let branch_after = run_libra_command(&["branch", "--show-current"], &repo_hello);
     assert_eq!(
         String::from_utf8_lossy(&branch_after.stdout).trim(),
@@ -2335,4 +2339,24 @@ fn test_init_issue473_verified_ok_guards() {
         "custom content\n",
         "customized file must be preserved by top-up"
     );
+}
+
+#[test]
+#[serial(cwd)]
+fn reinit_ignored_initial_branch_warning() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false", "-b", "main"], &repo),
+        "init",
+    );
+    let reinit = run_libra_command(&["init", "--vault=false", "-b", "foo"], &repo);
+    assert_cli_success(&reinit, "reinit");
+    let stderr = String::from_utf8_lossy(&reinit.stderr);
+    assert!(
+        stderr.contains("warning: re-init: ignored --initial-branch=foo"),
+        "{stderr}"
+    );
+    let branch = run_libra_command(&["branch", "--show-current"], &repo);
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
 }

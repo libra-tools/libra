@@ -854,7 +854,7 @@
 
 ### Task GII-08: 统一 `init` 重初始化告警文案 `ignored --initial-branch`（#946）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：重初始化告警改为 Git 文案 `re-init: ignored --initial-branch=<name>`；新增/更新测试；C 组 patch +1。偏差：init 共享过滤 20 条中 4 条旧 SQLite fixture 因默认 redb 失败，超出本卡；用户已取消独立 Claude/Codex 审计与全量测试。）
 
 **Description:** 将 `src/command/init.rs:1426` 重初始化时输出的 `ignoring --initial-branch '<name>' on re-initialization; keeping '<branch>'` 改为与 Git 一致的 `re-init: ignored --initial-branch=<name>`（上游 t0001#90 TC-1702 断言子串 `ignored --initial-branch`）。本卡的 C 组 PR 同时承载 `GII-07` 的独立本地提交（`GII-07` 为 `no-release` 卡，C/D 继承本卡；见「实施顺序」承载例外）。
 
@@ -880,7 +880,7 @@
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC2）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::init_test::reinit_ignored_initial_branch_warning)'`（`(new)`；`cargo nextest list` 须恰好列出该 1 条）
+- [x] 卡特有用例：`reinit_ignored_initial_branch_warning`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::init_test::.*(initial_branch|reinit)/)'`（2026-11-18 核对现有 19 条；按「验证执行协议」第 5 条）
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `GII-07, DEP-GII-03`（`GII-07` 达 `Acceptance=locally-accepted`、ER-05 review `PASS` 且已形成独立本地提交即满足，见「实施顺序」承载例外）

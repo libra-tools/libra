@@ -2301,3 +2301,5 @@ rm -n uses the short flag and exits via SIGPIPE on a closed pipe.
 reflog oneline output has no trailing blank line.
 
 initial pull into an unborn branch records initial pull.
+
+reinit warns with git's ignored initial-branch line.
