@@ -2227,3 +2227,5 @@ show-origin quotes paths and marks command-line defaults.
 upstream show-origin cases pass.
 
 upstream show-scope cases pass.
+
+expiry special words match the recorded git result.

@@ -307,8 +307,8 @@ fn test_type_expiry_date_matrix() {
     );
     assert_eq!(
         String::from_utf8_lossy(&now_out.stdout).trim(),
-        i64::MAX.to_string(),
-        "now maps to the far-future sentinel"
+        u64::MAX.to_string(),
+        "now maps to Git's far-future sentinel"
     );
 
     // E3: absolute dates.
@@ -809,4 +809,60 @@ fn test_bool_or_str_and_bool_or_int_matrix() {
         repo.path(),
     );
     assert_eq!(String::from_utf8_lossy(&int.stdout).trim(), "true");
+}
+
+#[test]
+#[serial(cwd, env)]
+fn test_cf_77_predicates() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], repo.path()),
+        "init",
+    );
+    for (word, expected) in [
+        ("never", Some("0".to_string())),
+        ("now", Some(u64::MAX.to_string())),
+        ("all", Some(u64::MAX.to_string())),
+    ] {
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["config", "--local", "exp.k", word],
+                repo.path(),
+                &[("TZ", "UTC")],
+            ),
+            "set",
+        );
+        let out = run_libra_command_with_env(
+            &["config", "--local", "--type=expiry-date", "--get", "exp.k"],
+            repo.path(),
+            &[("TZ", "UTC")],
+        );
+        assert_cli_success(&out, word);
+        assert_eq!(
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+            expected
+        );
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for word in ["yesterday", "noon"] {
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["config", "--local", "exp.k", word],
+                repo.path(),
+                &[("TZ", "UTC")],
+            ),
+            "set",
+        );
+        let out = run_libra_command_with_env(
+            &["config", "--local", "--type=expiry-date", "--get", "exp.k"],
+            repo.path(),
+            &[("TZ", "UTC")],
+        );
+        assert_cli_success(&out, word);
+        let ts: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert!((ts - now).abs() < 2 * 86_400, "{word}: {ts} vs {now}");
+    }
 }

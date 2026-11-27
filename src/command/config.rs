@@ -3387,7 +3387,13 @@ fn canonicalize_typed_value(value: &str, ty: ConfigValueType) -> CliResult<Strin
             })
         }
         ConfigValueType::ExpiryDate => crate::utils::approxidate::parse_expiry_date(value)
-            .map(|ts| ts.to_string())
+            .map(|ts| {
+                if ts == crate::utils::approxidate::TIME_MAX {
+                    u64::MAX.to_string()
+                } else {
+                    ts.to_string()
+                }
+            })
             .map_err(|error| {
                 CliError::fatal(error.to_string())
                     .with_stable_code(StableErrorCode::CliInvalidArguments)
