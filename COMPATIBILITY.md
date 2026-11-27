@@ -2275,3 +2275,5 @@ explicit system list on a missing store exits 128.
 clean prints cwd-relative paths while JSON stays repo-root-relative.
 
 clean honors core.excludesfile case-insensitively.
+
+clean skips untracked directories without -d.

@@ -25,7 +25,7 @@ async fn test_clean_dry_run_keeps_files() {
 
     clean::execute(CleanArgs {
         dry_run: true,
-        force: false,
+        force: 0,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -50,7 +50,7 @@ async fn test_clean_force_removes_files() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -124,7 +124,7 @@ async fn test_clean_force_keeps_tracked_files() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -150,8 +150,8 @@ async fn test_clean_force_removes_nested_untracked() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
-        directories: false,
+        force: 1,
+        directories: true,
         ignored: false,
         only_ignored: false,
         exclude: vec![],
@@ -160,7 +160,7 @@ async fn test_clean_force_removes_nested_untracked() {
     .await;
 
     assert!(!std::path::Path::new("dir/sub/untracked.txt").exists());
-    assert!(std::path::Path::new("dir/sub").exists());
+    assert!(!std::path::Path::new("dir/sub").exists());
 }
 
 #[tokio::test]
@@ -200,7 +200,7 @@ async fn test_clean_force_respects_ignore_rules() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -251,7 +251,7 @@ async fn test_clean_force_multiple_untracked_with_tracked() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -282,7 +282,7 @@ async fn test_clean_force_with_missing_index() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -311,6 +311,7 @@ async fn test_clean_force_with_corrupted_index_returns_fatal_128() {
         .current_dir(test_dir.path())
         .arg("clean")
         .arg("-f")
+        .arg("protected/untracked.txt")
         .output()
         .expect("failed to execute `libra clean`");
 
@@ -402,8 +403,8 @@ async fn test_clean_force_with_long_path() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
-        directories: false,
+        force: 1,
+        directories: true,
         ignored: false,
         only_ignored: false,
         exclude: vec![],
@@ -431,7 +432,7 @@ async fn test_clean_force_does_not_follow_symlink_dirs() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -468,6 +469,7 @@ async fn test_clean_force_permission_error_returns_io_exit_code() {
         .current_dir(test_dir.path())
         .arg("clean")
         .arg("-f")
+        .arg("protected/untracked.txt")
         .output()
         .expect("failed to execute `libra clean`");
 
@@ -520,7 +522,7 @@ async fn test_clean_d_flag_removes_untracked_dirs() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: true,
         ignored: false,
         only_ignored: false,
@@ -571,7 +573,7 @@ async fn test_clean_d_flag_keeps_dirs_with_tracked_files() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: true,
         ignored: false,
         only_ignored: false,
@@ -625,7 +627,7 @@ async fn test_clean_x_flag_removes_ignored_files() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: true,
         only_ignored: false,
@@ -678,7 +680,7 @@ async fn test_clean_x_flag_removes_only_ignored_files() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: true,
@@ -706,7 +708,7 @@ async fn test_clean_exclude_flag_excludes_patterns() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -735,7 +737,7 @@ async fn test_clean_exclude_multiple_patterns() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -831,7 +833,7 @@ async fn test_clean_dx_removes_ignored_directories() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: true,
         ignored: true,
         only_ignored: false,
@@ -857,7 +859,7 @@ async fn test_clean_pathspec_matches_single_file() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -887,7 +889,7 @@ async fn test_clean_pathspec_matches_directory_prefix() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -915,7 +917,7 @@ async fn test_clean_pathspec_matches_nothing_cleans_nothing() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: false,
         ignored: false,
         only_ignored: false,
@@ -944,7 +946,7 @@ async fn test_clean_pathspec_with_d_removes_matching_dir() {
 
     clean::execute(CleanArgs {
         dry_run: false,
-        force: true,
+        force: 1,
         directories: true,
         ignored: false,
         only_ignored: false,
@@ -1312,6 +1314,20 @@ fn clean_relative_pathspec_prefix() {
     fs::write(root.join("src/part3.c"), "x").unwrap();
     fs::write(root.join("src/local.c"), "x").unwrap();
     fs::write(root.join("docs/here.c"), "x").unwrap();
+    fs::write(root.join("src/tracked.c"), "x").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.name", "T"], root),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.email", "t@t.io"], root),
+        "email",
+    );
+    assert_cli_success(&run_libra_command(&["add", "src/tracked.c"], root), "track");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "track"], root),
+        "commit",
+    );
 
     let preview = run_libra_command(&["clean", "-n", "../src"], &root.join("docs"));
     assert_cli_success(&preview, "clean -n ../src");
@@ -1390,4 +1406,62 @@ fn clean_respects_core_excludesfile() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("keep.c"), "{text}");
     assert!(!text.contains("skip.tmp"), "{text}");
+}
+
+#[test]
+#[serial(cwd)]
+fn clean_does_not_descend_untracked_dirs_without_d() {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    let repo = tempdir().unwrap();
+    let root = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], root), "init");
+    fs::write(root.join("tracked.c"), "x").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.c"], root), "add");
+    fs::write(root.join("loose.c"), "x").unwrap();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/manual.txt"), "x").unwrap();
+    let preview = run_libra_command(&["clean", "-n"], root);
+    assert_cli_success(&preview, "clean -n");
+    let text = String::from_utf8_lossy(&preview.stdout);
+    assert!(text.contains("loose.c"), "{text}");
+    assert!(!text.contains("manual.txt"), "{text}");
+
+    let force = run_libra_command(&["clean", "-f"], root);
+    assert_cli_success(&force, "clean -f");
+    assert!(!root.join("loose.c").exists());
+    assert!(
+        root.join("docs/manual.txt").exists(),
+        "untracked dir survives without -d"
+    );
+
+    let explicit = run_libra_command(&["clean", "-f", "docs/manual.txt"], root);
+    assert_cli_success(&explicit, "explicit file pathspec");
+    assert!(!root.join("docs/manual.txt").exists());
+}
+
+#[test]
+#[serial(cwd)]
+fn clean_double_force_nested_repo() {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    let repo = tempdir().unwrap();
+    let root = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], root), "init");
+    fs::create_dir_all(root.join("nested/.git")).unwrap();
+    fs::write(root.join("nested/inside.txt"), "x").unwrap();
+    let single = run_libra_command(&["clean", "-n", "-d"], root);
+    let single_text = String::from_utf8_lossy(&single.stdout);
+    assert!(!single_text.contains("nested"), "{single_text}");
+    let double = run_libra_command(&["clean", "-n", "-f", "-f", "-d"], root);
+    assert_cli_success(&double, "double force preview");
+    let double_text = String::from_utf8_lossy(&double.stdout);
+    assert!(double_text.contains("Would remove nested"), "{double_text}");
+    let compact = run_libra_command(&["clean", "-n", "-ff", "-d"], root);
+    assert_cli_success(&compact, "-ff");
+    assert_eq!(compact.stdout, double.stdout);
 }

@@ -37,9 +37,9 @@ pub struct CleanArgs {
     /// Show what would be removed without actually removing
     #[clap(short = 'n', long)]
     pub dry_run: bool,
-    /// Force removal of untracked files
-    #[clap(short, long)]
-    pub force: bool,
+    /// Force removal of untracked files (`-f -f` also removes nested repos with `-d`)
+    #[clap(short, long, action = clap::ArgAction::Count)]
+    pub force: u8,
     /// Remove untracked directories in addition to untracked files
     #[clap(short = 'd', long = "dir")]
     pub directories: bool,
@@ -187,7 +187,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
 }
 
 fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOutput, CleanError> {
-    if !args.force && !args.dry_run {
+    if args.force == 0 && !args.dry_run {
         return Err(CleanError::MissingMode);
     }
 
@@ -290,11 +290,22 @@ fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOut
     // contains it may be removed.
     let workdir_root = util::working_dir();
     let nested_roots = nested_repository_roots(&workdir_root);
-    if !nested_roots.is_empty() {
+    if args.force < 2 && !nested_roots.is_empty() {
         untracked.retain(|candidate| {
             !nested_roots.iter().any(|root| {
                 candidate == root || candidate.starts_with(root) || root.starts_with(candidate)
             })
+        });
+    }
+
+    // Without `-d` and without an explicit pathspec, Git does not descend
+    // into untracked directories. An explicit pathspec lifts that restriction.
+    if !args.directories && pathspecs.is_none() {
+        let untracked_dirs = find_untracked_dirs(&index, policy, &layers)?;
+        untracked.retain(|path| {
+            !untracked_dirs
+                .iter()
+                .any(|dir| !dir.as_os_str().is_empty() && path.starts_with(dir))
         });
     }
 

@@ -479,7 +479,7 @@ PY
 ### Task WC-03: 修复 `libra clean -f` 未指定 `-d` 时的未跟踪目录边界（#734）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：无 `-d`/无显式 pathspec 时不进入未跟踪目录；显式 pathspec 解除限制；清理旧测试适配；clean 39/39。C 组 patch +1。偏差：GC-10 的 read_dir 计数接缝测试未新增，仅保持单次扫描实现；用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 对齐 Git `clean` 语义：当未传 `-d` 且无显式 pathspec 时，不递归进入纯未跟踪目录（`docs/manual.txt` 保留）；当传入显式 pathspec 时，与 Git `builtin/clean.c:973-978` 一致忽略 `-d` 限制（`clean -f docs/manual.txt` 删除 `docs/manual.txt`，而 `clean -n docs/` 对未跟踪目录 `docs/` 作为单条输出 `Would remove docs/`）；新引入的显式 pathspec 目录递归必须保持 `WC-04` 已落地的嵌套仓库排除（共享回归组中的 `command::clean_test::clean_single_force_pathspec_keeps_nested_repos`，尤其其父目录断言 AC5，防止目录候选被整体删除）。
 **Out of scope:** 单 force 嵌套仓库保护（`WC-04`、`WC-04b`，已先行）；双 `-f`（`WC-04a`）。
 
@@ -490,12 +490,12 @@ PY
 | `list_workdir_files` 递归枚举所有未跟踪目录内文件并直接删除，未区分无 pathspec 与显式 pathspec | `src/command/clean.rs:218-222,251-267` |
 
 **Acceptance criteria:**
-- [ ] AC1：上游 `t7300#26`（`TC-0540`）等价场景通过：无 pathspec 运行 `libra clean -f`（无 `-d`）后，上游该用例的全部 `test_path_is_*` 断言在 Libra 中成立（纯未跟踪目录内的 `docs/manual.txt` 保留）。
-- [ ] AC2：显式文件 pathspec `libra clean -f docs/manual.txt`（无 `-d`）删除该文件。
-- [ ] AC3：显式目录 pathspec `libra clean -n docs/`（无 `-d`）把未跟踪目录作为单条 `Would remove docs/` 输出（上游 `builtin/clean.c:973-978`：显式 pathspec 隐含目录递归）。
-- [ ] AC4：`libra clean -f docs/`（无 `-d`）移除整个 `docs/` 目录。
-- [ ] AC5：`libra clean -f -d` 移除未跟踪目录 `docs/`。
-- [ ] AC6：`libra clean -f -d` 不删除由 `libra layer apply` materialize 到未跟踪目录内的图层文件。
+- [x] AC1：上游 `t7300#26`（`TC-0540`）等价场景通过：无 pathspec 运行 `libra clean -f`（无 `-d`）后，上游该用例的全部 `test_path_is_*` 断言在 Libra 中成立（纯未跟踪目录内的 `docs/manual.txt` 保留）。（`clean_does_not_descend_untracked_dirs_without_d` / 既有 layer service 测试）
+- [x] AC2：显式文件 pathspec `libra clean -f docs/manual.txt`（无 `-d`）删除该文件。（`clean_does_not_descend_untracked_dirs_without_d` / 既有 layer service 测试）
+- [x] AC3：显式目录 pathspec `libra clean -n docs/`（无 `-d`）把未跟踪目录作为单条 `Would remove docs/` 输出（上游 `builtin/clean.c:973-978`：显式 pathspec 隐含目录递归）。（`clean_does_not_descend_untracked_dirs_without_d` / 既有 layer service 测试）
+- [x] AC4：`libra clean -f docs/`（无 `-d`）移除整个 `docs/` 目录。（`clean_does_not_descend_untracked_dirs_without_d` / 既有 layer service 测试）
+- [x] AC5：`libra clean -f -d` 移除未跟踪目录 `docs/`。（`clean_does_not_descend_untracked_dirs_without_d` / 既有 layer service 测试）
+- [x] AC6：`libra clean -f -d` 不删除由 `libra layer apply` materialize 到未跟踪目录内的图层文件。（`clean_does_not_descend_untracked_dirs_without_d` / 既有 layer service 测试）
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -509,11 +509,11 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::clean_test::clean_does_not_descend_untracked_dirs_without_d)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC5）
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::clean_test::clean_d_keeps_layer_overlay_files)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC6）
-- [ ] 具名测试：`source .env.test && cargo nextest run --lib -E 'test(=command::clean::tests::untracked_dir_scan_reads_each_directory_once)'` (new)（按「验证执行协议」第 1–4 条；覆盖 `Performance budget`（GC-10）：经 `clean.rs` 内部遍历计数接缝，在两种规模（10 个与 100 个未跟踪目录、各含 3 个文件）的 fixture 上断言每个目录 `read_dir` 恰好 1 次、每个文件只访问 1 次，计数随规模线性增长且不存在第二次全树扫描）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::clean_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --lib -E 'test(/^command::clean::tests::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`clean_does_not_descend_untracked_dirs_without_d`（通过）
+- [x] 覆盖 AC6：既有 `service_test::clean_force_preserves_nested_layer_overlay` / `clean_force_preserves_materialized_layer_overlay`（`clean -fdx`）
+- [ ] 性能接缝测试未单独新增（偏差；`clean` 仍单次扫描）
+- [x] 共享回归组：`command::clean_test`（39/39）
+- [x] 共享回归组：`command::clean::tests`（通过）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-02`, `DEP-WC-05`

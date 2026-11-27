@@ -183,3 +183,5 @@ Git 的交互式 clean 模式会显示菜单来选择文件。Libra 面向 AI �
 clean prints cwd-relative paths while JSON stays repo-root-relative.
 
 clean honors core.excludesfile case-insensitively.
+
+clean skips untracked directories without -d.
