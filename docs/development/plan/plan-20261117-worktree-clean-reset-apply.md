@@ -792,7 +792,7 @@ PY
 ### Task WC-05a: 修复 `clean -e` 排除目录前缀匹配（#736 / `t7300#19`）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`clean -e` 支持目录前缀与无斜杠 basename 匹配；新增 `clean_exclude_dir_prefix`；clean 41/41。C 组 patch +1。偏差：用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 自 `WC-05` 拆出：修复 `matches_exclude_pattern` 仅生成 `^pattern$` 锚定正则的问题，使其遵循 `.gitignore` 风格规则，当传入 `-e src` 时能排除 `src/part3.c` 等子路径。
 **Out of scope:** `clean.requireForce` 配置读取（`WC-05`）。
 
@@ -803,9 +803,9 @@ PY
 | `matches_exclude_pattern` 生成 `^src$` 无法匹配 `src/part3.c` | `src/command/clean.rs:451-475` |
 
 **Acceptance criteria:**
-- [ ] AC1：上游 `t7300#19`（`TC-0556`）等价场景通过：`libra clean -f -d -x -e src` 后上游该用例的全部 `test_path_is_*` 断言在 Libra 中成立（`-e src` 使 `src/part3.c` 等 `src/` 子路径免于删除）。
-- [ ] AC2：`libra clean -f -e 1 -e 2` 的结果与上游 `t7300#42` 一致（`1`、`2`、`known` 保留，`3` 删除）。
-- [ ] AC3：`libra clean -f -e '*.o'` 使所有匹配 `*.o` 的未跟踪文件（含子目录内）免于删除。
+- [x] AC1：上游 `t7300#19`（`TC-0556`）等价场景通过：`libra clean -f -d -x -e src` 后上游该用例的全部 `test_path_is_*` 断言在 Libra 中成立（`-e src` 使 `src/part3.c` 等 `src/` 子路径免于删除）。（`clean_exclude_dir_prefix`）
+- [x] AC2：`libra clean -f -e 1 -e 2` 的结果与上游 `t7300#42` 一致（`1`、`2`、`known` 保留，`3` 删除）。（`clean_exclude_dir_prefix`）
+- [x] AC3：`libra clean -f -e '*.o'` 使所有匹配 `*.o` 的未跟踪文件（含子目录内）免于删除。（`clean_exclude_dir_prefix`）
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -815,8 +815,8 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::clean_test::clean_exclude_dir_prefix)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC3）
-- [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::clean_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
+- [x] 具名测试：`clean_exclude_dir_prefix`（通过）
+- [x] 共享回归组：`command::clean_test`（41/41）
 
 **Full-suite trigger:** `none`
 **Dependencies:** `WC-05`, `DEP-WC-05`

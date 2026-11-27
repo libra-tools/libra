@@ -542,11 +542,17 @@ fn find_untracked_dirs(
 /// Check if a path matches an exclude pattern using glob-style matching.
 /// Supports * (match any characters) and ? (match single character).
 fn matches_exclude_pattern(path: &str, pattern: &str) -> bool {
-    // Escape special regex characters, then convert glob patterns
+    let pattern = pattern.trim_end_matches('/');
+    if pattern.is_empty() {
+        return false;
+    }
     let mut regex_pattern = String::new();
-    regex_pattern.push('^');
-    let chars = pattern.chars();
-    for c in chars {
+    if !pattern.contains('/') {
+        regex_pattern.push_str("(?:^|/)");
+    } else {
+        regex_pattern.push('^');
+    }
+    for c in pattern.chars() {
         match c {
             '*' => regex_pattern.push_str(".*"),
             '?' => regex_pattern.push('.'),
@@ -557,13 +563,12 @@ fn matches_exclude_pattern(path: &str, pattern: &str) -> bool {
             _ => regex_pattern.push(c),
         }
     }
-    regex_pattern.push('$');
+    regex_pattern.push_str("(?:$|/)");
 
     if let Ok(re) = regex::Regex::new(&regex_pattern) {
         re.is_match(path)
     } else {
-        // Fallback to simple string matching
-        path.contains(pattern)
+        path == pattern || path.starts_with(&format!("{pattern}/"))
     }
 }
 

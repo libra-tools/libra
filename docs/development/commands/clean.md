@@ -77,3 +77,5 @@ clean skips untracked directories without -d.
 clean -ff removes nested repositories with -d.
 
 clean honors clean.requireForce.
+
+clean -e matches directory and basename prefixes.

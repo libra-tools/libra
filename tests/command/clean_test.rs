@@ -1529,3 +1529,26 @@ fn clean_require_force_config() {
         "{stderr}"
     );
 }
+
+#[test]
+#[serial(cwd)]
+fn clean_exclude_dir_prefix() {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    let repo = tempdir().unwrap();
+    let root = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], root), "init");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/part3.c"), "x").unwrap();
+    fs::write(root.join("other.c"), "x").unwrap();
+    fs::create_dir_all(root.join("logs")).unwrap();
+    fs::write(root.join("logs/a.log"), "x").unwrap();
+    let out = run_libra_command(&["clean", "-n", "-e", "src", "-e", "*.log"], root);
+    assert_cli_success(&out, "clean -e prefixes");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("other.c"), "{text}");
+    assert!(!text.contains("src/part3.c"), "{text}");
+    assert!(!text.contains("logs/a.log"), "{text}");
+}
