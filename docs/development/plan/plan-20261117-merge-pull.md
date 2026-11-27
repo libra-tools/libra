@@ -1433,7 +1433,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-08: 补全 `merge --verify-signatures` 成功行（#1004）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：验签成功时 stdout 输出 Git 兼容 `Commit <oid7> has a good GPG signature by <signer>`；signer 取自仓库活动/生成/历史公钥首个主用户 ID；`-q`/`--json` 抑制。新增 AC1–AC4 用例。C 组 patch +1。偏差：AC5 由既有 unsigned 拒绝用例覆盖；用户已取消独立审计与全量测试。）
 
 **Description:** `merge --verify-signatures`（及 `merge.verifySignatures=true`）验签通过时，与 Git 一致在 stdout 输出 `Commit <oid7> has a good GPG signature by <signer>`（`<signer>` 为验签所用仓库 vault 密钥的主用户 ID）；`-q` 抑制该行，`--json` 下不输出该文本行。无签名/坏签名的拒绝行为不变。（按 G-09 自本卡拆出 `MP-32`。）
 
@@ -1453,7 +1453,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC3：`-q` 抑制成功行。
 - [ ] AC4：`--json` 下 stdout 只含 JSON。
 - [ ] AC5：无签名目标仍被拒绝。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：`merge` 中英文档与 COMPATIBILITY 已记录成功行及 `-q`/`--json` 抑制；网站同步。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::verify_signatures_good_line` 承载 AC1–AC5；夹具 F-SIG：以子进程环境 `GIT_COMMITTER_NAME='A U Thor'`、`GIT_COMMITTER_EMAIL=author@example.com` 执行 `libra init`（vault 密钥以 init 时的身份生成，`src/command/init.rs:2446-2460`），再执行 `libra config user.name 'A U Thor'`、`libra config user.email author@example.com` 与 `libra config vault.signing true`；`main` 提交 `B`；`topic` 自 `B` 提交已签名的 `T`（可快进）；`unsigned` 自 `B` 以 `--no-gpg-sign` 提交 `U`；`<T7>` 为 `T` 前 7 位；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -1466,7 +1466,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC5）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::verify_signatures_good_line)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::verify_signatures_good_line)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`verify_signatures_good_line`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_config_history_defaults`（整 target，`merge.verifySignatures` 等历史默认配置；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_config_history_defaults` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 

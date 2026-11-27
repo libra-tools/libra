@@ -15089,3 +15089,57 @@ fn merge_autostash_apply_conflict_stored() {
     assert_cli_success(&stash, "stash show");
     assert!(String::from_utf8_lossy(&stash.stdout).contains("LOCAL"));
 }
+
+fn create_signed_tip_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "vault.signing", "true"], p),
+        "enable signing",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "dev"], p), "branch dev");
+    assert_cli_success(&run_libra_command(&["checkout", "dev"], p), "checkout dev");
+    commit_file(p, "dev.txt", "dev\n", "signed dev");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    repo
+}
+
+#[test]
+fn verify_signatures_good_line() {
+    let repo = create_signed_tip_repo();
+    let p = repo.path();
+    let target = run_libra_command(&["rev-parse", "dev"], p);
+    let oid = String::from_utf8_lossy(&target.stdout).trim().to_string();
+    let merged = run_libra_command(&["merge", "--verify-signatures", "dev"], p);
+    assert_cli_success(&merged, "verify merge");
+    let line = format!("Commit {} has a good GPG signature by ", &oid[..7]);
+    assert!(String::from_utf8_lossy(&merged.stdout).contains(&line));
+
+    let quiet = create_signed_tip_repo();
+    let out = run_libra_command(&["merge", "-q", "--verify-signatures", "dev"], quiet.path());
+    assert_cli_success(&out, "quiet verify merge");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("good GPG signature"));
+
+    let json = create_signed_tip_repo();
+    let out = run_libra_command(
+        &["--json", "merge", "--verify-signatures", "dev"],
+        json.path(),
+    );
+    assert_cli_success(&out, "json verify merge");
+    serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+
+    let configured = create_signed_tip_repo();
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "merge.verifySignatures", "true"],
+            configured.path(),
+        ),
+        "config verify",
+    );
+    let out = run_libra_command(&["merge", "dev"], configured.path());
+    assert_cli_success(&out, "configured verify");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("has a good GPG signature by "));
+}

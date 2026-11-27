@@ -1614,6 +1614,25 @@ pub fn primary_uid_from_armor(armor: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Primary user ID of the active verification key, used by Git-compatible
+/// signature diagnostics (`merge --verify-signatures`).
+pub async fn configured_signing_user_id() -> Result<String> {
+    use pgp::composed::{Deserializable, SignedPublicKey};
+
+    let armors = verify_pubkey_allowlist().await?;
+    let armor = armors
+        .first()
+        .ok_or_else(|| anyhow!("no vault PGP public key is configured"))?;
+    let (key, _) = SignedPublicKey::from_armor_single(armor.as_bytes())
+        .context("failed to parse the configured vault public key")?;
+    Ok(key
+        .details
+        .users
+        .first()
+        .map(|user| String::from_utf8_lossy(user.id.id()).into_owned())
+        .unwrap_or_default())
+}
+
 /// Describe the real algorithm/bits of an armored public key (VG-06), so the
 /// list surface is not stuck on a hard-coded `PGP 2048`.
 pub fn describe_public_key(armor: &str) -> Result<String> {

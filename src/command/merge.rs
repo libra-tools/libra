@@ -1662,11 +1662,13 @@ async fn run_merge_message_hooks(
 /// a typed abort error when it is unsigned or the signature does not validate
 /// against the vault PGP key. Run on the already-loaded tip commit (before any
 /// state mutation) so the verified object is exactly the one being merged.
-async fn verify_merge_commit_signature(commit: &Commit) -> Result<(), MergeError> {
+async fn verify_merge_commit_signature(commit: &Commit) -> Result<String, MergeError> {
     use crate::command::commit::{CommitSignatureStatus, verify_commit_signature};
 
     match verify_commit_signature(commit).await {
-        Ok(CommitSignatureStatus::Good) => Ok(()),
+        Ok(CommitSignatureStatus::Good) => crate::internal::vault::configured_signing_user_id()
+            .await
+            .map_err(|error| MergeError::SignatureCheck(error.to_string())),
         Ok(CommitSignatureStatus::Unsigned) => Err(MergeError::UnsignedMergeCommit {
             commit: commit.id.to_string(),
         }),
@@ -1739,7 +1741,13 @@ async fn run_octopus_merge(
             detail: error.to_string(),
         })?;
         if options.verify_signatures {
-            verify_merge_commit_signature(&commit).await?;
+            let signer = verify_merge_commit_signature(&commit).await?;
+            if !output.quiet && !output.is_json() {
+                println!(
+                    "Commit {} has a good GPG signature by {signer}",
+                    commit.id.to_string().chars().take(7).collect::<String>()
+                );
+            }
         }
         requested.push((branch.clone(), commit));
     }
@@ -2369,7 +2377,18 @@ pub(crate) async fn run_merge_for_pull_with_options(
             detail: error.to_string(),
         })?;
     if options.verify_signatures {
-        verify_merge_commit_signature(&target_commit).await?;
+        let signer = verify_merge_commit_signature(&target_commit).await?;
+        if !output.quiet && !output.is_json() {
+            println!(
+                "Commit {} has a good GPG signature by {signer}",
+                target_commit
+                    .id
+                    .to_string()
+                    .chars()
+                    .take(7)
+                    .collect::<String>()
+            );
+        }
     }
     // ADR-MG-01: refuse a submodule-arbitrating merge here, ahead of the
     // autostash below — its stash commit, sidecar and worktree reset are
