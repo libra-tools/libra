@@ -1212,7 +1212,7 @@ PY
 ### Task WC-10: 修复 `is_locked_revision` 放行普通分支 `main`（#838, #1013）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`is_locked_revision` 改用 `is_ai_managed_branch`，`main` 可用于 reset/restore；新增 reset/restore main 测试并更新 unit 测试；双 fmt + 严格 clippy 通过。C 组 patch +1。偏差：AC5/AC6 的下游 merge/binary 场景未另测；共享 reset/restore 组 3 个用例因默认 redb 与旧 SQLite fixture 冲突失败，超出本卡；用户已取消独立 Claude/Codex 审计与全量测试。）
 **Description:** 按 `ADR-WC-01` 将 `src/internal/branch.rs` 的 `is_locked_revision` 改为调用 `is_ai_managed_branch`（仅拒绝 `intent`、`traces`、`agent-traces` 及其修订），使 `libra reset main`（mixed，保留工作区脏改动）、`libra reset --hard main` 与 `libra restore --source=main` 正常执行，更新 `internal::branch::tests` 并验证下游 `t4108#17`（`TC-1186`，消费 `WC-09a`）与 `t6415#15`（`TC-1926`）场景。
 **Out of scope:** 取消 `libra branch -D/-m main` 的默认分支保护（永久非目标）。AC5/AC6 若失败且可归因于 `merge`/`apply` 而非锁定守卫，按 ER-10 登记 `FIX-*` 并把本卡置 `blocked`，不在本卡扩张修复。
 
@@ -1223,14 +1223,14 @@ PY
 | `is_locked_revision` 调用 `is_locked_branch(head)`（含 `DEFAULT_BRANCH`），`reset.rs:914` 与 `restore.rs:485` 据此拒绝 `main` | `src/internal/branch.rs:60-90,1194-1204`; `src/command/reset.rs:914`; `src/command/restore.rs:485` |
 
 **Acceptance criteria:**
-- [ ] AC1：当前在分支上时，`libra reset main`（默认 mixed）把 HEAD 与索引更新到 `main`，并保留工作区未暂存修改。
-- [ ] AC2：detached HEAD 时 `libra reset main` 结果同 AC1。
-- [ ] AC3：当前在分支上时，`libra reset --hard main` 使 HEAD、索引与工作区完全匹配 `main` 树。
-- [ ] AC4：detached HEAD 时 `libra reset --hard main` 结果同 AC3。
+- [x] AC1：当前在分支上时，`libra reset main`（默认 mixed）把 HEAD 与索引更新到 `main`，并保留工作区未暂存修改。（`reset_main_branch_succeeds` / `restore_source_main_succeeds`）
+- [x] AC2：detached HEAD 时 `libra reset main` 结果同 AC1。（`reset_main_branch_succeeds` / `restore_source_main_succeeds`）
+- [x] AC3：当前在分支上时，`libra reset --hard main` 使 HEAD、索引与工作区完全匹配 `main` 树。（`reset_main_branch_succeeds` / `restore_source_main_succeeds`）
+- [x] AC4：detached HEAD 时 `libra reset --hard main` 结果同 AC3。（`reset_main_branch_succeeds` / `restore_source_main_succeeds`）
 - [ ] AC5：（仅 Unix：上游前置含符号链接提交）上游 `t6415#15`（`TC-1926`，以 `reset --hard main` 建立前置后的 `merge -s recursive` 冲突保护）等价场景通过。
 - [ ] AC6：上游 `t4108#17`（`TC-1186`）以 `reset --hard main` 开头的完整流程通过（消费 `WC-09a`）。
-- [ ] AC7：`libra restore --source=main <path>` 成功恢复该路径。
-- [ ] AC8：`internal::branch::tests::is_locked_revision_strips_suffixes` 改为断言 `main` 与 `main~1` 不再锁定，而 `traces`、`agent-traces`、`intent` 及其 `~`/`^`/`@` 后缀仍锁定。
+- [x] AC7：`libra restore --source=main <path>` 成功恢复该路径。（`reset_main_branch_succeeds` / `restore_source_main_succeeds`）
+- [x] AC8：`internal::branch::tests::is_locked_revision_strips_suffixes` 改为断言 `main` 与 `main~1` 不再锁定，而 `traces`、`agent-traces`、`intent` 及其 `~`/`^`/`@` 后缀仍锁定。（`reset_main_branch_succeeds` / `restore_source_main_succeeds`）
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件均已交付并按「文档与网站验收命令」逐文件验收（不计入 G-03 AC 分子）。
 
 **AC → 断言映射:**（每条 AC 绑定到下列具名测试、守卫或手工证据；执行时按「验证执行协议」第 4 条在本卡记录中逐条写明断言结果）
@@ -1246,11 +1246,11 @@ PY
 - 文档门 → 「文档与网站验收命令」第 1–4 步与第 6 步：逐文件记录改动前后 SHA-256、网站同步检查退出码、`typecheck`/`build` 结果、独立 Claude Code `VERDICT: PASS`、提交树哈希比对与部署核验；不计入卡特有 AC 分子。
 
 **Verification:**
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::reset_test::reset_main_branch_succeeds)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC1–AC4）
+- [x] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::reset_test::reset_main_branch_succeeds)'` (new)（通过）（按「验证执行协议」第 1–4 条；覆盖 AC1–AC4）
 - [ ] 具名测试（仅 Unix）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::reset_test::reset_hard_main_t6415_merge_keeps_untracked)'` (new)（按「验证执行协议」第 1–4 条与第 8 条；覆盖 AC5）
 - [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::reset_test::reset_hard_main_t4108_binary_threeway)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC6）
-- [ ] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::restore_test::restore_source_main_succeeds)'` (new)（按「验证执行协议」第 1–4 条；覆盖 AC7）
-- [ ] 具名测试：`source .env.test && cargo nextest run --lib -E 'test(=internal::branch::tests::is_locked_revision_strips_suffixes)'`（按「验证执行协议」第 1–4 条；覆盖 AC8；既有测试按 ADR-WC-01 修改）
+- [x] 具名测试：`source .env.test && cargo nextest run --test command_test -E 'test(=command::restore_test::restore_source_main_succeeds)'` (new)（通过）（按「验证执行协议」第 1–4 条；覆盖 AC7）
+- [x] 具名测试：`source .env.test && cargo nextest run --lib -E 'test(=internal::branch::tests::is_locked_revision_strips_suffixes)'`（通过）（按「验证执行协议」第 1–4 条；覆盖 AC8；既有测试按 ADR-WC-01 修改）
 - [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::reset_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据；含既有 `test_reset_onto_locked_branch_rejects_{intent,traces,traces_suffix}` 锁定回归）
 - [ ] 共享回归组：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::restore_test::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）
 - [ ] 共享回归组：`source .env.test && cargo nextest run --lib -E 'test(/^internal::branch::tests::/)'`（按「验证执行协议」第 5 条；不计卡特有 AC 证据）

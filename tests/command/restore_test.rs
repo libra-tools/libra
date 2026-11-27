@@ -2198,3 +2198,15 @@ fn restore_delta_index_size_matches_decoded_length_for_ofs_delta_pack() {
         "OFS_DELTA index size must be the decoded blob length, not peak_bytes"
     );
 }
+
+#[test]
+fn restore_source_main_succeeds() {
+    let repo = create_committed_repo_via_cli();
+    std::fs::write(repo.path().join("tracked.txt"), "modified\n").unwrap();
+    let output = run_libra_command(&["restore", "--source", "main", "tracked.txt"], repo.path());
+    assert_cli_success(&output, "restore --source main");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "tracked\n"
+    );
+}

@@ -2291,3 +2291,5 @@ apply --numstat matches t4012 binary and text output.
 apply --stat --summary aligns binary entries with git.
 
 apply --binary is a compatibility no-op for binary patches.
+
+reset and restore accept the main branch.

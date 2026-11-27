@@ -300,3 +300,5 @@ remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
 > `HEAD` or ref write. Only `status`, `log`, `cat-file`, the no-argument `branch`
 > listing, `alternates list`, `clone`, `upgrade`, `ui`, `login`, `whoami`, `logout` and
 > `completions` run in that layout.
+
+reset and restore accept the main branch.

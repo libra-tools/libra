@@ -86,7 +86,7 @@ pub fn is_ai_managed_branch(name: &str) -> bool {
 /// the bare ref name.
 pub fn is_locked_revision(rev: &str) -> bool {
     let head = rev.split(['~', '^', '@']).next().unwrap_or(rev);
-    is_locked_branch(head)
+    is_ai_managed_branch(head)
 }
 
 /// In-memory branch view materialised from a [`reference::Model`] row.
@@ -1879,7 +1879,7 @@ mod tests {
         assert!(is_locked_revision("traces"));
         assert!(is_locked_revision("agent-traces"));
         assert!(is_locked_revision("intent"));
-        assert!(is_locked_revision(DEFAULT_BRANCH));
+        assert!(!is_locked_revision(DEFAULT_BRANCH));
 
         // Single-suffix variants.
         assert!(is_locked_revision("traces~1"));

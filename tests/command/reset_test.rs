@@ -3549,3 +3549,22 @@ fn test_reset_removes_intent_to_add_entry() {
         "file is untracked again: {status}"
     );
 }
+
+#[test]
+fn reset_main_branch_succeeds() {
+    let repo = create_committed_repo_via_cli();
+    std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+    let output = run_libra_command(&["reset", "main"], repo.path());
+    assert_cli_success(&output, "reset main");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "dirty\n",
+        "mixed reset preserves the worktree"
+    );
+    let hard = run_libra_command(&["reset", "--hard", "main"], repo.path());
+    assert_cli_success(&hard, "reset --hard main");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+        "tracked\n"
+    );
+}
