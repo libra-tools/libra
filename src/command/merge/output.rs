@@ -181,6 +181,10 @@ pub(crate) fn render_merge_output(result: &MergeOutput, output: &OutputConfig) -
                 "When finished, apply stashed changes with `libra stash pop`"
             );
         }
+    } else if selected_strategy == "in-index" {
+        info_println!(output, "In-index merge");
+    } else if selected_strategy == "in-index" {
+        info_println!(output, "In-index merge");
     } else {
         match result.strategy.as_str() {
             "three-way" => info_println!(

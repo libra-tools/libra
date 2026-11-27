@@ -1434,6 +1434,9 @@ const fn rerere_autoupdate_override(enabled: bool, disabled: bool) -> Option<boo
 }
 
 fn attach_selected_strategy(mut summary: PullMergeSummary, selected: &str) -> PullMergeSummary {
+    if summary.selected_strategy.as_deref() == Some("in-index") {
+        return summary;
+    }
     if !matches!(
         summary.strategy.as_str(),
         "fast-forward" | "already-up-to-date" | "abort"
@@ -3460,6 +3463,24 @@ async fn perform_three_way_merge(
     }
 
     let head_name = current_head_name().await?;
+    let in_index_trivial = if options.strategy == Some(MergeStrategy::Resolve)
+        && !options.no_commit
+        && !options.dry_run
+    {
+        if !options.output.quiet && !options.output.is_json() {
+            println!("Trying really trivial in-index merge...");
+        }
+        let trivial = match base_commits.first() {
+            Some(base) => resolve_in_index_is_trivial(base, &current_commit, &target_commit)?,
+            None => true,
+        };
+        if !options.output.quiet && !options.output.is_json() {
+            println!("{}", if trivial { "Wonderful." } else { "Nope." });
+        }
+        trivial
+    } else {
+        false
+    };
     // MG-03: a merge against ONE real base (or none) walks the three trees
     // incrementally, opening only the directories the sides disagree about.
     // The recursive fold of several bases (MG-02) has already read every input
@@ -3951,7 +3972,7 @@ async fn perform_three_way_merge(
 
     Ok(PullMergeSummary {
         strategy: "three-way".to_string(),
-        selected_strategy: None,
+        selected_strategy: in_index_trivial.then(|| "in-index".to_string()),
         old_commit: Some(current_commit.id.to_string()),
         commit: Some(merge_commit.id.to_string()),
         files_changed,
@@ -9073,6 +9094,34 @@ fn announce_df_conflicts(
             target = target.display()
         );
     }
+}
+
+/// `resolve`'s "really trivial" test: no path is changed on both sides unless
+/// both sides made the same change. Such a merge needs no file-level merge.
+fn resolve_in_index_is_trivial(
+    base: &Commit,
+    ours: &Commit,
+    theirs: &Commit,
+) -> Result<bool, PullMergeError> {
+    let (base_items, _) = commit_tree_split(base)?;
+    let (our_items, _) = commit_tree_split(ours)?;
+    let (their_items, _) = commit_tree_split(theirs)?;
+    let paths: HashSet<&PathBuf> = base_items
+        .keys()
+        .chain(our_items.keys())
+        .chain(their_items.keys())
+        .collect();
+    for path in paths {
+        let base_entry = base_items.get(path);
+        let our_entry = our_items.get(path);
+        let their_entry = their_items.get(path);
+        let ours_changed = our_entry != base_entry;
+        let theirs_changed = their_entry != base_entry;
+        if ours_changed && theirs_changed && our_entry != their_entry {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Refuse only dirty paths the merge would actually rewrite. `--no-commit`

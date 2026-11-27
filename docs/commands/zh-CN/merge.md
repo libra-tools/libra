@@ -476,3 +476,5 @@ merge --continue applies and clears a held MERGE_AUTOSTASH.
 内容冲突进度（`Auto-merging <path>`、`CONFLICT (content): Merge conflict in <path>`、`Automatic merge failed; fix conflicts and then commit the result.`）与 autostash 提示（`Created autostash: <oid>`、`When finished, apply stashed changes with `libra stash pop``）写到 stdout；`--json`/`-q` 抑制。
 
 `--no-commit` 允许无关的未暂存修改并原样保留；只有与本次合并实际重写路径重叠的修改才会被拒绝并列出路径。合并写入会跳过结果已与 HEAD 相同的路径，保留其 mtime 与无关工作树内容。
+
+`-s resolve` 先输出 `Trying really trivial in-index merge...`；若每个路径至多一侧修改，则输出 `Wonderful.` 并以 `In-index merge` 完成，否则输出 `Nope.` 后继续普通三方合并。`-q` 与 `--json` 抑制这些诊断。

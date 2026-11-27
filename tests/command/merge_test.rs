@@ -15407,3 +15407,74 @@ fn dirty_worktree_overlap_only() {
         "local\n"
     );
 }
+
+fn create_resolve_fixture() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "a", "a0\n", "base a");
+    commit_file(p, "f", "f0\n", "base f");
+    assert_cli_success(&run_libra_command(&["branch", "C"], p), "branch C");
+    assert_cli_success(&run_libra_command(&["branch", "D"], p), "branch D");
+    assert_cli_success(&run_libra_command(&["checkout", "C"], p), "checkout C");
+    commit_file(p, "f", "fC\n", "C");
+    assert_cli_success(&run_libra_command(&["checkout", "D"], p), "checkout D");
+    commit_file(p, "f", "fD\n", "D");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    commit_file(p, "m", "m\n", "M");
+    repo
+}
+
+#[test]
+fn resolve_trivial_in_index_diagnostics() {
+    let repo = create_resolve_fixture();
+    let p = repo.path();
+    let out = run_libra_command(&["merge", "-s", "resolve", "C"], p);
+    assert_cli_success(&out, "resolve trivial");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("Trying really trivial in-index merge...\nWonderful.\nIn-index merge\n"),
+        "{stdout}"
+    );
+    assert_eq!(commit_parents(p).len(), 2);
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["show", ":f"], p).stdout),
+        "fC\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["show", ":m"], p).stdout),
+        "m\n"
+    );
+
+    let repo = create_resolve_fixture();
+    let p = repo.path();
+    let quiet = run_libra_command(&["-q", "merge", "-s", "resolve", "C"], p);
+    assert_cli_success(&quiet, "quiet resolve");
+    assert!(quiet.stdout.is_empty());
+
+    let repo = create_resolve_fixture();
+    let p = repo.path();
+    let json = run_libra_command(&["--json", "merge", "-s", "resolve", "C"], p);
+    assert_cli_success(&json, "json resolve");
+    serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(&json.stdout).trim())
+        .unwrap();
+
+    let repo = create_resolve_fixture();
+    let p = repo.path();
+    let default = run_libra_command(&["merge", "C"], p);
+    assert_cli_success(&default, "default merge");
+    assert!(!String::from_utf8_lossy(&default.stdout).contains("Trying really trivial"));
+
+    let repo = create_resolve_fixture();
+    let p = repo.path();
+    commit_file(p, "f", "fM\n", "M2");
+    let out = run_libra_command(&["merge", "-s", "resolve", "D"], p);
+    assert_ne!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("Trying really trivial in-index merge...\nNope.\n"),
+        "{stdout}"
+    );
+}

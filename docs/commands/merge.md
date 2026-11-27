@@ -619,3 +619,5 @@ If the editor exits non-zero or cannot be started, Libra applies the merge to th
 Content-conflict progress (`Auto-merging <path>`, `CONFLICT (content): Merge conflict in <path>`, `Automatic merge failed; fix conflicts and then commit the result.`) and autostash notices (`Created autostash: <oid>`, `When finished, apply stashed changes with `libra stash pop``) go to stdout; `--json`/`-q` suppress them.
 
 `--no-commit` allows unrelated unstaged edits and preserves them; only edits that overlap paths the merge actually rewrites are refused with the offending paths listed. Merge writes skip paths whose result already matches HEAD, preserving their mtime and any unrelated working-tree content.
+
+`-s resolve` prints `Trying really trivial in-index merge...` followed by `Wonderful.` and completes an in-index merge as `In-index merge` when each path is changed on at most one side; otherwise it prints `Nope.` and continues with the normal three-way engine. `-q` and `--json` suppress these diagnostics.

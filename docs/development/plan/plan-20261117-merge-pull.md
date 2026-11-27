@@ -1540,7 +1540,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-09: 补全 `merge -s resolve` 平凡合并诊断（`Wonderful.` / `In-index merge`）（#1001）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`-s resolve` 输出 Git 平凡合并诊断，平凡路径以 `In-index merge` 完成，非平凡输出 `Nope.` 后回落三方；`-q`/`--json` 抑制。新增 AC1–AC7 用例。C 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** `-s resolve`（Git 中允许平凡合并的策略）在单一目标、单一合并基、索引与 HEAD 一致且非 `--no-commit`/`--ff-only` 时，先尝试「真正平凡的索引内合并」：stdout 输出 `Trying really trivial in-index merge...`，成功则输出 `Wonderful.` 并以 `In-index merge` 完成（非 quiet 时打印），否则输出 `Nope.` 后走原三方路径；`ort`/`recursive` 不走该路径。
 
@@ -1562,7 +1562,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC5：非平凡场景 stdout 以 `Trying really trivial in-index merge...` 与 `Nope.` 两行开头。
 - [ ] AC6：默认 `ort` 不走平凡路径。
 - [ ] AC7：`--json` 下 stdout 只含 JSON。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：`merge` 中英文档记录 resolve 诊断与 `In-index merge`；网站同步。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::resolve_trivial_in_index_diagnostics` 承载 AC1–AC7；夹具 F-RES：`main` 提交 `B`（`a`=`a0\n`、`f`=`f0\n`），再提交 `M`（新增 `m`=`m\n`）；`C` 自 `B` 把 `f` 改为 `fC\n`（平凡：两侧无同一文件修改）；`D` 自 `B` 把 `f` 改为 `fD\n`；非平凡场景中 `main` 自 `M` 再提交 `M2`（`f`=`fM\n`），使两侧都修改 `f`；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -1577,7 +1577,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC7）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::resolve_trivial_in_index_diagnostics)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::resolve_trivial_in_index_diagnostics)'` 须恰好列出该 1 条）
+- [x] 卡特有用例：`resolve_trivial_in_index_diagnostics`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::/)'`（`command::merge_test` 模块族；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list` 记录 `N` ≥ 1）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --lib -E 'test(/^command::merge::tests::/)'`（`src/command/merge.rs` 内单元测试模块；按「验证执行协议」第 2、3、5 条，先以同一过滤 `cargo nextest list --lib` 记录 `N` ≥ 1）
 
