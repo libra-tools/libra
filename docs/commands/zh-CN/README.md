@@ -20,6 +20,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | `--json` | `-J` | 输出 JSON（格式：`pretty`、`compact`、`ndjson`） |
 | `--machine` | | 严格机器模式（隐含 `--json=ndjson --no-pager --color=never --quiet`） |
 | `-C <path>` | | 运行命令前切换到 `<path>`；仅接受为第一个参数，空路径不切换。 |
+| `--bare` | | 本次调用把当前目录视为裸仓库（不写入 `core.bare`）；与 `init` 组合等价于 `init --bare`。 |
 | `--no-pager` | | 禁用分页器（`less`） |
 | `--color` | | 何时使用颜色（`auto`、`never`、`always`） |
 | `--no-color` | | 禁用颜色；等价于 `--color=never` |

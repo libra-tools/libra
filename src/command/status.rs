@@ -552,6 +552,21 @@ pub(crate) async fn execute_safe_with_resolution(
     output: &OutputConfig,
     resolution: Option<&StatusArgvResolution>,
 ) -> CliResult<()> {
+    if crate::utils::util::global_bare_context_active() {
+        let cwd = std::env::current_dir().map_err(|error| {
+            CliError::fatal(format!("failed to read current directory: {error}"))
+                .with_stable_code(crate::utils::error::StableErrorCode::IoReadFailed)
+        })?;
+        let is_storage =
+            cwd.join(util::DATABASE).exists() || cwd.join("storage-format.json").exists();
+        if !is_storage {
+            return Err(CliError::repo_not_found());
+        }
+        return Err(
+            CliError::failure("this operation must be run in a work tree".to_string())
+                .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid),
+        );
+    }
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
     // Fail closed on invalid `status.*` config before any mode runs or any

@@ -322,6 +322,11 @@ pub(crate) struct Cli {
     #[arg(short = 'C', value_name = "PATH", action = clap::ArgAction::Append)]
     current_dir: Vec<std::path::PathBuf>,
 
+    /// Treat the current directory as a bare repository for this invocation
+    /// (Git's global `--bare`).
+    #[arg(long = "bare")]
+    bare: bool,
+
     /// Emit machine-readable JSON to stdout.
     /// Use `--json` alone for pretty output, or `--json=compact` / `--json=ndjson`
     /// to select an alternative layout.  The `=` is required when specifying a format
@@ -3966,6 +3971,12 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    if args.bare {
+        crate::utils::util::set_global_bare_context(true);
+        if let Commands::Init(init) = &mut args.command {
+            init.bare = true;
+        }
+    }
     for directory in &args.current_dir {
         if directory.as_os_str().is_empty() {
             continue;

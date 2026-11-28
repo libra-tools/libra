@@ -2494,3 +2494,48 @@ fn global_dash_c_directory() {
     assert_ne!(missing_dir.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&missing_dir.stderr).contains("LBR-IO-001"));
 }
+
+#[test]
+fn global_bare_init() {
+    let root = tempdir().unwrap();
+    let b1 = root.path().join("b1");
+    let b2 = root.path().join("b2");
+    assert_cli_success(
+        &run_libra_command(&["--bare", "init", b1.to_str().unwrap()], root.path()),
+        "global bare init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare", b2.to_str().unwrap()], root.path()),
+        "subcommand bare init",
+    );
+    let names = |path: &Path| {
+        let mut names: Vec<String> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&b1), names(&b2));
+    let bare = run_libra_command(
+        &["-C", b1.to_str().unwrap(), "config", "get", "core.bare"],
+        root.path(),
+    );
+    assert_cli_success(&bare, "core.bare");
+    assert_eq!(String::from_utf8_lossy(&bare.stdout).trim(), "true");
+
+    let nonbare = root.path().join("r");
+    super::init_repo_via_cli(&nonbare);
+    let storage = nonbare.join(".libra");
+    let inside = run_libra_command(&["--bare", "rev-parse", "--is-bare-repository"], &storage);
+    assert_cli_success(&inside, "bare rev-parse");
+    assert_eq!(String::from_utf8_lossy(&inside.stdout).trim(), "true");
+
+    let root_status = run_libra_command(&["--bare", "status"], &nonbare);
+    assert_ne!(root_status.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&root_status.stderr).contains("LBR-REPO-001"));
+
+    let storage_status = run_libra_command(&["--bare", "status"], &storage);
+    assert_ne!(storage_status.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&storage_status.stderr).contains("LBR-REPO-003"));
+}

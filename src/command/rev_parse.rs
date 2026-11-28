@@ -1010,6 +1010,10 @@ async fn resolve_short_commit(
 async fn is_bare_repository() -> CliResult<bool> {
     use crate::internal::config::parse_git_bool;
 
+    if crate::utils::util::global_bare_context_active() {
+        return Ok(true);
+    }
+
     match ConfigKv::get("core.bare").await {
         Ok(Some(entry)) => parse_git_bool(&entry.value).ok_or_else(|| {
             CliError::fatal(format!(

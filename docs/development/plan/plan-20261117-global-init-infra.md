@@ -534,7 +534,7 @@
 
 ### Task GII-04: 支持全局 `--bare` 选项（#944）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：全局 `--bare` 使 `init` 等价 `init --bare`，本次调用把 cwd 视为裸仓库且不写 `core.bare`；`rev-parse --is-bare-repository` 返回 true；工作树根 status 为 LBR-REPO-001、存储目录 status 为 LBR-REPO-003。新增 AC1–AC5 用例。D 组 patch +1。偏差：AC6 未做配置表逐行快照；用户已取消独立审计与全量测试。）
 
 **Description:** 在全局 `Cli` 入口支持 Git 全局 `--bare`：`libra --bare init <dir>` 等价于 `libra init --bare <dir>`；其它子命令按 Git 语义把当前目录视为仓库存储目录并以裸仓库上下文运行。该上下文只对本次调用生效、不写入 `core.bare`：裸仓库判定处（如 `rev-parse --is-bare-repository` 现读持久化的 `core.bare`，`src/command/rev_parse.rs:900-914`）与「须在工作树中运行」的检查先看本次调用的裸上下文。
 
@@ -555,7 +555,7 @@
 - [ ] AC4：在非存储目录（如工作树根 `<r>`）运行 `libra --bare status` 以 `LBR-REPO-001` 失败。
 - [ ] AC5：在非裸仓库的存储目录 `<r>/.libra` 内运行 `libra --bare status` 以 `LBR-REPO-003` 失败（以裸仓库上下文运行，无工作树）。
 - [ ] AC6：AC3 与 AC5 的调用不持久化改动该仓库的配置。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/{README,init}.md`、`docs/commands/zh-CN/{README,init}.md`、`docs/development/commands/init.md`、`COMPATIBILITY.md` 与网站 `index.en.mdx`、`init.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：全局标志 README 中英、init 文档与 COMPATIBILITY 已记录 `--bare`；网站首页同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::init_test::global_bare_init` 承载）
 

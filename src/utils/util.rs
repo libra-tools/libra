@@ -55,6 +55,19 @@ pub const ROOT_DIR: &str = ".libra";
 /// The Git metadata directory. Like Git, Libra always force-ignores any `.git`
 /// directory in the worktree so a nested Git repository is never surfaced as
 /// untracked or staged, and it cannot be un-ignored via `.libraignore`.
+/// Process-wide Git `--bare` context for this invocation. It never writes
+/// `core.bare`; code paths that need a worktree consult it explicitly.
+static GLOBAL_BARE_CONTEXT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_global_bare_context(active: bool) {
+    GLOBAL_BARE_CONTEXT.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn global_bare_context_active() -> bool {
+    GLOBAL_BARE_CONTEXT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub const GIT_DIR: &str = ".git";
 const LIBRAIGNORE_FILE: &str = ".libraignore";
 const GITIGNORE_FILE: &str = ".gitignore";
