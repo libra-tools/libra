@@ -2892,7 +2892,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-24: rename/directory 冲突：识别 HEAD 侧重命名、不伪造阶段、内容合并进 `newfile~HEAD`（#1016）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25 审计：既有 rename/directory D/F 处理覆盖不伪造阶段、内容合并与 `newfile~HEAD` 落盘；相关用例通过。D 组 patch +1。偏差：AC1/AC2 的 HEAD 侧重命名识别专项未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-17` 拆出：HEAD 侧把 `file` 重命名为 `newfile`、另一侧在 `newfile/` 建目录时，按 Git 识别重命名、把三方合并结果写到 `newfile~HEAD`，索引只含 `newfile/realfile`（stage 0）与 `newfile~HEAD`（stage 2），不残留 `file` 的伪阶段。
 
