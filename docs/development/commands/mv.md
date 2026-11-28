@@ -64,3 +64,5 @@ flowchart TD
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 
 mv renames a directory to a new nonexistent path.
+
+`mv` 拒绝父路径经过符号链接的目标（`destination is beyond a symbolic link`，`LBR-CLI-003`），且不修改 index。

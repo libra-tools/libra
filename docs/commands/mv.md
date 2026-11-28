@@ -295,3 +295,5 @@ Note: jj does not have a dedicated mv command. File renames are detected automat
 | Index save failed | `fatal: failed to save index after mv: <err>` |
 
 mv renames a directory to a new nonexistent path.
+
+Moving to a path whose parent traverses a symbolic link is refused with `LBR-CLI-003` and `destination is beyond a symbolic link`, leaving the index unchanged (also under `-f`).

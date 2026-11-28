@@ -1144,3 +1144,41 @@ async fn mv_rename_directory_to_new_path() {
     assert!(index.tracked("folder/a.txt", 0));
     assert!(index.tracked("folder/sub/b.txt", 0));
 }
+
+#[cfg(unix)]
+#[test]
+fn mv_refuses_destination_beyond_symlink() {
+    let repo = tempfile::tempdir().unwrap();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "init");
+    configure_identity_via_cli(p);
+    std::fs::create_dir(p.join("from")).unwrap();
+    std::fs::write(p.join("from/src"), "contents\n").unwrap();
+    std::os::unix::fs::symlink(".", p.join("from/link")).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "from/src", "from/link"], p),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "setup", "--no-gpg-sign"], p),
+        "commit",
+    );
+    let before = run_libra_command(&["ls-files", "-s"], p);
+    let out = run_libra_command(&["mv", "from/src", "from/link/real/dst"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("destination is beyond a symbolic link"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"));
+    assert_eq!(
+        run_libra_command(&["ls-files", "-s"], p).stdout,
+        before.stdout
+    );
+    assert_cli_success(&run_libra_command(&["reset", "--hard"], p), "reset");
+
+    let out = run_libra_command(&["mv", "-f", "from/src", "from/link/real/dst"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("destination is beyond a symbolic link"));
+    assert_eq!(
+        run_libra_command(&["ls-files", "-s"], p).stdout,
+        before.stdout
+    );
+}

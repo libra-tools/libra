@@ -115,9 +115,14 @@ pub async fn execute(args: MvArgs) {
 /// updates the index accordingly.
 pub async fn execute_safe(args: MvArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
-    let result = execute_inner(args, output)
-        .await
-        .map_err(CliError::from_legacy_string)?;
+    let result = execute_inner(args, output).await.map_err(|error| {
+        if error.contains("is beyond a symbolic link") {
+            CliError::command_usage(error.strip_prefix("fatal: ").unwrap_or(&error).to_string())
+                .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidTarget)
+        } else {
+            CliError::from_legacy_string(error)
+        }
+    })?;
     if output.is_json() {
         emit_json_data("mv", &result, output)?;
     }
@@ -144,6 +149,7 @@ async fn execute_inner(args: MvArgs, output: &OutputConfig) -> Result<MvOutput, 
         validate_path_within_workdir(src)?;
     }
     validate_path_within_workdir(&destination)?;
+    reject_destination_beyond_symlink(&destination)?;
 
     // Check if the destination is a directory (if it exists), which affects how we handle multiple sources.
     let destination_is_dir = destination.is_dir();
@@ -223,6 +229,29 @@ fn strip_fatal_prefix(message: &str) -> String {
         .unwrap_or(message)
         .to_string()
 }
+/// Git refuses a destination whose parent path traverses a symbolic link:
+/// writing through it would escape the logical path the index records.
+fn reject_destination_beyond_symlink(destination: &Path) -> Result<(), String> {
+    let workdir = util::working_dir();
+    let Ok(relative) = destination.strip_prefix(&workdir) else {
+        return Ok(());
+    };
+    let Some(parent) = relative.parent() else {
+        return Ok(());
+    };
+    let mut current = workdir;
+    for component in parent.components() {
+        current.push(component);
+        if std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(format!(
+                "fatal: destination is beyond a symbolic link: '{}'",
+                util::to_workdir_path(destination).display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validates a source path and builds the move plan.
 ///
 /// Returns:

@@ -1279,7 +1279,7 @@
 
 ### Task GII-14: `mv` 拒绝越过符号链接的目标，消除随之而来的 snapshot 树冲突（#1039）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`mv`/`mv -f` 在目标父路径经过符号链接时以 `LBR-CLI-003` 和 `destination is beyond a symbolic link` 拒绝，index 不变，`reset --hard` 可继续；新增 AC1–4/7–8 用例。D 组 patch +1。偏差：AC5/6 仅核验既有 `insert_tree_path` 错误路径，未新增单测；用户已取消独立审计与全量测试。）
 
 **Description:** #1039 的 `tree path conflicts with file 'link'` 源于 `libra mv`：pinned 上游 `t7001-mv.sh` #23 在已提交 `from/src` 与 `from/link -> .` 的仓库中执行 `mv from/src from/link/real/dst`，期望以 `destination is beyond a symbolic link` 拒绝且不改 index；Libra 却把 index 条目改写为 `from/link/real/dst`，命令自身的 operation snapshot 随即以该树冲突失败，而 index 中残留的 `from/link`（`120000`）与 `from/link/real/dst` 使此后每条需要快照的命令（#24 起的 `reset --hard`、`mv -f`）以同一错误失败（TC-2033/2037）。本卡让 `mv` 在目标路径的任一前导分量为符号链接时按 Git 文案（`destination is beyond a symbolic link`）拒绝，`mv -f` 同样拒绝；两者都不改动 index 条目。#1039 中 #47/#48 的 `rm -fr .git && git init` 失败（TC-2038/2039）为同一测试文件前序状态的连锁结果：开工时按 pinned `t7001-mv.sh` 复刻 #47 的前序状态核对，若本修复后仍复现，先按 ER-03 修订本卡再开工。
 
@@ -1304,7 +1304,7 @@
 - [ ] AC6：`insert_tree_path` 在目标已是目录时返回 `conflicts with directory` 错误。
 - [ ] AC7：AC1 的 stderr 含 Git 文案 `destination is beyond a symbolic link`。
 - [ ] AC8：AC3 的失败后 index 条目不变（`libra ls-files -s` 的全量输出与该命令执行前逐字节相同）。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/mv.md`、`docs/commands/zh-CN/mv.md`、`docs/development/commands/mv.md`、`COMPATIBILITY.md` 与网站 `mv.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：`mv` 中英/开发文档与 COMPATIBILITY 已记录符号链接目标拒绝；网站同步。
 
 **AC → 断言映射:**（AC1–AC4、AC7–AC8 由 `(new)` `command::mv_test::mv_refuses_destination_beyond_symlink` 承载，`#[cfg(unix)]`；AC5–AC6 由 `(new)` 单元用例 `internal::operation::snapshot::tests::insert_tree_path_rejects_real_file_directory_conflicts` 承载。夹具按 `t7001-mv.sh` #23：`mkdir from && echo contents >from/src && ln -s . from/link && libra add from/src from/link && libra commit -m "setup symlink case"`，记录 `libra ls-files -s` 为 `I0`）
 

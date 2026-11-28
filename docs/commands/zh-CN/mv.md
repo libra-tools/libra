@@ -283,3 +283,5 @@ Libra 提供显式 `mv` 命令（类似 Git），因为其基于索引的模型�
 | 索引保存失败 | `fatal: failed to save index after mv: <err>` |
 
 mv renames a directory to a new nonexistent path.
+
+目标路径的任一父分量是符号链接时，`libra mv`（含 `-f`）以 `LBR-CLI-003` 和 `destination is beyond a symbolic link` 拒绝，索引不变。
