@@ -1340,7 +1340,7 @@
 
 ### Task GII-15: 修复仓库数据库繁忙时存储类型解析被误报为配置错误（#875）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25 审计：既有 `FIX-LTR-08` 已实现进程级 busy budget、200ms busy timeout、退避重试与仅 SQLite 写锁分类；`LIBRA_STORAGE_BACKEND=sqlite` 下 busy 用例 4/4 通过，含等锁成功、超预算 fail-closed、非 busy 立即返回。偏差：AC3 20 目录循环与 AC4 cloud marker 预检未单列；用户已取消独立审计与全量测试。）
 
 **Description:** #875 的 tc1375 序列（`libra fetch remote_one`，远端为本地路径的镜像克隆）在 durable object-index repair marker 积压时间歇性失败：命令后台排空超出 60 秒预算后，`fetch` 解析对象存储时报 `failed to read object storage configuration for LIBRA_STORAGE_TYPE`（`LBR-IO-001`，退出 128）。源码路径：`fetch` → `util::resolve_configured_objects_storage` → `ClientStorage::resolve_configured_storage` → `read_storage_type()` → `resolve_env_sync_typed("LIBRA_STORAGE_TYPE")`；进程环境未设置该变量时，后者从仓库数据库读取 `vault.env.LIBRA_STORAGE_TYPE`，读取失败即被 `open_after_type_read` 映射为 `StorageConfigFailure{LIBRA_STORAGE_TYPE}`，而 object-index 回放可使仓库数据库（回滚日志模式）长时间持锁。本卡让该读取在仓库数据库暂时持锁时有界等待后正确解析，不再把暂时性锁竞争误报为存储配置错误；为使竞争可确定性复现，新增仅在 `debug_assertions` 且 `LIBRA_TEST=1` 时生效的故障注入点（与仓库既有 `LIBRA_TEST` 故障注入约定一致）。`cloud` / 非 dry-run `agent clean` 在积压未清时的 fail-closed（`LBR-IO-002`）保持不变。开工时先以 AC1 的用例在修复前代码上复现失败；若根因不是数据库持锁，先按 ER-03 修订本卡再实现。
 
