@@ -1398,7 +1398,7 @@
 
 ### Task GII-16: `add` 的 object-index 更新改为批末批量回放（#611 第 2 项）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`add` 的批末改为持久化 marker 后立即分页调用 `repair_pending_object_index_updates`，不再逐对象入队；200 文件 add 后 marker 目录为空。D 组 patch +1。偏差：AC3 统计钩子、AC8 release 基准未执行；用户已取消独立审计与全量测试。）
 
 **Description:** `libra add` 当前在批末一次性持久化 repair marker（ADR-OI-04），但随后逐对象入队、由后台消费者逐个打开连接并提交事务（#611 以 `strace` 计每文件 2 次数据库打开、4 次 `fsync`）。本卡保持 marker 持久化语义不变，把批末的逐对象入队改为经既有批量回放路径 `ClientStorage::repair_pending_object_index_updates` 一次（或分页）回放本批 marker，并以固定基准证明 `add` 提速。本卡于 2026-11-18 按 G-09 拆出 `GII-18`（`fsck` 就地哈希）。
 

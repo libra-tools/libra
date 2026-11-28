@@ -5598,3 +5598,23 @@ fn test_add_sparse_chmod_opt_out_tc0052() {
             .to_string();
     assert!(dense_stage.starts_with("100755 "), "AC10 dense mode");
 }
+
+#[test]
+fn add_replays_object_index_markers_in_batches() {
+    let repo = tempfile::tempdir().unwrap();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command_with_env(&["init"], p, &[("LIBRA_STORAGE_BACKEND", "sqlite")]),
+        "init sqlite",
+    );
+    configure_identity_via_cli(p);
+    for index in 0..200 {
+        std::fs::write(p.join(format!("f{index}.txt")), format!("{index}\n")).unwrap();
+    }
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add 200 files");
+    let markers = p.join(".libra/object-index-repair");
+    let remaining = std::fs::read_dir(&markers)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(remaining, 0, "batch markers must be replayed");
+}

@@ -1347,7 +1347,8 @@ async fn run_add_patch(
     let batch_storage = util::objects_storage()?;
     let stored_objects = batch_storage.pending_object_index_batch_count();
     batch_storage
-        .flush_object_index_batch()
+        .flush_object_index_batch_replayed()
+        .await
         .map_err(|source| AddError::ObjectIndexBatchFlush {
             stored_objects,
             source,
@@ -1480,7 +1481,8 @@ async fn run_add_resolved(
     let batch_storage = util::objects_storage()?;
     let stored_objects = batch_storage.pending_object_index_batch_count();
     batch_storage
-        .flush_object_index_batch()
+        .flush_object_index_batch_replayed()
+        .await
         .map_err(|source| AddError::ObjectIndexBatchFlush {
             stored_objects,
             source,
@@ -1892,12 +1894,13 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                 .collect();
             let batch_storage = util::objects_storage()?;
             let stored_objects = batch_storage.pending_object_index_batch_count();
-            batch_storage.flush_object_index_batch().map_err(|source| {
-                AddError::ObjectIndexBatchFlush {
+            batch_storage
+                .flush_object_index_batch_replayed()
+                .await
+                .map_err(|source| AddError::ObjectIndexBatchFlush {
                     stored_objects,
                     source,
-                }
-            })?;
+                })?;
             save_index(&index, &index_path)?;
         }
 
@@ -2241,7 +2244,8 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     let batch_storage = util::objects_storage()?;
     let stored_objects = batch_storage.pending_object_index_batch_count();
     batch_storage
-        .flush_object_index_batch()
+        .flush_object_index_batch_replayed()
+        .await
         .map_err(|source| AddError::ObjectIndexBatchFlush {
             stored_objects,
             source,

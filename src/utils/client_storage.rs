@@ -2144,6 +2144,39 @@ impl ClientStorage {
         Ok(())
     }
 
+    /// Persist the pending batch's durable markers and replay them immediately
+    /// in bounded pages, without enqueueing one background message per object.
+    pub(crate) async fn flush_object_index_batch_replayed(&self) -> io::Result<usize> {
+        if let Some(variable) = self.configuration_variable() {
+            return Err(storage_config_io_error(variable));
+        }
+        let Some(key) = Self::index_db_path_from_base(&self.base_path) else {
+            return Ok(0);
+        };
+        let msgs = with_object_index_batch_state(&key, |state| std::mem::take(&mut state.pending));
+        if msgs.is_empty() {
+            return Ok(0);
+        }
+        let count = msgs.len();
+        persist_index_repair_marker_batch(&msgs).map_err(object_index_marker_registration_error)?;
+        let mut repaired = 0usize;
+        loop {
+            let outcome = Self::repair_pending_object_index_updates(&key)
+                .await
+                .map_err(io::Error::other)?;
+            repaired += outcome.repaired;
+            if !outcome.remaining {
+                break;
+            }
+        }
+        if repaired < count {
+            return Err(io::Error::other(format!(
+                "object-index replay repaired {repaired} of {count} queued objects"
+            )));
+        }
+        Ok(count)
+    }
+
     /// Number of markers currently accumulated for this storage's repository
     /// (ADR-OI-05 item 3: reported as `stored_objects` in the error envelope
     /// when a batch flush fails).
