@@ -68,15 +68,15 @@ pub struct PullArgs {
     no_rebase: bool,
 
     /// Refuse to merge unless the upstream can be fast-forwarded
-    #[clap(long = "ff-only", conflicts_with_all = ["rebase", "ff", "no_ff"])]
+    #[clap(long = "ff-only", conflicts_with_all = ["ff", "no_ff"])]
     ff_only: bool,
 
     /// Allow a fast-forward merge, overriding `pull.ff` for the invocation
-    #[clap(long, conflicts_with_all = ["no_ff", "ff_only", "rebase"])]
+    #[clap(long, conflicts_with_all = ["no_ff", "ff_only"])]
     ff: bool,
 
     /// Always create a merge commit even when fast-forward is possible
-    #[clap(long = "no-ff", conflicts_with_all = ["ff", "ff_only", "rebase"])]
+    #[clap(long = "no-ff", conflicts_with_all = ["ff", "ff_only"])]
     no_ff: bool,
 
     /// Limit the fetch to the given number of commits from each tip (shallow fetch)
@@ -617,24 +617,26 @@ async fn resolve_effective_pull_options(
     args: &PullArgs,
     branch: &str,
 ) -> Result<EffectivePullOptions, PullError> {
-    let explicit_merge_mode = args.no_rebase
-        || args.ff_only
-        || args.ff
-        || args.no_ff
-        || args.squash
-        || args.no_commit
-        || args.commit;
-    let rebase = if args.rebase {
+    let explicit_merge_mode = args.no_rebase || args.squash || args.no_commit || args.commit;
+    let configured_ff = configured_pull_ff().await?;
+    let rebase = if args.ff_only {
+        // `--ff-only` wins over `--rebase` in either order and over config.
+        false
+    } else if args.rebase {
         true
     } else if explicit_merge_mode {
         false
+    } else if configured_ff.0 {
+        // `pull.ff=only` wins over `pull.rebase`.
+        false
+    } else if configured_pull_rebase(branch).await? {
+        // Configured rebase wins over CLI `--ff`/`--no-ff`.
+        true
     } else {
-        configured_pull_rebase(branch).await?
+        false
     };
 
     let (ff_only, no_ff) = if rebase {
-        // `pull.ff` is merge-only. Once the effective mode is rebase, do not
-        // read or validate an unrelated merge policy from the config cascade.
         (false, false)
     } else if args.ff_only {
         (true, false)
@@ -643,7 +645,7 @@ async fn resolve_effective_pull_options(
     } else if args.ff {
         (false, false)
     } else {
-        configured_pull_ff().await?
+        configured_ff
     };
 
     Ok(EffectivePullOptions {
@@ -1556,5 +1558,55 @@ mod tests {
             "cannot pull: branch 'alpha' tracks a local upstream; \
              network commands do not operate on local upstreams (issues/480 HP-16)",
         );
+    }
+
+    #[tokio::test]
+    async fn pull_rebase_and_ff_precedence_matrix() {
+        let repo = tempfile::tempdir().expect("temp");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let mut args = PullArgs::make(None, None);
+        args.rebase = true;
+        args.no_ff = true;
+        let effective = resolve_effective_pull_options(&args, "main")
+            .await
+            .expect("rebase wins over --no-ff");
+        assert!(effective.rebase);
+
+        args.ff_only = true;
+        let effective = resolve_effective_pull_options(&args, "main")
+            .await
+            .expect("ff-only wins over rebase");
+        assert!(!effective.rebase && effective.ff_only);
+
+        ConfigKv::set("pull.rebase", "true", false)
+            .await
+            .expect("set pull.rebase");
+        let mut args = PullArgs::make(None, None);
+        args.no_ff = true;
+        let effective = resolve_effective_pull_options(&args, "main")
+            .await
+            .expect("configured rebase wins over --no-ff");
+        assert!(effective.rebase, "{effective:?}");
+
+        ConfigKv::set("pull.ff", "only", false)
+            .await
+            .expect("set pull.ff");
+        let effective = resolve_effective_pull_options(&PullArgs::make(None, None), "main")
+            .await
+            .expect("ff-only config wins over pull.rebase");
+        assert!(!effective.rebase && effective.ff_only, "{effective:?}");
+
+        ConfigKv::set("pull.rebase", "false", false)
+            .await
+            .expect("disable rebase");
+        ConfigKv::unset("pull.ff").await.expect("unset pull.ff");
+        let mut args = PullArgs::make(None, None);
+        args.no_ff = true;
+        let effective = resolve_effective_pull_options(&args, "main")
+            .await
+            .expect("ff flags decide");
+        assert!(!effective.rebase && effective.no_ff, "{effective:?}");
     }
 }

@@ -455,3 +455,5 @@ HTTP(S) 广告声明仓库为空后，仍会校验剩余的全部 pkt-line 帧�
 initial pull into an unborn branch records initial pull.
 
 merge and pull ff-only print git's diverging advice.
+
+优先级：`--ff-only` 胜过 `--rebase`；`--rebase` 胜过 `--ff`/`--no-ff`；配置 `pull.ff=only` 胜过 `pull.rebase`；配置 `pull.rebase=true` 胜过命令行 `--ff`/`--no-ff`；`pull.rebase=false` 时由 ff 标志决定。

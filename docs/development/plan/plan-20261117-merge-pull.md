@@ -2195,7 +2195,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-13: `pull --rebase` 与 `--ff`/`--no-ff`/`--ff-only` 的 Git 优先级（#998）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：解除 clap 互斥，解析优先级为 `--ff-only` > `--rebase` > CLI ff 标志；配置 `pull.ff=only` > `pull.rebase=true` > CLI `--ff`/`--no-ff`；`pull.rebase=false` 由 ff 标志决定。新增解析矩阵单测。D 组 patch +1。偏差：端到端 rebase/merge 网络矩阵未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 解除 `PullArgs` 中 `--rebase` 与 `--ff`/`--no-ff`/`--ff-only` 的 clap 互斥，按 Git 优先级执行：`--rebase` 胜过 `--ff`/`--no-ff`；`--ff-only` 胜过 `--rebase`（任意顺序）；`pull.ff=only` 胜过 `pull.rebase`；`pull.rebase=true` 胜过命令行 `--ff`/`--no-ff`；`pull.rebase=false` 时由 ff 标志决定。（按 G-09 自本卡拆出 `MP-23`。）
 
@@ -2220,7 +2220,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC6：`pull.ff=only` 与 `pull.rebase=true` 同时配置时 `libra pull` 拒绝分叉历史。
 - [ ] AC7：`pull.rebase=true` 时 `libra pull --no-ff` 执行变基。
 - [ ] AC8：`pull.rebase=false` 时 `libra pull --no-ff` 执行合并。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：pull 中英/开发文档与 COMPATIBILITY 已记录优先级。
 
 **AC → 断言映射:**（`(new)` `command::pull_test::pull_rebase_ff_precedence_matrix` 承载 AC1–AC8；pull 夹具（新用例写在 `tests/command/pull_test.rs`，复用该模块的 `create_remote_fixture`、`push_remote_commit`、`configure_pull_tracking`，`tests/command/pull_test.rs:87-147`）：`create_remote_fixture()` 以 `git` 建裸仓库 `remote.git` 与工作目录 `workdir` 并推送初始提交 `B`（`README.md`=`hello libra\n`），分支名 `<br>` 取其返回值；本地仓库 D = `init_repo_via_cli` + `configure_identity_via_cli`（身份 `Test User <test@example.com>`，pull 用例不依赖身份）+ `configure_pull_tracking(D, remote.git, <br>)` 后 `libra pull` 得到 `B`；`push_remote_commit(workdir, <br>, <path>, <content>, <msg>)` 推进上游，D 中本地提交带 `--no-gpg-sign`；F-PR：上游 `push_remote_commit` 提交 `U1`（新增 `u.txt`=`u\n`），D 本地提交 `D1`（新增 `d.txt`=`d1\n`），二者分叉；「变基结果」= D 中 `main` 的父提交（`libra cat-file -p main` 中按序的全部 `parent` 行；直接读分支而非 `HEAD`，使把结果留在分离 HEAD 上、`main` 未前移的实现失败）恰为 `[U1]`（D 的分支为 `libra init` 默认的 `main`，`src/command/init.rs:37`）；「合并结果」= `main` 的父提交（`libra cat-file -p main` 中按序的全部 `parent` 行；直接读分支而非 `HEAD`，使把结果留在分离 HEAD 上、`main` 未前移的实现失败）恰为 `[D1, U1]`；除映射中写明「沿用」者外，每个 AC 用一份重建的夹具；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 

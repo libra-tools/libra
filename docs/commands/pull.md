@@ -555,3 +555,5 @@ refuses a local upstream (`branch.<name>.remote=.`)
 initial pull into an unborn branch records initial pull.
 
 merge and pull ff-only print git's diverging advice.
+
+Integration precedence: `--ff-only` wins over `--rebase`; `--rebase` wins over `--ff`/`--no-ff`; configured `pull.ff=only` wins over configured `pull.rebase`; configured `pull.rebase=true` wins over CLI `--ff`/`--no-ff`; configured `pull.rebase=false` lets the ff flags decide.

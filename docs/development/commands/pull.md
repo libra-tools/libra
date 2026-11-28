@@ -367,3 +367,5 @@ See the user-facing `pull` page for the local-path Git `objectformat=sha256` rej
 initial pull into an unborn branch records initial pull.
 
 merge and pull ff-only print git's diverging advice.
+
+`--rebase`/`--ff*` 可组合；解析优先级见命令文档，配置 `pull.ff=only` 优先于 `pull.rebase`。
