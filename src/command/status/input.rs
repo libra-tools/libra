@@ -45,6 +45,11 @@ pub struct StatusArgs {
     #[clap(long = "long", conflicts_with_all = ["short", "porcelain"])]
     pub long_format: bool,
 
+    /// Show staged changes as a unified diff after the long status; repeat for
+    /// unstaged changes too (`-vv`).
+    #[clap(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
     /// Output with branch info (short or porcelain mode)
     #[clap(short = 'b', long = "branch")]
     pub branch: bool,

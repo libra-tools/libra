@@ -1073,7 +1073,7 @@
 
 ### Task GII-10: 实现 `status -v` / `--verbose`（#834）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`status -v/--verbose` 追加 staged diff，`-vv` 再追加 unstaged diff，使用 Git `c/`/`i/`/`w/` 前缀；HEAD/index 不变。新增用例覆盖 staged/unstaged 区分、长标志与只读性。D 组 patch +1。偏差：未逐字节对照 pinned Git 的完整长格式；用户已取消独立审计与全量测试。）
 
 **Description:** 在 `StatusArgs` 新增可重复的 `-v` / `--verbose`：`-v` 在长格式输出后附已暂存变更（HEAD↔index）的 unified diff，`-vv` 再附未暂存变更（index↔worktree）的 unified diff；命令保持只读，修复 t4030#18 因 `status -v` 被拒导致 `HEAD` 未恢复的级联失败。
 
@@ -1095,7 +1095,7 @@
 - [ ] AC5：`status -v` / `-vv` 不移动 `HEAD`。
 - [ ] AC6：`status -v` / `-vv` 不改写 index。
 - [ ] AC7：`status -v` / `-vv` 不改动工作区。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/status.md`、`docs/commands/zh-CN/status.md`、`docs/development/commands/status.md`、`COMPATIBILITY.md` 与网站 `status.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：`status` 中英/开发文档与 COMPATIBILITY 已记录 `-v`/`-vv`；网站同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::status_test::verbose_staged_and_unstaged_diff` 承载；仓库位于分支 `main`，含已提交 `a.txt`，暂存其修改 `staged-line`，另在工作区追加未暂存行 `unstaged-line`。期望文本 `E1` / `E2` 的组成：状态部分为同一状态下 `libra status` 的 stdout（本卡不改变长格式状态文本）；diff 部分及其与状态部分之间的分隔、分段标题，取开工时以 pinned Git `git@6de20f6092` 在同构仓库（相同分支名、文件内容与提交，故 blob OID 相同）中实测的 `git status -v` / `git status -vv` 输出的对应部分，逐字节写入本卡并作为测试常量——不由 Libra 自身的 `diff` 输出生成，因此 diff 渲染缺陷不会同时出现在期望与实际中）
 

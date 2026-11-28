@@ -100,3 +100,5 @@ flowchart TD
 **`--separate-git-dir` 指针布局（2026-11-20，CL-23）：** `<worktree>/.libra` 为 `gitdir: <dir>` 指针文件时，`util::resolve_dot_libra_pointer` 解析真实元数据目录，仓库发现（`try_get_paths_full_with_storage_lookup`）、`info/*` 候选与 `alternates` 的 objects 解析都改读 `<dir>`。会写 ref 的子命令仍由 `CL-28` 默认拒绝。
 
 `status` 对已跟踪路径执行 `has_symlink_leading_path` 语义：前导分量为符号链接即视为工作区删除，不遍历链接。
+
+`-v`/`-vv` 追加 staged / staged+unstaged diff（`c/`、`i/`、`w/` 前缀），只读。

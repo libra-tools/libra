@@ -5435,10 +5435,26 @@ fn flush_unified_hunk<'a>(
 /// Render the staged (index-vs-HEAD) changes as an uncolorized unified diff.
 /// Used by `commit -v` to embed the diff into the editor template / stderr.
 pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
+    diff_text(true, None, None).await
+}
+
+pub(crate) async fn status_staged_diff_text() -> Result<String, DiffError> {
+    diff_text(true, Some("c/"), Some("i/")).await
+}
+
+pub(crate) async fn status_worktree_diff_text() -> Result<String, DiffError> {
+    diff_text(false, Some("i/"), Some("w/")).await
+}
+
+async fn diff_text(
+    staged: bool,
+    src_prefix: Option<&str>,
+    dst_prefix: Option<&str>,
+) -> Result<String, DiffError> {
     let args = DiffArgs {
         old: None,
         new: None,
-        staged: true,
+        staged,
         no_index: false,
         pathspec: Vec::new(),
         algorithm: None,
@@ -5489,8 +5505,8 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         text: false,
         binary: false,
         full_index: false,
-        src_prefix: None,
-        dst_prefix: None,
+        src_prefix: src_prefix.map(str::to_string),
+        dst_prefix: dst_prefix.map(str::to_string),
         // Git's commit-verbose helper always renders the built-in staged diff;
         // `diff.external` must not replace the editor template or stderr patch.
         no_ext_diff: true,

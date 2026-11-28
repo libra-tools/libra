@@ -5041,3 +5041,44 @@ fn status_does_not_traverse_leading_symlinks() {
     assert_cli_success(&out, "status dangling symlink");
     assert!(String::from_utf8_lossy(&out.stdout).contains(" D d/f"));
 }
+
+#[test]
+fn verbose_staged_and_unstaged_diff() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("a.txt"), "a\nstaged-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "stage");
+    std::fs::write(p.join("a.txt"), "a\nstaged-line\nunstaged-line\n").unwrap();
+    let head = run_libra_command(&["rev-parse", "HEAD"], p);
+    let index = run_libra_command(&["ls-files", "-s"], p);
+
+    let verbose = run_libra_command(&["status", "-v"], p);
+    assert_cli_success(&verbose, "status -v");
+    let stdout = String::from_utf8_lossy(&verbose.stdout);
+    assert!(stdout.contains("diff --git c/a.txt i/a.txt"), "{stdout}");
+    assert!(stdout.contains("+staged-line"), "{stdout}");
+    assert!(!stdout.contains("+unstaged-line"), "{stdout}");
+    let long = run_libra_command(&["status", "--verbose"], p);
+    assert_eq!(long.stdout, verbose.stdout);
+
+    let vv = run_libra_command(&["status", "-vv"], p);
+    assert_cli_success(&vv, "status -vv");
+    let stdout = String::from_utf8_lossy(&vv.stdout);
+    assert!(stdout.contains("Changes to be committed:"), "{stdout}");
+    assert!(
+        stdout.contains("Changes not staged for commit:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("+staged-line"), "{stdout}");
+    assert!(stdout.contains("+unstaged-line"), "{stdout}");
+    assert!(stdout.contains("diff --git i/a.txt w/a.txt"), "{stdout}");
+
+    assert_eq!(
+        run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+        head.stdout
+    );
+    assert_eq!(
+        run_libra_command(&["ls-files", "-s"], p).stdout,
+        index.stdout
+    );
+}

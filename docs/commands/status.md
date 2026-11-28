@@ -830,3 +830,5 @@ object store.
 > `<dir>/objects` instead of `<worktree>/.libra`.
 
 Tracked paths whose leading components are symbolic links are treated as deleted in the working tree and are never traversed; nested loops or links outside the repository therefore cannot make `status` fail or be read as unchanged.
+
+`-v`/`--verbose` appends the staged (HEAD↔index) unified diff to the long status; `-vv` appends the staged diff and then the unstaged (index↔worktree) diff, using Git's `c/`, `i/`, and `w/` status prefixes.

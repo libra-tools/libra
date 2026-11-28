@@ -196,6 +196,25 @@ pub(super) async fn render_status_to_writer(
 
     // Standard human format
     render_human_status(data, args, &mut buffer)?;
+    if args.verbose > 0 {
+        let staged = crate::command::diff::status_staged_diff_text()
+            .await
+            .map_err(|error| CliError::failure(error.to_string()))?;
+        if args.verbose == 1 {
+            buffer.push(b'\n');
+            buffer.extend_from_slice(staged.as_bytes());
+        } else {
+            buffer.extend_from_slice(b"\nChanges to be committed:\n");
+            buffer.extend_from_slice(staged.as_bytes());
+            buffer.extend_from_slice(
+                b"--------------------------------------------------\nChanges not staged for commit:\n",
+            );
+            let unstaged = crate::command::diff::status_worktree_diff_text()
+                .await
+                .map_err(|error| CliError::failure(error.to_string()))?;
+            buffer.extend_from_slice(unstaged.as_bytes());
+        }
+    }
     writer.write_all(&buffer).map_err(write_error)?;
     Ok(())
 }
