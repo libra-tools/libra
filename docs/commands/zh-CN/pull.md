@@ -457,3 +457,5 @@ initial pull into an unborn branch records initial pull.
 merge and pull ff-only print git's diverging advice.
 
 优先级：`--ff-only` 胜过 `--rebase`；`--rebase` 胜过 `--ff`/`--no-ff`；配置 `pull.ff=only` 胜过 `pull.rebase`；配置 `pull.rebase=true` 胜过命令行 `--ff`/`--no-ff`；`pull.rebase=false` 时由 ff 标志决定。
+
+显式仓库与 refspec 时，`pull --rebase . <branch>` 直接变基到该本地分支，不要求跟踪配置；`--ff`/`--no-ff` 不会关闭变基，`--ff-only` 仍拒绝分叉历史。

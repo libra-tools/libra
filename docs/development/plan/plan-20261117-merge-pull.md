@@ -2256,7 +2256,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-23: `pull --rebase <repo> <refspec>` 显式上游解析（含 `.` 与 ff 标志组合）（#998）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：显式 `. <refspec>` 的 rebase 目标解析为 `refs/heads/<branch>`，rebase 调用使用本地分支名而非 `./side`；`--ff`/`--no-ff` 不关闭变基，`--ff-only` 拒绝分叉。新增 AC1/2/5–8 用例。D 组 patch +1。偏差：AC3/AC4 远端无跟踪专项未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-13` 拆出：`libra pull --rebase <repo> <refspec>` 以本次 fetch 得到的 `<refspec>` 结果为变基上游（`<repo>` 为 `.` 时即本地分支），不再要求当前分支配置 `branch.<name>.remote`/`merge`，也不再把 `./side` 当作引用名解析；与 `MP-13` 的 ff 优先级在显式参数形式下同样成立（`#998` AC1、AC3 的 `. side` 形式）。
 
@@ -2278,7 +2278,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC6：`libra pull --rebase --ff . side` 执行变基。
 - [ ] AC7：`libra pull --ff-only --rebase . side` 拒绝分叉历史。
 - [ ] AC8：`libra pull --rebase --ff-only . side`（反序）拒绝分叉历史。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：pull 中英/开发文档与 COMPATIBILITY 已记录显式本地 rebase。
 
 **AC → 断言映射:**（`(new)` `command::pull_test::pull_rebase_explicit_repo_refspec` 承载 AC1–AC8；夹具 F-998（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：仓库 R 中提交 `c0`；`side` 自 `c0` 提交 `c1`（新增 `s`=`s\n`）；`main` 自 `c0` 提交 `c2`（新增 `m`=`m\n`）并检出 `main`，不配置 `branch.main.remote`/`merge`；AC1、AC3、AC5–AC8 各用一份重建的夹具，AC2 与 AC4 分别沿用 AC1 与 AC3 执行后的仓库；远端变体 F-998R：pull 夹具（新用例写在 `tests/command/pull_test.rs`，复用该模块的 `create_remote_fixture`、`push_remote_commit`、`configure_pull_tracking`，`tests/command/pull_test.rs:87-147`）：`create_remote_fixture()` 以 `git` 建裸仓库 `remote.git` 与工作目录 `workdir` 并推送初始提交 `B`（`README.md`=`hello libra\n`），分支名 `<br>` 取其返回值；本地仓库 D = `init_repo_via_cli` + `configure_identity_via_cli`（身份 `Test User <test@example.com>`，pull 用例不依赖身份）+ `configure_pull_tracking(D, remote.git, <br>)` 后 `libra pull` 得到 `B`；`push_remote_commit(workdir, <br>, <path>, <content>, <msg>)` 推进上游，D 中本地提交带 `--no-gpg-sign`，在 `workdir` 中以 `git` 自 `B` 建分支 `side`、提交 `S1`（新增 `s`）并推送到 `remote.git`，D 再本地提交 `D1`（新增 `d.txt`=`d1\n`）后以 `libra config unset branch.main.remote` 与 `libra config unset branch.main.merge` 删除跟踪配置（`configure_pull_tracking` 固定写入 `branch.main.*`，`tests/command/pull_test.rs:141-146`），并以 `libra config list` 的 stdout 不含 `branch.main.remote` 与 `branch.main.merge` 确认（执行条件）；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 

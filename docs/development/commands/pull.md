@@ -369,3 +369,5 @@ initial pull into an unborn branch records initial pull.
 merge and pull ff-only print git's diverging advice.
 
 `--rebase`/`--ff*` 可组合；解析优先级见命令文档，配置 `pull.ff=only` 优先于 `pull.rebase`。
+
+显式 `. <branch>` 的 rebase 上游直接解析为本地分支，不要求 branch.<name>.remote/merge。

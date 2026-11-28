@@ -488,8 +488,13 @@ pub(crate) async fn run_pull(
     // even when the merge/rebase fails.
     let integrate_result: Result<PullOutput, PullError> = if effective.rebase {
         // Rebase resolves `<remote>/<branch>` through the same public ref
-        // path used by `libra rebase`, so keep the human-readable upstream form.
-        match rebase::run_rebase_for_pull(&target.upstream, &child_output).await {
+        // path used by `libra rebase`; a local `.` upstream is a branch name,
+        // not a `./side` revision.
+        let rebase_upstream = target
+            .upstream
+            .strip_prefix("./")
+            .unwrap_or(&target.upstream);
+        match rebase::run_rebase_for_pull(rebase_upstream, &child_output).await {
             Ok(rebase_summary) => {
                 let up_to_date = matches!(
                     rebase_summary.status.as_str(),
@@ -714,6 +719,16 @@ async fn resolve_pull_target(
     match (&args.repository, &args.refspec) {
         (Some(remote), Some(refspec)) => {
             let (remote_config, _is_anonymous) = resolve_remote_config(remote).await?;
+            if remote == "." {
+                let remote_branch = normalize_remote_branch_name(refspec);
+                return Ok(ResolvedPullTarget {
+                    branch,
+                    upstream: format!("./{remote_branch}"),
+                    merge_target: format!("refs/heads/{remote_branch}"),
+                    remote_branch,
+                    remote_config,
+                });
+            }
             // `pull <remote> <tag>:<dest>` (`ADR-I997-02`): the fetch handles the
             // tag refspec and writes the peeled commit to `<dest>`; merge that
             // destination directly instead of deriving a branch tracking ref.

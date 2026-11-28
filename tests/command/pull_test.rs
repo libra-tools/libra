@@ -2250,3 +2250,61 @@ async fn unborn_pull_reflog_initial_pull() {
         String::from_utf8_lossy(&branch_log.stdout)
     );
 }
+
+fn local_commit(p: &std::path::Path, file: &str, content: &str, message: &str) {
+    std::fs::write(p.join(file), content).unwrap();
+    assert_cli_success(&run_libra_command(&["add", file], p), "add local");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", message, "--no-gpg-sign"], p),
+        "commit local",
+    );
+}
+
+fn local_rebase_fixture() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    local_commit(p, "c0", "c0\n", "c0");
+    assert_cli_success(&run_libra_command(&["branch", "side"], p), "side");
+    assert_cli_success(&run_libra_command(&["checkout", "side"], p), "co side");
+    local_commit(p, "s", "s\n", "c1");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    local_commit(p, "m", "m\n", "c2");
+    repo
+}
+
+#[test]
+fn pull_rebase_explicit_repo_refspec() {
+    for args in [
+        vec!["pull", "--rebase", ".", "side"],
+        vec!["pull", "--rebase", "--no-ff", ".", "side"],
+        vec!["pull", "--rebase", "--ff", ".", "side"],
+    ] {
+        let repo = local_rebase_fixture();
+        let p = repo.path();
+        let before = run_libra_command(&["rev-parse", "HEAD"], p);
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, "local rebase pull");
+        let log = run_libra_command(&["log", "--oneline", "-3"], p);
+        assert!(String::from_utf8_lossy(&log.stdout).contains("c2"));
+        let parents = run_libra_command(&["cat-file", "-p", "main"], p);
+        assert!(!String::from_utf8_lossy(&parents.stdout).contains(&format!(
+            "parent {}",
+            String::from_utf8_lossy(&before.stdout).trim()
+        )));
+    }
+
+    for args in [
+        vec!["pull", "--ff-only", "--rebase", ".", "side"],
+        vec!["pull", "--rebase", "--ff-only", ".", "side"],
+    ] {
+        let repo = local_rebase_fixture();
+        let p = repo.path();
+        let before = run_libra_command(&["rev-parse", "HEAD"], p);
+        let out = run_libra_command(&args, p);
+        assert_ne!(out.status.code(), Some(0));
+        assert_eq!(
+            run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+            before.stdout
+        );
+    }
+}
