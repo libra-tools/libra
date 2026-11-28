@@ -2360,3 +2360,87 @@ fn reinit_ignored_initial_branch_warning() {
     let branch = run_libra_command(&["branch", "--show-current"], &repo);
     assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
 }
+
+fn relative_entries(root: &Path) -> Vec<String> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            out.push(
+                path.strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if path.is_dir() {
+                walk(base, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn missing_template_warns_and_succeeds() {
+    let root = tempdir().unwrap();
+    let missing = root.path().join("missing");
+    let repo = root.path().join("repo");
+    let out = run_libra_command(
+        &[
+            "init",
+            &format!("--template={}", missing.display()),
+            repo.to_str().unwrap(),
+        ],
+        root.path(),
+    );
+    assert_cli_success(&out, "missing template init");
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!(
+        "warning: templates not found in {}",
+        missing.display()
+    )));
+
+    let plain = root.path().join("plain");
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--template=", plain.to_str().unwrap()],
+            root.path(),
+        ),
+        "plain init",
+    );
+    assert_eq!(
+        relative_entries(&repo.join(".libra")),
+        relative_entries(&plain.join(".libra"))
+    );
+    assert_cli_success(
+        &run_libra_command(&["status"], &repo),
+        "open missing-template repo",
+    );
+
+    let long_name = "x".repeat(10_001);
+    let long_template = root.path().join(&long_name);
+    let long_repo = root.path().join("long-repo");
+    let out = run_libra_command(
+        &[
+            "init",
+            &format!("--template={}", long_template.display()),
+            long_repo.to_str().unwrap(),
+        ],
+        root.path(),
+    );
+    assert_cli_success(&out, "long template init");
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!(
+        "warning: templates not found in {}",
+        long_template.display()
+    )));
+    assert_eq!(
+        relative_entries(&long_repo.join(".libra")),
+        relative_entries(&plain.join(".libra"))
+    );
+    assert_cli_success(
+        &run_libra_command(&["status"], &long_repo),
+        "open long-template repo",
+    );
+}

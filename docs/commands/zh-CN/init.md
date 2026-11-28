@@ -353,3 +353,5 @@ mv /path/to/separate/storage .libra
 > `clone --separate-git-dir` 指针布局：当 `<worktree>/.libra` 是 `gitdir:` 指针文件时，本命令在任何索引、`HEAD` 或 ref 写入之前以 `LBR-UNSUPPORTED-001` 拒绝。该布局下只放行 `status`、`log`、`cat-file`、无参数 `branch` 列表、`alternates list`、`clone`、`upgrade`、`ui`、`login`、`whoami`、`logout` 与 `completions`。
 
 reinit warns with git's ignored initial-branch line.
+
+`--template` 指向不存在或不可读目录（含 `ENAMETOOLONG` 超长路径）时输出 `warning: templates not found in <path>`，并按空模板布局继续初始化，不再致命失败。

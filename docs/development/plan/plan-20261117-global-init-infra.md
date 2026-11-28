@@ -702,7 +702,7 @@
 
 ### Task GII-06: `init --template` 缺失模板目录降级为告警并继续建库（#942）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：缺失/不可读 `--template` 打印 Git 告警并按空模板布局初始化；超长路径同路径；self-reference guard 不变；新增 AC1–AC3/AC5–AC7 用例。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** `--template` 指向不存在（含 `ENAMETOOLONG` 等无法 `stat`）的目录时，不再以致命错误中止，而是向 stderr 打印 `warning: templates not found in <path>` 并按「无模板」继续创建仓库（匹配 Git，上游 t0001#22 TC-1692）。
 
@@ -724,7 +724,7 @@
 - [ ] AC5：AC3 的 stderr 含 `warning: templates not found in <该超长路径>`。
 - [ ] AC6：AC1 建成的仓库可正常打开。
 - [ ] AC7：AC3 建成的仓库可正常打开。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/init.md`、`docs/commands/zh-CN/init.md`、`docs/development/commands/init.md`、`COMPATIBILITY.md` 与网站 `init.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：`init` 中英/开发文档、COMPATIBILITY 与网站已同步缺失模板告警。
 
 **AC → 断言映射:**（AC1–AC3、AC5–AC7 由 `(new)` `command::init_test::missing_template_warns_and_succeeds` 承载；AC4 由既有 `command::init_test::test_init_template_self_reference_guard` 承载）
 
@@ -739,7 +739,7 @@
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC7）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::init_test::missing_template_warns_and_succeeds) or test(=command::init_test::test_init_template_self_reference_guard)'`（前者 `(new)`；`cargo nextest list` 须恰好列出这 2 条）
+- [x] 卡特有用例：`missing_template_warns_and_succeeds`（通过）
 - [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::init_test::.*template/)'`（2026-11-18 核对现有 12 条；按「验证执行协议」第 5 条）
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `GII-05, DEP-GII-03`

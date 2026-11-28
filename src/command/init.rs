@@ -721,7 +721,17 @@ async fn run_init_internal(
     // structure is created, and the built-in hooks/exclude defaults are skipped.
     let template_dir = match args.template.as_deref() {
         Some("") => None,
-        Some(path) => Some(resolve_template_path(&current_dir, path)?),
+        Some(path) => match resolve_template_path(&current_dir, path) {
+            Ok(path) => Some(path),
+            Err(InitError::TemplateNotFound { path }) => {
+                // Git treats a missing template as a warning and initializes
+                // with no template; `ENAMETOOLONG` lands here too because the
+                // path cannot be `stat`ed.
+                eprintln!("warning: templates not found in {}", path.display());
+                None
+            }
+            Err(error) => return Err(error),
+        },
         // Boxed: keeps the init future's layout depth bounded for callers.
         None => Box::pin(resolve_template_from_sources()).await?,
     };
@@ -986,7 +996,7 @@ async fn run_init_internal(
         &root_dir,
         &target_dir,
         template_dir.as_deref(),
-        args.template.as_deref() != Some(""),
+        builtin_template_defaults(args.template.as_deref(), template_dir.as_deref()),
     ) {
         // ADR-IN-03 item 6: a fresh-repo template/layout failure rolls back the
         // storage directory this run created, restoring the pre-run snapshot.
@@ -1422,7 +1432,7 @@ async fn reinitialize_existing(
         root_dir,
         target_dir,
         template_dir,
-        args.template.as_deref() != Some(""),
+        builtin_template_defaults(args.template.as_deref(), template_dir),
     )?;
     set_dir_hidden(root_dir)?;
     if let Some(shared_mode) = shared_mode {
@@ -2009,6 +2019,13 @@ fn is_writable(path: &Path) -> io::Result<()> {
         Err(_) => {}
     }
     Ok(())
+}
+
+/// Missing explicit templates behave like `--template=`: no built-in hooks or
+/// exclude file are installed. `None` with no explicit flag still gets defaults.
+fn builtin_template_defaults(template_arg: Option<&str>, resolved: Option<&Path>) -> bool {
+    template_arg != Some("")
+        && !(resolved.is_none() && matches!(template_arg, Some(path) if !path.is_empty()))
 }
 
 fn prepare_repository_layout(

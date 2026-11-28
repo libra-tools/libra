@@ -225,7 +225,7 @@ libra init --vault false
 
 Path to a template directory whose contents are copied into the new `.libra` directory.
 An empty value (`--template=`) means "no template", like Git: nothing is copied and the
-built-in `info/exclude` + hook templates are skipped.
+built-in `info/exclude` + hook templates are skipped. A missing or unreadable template path (including an over-long `ENAMETOOLONG` name) prints `warning: templates not found in <path>` and initializes the same no-template layout instead of failing.
 
 The template can never be copied into itself. A template that **is** the target
 repository is refused with a CLI error (`LBR-CLI-002`), and a template that **contains**
