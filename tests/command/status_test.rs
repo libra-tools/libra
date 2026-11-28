@@ -5226,3 +5226,96 @@ fn global_git_dir_and_work_tree_space_form() {
     assert_ne!(work_dash.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&work_dash.stderr).contains("Error-Code: LBR-IO-001"));
 }
+
+#[test]
+fn git_dir_env_overrides_cwd() {
+    let root = tempfile::tempdir().unwrap();
+    let c = root.path().join("c");
+    let r = root.path().join("r");
+    let s = root.path().join("s");
+    for repo in [&c, &r, &s] {
+        assert_cli_success(&run_libra_command(&["init"], repo), "init");
+        configure_identity_via_cli(repo);
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "--allow-empty", "-m", "c1", "--no-gpg-sign"],
+                repo,
+            ),
+            "first commit",
+        );
+    }
+    std::fs::write(r.join("u.txt"), "u\n").unwrap();
+    let work = root.path().join("w");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::write(work.join("w.txt"), "w\n").unwrap();
+    let git_dir = r.join(".libra").to_string_lossy().into_owned();
+    let work_tree = r.to_string_lossy().into_owned();
+
+    let head = run_libra_command_with_env(
+        &["rev-parse", "HEAD"],
+        &c,
+        &[("GIT_DIR", &git_dir), ("GIT_WORK_TREE", &work_tree)],
+    );
+    assert_cli_success(&head, "env rev-parse");
+    let r_head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+    let c_before = run_libra_command(&["rev-parse", "HEAD"], &c);
+    let r_after = run_libra_command_with_env(
+        &["commit", "--allow-empty", "-m", "r2", "--no-gpg-sign"],
+        &c,
+        &[("GIT_DIR", &git_dir), ("GIT_WORK_TREE", &work_tree)],
+    );
+    assert_cli_success(&r_after, "env commit");
+    let c_after = run_libra_command(&["rev-parse", "HEAD"], &c);
+    assert_eq!(c_before.stdout, c_after.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD^"], &r).stdout).trim(),
+        r_head
+    );
+
+    let explicit = run_libra_command_with_env(
+        &[
+            &format!("--git-dir={}", s.join(".libra").display()),
+            "rev-parse",
+            "HEAD",
+        ],
+        &c,
+        &[("GIT_DIR", &git_dir), ("GIT_WORK_TREE", &work_tree)],
+    );
+    assert_cli_success(&explicit, "explicit wins");
+    assert_eq!(
+        explicit.stdout,
+        run_libra_command(&["rev-parse", "HEAD"], &s).stdout
+    );
+
+    let missing = run_libra_command_with_env(
+        &["rev-parse", "HEAD"],
+        &c,
+        &[("GIT_DIR", root.path().join("none").to_str().unwrap())],
+    );
+    assert_ne!(missing.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("LBR-REPO-001"));
+
+    let w_env = work.to_string_lossy().into_owned();
+    let status = run_libra_command_with_env(
+        &["status", "--short", "--no-branch"],
+        &c,
+        &[("GIT_DIR", &git_dir), ("GIT_WORK_TREE", &w_env)],
+    );
+    assert_cli_success(&status, "env work tree");
+    assert!(String::from_utf8_lossy(&status.stdout).contains("?? w.txt"));
+
+    let explicit_work = run_libra_command_with_env(
+        &[
+            &format!("--git-dir={}", r.join(".libra").display()),
+            &format!("--work-tree={}", r.display()),
+            "status",
+            "--short",
+            "--no-branch",
+        ],
+        &c,
+        &[("GIT_DIR", &git_dir), ("GIT_WORK_TREE", &w_env)],
+    );
+    assert_cli_success(&explicit_work, "explicit work tree wins");
+    assert!(String::from_utf8_lossy(&explicit_work.stdout).contains("?? u.txt"));
+}

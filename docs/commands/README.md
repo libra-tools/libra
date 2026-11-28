@@ -27,6 +27,8 @@ Every Libra command accepts the following global flags:
 | `--bare` | | Treat the current directory as a bare repository for this invocation (does not write `core.bare`); with `init`, same as `init --bare`. |
 | `--git-dir=<path>` / `--git-dir <path>` | | Use `<path>` as the repository storage directory. |
 | `--work-tree=<path>` / `--work-tree <path>` | | Use `<path>` as the work tree. |
+| `GIT_DIR` | env | Repository storage directory; overridden by `--git-dir`. |
+| `GIT_WORK_TREE` | env | Work tree root; overridden by `--work-tree`. |
 | `--no-pager` | | Disable pager (`less`) |
 | `--color` | | When to use colors (`auto`, `never`, `always`) |
 | `--no-color` | | Disable colors; equivalent to `--color=never` |

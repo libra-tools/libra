@@ -358,6 +358,16 @@ fn extract_git_dir_and_work_tree_overrides(
         }
         index += 1;
     }
+    if git_dir.is_none()
+        && let Some(value) = std::env::var_os("GIT_DIR")
+    {
+        git_dir = Some(std::path::PathBuf::from(value));
+    }
+    if work_tree.is_none()
+        && let Some(value) = std::env::var_os("GIT_WORK_TREE")
+    {
+        work_tree = Some(std::path::PathBuf::from(value));
+    }
     if let Some(git_dir) = git_dir {
         if !git_dir.is_dir() {
             return Err(CliError::repo_not_found());

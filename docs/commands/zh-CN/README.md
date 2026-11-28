@@ -23,6 +23,8 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | `--bare` | | 本次调用把当前目录视为裸仓库（不写入 `core.bare`）；与 `init` 组合等价于 `init --bare`。 |
 | `--git-dir=<path>` / `--git-dir <path>` | | 使用 `<path>` 作为仓库存储目录。 |
 | `--work-tree=<path>` / `--work-tree <path>` | | 使用 `<path>` 作为工作树。 |
+| `GIT_DIR` | env | 仓库存储目录；被 `--git-dir` 覆盖。 |
+| `GIT_WORK_TREE` | env | 工作树根；被 `--work-tree` 覆盖。 |
 | `--no-pager` | | 禁用分页器（`less`） |
 | `--color` | | 何时使用颜色（`auto`、`never`、`always`） |
 | `--no-color` | | 禁用颜色；等价于 `--color=never` |

@@ -479,7 +479,7 @@
 
 ### Task GII-03: 支持 `GIT_DIR` / `GIT_WORK_TREE` 环境变量（#987）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`GIT_DIR`/`GIT_WORK_TREE` 参与发现且低于显式 `--git-dir`/`--work-tree`；不存在 GIT_DIR 为 REPO-001、env work-tree 驱动 status、写命令只推进目标仓库。新增 AC1–AC7 用例。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 在仓库发现管线（`src/utils/util.rs` 与 `src/cli.rs` / `src/main.rs` 预处理）识别 `GIT_DIR` 与 `GIT_WORK_TREE` 环境变量（优先级低于显式 `--git-dir` / `--work-tree`），不再静默回落操作 cwd 仓库。
 
@@ -500,7 +500,7 @@
 - [ ] AC5：`GIT_DIR` 指向不存在的仓库时以 `LBR-REPO-001` 失败（不回落 cwd 仓库）。
 - [ ] AC6：设置 `GIT_DIR=<r>/.libra`、`GIT_WORK_TREE=<w>` 时 `libra status --short` 以 `<w>` 为工作树。
 - [ ] AC7：显式 `--work-tree` 优先于 `GIT_WORK_TREE`。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/README.md`、`docs/commands/zh-CN/README.md`、`COMPATIBILITY.md` 与 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/index.en.mdx`（`## Global Flags` 说明 `GIT_DIR` / `GIT_WORK_TREE`），按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：全局标志 README 中英与 COMPATIBILITY 已记录环境变量；网站首页同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::status_test::git_dir_env_overrides_cwd` 承载；环境变量只注入子进程，不修改测试进程环境，故无需 `#[serial(env)]`；子进程 cwd 位于仓库 `<c>` 内，`<c>`、`<r>`、`<s>` 的首个提交 `c1` / `r1` / `s1` 均以 `libra commit --allow-empty` 创建（不含文件、彼此不同），`<r>` 含未跟踪文件 `u.txt`；`<w>` 为独立目录，只含未跟踪文件 `w.txt`）
 
