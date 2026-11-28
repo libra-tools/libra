@@ -282,6 +282,28 @@ fn set_hash_kind_from_object_format(object_format: String) -> CliResult<()> {
     Ok(())
 }
 
+/// Remove `--git-dir`/`--work-tree` (equals or space form) from an argv used
+/// only for output-mode/error rendering. The value token is consumed even when
+/// it starts with `-`, matching the dispatcher's pre-scan.
+pub fn sanitize_git_dir_and_work_tree_argv(argv: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut index = 0;
+    while index < argv.len() {
+        let text = argv[index].as_str();
+        if text == "--git-dir" || text == "--work-tree" {
+            index += 2;
+            continue;
+        }
+        if text.starts_with("--git-dir=") || text.starts_with("--work-tree=") {
+            index += 1;
+            continue;
+        }
+        out.push(argv[index].clone());
+        index += 1;
+    }
+    out
+}
+
 fn extract_git_dir_and_work_tree_overrides(
     mut argv: Vec<std::ffi::OsString>,
 ) -> CliResult<Vec<std::ffi::OsString>> {
@@ -292,6 +314,21 @@ fn extract_git_dir_and_work_tree_overrides(
         let text = argv[index].to_string_lossy().into_owned();
         if text == "--" {
             break;
+        }
+        if text == "--git-dir" || text == "--work-tree" {
+            let is_git_dir = text == "--git-dir";
+            if index + 1 >= argv.len() {
+                return Err(CliError::command_usage(format!("{text} requires a path"))
+                    .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments));
+            }
+            let value = argv.remove(index + 1);
+            argv.remove(index);
+            if is_git_dir {
+                git_dir = Some(std::path::PathBuf::from(value));
+            } else {
+                work_tree = Some(std::path::PathBuf::from(value));
+            }
+            continue;
         }
         if let Some(value) = text.strip_prefix("--git-dir=") {
             if value.is_empty() {

@@ -703,6 +703,7 @@ fn main() {
         let argv: Vec<String> = std::env::args_os()
             .filter_map(|arg| arg.into_string().ok())
             .collect();
+        let argv = cli::sanitize_git_dir_and_work_tree_argv(&argv);
         let output = OutputConfig::resolve_from_argv(&argv);
         err.print_for_output(&output);
         flush_telemetry();
@@ -774,6 +775,7 @@ fn init_tracing() {
     let argv: Vec<String> = std::env::args_os()
         .filter_map(|arg| arg.into_string().ok())
         .collect();
+    let argv = cli::sanitize_git_dir_and_work_tree_argv(&argv);
     let structured_output = OutputConfig::resolve_from_argv(&argv).is_json();
 
     // OTLP layer (lore.md 1.7): compiled only with the feature, active only

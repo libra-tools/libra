@@ -427,7 +427,7 @@
 
 ### Task GII-24: 全局 `--git-dir` / `--work-tree` 空格分隔形式与末尾缺值（#801，自 GII-02 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--git-dir`/`--work-tree` 支持空格形式，下一 token 即使以 `-` 开头也作为路径；末尾缺值 CLI-002；错误渲染路径同步剔除已消费标志，`--json` 作为路径时不进入 JSON 模式。新增 AC1–AC5 用例。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 解除 `GII-02` 发布中「本版只支持等号形式」的限制：全局预扫描识别空格分隔形式 `--git-dir <path>` 与 `--work-tree <path>`，按 `ADR-GII-01` 把紧随其后的下一 token 作为取值（即使以 `-` 开头，如 `--git-dir --json`，与 Git 一致），并把标志与取值从交给 `OutputConfig::resolve_from_argv`（含错误渲染路径 `src/main.rs:699-703` 所用的 argv）与 `clap` 的 argv 中剔除；标志位于 argv 末尾缺值时以 `LBR-CLI-002` 失败。拆分原因（G-09）：原 `GII-02` 按独立谓词计数超过 G-03 上限；等号形式与空格分隔形式是两个可独立恢复的轴，`GII-02` 单独发布时空格分隔形式按现状拒绝且有文档说明，本卡追加于 Phase 0 末尾、在执行链上紧随 `GII-02`。
 
@@ -447,7 +447,7 @@
 - [ ] AC3：`--git-dir` 位于 argv 末尾缺值时以 `LBR-CLI-002` 失败。
 - [ ] AC4：`--work-tree` 位于 argv 末尾缺值时以 `LBR-CLI-002` 失败。
 - [ ] AC5：`--work-tree` 的取值以 `-` 开头时（`libra --git-dir=<r>/.libra --work-tree --json status`）该取值按路径处理，失败时错误以人读格式输出（不进入 JSON 模式）。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/README.md`、`docs/commands/zh-CN/README.md`、`COMPATIBILITY.md` 与 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/index.en.mdx`（`## Global Flags`），按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：全局标志 README 中英与 COMPATIBILITY 已记录空格形式；网站首页同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::status_test::global_git_dir_and_work_tree_space_form` 承载；夹具与 `GII-02` 相同的构造在本用例内重建：子进程 cwd 为无仓库的 `<tmp>/outside`；`<r>` 的唯一提交只含 `a.txt`，另含未跟踪 `u.txt`；`<w>` 为独立目录，只含同内容的 `a.txt` 与未跟踪 `w.txt`）
 
