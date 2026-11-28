@@ -202,3 +202,5 @@ A short object name that matches multiple **distinct** objects fails with `error
 | Corrupt stored refs/config | `LBR-REPO-002` | 128 |
 
 rev-parse resolves MERGE_AUTOSTASH while held.
+
+Symmetric-difference `A...B` (omitted side defaults to `HEAD`) prints `<B_oid>`, `<A_oid>`, then `^<merge-base>` for every best common ancestor; unrelated histories print only the two commit ids.

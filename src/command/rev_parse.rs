@@ -343,6 +343,44 @@ pub async fn execute_safe(args: RevParseArgs, output: &OutputConfig) -> CliResul
 
     let mut results = Vec::with_capacity(specs.len());
     for spec in &specs {
+        if !any_filter
+            && !is_query_mode
+            && !single_revision
+            && let Some((left, right)) = spec.split_once("...")
+        {
+            let left = if left.is_empty() { "HEAD" } else { left };
+            let right = if right.is_empty() { "HEAD" } else { right };
+            let a = util::get_commit_base_typed(left)
+                .await
+                .map_err(|error| rev_parse_target_error(left, error))?;
+            let b = util::get_commit_base_typed(right)
+                .await
+                .map_err(|error| rev_parse_target_error(right, error))?;
+            results.push(RevParseOutput {
+                mode: "resolve",
+                input: Some(spec.clone()),
+                value: b.to_string(),
+            });
+            results.push(RevParseOutput {
+                mode: "resolve",
+                input: Some(spec.clone()),
+                value: a.to_string(),
+            });
+            let bases = crate::internal::merge_base::merge_bases(&a, &b).map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to compute merge bases for '{spec}': {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            for base in bases {
+                results.push(RevParseOutput {
+                    mode: "resolve",
+                    input: Some(spec.clone()),
+                    value: format!("^{base}"),
+                });
+            }
+            continue;
+        }
         match resolve_rev_parse(spec, &args).await {
             Ok(result) => results.push(result),
             Err(error) => {

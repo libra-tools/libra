@@ -76,3 +76,5 @@ flowchart TD
 - 2026-11-23（PM-06 / #947）：新增查询模式 `--show-object-format[=storage|input|output|compat]`（`require_equals`、默认 `storage`、与 SPEC/`--show-toplevel` 互斥），前三种模式输出 `object_format::as_str(get_hash_kind())`，`compat` 输出空行，其它取值 `LBR-CLI-002`；`--json` 沿用 `{mode,input,value}` 信封（`mode=show_object_format`）。回归：`rev_parse_show_object_format_modes`（AC1–AC8）。
 
 rev-parse resolves MERGE_AUTOSTASH while held.
+
+Triple-dot specs resolve to the symmetric-difference tuple: right tip, left tip, then every best merge base prefixed with `^`.

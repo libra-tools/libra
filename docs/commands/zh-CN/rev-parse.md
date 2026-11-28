@@ -157,3 +157,5 @@ main
 | 存储的引用/配置损坏 | `LBR-REPO-002` | 128 |
 
 rev-parse resolves MERGE_AUTOSTASH while held.
+
+对称差 `A...B`（省略一侧时取 `HEAD`）依次输出 `<B_oid>`、`<A_oid>`，再为每个最佳共同祖先输出 `^<merge-base>`；无共同祖先时只输出两个提交 id。

@@ -2708,3 +2708,108 @@ fn rev_parse_show_object_format_modes() {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "sha256\n", "{args:?}");
     }
 }
+
+#[test]
+fn triple_dot_merge_base() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base = run_libra_command(&["rev-parse", "HEAD"], p);
+    let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
+    assert_cli_success(&run_libra_command(&["branch", "a"], p), "branch a");
+    assert_cli_success(&run_libra_command(&["checkout", "a"], p), "checkout a");
+    std::fs::write(p.join("a.txt"), "a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-gpg-sign"], p),
+        "commit A",
+    );
+    let a = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "back main");
+    assert_cli_success(&run_libra_command(&["branch", "b"], p), "branch b");
+    assert_cli_success(&run_libra_command(&["checkout", "b"], p), "checkout b");
+    std::fs::write(p.join("b.txt"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], p), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "B", "--no-gpg-sign"], p),
+        "commit B",
+    );
+    let b = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "a"], p), "back a");
+    let expected = format!("{b}\n{a}\n^{base}\n");
+    let out = run_libra_command(&["rev-parse", "a...b"], p);
+    assert_cli_success(&out, "a...b");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    assert_cli_success(&run_libra_command(&["checkout", "b"], p), "b for a...");
+    let out = run_libra_command(&["rev-parse", "a..."], p);
+    assert_cli_success(&out, "a...");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    assert_cli_success(&run_libra_command(&["checkout", "a"], p), "a for ...b");
+    let out = run_libra_command(&["rev-parse", "...b"], p);
+    assert_cli_success(&out, "...b");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+
+    // Criss-cross: A=[X,Y], B=[Y,X], so both X and Y are best merge bases.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["branch", "x"], p), "branch x");
+    assert_cli_success(&run_libra_command(&["branch", "y"], p), "branch y");
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "checkout x");
+    std::fs::write(p.join("x.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt"], p), "add x");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "X", "--no-gpg-sign"], p),
+        "commit X",
+    );
+    let x = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "y"], p), "checkout y");
+    std::fs::write(p.join("y.txt"), "y\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "y.txt"], p), "add y");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "Y", "--no-gpg-sign"], p),
+        "commit Y",
+    );
+    let y = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["checkout", "x"], p),
+        "checkout x again",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "-m", "A", "y"], p),
+        "merge A",
+    );
+    let a = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["checkout", "y"], p),
+        "checkout y again",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "-m", "B", &x], p),
+        "merge B",
+    );
+    let b = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let spec = format!("{a}...{b}");
+    let out = run_libra_command(&["rev-parse", &spec], p);
+    assert_cli_success(&out, "criss-cross triple dot");
+    let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.remove(0), b);
+    assert_eq!(lines.remove(0), a);
+    lines.sort();
+    let mut expected_bases = vec![format!("^{x}"), format!("^{y}")];
+    expected_bases.sort();
+    assert_eq!(lines, expected_bases);
+}

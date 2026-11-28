@@ -1178,7 +1178,7 @@
 
 ### Task GII-12: 支持 `<rev>...` 三点范围解析（`rev-parse`；#720 的范围部分）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`rev-parse A...B` 输出右侧、左侧及全部最佳 merge base `^` 行；省略侧补 `HEAD`；新增唯一 merge-base 与 criss-cross 用例。D 组 patch +1。偏差：无共同祖先专项未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 让 `libra rev-parse A...B`（任一侧省略时取 `HEAD`）按 Git 对称差语义输出 `<B_oid>`、`<A_oid>` 以及零个或全部最佳 merge-base 排除项 `^<mb_i>`。`checkout -b <branch> A...B` 等单一起点上下文的 merge-base 解析于 2026-11-18 按 G-09 拆出为 `GII-23`（追加于 Phase 2 末尾，链上紧随本卡）。
 
@@ -1198,7 +1198,7 @@
 - [ ] AC3：`libra rev-parse ...B` 以 `HEAD` 补全左侧。
 - [ ] AC4：无共同祖先时 `libra rev-parse A...B` 的 stdout 逐字等于 `<B_oid>`、`<A_oid>` 两行（命令须退出 0）。
 - [ ] AC5：criss-cross 历史存在多个最佳 merge-base 时，`libra rev-parse A...B` 的 stdout 由 `<B_oid>`、`<A_oid>` 两行及全部最佳 merge-base 的 `^<mb_i>` 行组成（命令须退出 0）。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/rev-parse.md`、`docs/commands/zh-CN/rev-parse.md`、`docs/development/commands/rev-parse.md`、`COMPATIBILITY.md` 与网站 `rev-parse.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：`rev-parse` 中英/开发文档与 COMPATIBILITY 已记录 `A...B`；网站同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::rev_parse_test::triple_dot_merge_base` 承载；期望顺序与集合由执行者在开工时以 pinned Git（`git@6de20f6092`）对同构历史预先核对并写入本卡记录，测试内以 Libra 自身 `merge-base --all` 输出交叉核对）
 
