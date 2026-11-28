@@ -333,3 +333,5 @@ remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
 > `HEAD` or ref write. Only `status`, `log`, `cat-file`, the no-argument `branch`
 > listing, `alternates list`, `clone`, `upgrade`, `ui`, `login`, `whoami`, `logout` and
 > `completions` run in that layout.
+
+`checkout -b <branch> A...B` (or `A...`, defaulting the right side to `HEAD`) uses the single best merge base as the new branch start; zero or multiple best merge bases fail with `LBR-CLI-003` without creating the branch or changing HEAD.

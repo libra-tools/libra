@@ -1682,3 +1682,114 @@ fn eol_consumer_checkout_accepts_clean_representation_and_preserves_real_edits(a
         }
     }
 }
+
+#[test]
+fn checkout_b_triple_dot_merge_base() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["branch", "a"], p), "branch a");
+    assert_cli_success(&run_libra_command(&["checkout", "a"], p), "checkout a");
+    std::fs::write(p.join("a.txt"), "a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-gpg-sign"], p),
+        "commit A",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    assert_cli_success(&run_libra_command(&["branch", "b"], p), "branch b");
+    assert_cli_success(&run_libra_command(&["checkout", "b"], p), "checkout b");
+    std::fs::write(p.join("b.txt"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], p), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "B", "--no-gpg-sign"], p),
+        "commit B",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "a"], p), "back a");
+    let out = run_libra_command(&["checkout", "-b", "topic", "a...b"], p);
+    assert_cli_success(&out, "checkout -b topic a...b");
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "topic"], p).stdout).trim(),
+        base
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["symbolic-ref", "HEAD"], p).stdout).trim(),
+        "refs/heads/topic"
+    );
+    assert!(
+        run_libra_command(&["status", "--porcelain"], p)
+            .stdout
+            .is_empty()
+    );
+
+    assert_cli_success(&run_libra_command(&["checkout", "b"], p), "b for omitted");
+    let out = run_libra_command(&["checkout", "-b", "topic2", "a..."], p);
+    assert_cli_success(&out, "checkout -b topic2 a...");
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "topic2"], p).stdout).trim(),
+        base
+    );
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["branch", "x"], p), "branch x");
+    assert_cli_success(&run_libra_command(&["branch", "y"], p), "branch y");
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "checkout x");
+    std::fs::write(
+        p.join("x.txt"),
+        "x
+",
+    )
+    .unwrap();
+    assert_cli_success(&run_libra_command(&["add", "x.txt"], p), "add x");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "X", "--no-gpg-sign"], p),
+        "commit X",
+    );
+    let x = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "y"], p), "checkout y");
+    std::fs::write(
+        p.join("y.txt"),
+        "y
+",
+    )
+    .unwrap();
+    assert_cli_success(&run_libra_command(&["add", "y.txt"], p), "add y");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "Y", "--no-gpg-sign"], p),
+        "commit Y",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "back x");
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "-m", "A", "y"], p),
+        "merge A",
+    );
+    let a = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "y"], p), "back y");
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "-m", "B", &x], p),
+        "merge B",
+    );
+    let b = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let head = run_libra_command(&["symbolic-ref", "HEAD"], p);
+    let failed = run_libra_command(&["checkout", "-b", "bad", &format!("{a}...{b}")], p);
+    assert_ne!(failed.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("LBR-CLI-003"));
+    assert_eq!(
+        run_libra_command(&["symbolic-ref", "HEAD"], p).stdout,
+        head.stdout
+    );
+    assert!(
+        !run_libra_command(&["show-ref", "--verify", "refs/heads/bad"], p)
+            .status
+            .success()
+    );
+}

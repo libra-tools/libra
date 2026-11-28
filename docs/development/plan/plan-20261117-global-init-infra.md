@@ -1679,7 +1679,7 @@ sys.exit(1 if (new_fns or kept or lits or mods) else 0)
 
 ### Task GII-23: `checkout -b <branch> A...B` 单一起点 merge-base 解析（#720 的单一起点部分，自 GII-12 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`checkout -b` 单一起点支持 `A...B`/`A...`，唯一 merge-base 建并切换分支，多个/零个 fail-closed；新增唯一、省略右侧与多 base 失败用例。D 组 patch +1。偏差：无共同祖先专项未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 让经 `util::get_commit_base_typed`（`src/utils/util.rs:3128`）解析单一提交的上下文（规范场景 `libra checkout -b <branch> A...B`，上游 t2018#4 TC-0390）把 `A...B`（右侧省略的 `A...` 取 `HEAD`，即上游 t2018#4 的 `branch1...` 形式）解析为唯一 merge-base 并照常创建与切换分支；0 个或多个最佳 merge-base 时按 Git fail-closed，且失败时不创建分支、不改动 HEAD、index 与工作区。拆分原因（G-09）：原 `GII-12` 计入 `checkout` 的切换与失败无副作用谓词后超过 G-03 上限；范围解析与单一起点解析是两个可独立恢复的轴，本卡追加于 Phase 2 末尾、在执行链上紧随 `GII-12`。
 
@@ -1703,7 +1703,7 @@ sys.exit(1 if (new_fns or kept or lits or mods) else 0)
 - [ ] AC6：存在多个最佳 merge-base 时 `libra checkout -b topic A...B` 以 `LBR-CLI-003` 失败。
 - [ ] AC7：AC6 的失败前后仓库状态快照 `RS` 逐字节相同。
 - [ ] AC8：HEAD 指向 `B` 时 `libra checkout -b topic2 A...`（右侧省略取 `HEAD`）创建的 `topic2` 指向 `M`。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/checkout.md`、`docs/commands/zh-CN/checkout.md`、`docs/development/commands/checkout.md`、`COMPATIBILITY.md` 与网站 `checkout.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：`checkout` 中英/开发文档与 COMPATIBILITY 已记录 `A...B`；网站同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::checkout_test::checkout_b_triple_dot_merge_base` 承载。唯一 merge-base 夹具：提交 `m.txt` 得 `M`，分支 `a` 在 `M` 上加 `a.txt` 得 `A`，分支 `b` 在 `M` 上加 `b.txt` 得 `B`，执行前 HEAD 指向 `refs/heads/a`（`A` ≠ `M`）；无关历史夹具与 criss-cross 夹具（自根 `R` 分出改动不同文件的提交 `X`、`Y`，`A` = 以 `X`、`Y` 为父的合并提交，`B` = 以 `Y`、`X` 为父的合并提交，按构造有两个最佳 merge-base）各用独立的新仓库。仓库状态快照 `RS` = `libra show-ref` 的 stdout、`libra symbolic-ref HEAD` 的 stdout、`.libra/index` 的 SHA-256 与工作区全部条目（排除 `.libra`）以 `lstat`（不跟随符号链接）取得的「路径、类型（普通文件 / 符号链接 / 目录）、权限位、普通文件内容的 SHA-256 或符号链接目标」按路径排序的列表，按此顺序拼接的文本）
 

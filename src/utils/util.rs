@@ -3363,6 +3363,21 @@ pub async fn resolve_tree_ish_with_auto_merge_typed(
 }
 
 pub async fn get_commit_base_typed(name: &str) -> Result<ObjectHash, CommitBaseError> {
+    if let Some((left, right)) = name.split_once("...") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        let a = Box::pin(get_commit_base_typed(left)).await?;
+        let b = Box::pin(get_commit_base_typed(right)).await?;
+        let bases = crate::internal::merge_base::merge_bases(&a, &b)
+            .map_err(|error| CommitBaseError::ReadFailure(error.to_string()))?;
+        return match bases.as_slice() {
+            [base] => Ok(*base),
+            _ => Err(CommitBaseError::InvalidReference(format!(
+                "symmetric difference '{name}' has {} best merge bases, expected exactly one",
+                bases.len()
+            ))),
+        };
+    }
     let object_id = resolve_object_spec_typed(name).await?;
     peel_object_to_type_typed(object_id, Some(ObjectType::Commit), name)
 }

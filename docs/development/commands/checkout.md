@@ -87,3 +87,5 @@ flowchart TD
 
 
 **`clone --separate-git-dir` 指针布局（2026-11-20，CL-28）：** `.libra` 为 `gitdir:` 指针文件时，`src/cli.rs::command_preflight` 在分发前以 `LBR-UNSUPPORTED-001` 默认拒绝本命令，因此不会写错目录；放行名单与逐变体判定见 `docs/development/commands/_compatibility.md` 的「指针布局：命令放行清单」。
+
+`checkout -b` 的单一起点解析支持 `A...B`/`A...`：取唯一最佳 merge-base，0 或多个则 fail-closed。
