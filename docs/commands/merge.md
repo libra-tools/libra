@@ -622,3 +622,5 @@ Content-conflict progress (`Auto-merging <path>`, `CONFLICT (content): Merge con
 `--no-commit` allows unrelated unstaged edits and preserves them; only edits that overlap paths the merge actually rewrites are refused with the offending paths listed. Merge writes skip paths whose result already matches HEAD, preserving their mtime and any unrelated working-tree content.
 
 `-s resolve` prints `Trying really trivial in-index merge...` followed by `Wonderful.` and completes an in-index merge as `In-index merge` when each path is changed on at most one side; otherwise it prints `Nope.` and continues with the normal three-way engine. `-q` and `--json` suppress these diagnostics.
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

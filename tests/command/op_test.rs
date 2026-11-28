@@ -2454,3 +2454,44 @@ fn test_worktree_mutations_still_record_operations() {
     assert_cli_success(&run_libra_command(&["add", "-n", "-u"], p), "add -n -u");
     assert_eq!(op_count(p), before_preview, "preview records no operation");
 }
+
+#[cfg(unix)]
+#[test]
+fn snapshot_scan_does_not_traverse_leading_symlinks() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for (path, content) in [("a/b/c/d", "d\n"), ("a/b-2/c/d", "d\n"), ("a/x", "x\n")] {
+        std::fs::create_dir_all(p.join(path).parent().unwrap()).unwrap();
+        std::fs::write(p.join(path), content).unwrap();
+    }
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add tree");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tree", "--no-gpg-sign"], p),
+        "commit tree",
+    );
+    std::fs::remove_dir_all(p.join("a/b")).unwrap();
+    std::os::unix::fs::symlink("b-2", p.join("a/b")).unwrap();
+    std::fs::remove_dir_all(p.join("a/b-2")).unwrap();
+    std::os::unix::fs::symlink("b", p.join("a/b-2")).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add -A");
+    let staged = run_libra_command(&["ls-files", "-s", "a/b", "a/b-2"], p);
+    let lines: Vec<&str> = String::from_utf8_lossy(&staged.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .leak()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.iter().all(|line| line.starts_with("120000 ")));
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "loop", "--no-gpg-sign"], p),
+        "commit loop",
+    );
+    assert_cli_success(&run_libra_command(&["reset", "--hard"], p), "reset hard");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+}

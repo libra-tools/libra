@@ -290,3 +290,5 @@ remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
 > `completions` run in that layout.
 
 reset and restore accept the main branch.
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

@@ -175,3 +175,5 @@ NothingToCommit 按工作树状态分型
 **`clone --separate-git-dir` 指针布局（2026-11-20，CL-28）：** `.libra` 为 `gitdir:` 指针文件时，`src/cli.rs::command_preflight` 在分发前以 `LBR-UNSUPPORTED-001` 默认拒绝本命令，因此不会写错目录；放行名单与逐变体判定见 `docs/development/commands/_compatibility.md` 的「指针布局：命令放行清单」。
 
 commit rejects -m with fixup amend or reword and unknown prefixes.
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

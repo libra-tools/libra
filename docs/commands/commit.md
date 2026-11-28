@@ -913,3 +913,5 @@ records a commit whose message is empty
 > `completions` run in that layout.
 
 commit rejects -m with fixup amend or reword and unknown prefixes.
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

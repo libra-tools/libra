@@ -388,3 +388,5 @@ with the full conflict list).
 
 The forward-only database transition is documented under
 [operation-v2 convergence](init.md#operation-v2-convergence).
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

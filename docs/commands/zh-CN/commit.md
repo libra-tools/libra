@@ -559,3 +559,5 @@ cleanup 在该 fence 下重新核验精确候选 OID，并一直持有到 prune 
 > `clone --separate-git-dir` 指针布局：当 `<worktree>/.libra` 是 `gitdir:` 指针文件时，本命令在任何索引、`HEAD` 或 ref 写入之前以 `LBR-UNSUPPORTED-001` 拒绝。该布局下只放行 `status`、`log`、`cat-file`、无参数 `branch` 列表、`alternates list`、`clone`、`upgrade`、`ui`、`login`、`whoami`、`logout` 与 `completions`。
 
 commit rejects -m with fixup amend or reword and unknown prefixes.
+
+operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺失处理，不沿链接遍历；末级符号链接按链接目标字节计算 blob。

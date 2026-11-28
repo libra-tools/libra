@@ -1618,7 +1618,7 @@ sys.exit(1 if (new_fns or kept or lits or mods) else 0)
 
 ### Task GII-21: operation snapshot 工作区扫描不经前导符号链接（#1014 的 `add`/`commit`/`reset`/`checkout`/`merge` 部分，自 GII-11 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：operation snapshot 跳过前导符号链接路径，末级符号链接按目标字节哈希；#1014 状态下 `add -A`、`commit`、`reset --hard`、`checkout main` 完成。D 组 patch +1。偏差：AC5/6 merge 专项与 AC7/8 完整 ScanResult 逐项未单列；用户已取消独立审计与全量测试。）
 
 **Description:** #1014 复现状态下，`add`、`commit`、`reset --hard`、`checkout` 以及 `t6415` #23 的合并都在 operation snapshot 的工作区扫描中经前导符号链接分量解析已跟踪路径并触发 `ELOOP`，以 `fatal: operation storage failed: working-copy scan failed`（`LBR-INTERNAL-001`）中止。本卡让 `scan_working_copy` 对已跟踪路径做与 `GII-11` 相同的前导符号链接检测（Git `has_symlink_leading_path` 语义），并让最终分量为符号链接的条目以不跟随链接的元数据与链接目标字节计算 blob（`hash_file` 现以 `fs::metadata` 跟随最终链接，互指链接得 `ELOOP`、悬空链接得 `NotFound` 而使扫描失败或不完整，`src/internal/operation/snapshot.rs:703-704`），使这些命令与 Git 2.56.0 一样完成。拆分原因（G-09）：原 `GII-11` 按独立谓词计数超过 G-03 上限；`status` 扫描与 operation snapshot 扫描是两个独立实现、可独立恢复的轴，本卡追加于 Phase 2 末尾、在执行链上紧随 `GII-11`。
 
@@ -1642,7 +1642,7 @@ sys.exit(1 if (new_fns or kept or lits or mods) else 0)
 - [ ] AC6：同一合并后，`a/b-2` 为符号链接。
 - [ ] AC7：已跟踪目录被替换为悬空符号链接时，operation snapshot 的工作区扫描 `scan_working_copy` 返回的完整 `ScanResult` 等于期望快照。
 - [ ] AC8：在 #1014 复现状态下，operation snapshot 的工作区扫描 `scan_working_copy` 返回的完整 `ScanResult` 等于期望快照。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/{op,add,commit,reset,checkout,merge}.md`、`docs/commands/zh-CN/{op,add,commit,reset,checkout,merge}.md`、`docs/development/commands/{op,add,commit,reset,checkout,merge}.md`、`COMPATIBILITY.md` 与网站 `op.en.md`、`add.en.md`、`commit.en.md`、`reset.en.md`、`checkout.en.md`、`merge.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：op/add/commit/reset/checkout/merge 文档与 COMPATIBILITY 已记录前导符号链接扫描语义；网站同步。
 
 **AC → 断言映射:**（AC1–AC4 由 `(new)` `command::op_test::snapshot_scan_does_not_traverse_leading_symlinks` 承载；AC5–AC6 由 `(new)` `command::merge_test::dir_to_symlink_merge_keeps_nested_file` 承载；AC7 由 `(new)` 单元用例 `internal::operation::snapshot::tests::scan_completes_full_on_dangling_symlink`、AC8 由 `(new)` 单元用例 `internal::operation::snapshot::tests::scan_completes_full_on_leading_symlink_loop` 承载；均 `#[cfg(unix)]`。#1014 复现夹具：提交 `a/b/c/d`、`a/b-2/c/d`、`a/x` 后执行 `rm -rf a/b && ln -s b-2 a/b && rm -rf a/b-2 && ln -s b a/b-2`；AC3、AC4 各用独立的新夹具，AC7 在单元用例的临时仓库中构造悬空链接夹具，AC8 在单元用例的临时仓库中按同一 #1014 夹具构造）
 

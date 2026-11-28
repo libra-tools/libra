@@ -334,6 +334,12 @@ impl WorkspaceSnapshotter {
             )?;
             let key = relative.to_string_lossy().replace('\\', "/");
             let absolute = self.scope.worktree_root.join(&relative);
+            if path_has_symlink_leading_component(&self.scope.worktree_root, &relative) {
+                // Git's `has_symlink_leading_path`: the path is absent from the
+                // logical worktree; never follow the link.
+                complete = false;
+                continue;
+            }
             let metadata = match fs::symlink_metadata(&absolute) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -745,7 +751,25 @@ impl WorkspaceSnapshotter {
     }
 
     fn hash_file(&self, relative: &Path, deadline: Instant) -> Result<ObjectHash, ScanError> {
-        let before = fs::metadata(self.scope.worktree_root.join(relative))?;
+        let absolute = self.scope.worktree_root.join(relative);
+        let before = fs::symlink_metadata(&absolute)?;
+        if before.file_type().is_symlink() {
+            // A symlink's blob is its target bytes; following it could loop or
+            // capture content outside the repository.
+            let bytes = fs::read_link(&absolute)?
+                .as_os_str()
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes();
+            let after = fs::symlink_metadata(&absolute)?;
+            if after.file_type().is_symlink() != before.file_type().is_symlink()
+                || after.len() != before.len()
+                || after.modified().ok() != before.modified().ok()
+            {
+                return Err(ScanError::Unstable(relative.to_path_buf()));
+            }
+            return Ok(ObjectHash::from_type_and_data(ObjectType::Blob, &bytes));
+        }
         let request = || IoRequest::FileBlobHash {
             path: path_to_bytes(relative),
             root: path_to_bytes(&self.scope.worktree_root),
@@ -777,7 +801,7 @@ impl WorkspaceSnapshotter {
                 _ => None,
             })
             .ok_or_else(|| ScanError::Worker("hash worker returned no result".to_string()))??;
-        let after = fs::metadata(self.scope.worktree_root.join(relative))?;
+        let after = fs::symlink_metadata(self.scope.worktree_root.join(relative))?;
         if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
             return Err(ScanError::Unstable(relative.to_path_buf()));
         }
@@ -1067,6 +1091,20 @@ fn path_has_content_conversion(relative: &Path, worktree_root: &Path, autocrlf: 
 /// Store an immutable content-addressed object without repairing or replacing
 /// a pre-existing payload. A matching object is already complete; a mismatch
 /// is repository corruption and must stay visible to the caller.
+fn path_has_symlink_leading_component(workdir: &Path, relative: &Path) -> bool {
+    let Some(parent) = relative.parent() else {
+        return false;
+    };
+    let mut current = workdir.to_path_buf();
+    for component in parent.components() {
+        current.push(component);
+        if fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
 fn put_content_addressed_object(
     storage: &ClientStorage,
     oid: &ObjectHash,

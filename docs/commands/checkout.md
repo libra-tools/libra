@@ -335,3 +335,5 @@ remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
 > `completions` run in that layout.
 
 `checkout -b <branch> A...B` (or `A...`, defaulting the right side to `HEAD`) uses the single best merge base as the new branch start; zero or multiple best merge bases fail with `LBR-CLI-003` without creating the branch or changing HEAD.
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

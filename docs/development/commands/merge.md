@@ -299,3 +299,5 @@ merge combines --strategy with --strategy-option.
 merge rejects squash with no-ff and allows squash ff-only.
 
 merge --continue applies and clears a held MERGE_AUTOSTASH.
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

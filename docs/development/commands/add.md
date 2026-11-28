@@ -120,3 +120,5 @@ flowchart TD
 **`clone --separate-git-dir` 指针布局（2026-11-20，CL-28）：** `.libra` 为 `gitdir:` 指针文件时，`src/cli.rs::command_preflight` 在分发前以 `LBR-UNSUPPORTED-001` 默认拒绝本命令，因此不会写错目录；放行名单与逐变体判定见 `docs/development/commands/_compatibility.md` 的「指针布局：命令放行清单」。
 
 - 2026-11-25（I667-01 / #667）：真实 `--chmod` mutation 候选复用 validation 的 stage-0 skip-worktree 事实——未带 `--sparse` 时从 chmod 候选中排除这些条目，使 sparse 拒绝（rc=1、既有 header/path/two hints）不再先改写索引；`--sparse --chmod` 与 dense chmod 行为不变。回归：`test_add_chmod_sparse_rejection_is_atomic_tc0052`（AC1–AC8）、`test_add_sparse_chmod_opt_out_tc0052`（AC9/AC10）、既有 `test_add_sparse_path_advice_matrix`/`test_add_chmod_sets_and_clears_exec_bit`；TC-0052 复跑仍因现有 sparse 提示文案与上游 Git 文案不同而 FAIL（非本卡范围）。
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

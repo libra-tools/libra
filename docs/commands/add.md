@@ -617,3 +617,5 @@ remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
 > `HEAD` or ref write. Only `status`, `log`, `cat-file`, the no-argument `branch`
 > listing, `alternates list`, `clone`, `upgrade`, `ui`, `login`, `whoami`, `logout` and
 > `completions` run in that layout.
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

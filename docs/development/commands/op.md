@@ -300,3 +300,5 @@ write endpoint.
 - The feature-branch validation record in
   `docs/development/plan/plan-20260822.md` is the source of truth for this
   closeout. Version release and tag creation are outside this plan.
+
+Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.

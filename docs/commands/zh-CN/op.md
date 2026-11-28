@@ -324,3 +324,5 @@ reconcile 操作本身不改变任何仓库内容，只记录收敛点，使后�
 收敛或「无可收敛」时退出码为 `0`；报告冲突时为非零（JSON 输出携带 `outcome: "conflicted"` 与完整冲突列表）。
 
 已发布版本中的前向数据库过渡见 [operation-v2 收敛](init.md#operation-v2-收敛)。
+
+operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺失处理，不沿链接遍历；末级符号链接按链接目标字节计算 blob。

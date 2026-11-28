@@ -480,3 +480,5 @@ merge --continue applies and clears a held MERGE_AUTOSTASH.
 `-s resolve` 先输出 `Trying really trivial in-index merge...`；若每个路径至多一侧修改，则输出 `Wonderful.` 并以 `In-index merge` 完成，否则输出 `Nope.` 后继续普通三方合并。`-q` 与 `--json` 抑制这些诊断。
 
 `-s octopus` 可显式选择八爪鱼策略：多目标逐个暂存；单目标只接受快进或真正平凡索引内合并，否则输出 `Merge with strategy octopus failed.` 且不改变仓库；`--no-commit` 不进入单目标平凡路径。
+
+operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺失处理，不沿链接遍历；末级符号链接按链接目标字节计算 blob。

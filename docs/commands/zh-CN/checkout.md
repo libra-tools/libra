@@ -320,3 +320,5 @@ Git 肌肉记忆根深蒂固。使用 `git checkout` 多年的开发者会本能
 > `clone --separate-git-dir` 指针布局：当 `<worktree>/.libra` 是 `gitdir:` 指针文件时，本命令在任何索引、`HEAD` 或 ref 写入之前以 `LBR-UNSUPPORTED-001` 拒绝。该布局下只放行 `status`、`log`、`cat-file`、无参数 `branch` 列表、`alternates list`、`clone`、`upgrade`、`ui`、`login`、`whoami`、`logout` 与 `completions`。
 
 `checkout -b <branch> A...B`（或右侧省略的 `A...`，以 `HEAD` 补全）以唯一最佳 merge-base 为起点；零个或多个最佳 merge-base 时以 `LBR-CLI-003` 失败，且不创建分支、不改变 HEAD。
+
+operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺失处理，不沿链接遍历；末级符号链接按链接目标字节计算 blob。
