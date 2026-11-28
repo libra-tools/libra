@@ -4993,3 +4993,51 @@ fn eol_fast_forward_scripts(auto: bool) -> (tempfile::TempDir, Vec<u8>) {
     }
     (temp, tip)
 }
+
+#[cfg(unix)]
+#[test]
+fn status_does_not_traverse_leading_symlinks() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for (path, content) in [("a/b/c/d", "d\n"), ("a/b-2/c/d", "d\n"), ("a/x", "x\n")] {
+        std::fs::create_dir_all(p.join(path).parent().unwrap()).unwrap();
+        std::fs::write(p.join(path), content).unwrap();
+    }
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add tree");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tree", "--no-gpg-sign"], p),
+        "commit tree",
+    );
+    std::fs::remove_dir_all(p.join("a/b")).unwrap();
+    std::os::unix::fs::symlink("b-2", p.join("a/b")).unwrap();
+    std::fs::remove_dir_all(p.join("a/b-2")).unwrap();
+    std::os::unix::fs::symlink("b", p.join("a/b-2")).unwrap();
+    let out = run_libra_command(&["status", "--short", "--no-branch"], p);
+    assert_cli_success(&out, "status loop");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(" D a/b/c/d"), "{stdout}");
+    assert!(stdout.contains(" D a/b-2/c/d"), "{stdout}");
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("d")).unwrap();
+    std::fs::write(p.join("d/f"), "same\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "d/f"], p), "add d/f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "d/f", "--no-gpg-sign"], p),
+        "commit d/f",
+    );
+    let ext = tempfile::tempdir().unwrap();
+    std::fs::write(ext.path().join("f"), "same\n").unwrap();
+    std::fs::remove_dir_all(p.join("d")).unwrap();
+    std::os::unix::fs::symlink(ext.path(), p.join("d")).unwrap();
+    let out = run_libra_command(&["status", "--short"], p);
+    assert_cli_success(&out, "status external symlink");
+    assert!(String::from_utf8_lossy(&out.stdout).contains(" D d/f"));
+
+    std::fs::remove_file(p.join("d")).unwrap();
+    std::os::unix::fs::symlink("missing", p.join("d")).unwrap();
+    let out = run_libra_command(&["status", "--short"], p);
+    assert_cli_success(&out, "status dangling symlink");
+    assert!(String::from_utf8_lossy(&out.stdout).contains(" D d/f"));
+}

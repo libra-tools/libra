@@ -1129,7 +1129,7 @@
 
 ### Task GII-11: `status` 工作区扫描不经前导符号链接（#1014 的 `status` 部分）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`status` 对已跟踪路径按 `has_symlink_leading_path` 语义视为删除，不遍历前导链接；conversion probe 同步跳过符号链接目录；循环链接、外部链接、悬空链接均验证。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 当已跟踪目录被替换为符号链接时（#1014 复现：原跟踪 `a/b/c/d`、`a/b-2/c/d`，随后 `a/b -> b-2`、`a/b-2 -> b`），`status` 检查已跟踪路径 `a/b-2/c/d` 时虽对末级路径使用 `symlink_metadata`，内核仍会解析前导分量 `a/b-2`（符号链接）并触发 `ELOOP`，于是 `status` 以「输出不完整」退出 128。本卡让 `status` 扫描对已跟踪路径先做前导符号链接检测（Git `has_symlink_leading_path` 语义：任一前导分量为符号链接即视该路径在工作区中已删除），与 Git 2.56.0 一致。operation snapshot 的同类扫描（影响 `add`、`commit`、`reset`、`checkout`、`merge`）于 2026-11-18 按 G-09 拆出为 `GII-21`。
 
@@ -1148,7 +1148,7 @@
 - [ ] AC1：在 #1014 复现状态下 `libra status --short --no-branch` 的输出行集合与 pinned Git 在同构状态下的 `git status --short --no-branch` 相同（前导符号链接下的两条已跟踪路径报告为工作区删除）。
 - [ ] AC2：已跟踪目录 `d` 被替换为指向仓库外目录 `<ext>`（含同名同内容的 `f`）的符号链接时，`libra status --short` 把已跟踪的 `d/f` 报告为已删除（经链接读到同内容 `<ext>/f` 的错误实现会把它视为未变更）。
 - [ ] AC3：已跟踪目录 `d` 被替换为指向不存在目标的符号链接时，`libra status --short` 把已跟踪的 `d/f` 报告为已删除。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/status.md`、`docs/commands/zh-CN/status.md`、`docs/development/commands/status.md`、`COMPATIBILITY.md` 与网站 `status.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：`status` 中英/开发文档与 COMPATIBILITY 已记录前导符号链接语义；网站同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::status_test::status_does_not_traverse_leading_symlinks` 承载，`#[cfg(unix)]`；各 AC 使用独立的新夹具）
 

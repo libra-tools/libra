@@ -828,3 +828,5 @@ object store.
 > `gitdir: <dir>` pointer file (created by `libra clone --separate-git-dir`), this
 > command resolves the real metadata directory and reads `<dir>/libra.db` and
 > `<dir>/objects` instead of `<worktree>/.libra`.
+
+Tracked paths whose leading components are symbolic links are treated as deleted in the working tree and are never traversed; nested loops or links outside the repository therefore cannot make `status` fail or be read as unchanged.

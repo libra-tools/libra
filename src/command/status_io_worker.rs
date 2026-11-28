@@ -396,6 +396,17 @@ pub(crate) fn index_has_text_crlf(oid: Option<git_internal::hash::ObjectHash>) -
 
 /// A scan-local proof key binds the exact loaded index and all possible
 /// attribute sources. Only a complete clean scan can enable future stat hits.
+fn path_has_symlink_component(workdir: &Path, relative: &Path) -> bool {
+    let mut current = workdir.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        if std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) struct ConversionScan {
     root: Vec<u8>,
     directories: Vec<Vec<u8>>,
@@ -417,6 +428,11 @@ impl ConversionScan {
             let Some(name) = path.to_str() else {
                 continue;
             };
+            // A tracked path behind a symlink is reported deleted by status;
+            // probing its (possibly looping) directory would only fail.
+            if path_has_symlink_component(workdir, path.as_path()) {
+                continue;
+            }
             for stage in 0..=3 {
                 if let Some(entry) = index.get(name, stage) {
                     // Include stat, flags and mode, not only the object ID:
@@ -428,6 +444,9 @@ impl ConversionScan {
             }
             let mut parent = path.parent();
             while let Some(directory) = parent {
+                if path_has_symlink_component(workdir, directory) {
+                    break;
+                }
                 directories.insert(directory.to_path_buf());
                 parent = directory.parent();
             }

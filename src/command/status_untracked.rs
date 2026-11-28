@@ -193,6 +193,22 @@ fn captured_stat_times(
     )
 }
 
+/// Whether any parent component of a tracked relative path is a symlink.
+fn tracked_path_has_symlink_leading_component(workdir: &Path, file: &str) -> bool {
+    let relative = Path::new(file);
+    let Some(parent) = relative.parent() else {
+        return false;
+    };
+    let mut current = workdir.to_path_buf();
+    for component in parent.components() {
+        current.push(component);
+        if std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether the index entry's cached stat data disagrees with `metadata`
 /// (the `ctime`/`mtime`/`size` triple `Index::is_modified` compares). A path
 /// missing from the index counts as differing so the caller falls through to
@@ -264,6 +280,13 @@ fn collect_tracked_worktree_changes(
             .get(file_str, 0)
             .is_some_and(|entry| entry.mode == 0o160000)
         {
+            continue;
+        }
+        // Git's `has_symlink_leading_path`: a tracked path with any symlink
+        // among its leading components is treated as deleted in the worktree,
+        // never traversed (which could loop or leave the repository).
+        if tracked_path_has_symlink_leading_component(&workdir, &file.to_string_lossy()) {
+            changes.deleted.push(file.clone());
             continue;
         }
         let file_abs = workdir.join(file);

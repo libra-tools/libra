@@ -520,3 +520,5 @@ Git 的 porcelain v1 不包含 upstream tracking 信息；porcelain v2 会添加
 
 
 > 支持 `--separate-git-dir` 指针布局：当 `<worktree>/.libra` 是指向 `<dir>` 的 `gitdir:` 指针文件（由 `libra clone --separate-git-dir` 创建）时，本命令会解析真实元数据目录并读取 `<dir>/libra.db` 与 `<dir>/objects`，而不是 `<worktree>/.libra`。
+
+已跟踪路径的任一前导分量为符号链接时，该路径按工作区已删除处理，绝不沿链接遍历；因此循环链接或指向仓库外的链接不会令 `status` 失败或被误判为未变更。
