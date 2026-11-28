@@ -25,6 +25,8 @@ Every Libra command accepts the following global flags:
 | `--machine` | | Strict machine mode (implies `--json=ndjson --no-pager --color=never --quiet`) |
 | `-C <path>` | | Change to `<path>` before running the command; only accepted as the first argument. Empty path is a no-op. |
 | `--bare` | | Treat the current directory as a bare repository for this invocation (does not write `core.bare`); with `init`, same as `init --bare`. |
+| `--git-dir=<path>` | | Use `<path>` as the repository storage directory (equals form only in this release). |
+| `--work-tree=<path>` | | Use `<path>` as the work tree (equals form only in this release). |
 | `--no-pager` | | Disable pager (`less`) |
 | `--color` | | When to use colors (`auto`, `never`, `always`) |
 | `--no-color` | | Disable colors; equivalent to `--color=never` |

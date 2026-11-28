@@ -372,7 +372,7 @@
 
 ### Task GII-02: 支持全局 `--git-dir=<path>` 与 `--work-tree=<path>`（等号形式；#801）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：等号形式 `--git-dir=`/`--work-tree=` 在 clap 前消费并覆盖路径发现；空格形式仍 CLI-002；空值 CLI-002、缺失 git-dir REPO-001、缺失 work-tree IO-001；显式 work-tree 在 cwd 外时状态路径相对 work-tree。新增 AC1–AC3/AC4–AC7 用例。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 在全局 CLI 入口支持等号形式 `--git-dir=<path>` 与 `--work-tree=<path>`，覆盖默认 `.libra` 仓库存储目录与工作树根目录的发现，并把已消费的标志从交给 `OutputConfig::resolve_from_argv`（含错误渲染路径 `src/main.rs:699-703` 所用的 argv）与 `clap` 的 argv 中移除；空值按 Libra 的 fail-closed 取值以 `LBR-CLI-002` 拒绝（按 GC-03 写入文档）。本卡发布中只支持等号形式：空格分隔形式 `--git-dir <path>` / `--work-tree <path>` 不被预扫描消费、也不注册进 clap，原样交给 clap 并按当前行为以 `LBR-CLI-002` 拒绝（发布文档写明「本版只支持等号形式」的限制）；空格分隔形式及其末尾缺值由 `GII-24` 解除与定义（2026-11-18 按 G-09 拆出）。
 
@@ -393,7 +393,7 @@
 - [ ] AC5：空值 `--git-dir=` 以 `LBR-CLI-002` 失败。
 - [ ] AC6：空值 `--work-tree=` 以 `LBR-CLI-002` 失败。
 - [ ] AC7：`--work-tree` 的空格分隔形式（本卡发布的已文档化限制，规范场景 `libra --git-dir=<r>/.libra --work-tree <w> status`）以 `LBR-CLI-002` 失败。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/README.md`、`docs/commands/zh-CN/README.md`、`COMPATIBILITY.md` 与 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/index.en.mdx`（`## Global Flags`），按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：全局标志 README 中英与 COMPATIBILITY 已记录 `--git-dir=`/`--work-tree=`；网站首页同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::status_test::global_git_dir_and_work_tree` 承载；子进程 cwd 为无仓库的 `<tmp>/outside`；`<r>` 的唯一提交只含 `a.txt`，`<r>` 另含未跟踪文件 `u.txt`；`<w>` 为独立目录，只含与该提交内容相同的 `a.txt` 和未跟踪文件 `w.txt`；忽略 `--work-tree`、改以 `<r>` 为工作树的错误实现会输出 `?? u.txt`）
 

@@ -68,6 +68,19 @@ pub fn global_bare_context_active() -> bool {
     GLOBAL_BARE_CONTEXT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static GLOBAL_GIT_DIR_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+static GLOBAL_WORK_TREE_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+pub fn set_global_git_dir_override(path: std::path::PathBuf) {
+    let _ = GLOBAL_GIT_DIR_OVERRIDE.set(path);
+}
+
+pub fn set_global_work_tree_override(path: std::path::PathBuf) {
+    let _ = GLOBAL_WORK_TREE_OVERRIDE.set(path);
+}
+
 pub const GIT_DIR: &str = ".git";
 const LIBRAIGNORE_FILE: &str = ".libraignore";
 const GITIGNORE_FILE: &str = ".gitignore";
@@ -741,6 +754,14 @@ fn try_get_paths_full_with_storage_lookup(
     path: Option<PathBuf>,
     explicit_storage_lookup: bool,
 ) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
+    if let Some(git_dir) = GLOBAL_GIT_DIR_OVERRIDE.get() {
+        let work_tree = GLOBAL_WORK_TREE_OVERRIDE
+            .get()
+            .cloned()
+            .or_else(|| git_dir.parent().map(std::path::Path::to_path_buf))
+            .ok_or_else(|| io::Error::other("git-dir has no parent for a work tree"))?;
+        return Ok((git_dir.clone(), work_tree, git_dir.clone()));
+    }
     let mut path = path.unwrap_or_else(cur_dir);
     if !path.is_absolute() {
         path = env::current_dir()?.join(path);
@@ -1838,7 +1859,16 @@ pub fn workdir_to_current<P>(path: P) -> PathBuf
 where
     P: AsRef<Path>,
 {
-    workdir_to_relative(path, cur_dir())
+    let workdir = working_dir();
+    let cwd = cur_dir();
+    let base = if cwd.starts_with(&workdir) {
+        cwd
+    } else {
+        // An explicit `--work-tree` may be outside the process cwd; paths are
+        // then displayed relative to that work tree, not through `../`.
+        workdir
+    };
+    workdir_to_relative(path, base)
 }
 
 /// List all files in the given dir and its sub_dir, except `.libra`

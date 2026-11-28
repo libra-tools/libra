@@ -5082,3 +5082,83 @@ fn verbose_staged_and_unstaged_diff() {
         index.stdout
     );
 }
+
+#[test]
+fn global_git_dir_and_work_tree() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("r");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    configure_identity_via_cli(&repo);
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-gpg-sign"], &repo),
+        "commit",
+    );
+    std::fs::write(repo.join("u.txt"), "u\n").unwrap();
+    let work = root.path().join("w");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::write(work.join("a.txt"), "a\n").unwrap();
+    std::fs::write(work.join("w.txt"), "w\n").unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let git_dir = repo.join(".libra");
+    let out = run_libra_command(
+        &[
+            &format!("--git-dir={}", git_dir.display()),
+            &format!("--work-tree={}", work.display()),
+            "status",
+            "--short",
+            "--no-branch",
+        ],
+        &outside,
+    );
+    assert_cli_success(&out, "git-dir/work-tree");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "?? w.txt\n");
+
+    let spaced = run_libra_command(
+        &["--git-dir", git_dir.to_str().unwrap(), "status"],
+        &outside,
+    );
+    assert_ne!(spaced.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&spaced.stderr).contains("LBR-CLI-002"));
+
+    let missing_git = run_libra_command(
+        &[
+            &format!("--git-dir={}/none", root.path().display()),
+            "status",
+        ],
+        &outside,
+    );
+    assert_ne!(missing_git.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&missing_git.stderr).contains("LBR-REPO-001"));
+
+    let missing_work = run_libra_command(
+        &[
+            &format!("--git-dir={}", git_dir.display()),
+            &format!("--work-tree={}/none", root.path().display()),
+            "status",
+        ],
+        &outside,
+    );
+    assert_ne!(missing_work.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&missing_work.stderr).contains("LBR-IO-001"));
+
+    for flag in ["--git-dir=", "--work-tree="] {
+        let empty = run_libra_command(&[flag, "status"], &outside);
+        assert_ne!(empty.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&empty.stderr).contains("LBR-CLI-002"));
+    }
+
+    let spaced_work = run_libra_command(
+        &[
+            &format!("--git-dir={}", git_dir.display()),
+            "--work-tree",
+            work.to_str().unwrap(),
+            "status",
+        ],
+        &outside,
+    );
+    assert_ne!(spaced_work.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&spaced_work.stderr).contains("LBR-CLI-002"));
+}

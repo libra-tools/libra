@@ -282,6 +282,64 @@ fn set_hash_kind_from_object_format(object_format: String) -> CliResult<()> {
     Ok(())
 }
 
+fn extract_git_dir_and_work_tree_overrides(
+    mut argv: Vec<std::ffi::OsString>,
+) -> CliResult<Vec<std::ffi::OsString>> {
+    let mut git_dir = None;
+    let mut work_tree = None;
+    let mut index = 1;
+    while index < argv.len() {
+        let text = argv[index].to_string_lossy().into_owned();
+        if text == "--" {
+            break;
+        }
+        if let Some(value) = text.strip_prefix("--git-dir=") {
+            if value.is_empty() {
+                return Err(
+                    CliError::command_usage("--git-dir= requires a path".to_string())
+                        .with_stable_code(
+                            crate::utils::error::StableErrorCode::CliInvalidArguments,
+                        ),
+                );
+            }
+            git_dir = Some(std::path::PathBuf::from(value));
+            argv.remove(index);
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--work-tree=") {
+            if value.is_empty() {
+                return Err(
+                    CliError::command_usage("--work-tree= requires a path".to_string())
+                        .with_stable_code(
+                            crate::utils::error::StableErrorCode::CliInvalidArguments,
+                        ),
+                );
+            }
+            work_tree = Some(std::path::PathBuf::from(value));
+            argv.remove(index);
+            continue;
+        }
+        index += 1;
+    }
+    if let Some(git_dir) = git_dir {
+        if !git_dir.is_dir() {
+            return Err(CliError::repo_not_found());
+        }
+        crate::utils::util::set_global_git_dir_override(git_dir);
+    }
+    if let Some(work_tree) = work_tree {
+        if !work_tree.is_dir() {
+            return Err(CliError::fatal(format!(
+                "cannot use '{}' as a work tree: not a directory",
+                work_tree.display()
+            ))
+            .with_stable_code(crate::utils::error::StableErrorCode::IoReadFailed));
+        }
+        crate::utils::util::set_global_work_tree_override(work_tree);
+    }
+    Ok(argv)
+}
+
 fn strip_empty_leading_dash_c(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     if argv.len() >= 3
         && argv.get(1).is_some_and(|arg| arg == "-C")
@@ -3927,6 +3985,7 @@ fn reject_unsupported_single_dash_control(utf8_argv: &[String]) -> CliResult<()>
 }
 
 async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
+    let argv = extract_git_dir_and_work_tree_overrides(argv)?;
     let argv = rewrite_short_number_args(argv, "log");
     let argv = rewrite_short_number_args(argv, "reflog");
     // `format-patch -<n>` is Git's "last n commits" shorthand (the same numeric
