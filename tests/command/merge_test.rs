@@ -2120,7 +2120,7 @@ async fn test_merge_continue_after_resolving_conflict_creates_two_parent_commit(
     assert_eq!(commit.parent_commit_ids.len(), 2);
     let (message, _) = parse_commit_msg(&commit.message);
     assert!(
-        message.starts_with("Merge feature into main"),
+        message.starts_with("Merge feature"),
         "merge --continue must retain its generated message, got: {}",
         commit.message
     );
@@ -2314,7 +2314,7 @@ fn test_merge_no_edit_accepts_default_message() {
     assert_cli_success(&output, "merge feature --no-edit");
     let log = run_libra_command(&["log", "--oneline", "-n", "1"], temp_path);
     assert!(
-        String::from_utf8_lossy(&log.stdout).contains("Merge feature into main"),
+        String::from_utf8_lossy(&log.stdout).contains("Merge feature"),
         "merge commit landed with the default message: {:?}",
         String::from_utf8_lossy(&log.stdout)
     );
@@ -15855,4 +15855,108 @@ fn commit_flag_and_merge_options_commit() {
         String::from_utf8_lossy(&out.stderr)
             .contains("options '--squash' and '--commit.' cannot be used together")
     );
+}
+
+#[test]
+fn into_name_and_suppress_dest() {
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "--into-name=other", "feature"], p),
+        "into-name",
+    );
+    let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert!(String::from_utf8_lossy(&subject.stdout).contains("into other"));
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "merge.suppressDest", "other"], p),
+        "suppress other",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "--into-name=other", "feature"], p),
+        "suppressed",
+    );
+    let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert!(!String::from_utf8_lossy(&subject.stdout).contains("into other"));
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "merge.suppressDest", "oth*"], p),
+        "glob",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "--into-name=other", "feature"], p),
+        "glob suppressed",
+    );
+    let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert!(!String::from_utf8_lossy(&subject.stdout).contains("into other"));
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "merge.suppressDest", "first"], p),
+        "first",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "--add", "merge.suppressDest", "other"],
+            p,
+        ),
+        "add other",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "--into-name=other", "feature"], p),
+        "multi suppressed",
+    );
+    let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert!(!String::from_utf8_lossy(&subject.stdout).contains("into other"));
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "merge.suppressDest", "other"], p),
+        "set then clear",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "--add", "merge.suppressDest", ""], p),
+        "clear",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "--into-name=other", "feature"], p),
+        "cleared",
+    );
+    let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert!(String::from_utf8_lossy(&subject.stdout).contains("into other"));
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "merge",
+                "--no-ff",
+                "--into-name=other",
+                "-m",
+                "explicit",
+                "feature",
+            ],
+            p,
+        ),
+        "explicit message",
+    );
+    let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert_eq!(String::from_utf8_lossy(&subject.stdout).trim(), "explicit");
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["checkout", "--detach"], p), "detach");
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "--into-name=main", "feature"], p),
+        "detached main suppressed",
+    );
+    let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert!(!String::from_utf8_lossy(&subject.stdout).contains("into main"));
 }

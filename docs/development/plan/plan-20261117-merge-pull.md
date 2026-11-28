@@ -1107,7 +1107,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-04: 实现 `merge --into-name` 与 `merge.suppressDest`（#999）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--into-name` 替换单目标默认消息目标；`merge.suppressDest` 多值 glob、空值清空、未配置默认 main/master，匹配时省略 ` into`；显式消息不变。merge 模块 336/337，唯一失败为既有 GC/restart。D 组 patch +1。偏差：AC6 空值后追加专项未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 使 `--into-name <name>` 在双头（单目标）合并的全部消息生成路径替换目标分支名，并实现 `merge.suppressDest`（多值 glob；空值清空先前列表；未配置时默认 `main`、`master`）：目标名匹配任一模式时省略 ` into <name>`。显式 `-m`/`-F` 不受影响。（按 G-09 自本卡拆出 `MP-49` 承接 octopus 合并消息。）
 
@@ -1130,7 +1130,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC6：空值之后追加的值仍生效。
 - [ ] AC7：显式 `-m` 不受 `--into-name` 影响。
 - [ ] AC8：分离 HEAD 上未配置 `merge.suppressDest` 时，`--into-name` 为默认列表中的 `main` 或 `master` 都省略目标名。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录 into-name/suppressDest。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::into_name_and_suppress_dest` 承载 AC1–AC8；夹具 F-DIV（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 上提交 `B`（`f`=`base\n`）；自 `B` 建分支 `topic` 并提交 `T`（新增 `g`=`t1\n`）；`main` 自 `B` 再提交 `M`（新增 `h`=`m1\n`），与 `topic` 分叉且无冲突；每个 AC 使用一份重建的 F-DIV（配置互不累积）；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 

@@ -3357,14 +3357,18 @@ async fn resolve_merge_message(
             settings.merge_log,
         )
         .map_err(PullMergeError::History),
-        None => crate::command::merge_message::default_message(
-            current,
-            target,
-            upstream,
-            settings.into_name.unwrap_or(head_name),
-            settings.merge_log,
-        )
-        .map_err(PullMergeError::History),
+        None => {
+            let destination = settings.into_name.unwrap_or(head_name);
+            let suppress = merge_suppress_destination(destination).await?;
+            crate::command::merge_message::default_message(
+                current,
+                target,
+                upstream,
+                (!suppress).then_some(destination),
+                settings.merge_log,
+            )
+            .map_err(PullMergeError::History)
+        }
     }?;
     let message = if settings.edit {
         edit_merge_message(&message).await?
@@ -3372,6 +3376,47 @@ async fn resolve_merge_message(
         message
     };
     finalize_merge_message(&message, settings.cleanup, settings.edit)
+}
+
+async fn merge_suppress_destination(destination: &str) -> Result<bool, PullMergeError> {
+    let entries = crate::internal::config::ConfigKv::get_all("merge.suppressDest")
+        .await
+        .map_err(|error| {
+            PullMergeError::HistoryConfig(
+                crate::command::history_config::HistoryConfigError::Read {
+                    key: "merge.suppressDest".to_string(),
+                    detail: format!("{error:#}"),
+                },
+            )
+        })?;
+    if entries.is_empty() {
+        return Ok(matches!(destination, "main" | "master"));
+    }
+    let mut patterns: Vec<String> = Vec::new();
+    for entry in entries {
+        if entry.value.is_empty() {
+            patterns.clear();
+        } else {
+            patterns.push(entry.value);
+        }
+    }
+    Ok(patterns
+        .iter()
+        .any(|pattern| glob_matches(pattern, destination)))
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    fn matches(pattern: &[u8], value: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => value.is_empty(),
+            Some((b'*', rest)) => {
+                matches(rest, value) || (!value.is_empty() && matches(pattern, &value[1..]))
+            }
+            Some((b'?', rest)) => !value.is_empty() && matches(rest, &value[1..]),
+            Some((byte, rest)) => value.first() == Some(byte) && matches(rest, &value[1..]),
+        }
+    }
+    matches(pattern.as_bytes(), value.as_bytes())
 }
 
 /// Git's `ours` merge strategy records the target as a second parent while

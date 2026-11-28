@@ -10,16 +10,14 @@ pub(crate) fn default_message(
     current: ObjectHash,
     target: ObjectHash,
     upstream: &str,
-    head_name: &str,
+    head_name: Option<&str>,
     log_limit: usize,
 ) -> Result<String, String> {
-    append_shortlog(
-        format!("Merge {upstream} into {head_name}"),
-        current,
-        target,
-        upstream,
-        log_limit,
-    )
+    let message = match head_name {
+        Some(head_name) => format!("Merge {upstream} into {head_name}"),
+        None => format!("Merge {upstream}"),
+    };
+    append_shortlog(message, current, target, upstream, log_limit)
 }
 
 /// Append the Git-style target-side shortlog to an already-resolved message.

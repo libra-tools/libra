@@ -632,3 +632,5 @@ Staged changes are still refused even with `--no-commit`, naming the affected pa
 A binary rename/rename(1to2) whose content cannot be merged warns `Cannot merge binary files: <old> (<ours-label> vs. <theirs-label>)` and records each destination with its own side blob and worktree content.
 
 `--commit` forces the merge commit and overrides `branch.<name>.mergeOptions=--no-commit`; `--no-commit` and `--commit` are last-one-wins. `branch.<name>.mergeOptions` tokens `--commit`, `--no-commit`, and `--squash` are read for the current branch, with explicit CLI flags winning. `--squash` combined with an effective `--commit` fails with `options '--squash' and '--commit.' cannot be used together`.
+
+`--into-name <name>` replaces the destination branch in generated messages, and `merge.suppressDest` (repeatable glob; an empty value clears earlier values; unset defaults to `main`/`master`) omits the ` into <name>` suffix when the destination matches. Explicit `-m`/`-F` are unaffected.

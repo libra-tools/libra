@@ -490,3 +490,5 @@ operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺�
 二进制 rename/rename(1to2) 无法合并内容时输出 `Cannot merge binary files: <old> (<ours-label> vs. <theirs-label>)`，两个目标各记录己侧 blob 与工作树内容。
 
 `--commit` 强制创建合并提交并覆盖 `branch.<name>.mergeOptions=--no-commit`；`--no-commit`/`--commit` last-one-wins。读取当前分支的 `branch.<name>.mergeOptions` 中 `--commit`/`--no-commit`/`--squash`，显式 CLI 优先；`--squash` 与最终生效的 `--commit` 组合以 `options '--squash' and '--commit.' cannot be used together` 拒绝。
+
+`--into-name <name>` 替换自动消息中的目标分支；`merge.suppressDest`（可重复 glob，空值清空先前值，未配置时默认 `main`/`master`）在目标匹配时省略 ` into <name>`；显式 `-m`/`-F` 不受影响。
