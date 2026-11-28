@@ -1477,11 +1477,12 @@ async fn apply_branch_merge_options(args: &mut MergeArgs, branch: &str) -> Resul
             }
         }
     }
-    if !args.commit && !args.no_commit {
-        if let Some(no_commit) = configured_commit {
-            args.no_commit = no_commit;
-            args.commit = !no_commit;
-        }
+    if !args.commit
+        && !args.no_commit
+        && let Some(no_commit) = configured_commit
+    {
+        args.no_commit = no_commit;
+        args.commit = !no_commit;
     }
     if configured_squash {
         args.squash = true;
