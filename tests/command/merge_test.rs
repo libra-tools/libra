@@ -15960,3 +15960,71 @@ fn into_name_and_suppress_dest() {
     let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
     assert!(!String::from_utf8_lossy(&subject.stdout).contains("into main"));
 }
+
+#[test]
+fn octopus_message_matches_fmt_merge_msg() {
+    for (branches, expected) in [
+        (vec!["b1", "b2"], "Merge branches 'b1' and 'b2'"),
+        (vec!["b1", "b2", "b3"], "Merge branches 'b1', 'b2' and 'b3'"),
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        commit_file(p, "a", "a0\n", "base");
+        for branch in ["b1", "b2", "b3"] {
+            assert_cli_success(&run_libra_command(&["branch", branch], p), "branch");
+        }
+        for branch in ["b1", "b2", "b3"] {
+            assert_cli_success(&run_libra_command(&["checkout", branch], p), "co");
+            commit_file(p, &format!("{branch}.txt"), &format!("{branch}\n"), branch);
+        }
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        commit_file(p, "m", "m\n", "M");
+        let mut args = vec!["merge"];
+        args.extend(branches.iter().copied());
+        assert_cli_success(&run_libra_command(&args, p), "octopus");
+        let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+        assert_eq!(String::from_utf8_lossy(&subject.stdout).trim(), expected);
+    }
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "a", "a0\n", "base");
+    for branch in ["b1", "b2"] {
+        assert_cli_success(&run_libra_command(&["branch", branch], p), "branch");
+    }
+    for branch in ["b1", "b2"] {
+        assert_cli_success(&run_libra_command(&["checkout", branch], p), "co");
+        commit_file(p, &format!("{branch}.txt"), &format!("{branch}\n"), branch);
+    }
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    commit_file(p, "m", "m\n", "M");
+    assert_cli_success(
+        &run_libra_command(&["merge", "--into-name=other", "b1", "b2"], p),
+        "into-name octopus",
+    );
+    let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert_eq!(
+        String::from_utf8_lossy(&subject.stdout).trim(),
+        "Merge branches 'b1' and 'b2' into other"
+    );
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "a", "a0\n", "base");
+    for branch in ["b1", "b2"] {
+        assert_cli_success(&run_libra_command(&["branch", branch], p), "branch");
+    }
+    for branch in ["b1", "b2"] {
+        assert_cli_success(&run_libra_command(&["checkout", branch], p), "co");
+        commit_file(p, &format!("{branch}.txt"), &format!("{branch}\n"), branch);
+    }
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main for dev");
+    assert_cli_success(&run_libra_command(&["checkout", "-b", "dev"], p), "dev");
+    commit_file(p, "m", "m\n", "M");
+    assert_cli_success(&run_libra_command(&["merge", "b1", "b2"], p), "dev octopus");
+    let subject = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert_eq!(
+        String::from_utf8_lossy(&subject.stdout).trim(),
+        "Merge branches 'b1' and 'b2' into dev"
+    );
+}

@@ -313,3 +313,5 @@ modify/delete / rename/delete 冲突工作树保留存活一侧内容（无冲�
 `--commit` 与 `branch.<name>.mergeOptions` 的 commit/no-commit/squash 已接入；squash+commit 在配置合并后按 Git 文案拒绝。
 
 `--into-name` 与 `merge.suppressDest`（多值 glob、空值清空、默认 main/master）已接入默认消息。
+
+octopus 默认消息使用 Git 列举格式，并接入 `--into-name`/`merge.suppressDest`。

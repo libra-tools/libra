@@ -2183,17 +2183,30 @@ async fn resolve_octopus_message(
     head_name: &str,
     settings: MergeMessageSettings<'_>,
 ) -> Result<String, PullMergeError> {
-    let names = targets
+    let quoted: Vec<String> = targets
         .iter()
         .map(|(name, _)| format!("'{name}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut message = settings.message_override.cloned().unwrap_or_else(|| {
-        format!(
-            "Merge branches {names} into {}",
-            settings.into_name.unwrap_or(head_name)
-        )
-    });
+        .collect();
+    let names = match quoted.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [one, two] => format!("{one} and {two}"),
+        many => {
+            let (last, rest) = many.split_last().expect("non-empty");
+            format!("{} and {last}", rest.join(", "))
+        }
+    };
+    let destination = settings.into_name.unwrap_or(head_name);
+    let suppress = merge_suppress_destination(destination).await?;
+    let default_message = if suppress {
+        format!("Merge branches {names}")
+    } else {
+        format!("Merge branches {names} into {destination}")
+    };
+    let mut message = settings
+        .message_override
+        .cloned()
+        .unwrap_or(default_message);
     for (name, target) in targets {
         message = crate::command::merge_message::append_shortlog(
             message,

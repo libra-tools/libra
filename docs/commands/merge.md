@@ -634,3 +634,5 @@ A binary rename/rename(1to2) whose content cannot be merged warns `Cannot merge 
 `--commit` forces the merge commit and overrides `branch.<name>.mergeOptions=--no-commit`; `--no-commit` and `--commit` are last-one-wins. `branch.<name>.mergeOptions` tokens `--commit`, `--no-commit`, and `--squash` are read for the current branch, with explicit CLI flags winning. `--squash` combined with an effective `--commit` fails with `options '--squash' and '--commit.' cannot be used together`.
 
 `--into-name <name>` replaces the destination branch in generated messages, and `merge.suppressDest` (repeatable glob; an empty value clears earlier values; unset defaults to `main`/`master`) omits the ` into <name>` suffix when the destination matches. Explicit `-m`/`-F` are unaffected.
+
+Automatic octopus messages list targets as Git does (`Merge branches 'a' and 'b'`, or `'a', 'b' and 'c'`), honor `--into-name`, and apply `merge.suppressDest` to omit the destination suffix.

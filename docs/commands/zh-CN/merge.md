@@ -492,3 +492,5 @@ operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺�
 `--commit` 强制创建合并提交并覆盖 `branch.<name>.mergeOptions=--no-commit`；`--no-commit`/`--commit` last-one-wins。读取当前分支的 `branch.<name>.mergeOptions` 中 `--commit`/`--no-commit`/`--squash`，显式 CLI 优先；`--squash` 与最终生效的 `--commit` 组合以 `options '--squash' and '--commit.' cannot be used together` 拒绝。
 
 `--into-name <name>` 替换自动消息中的目标分支；`merge.suppressDest`（可重复 glob，空值清空先前值，未配置时默认 `main`/`master`）在目标匹配时省略 ` into <name>`；显式 `-m`/`-F` 不受影响。
+
+八爪鱼自动消息按 Git 列举目标（`Merge branches 'a' and 'b'` 或 `'a', 'b' and 'c'`），支持 `--into-name`，并由 `merge.suppressDest` 决定是否省略目标后缀。

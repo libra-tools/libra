@@ -1166,7 +1166,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-49: octopus 合并默认消息对齐 Git（列举格式、`--into-name` 与 `merge.suppressDest`）（#999）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：octopus 默认消息按 Git 的 `and`/逗号列举，接入 `--into-name` 与 `merge.suppressDest`；显式消息不变。新增 AC1–AC5 用例。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-04` 拆出：octopus 合并的默认消息按 Git `fmt-merge-msg` 生成：两个目标为 `Merge branches '<b1>' and '<b2>'`，三个及以上为 `Merge branches '<b1>', '<b2>' and '<b3>'` 形式；目标名（`--into-name` 或当前分支）匹配 `MP-04` 实现的 `merge.suppressDest` 列表（未配置时默认 `main`、`master`）时省略 ` into <name>`，否则追加。显式 `-m`/`-F` 不受影响。
 
@@ -1186,7 +1186,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC3：`--into-name` 替换 octopus 消息的目标名。
 - [ ] AC4：`merge.suppressDest` 匹配时 octopus 消息省略目标名。
 - [ ] AC5：目标名不匹配时追加 ` into <当前分支>`。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录 octopus 消息格式。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::octopus_message_matches_fmt_merge_msg` 承载 AC1–AC5；夹具 F-OCTM（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 提交 `B`（`a`=`a0\n`）；`b1`、`b2`、`b3` 各自 `B` 新增 `b1.txt`=`b1\n`、`b2.txt`=`b2\n`、`b3.txt`=`b3\n` 并提交；`main` 自 `B` 再提交 `M`（新增 `m`=`m\n`，与三者无冲突）；每个 AC 使用一份重建的夹具并在 `main` 上执行（AC5 先 `libra switch -c dev`）；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
