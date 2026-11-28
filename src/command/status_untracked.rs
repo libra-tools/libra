@@ -285,7 +285,7 @@ fn collect_tracked_worktree_changes(
         // Git's `has_symlink_leading_path`: a tracked path with any symlink
         // among its leading components is treated as deleted in the worktree,
         // never traversed (which could loop or leave the repository).
-        if tracked_path_has_symlink_leading_component(&workdir, &file.to_string_lossy()) {
+        if tracked_path_has_symlink_leading_component(workdir, &file.to_string_lossy()) {
             changes.deleted.push(file.clone());
             continue;
         }
