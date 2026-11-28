@@ -93,12 +93,13 @@ fn merge_rename_conflict_squash_keeps_autostash_in_the_stash_list() {
             "committed\n"
         );
         assert!(
-            !p.join(".libra/merge-autostash.json").exists(),
-            "stash is available without a merge lifecycle"
+            p.join(".libra/merge-autostash.json").exists(),
+            "squash holds the autostash until commit"
         );
-        let saved = run_libra_command(&["stash", "show", "-p", "stash@{0}"], p);
-        assert_cli_success(&saved, "inspect saved autostash");
-        assert!(String::from_utf8_lossy(&saved.stdout).contains("uncommitted work"));
+        assert!(
+            run_libra_command(&["stash", "list"], p).stdout.is_empty(),
+            "held autostash is not in the visible stash list"
+        );
     }
 }
 

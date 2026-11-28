@@ -315,3 +315,5 @@ modify/delete / rename/delete 冲突工作树保留存活一侧内容（无冲�
 `--into-name` 与 `merge.suppressDest`（多值 glob、空值清空、默认 main/master）已接入默认消息。
 
 octopus 默认消息使用 Git 列举格式，并接入 `--into-name`/`merge.suppressDest`。
+
+clean/conflict squash 保留 held autostash sidecar，由后续 commit 应用；FF squash 立即应用。

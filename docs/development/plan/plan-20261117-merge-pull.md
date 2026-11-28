@@ -1814,7 +1814,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-41: 干净三方 `--squash --autostash` 保留 autostash 并由 `commit` 应用（#991）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：干净三方与冲突 squash 均保留 held autostash sidecar，由后续 commit 应用；FF squash 立即应用。由 `merge_autostash_clean_three_way_squash` 覆盖。D 组 patch +1。偏差：冲突 squash 的解决后 commit 应用未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-39` 拆出：干净的三方 `--squash --autostash` 停在提交前时，autostash 只记录在 `merge-autostash.json`、不在合并结束时应用、不进入 `stash list`；随后的 `libra commit` 应用并删除 sidecar（Git 保留 `MERGE_AUTOSTASH` 由 `commit` 应用）。（按 G-09 自本卡拆出 `MP-45` 承接冲突的三方 squash。）
 
@@ -1836,7 +1836,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC5：AC1 之后 `libra commit` 应用 autostash。
 - [ ] AC6：AC5 的提交为不含本地修改的 squash 结果。
 - [ ] AC7：AC5 之后 sidecar 被删除。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录 squash autostash 保持语义。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::merge_autostash_clean_three_way_squash` 承载 AC1–AC7；夹具 F-991（`#991` 形态）（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 提交 `B`（`file`=`1\n2\n3\n4\n5\n6\n7\n8\n9\n`）；`topic` 自 `B` 把第 5 行改为 `five` 提交 `T`；`main` 自 `B` 提交 `M`（新增 `h`=`m1\n`），二者无冲突；调用前把工作树 `file` 第 9 行改为 `nine`（与合并改动不重叠的同文件修改），记合并前 `libra diff` 的 stdout 为 `D0`；`R15` = 第 5 行为 `five` 的内容，`R159` = 第 5 行为 `five` 且第 9 行为 `nine` 的内容；应用冲突变体 F-991X：`topic` 另把第 9 行改为 `NINE`；快进变体 F-991F：`main` 停在 `B`（`topic` 可快进）；冲突变体 F-991C：`main` 自 `B` 提交的 `M` 改为只把第 5 行改为 `FIVE`（不新增 `h`，与 `topic` 冲突）；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -1871,7 +1871,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-45: 冲突三方 `--squash --autostash` 保留 autostash 并由 `commit` 应用（#981, #991）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：干净三方与冲突 squash 均保留 held autostash sidecar，由后续 commit 应用；FF squash 立即应用。由 `merge_rename_conflict_squash_keeps_autostash_in_the_stash_list` 覆盖。D 组 patch +1。偏差：冲突 squash 的解决后 commit 应用未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-41` 拆出：冲突的三方 `--squash --autostash` 停止时，autostash 只记录在 `merge-autostash.json`、不进入 `stash list`（取代 Libra 现把它放进 `stash list` 的行为）；用户解决冲突后的 `libra commit` 应用并删除 sidecar。
 
@@ -1892,7 +1892,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC3：AC1 之后 autostash 不在 `stash list`。
 - [ ] AC4：解决冲突后 `libra commit` 应用 autostash。
 - [ ] AC5：AC4 之后 sidecar 被删除。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录 squash autostash 保持语义。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::merge_autostash_conflicted_three_way_squash` 承载 AC1–AC5；夹具 F-991（`#991` 形态）（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 提交 `B`（`file`=`1\n2\n3\n4\n5\n6\n7\n8\n9\n`）；`topic` 自 `B` 把第 5 行改为 `five` 提交 `T`；`main` 自 `B` 提交 `M`（新增 `h`=`m1\n`），二者无冲突；调用前把工作树 `file` 第 9 行改为 `nine`（与合并改动不重叠的同文件修改），记合并前 `libra diff` 的 stdout 为 `D0`；`R15` = 第 5 行为 `five` 的内容，`R159` = 第 5 行为 `five` 且第 9 行为 `nine` 的内容；应用冲突变体 F-991X：`topic` 另把第 9 行改为 `NINE`；快进变体 F-991F：`main` 停在 `B`（`topic` 可快进）；冲突变体 F-991C：`main` 自 `B` 提交的 `M` 改为只把第 5 行改为 `FIVE`（不新增 `h`，与 `topic` 冲突）；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 

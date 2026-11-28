@@ -2547,6 +2547,17 @@ pub(crate) async fn run_merge_for_pull_with_options(
     prepare_merge_autostash(&options, output).await?;
 
     let dry_run = options.dry_run;
+    let squash_requested = options.squash;
+    let squash_is_fast_forward = if squash_requested {
+        match (Head::current_commit().await, target_commit.id) {
+            (Some(current), target) => crate::internal::merge_base::merge_bases(&current, &target)
+                .map(|bases| bases.len() == 1 && bases[0] == current)
+                .unwrap_or(false),
+            _ => false,
+        }
+    } else {
+        false
+    };
     let result = run_merge_for_pull_inner(
         target_commit,
         upstream,
@@ -2560,7 +2571,12 @@ pub(crate) async fn run_merge_for_pull_with_options(
     // (conflict / --no-commit). The merge outcome itself is never changed.
     // Skipped for `--dry-run`, which took no autostash and must not apply or
     // promote a held one either.
-    let autostash_outcome = if dry_run {
+    let keep_for_squash_commit = squash_requested
+        && !dry_run
+        && !squash_is_fast_forward
+        && (matches!(&result, Err(PullMergeError::Conflicts { squash: true, .. }))
+            || matches!(&result, Ok(summary) if summary.strategy == "squash"));
+    let autostash_outcome = if dry_run || keep_for_squash_commit {
         None
     } else {
         resolve_pending_autostash(

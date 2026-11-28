@@ -444,7 +444,9 @@ pub(super) async fn resolve_pending_autostash_with(
     // A conflicted squash has no merge sidecar, but its unmerged stages must
     // survive. Git leaves its autostash for a later stash pop in this case.
     if preserve_conflicts {
-        return store_pending_autostash(output, &snapshot, &oid).await;
+        // A conflicted squash has no merge state; keep the sidecar so the
+        // ordinary `commit` that finishes the squash applies it.
+        return Some("kept".to_string());
     }
     match crate::command::stash::apply_held_stash_commit(&oid).await {
         Ok(()) => {

@@ -16028,3 +16028,27 @@ fn octopus_message_matches_fmt_merge_msg() {
         "Merge branches 'b1' and 'b2' into dev"
     );
 }
+
+#[test]
+fn merge_autostash_clean_three_way_squash() {
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    std::fs::write(p.join("base.txt"), "local dirty\n").unwrap();
+    let out = run_libra_command(&["merge", "--squash", "--autostash", "feature"], p);
+    assert_cli_success(&out, "clean squash");
+    assert!(p.join(".libra/merge-autostash.json").exists());
+    assert!(run_libra_command(&["stash", "list"], p).stdout.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(p.join("base.txt")).unwrap(),
+        "base\n"
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "--no-edit", "--cleanup=whitespace"], p),
+        "commit squash",
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("base.txt")).unwrap(),
+        "local dirty\n"
+    );
+    assert!(!p.join(".libra/merge-autostash.json").exists());
+}
