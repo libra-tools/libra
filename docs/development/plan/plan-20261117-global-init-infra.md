@@ -960,7 +960,7 @@
 
 ### Task GII-20: `extensions.refstorage` 校验（#948，自 GII-09 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`extensions.objectformat` 校验取值与 `core.objectformat` 一致；`extensions.refstorage` 接受 `files`、拒绝 `reftable` 与非法值；`config` 修复通道保留。由 `refstorage_extension_validation` 覆盖。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 在 `GII-09` 建立的仓库格式校验中加入 `extensions.refstorage` 的专门规则：它是 v1-only 扩展（版本 0 出现即拒绝）；版本 1 下接受 `files`（Libra 引用存于 SQLite，`files` 作为 Git 兼容声明接受），`reftable` 以不支持拒绝，其它取值按非法值拒绝；`GII-09` 的修复通道（`libra config` 跳过格式校验）对本卡新增的被拒状态同样适用。拆分原因（G-09）：原 `GII-09` 按独立谓词计数超过 G-03 上限，`extensions.refstorage` 是可独立恢复的规则集，本卡追加于 Phase 1 末尾。
 
@@ -983,7 +983,7 @@
 - [ ] AC6：AC3 的状态经 `libra config unset extensions.refstorage` 修复后，`libra status` 退出 0。
 - [ ] AC7：AC4 的状态经 `libra config set extensions.refstorage files` 修复后，`libra status` 退出 0。
 - [ ] AC8：版本 1 且 `extensions.refstorage=reftable` 时，经无 schema 守卫预检的 `libra count-objects` 同样以 `LBR-REPO-002` 失败。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/init.md`、`docs/commands/zh-CN/init.md`、`docs/development/commands/init.md`、`COMPATIBILITY.md` 与网站 `init.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：init 中英/开发文档与 COMPATIBILITY 已记录扩展规则。
 
 **AC → 断言映射:**（均由 `(new)` `command::init_test::refstorage_extension_validation` 承载；每个场景使用新建的独立仓库，用 `libra config set` 写入对应键后运行 `libra status`；修复 AC 中的修复命令须退出 0，否则该 AC 失败）
 
@@ -1018,7 +1018,7 @@
 
 ### Task GII-22: `extensions.objectformat` 取值与一致性校验（#948，自 GII-09 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`extensions.objectformat` 校验取值与 `core.objectformat` 一致；`extensions.refstorage` 接受 `files`、拒绝 `reftable` 与非法值；`config` 修复通道保留。由 `objectformat_extension_value_validation` 覆盖。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 在 `GII-09` 建立的仓库格式校验中加入 `extensions.objectformat` 的取值规则：版本 1 下其取值须为对象格式名的单一事实源 `parse_config_value`（`src/internal/object_format.rs:20-27`，接受 `sha1` / `sha256` / `blake3`，与 `core.objectformat` 的取值集合一致；`blake3` 为 Libra 扩展取值）所接受的值，否则以 `invalid value for 'extensions.objectformat'` 拒绝；取值合法但与 `core.objectformat` 不一致时拒绝。`GII-09` 的修复通道（`libra config` 跳过格式校验）对本卡新增的被拒状态同样适用。拆分原因（G-09）：原 `GII-09` 的修复通道按每个非法状态各计一条 AC 后超过 G-03 上限，`extensions.objectformat` 的取值规则是可独立恢复的规则集，本卡追加于 Phase 1 末尾，在串行链中位于 `GII-09` 与 `GII-20` 之间。
 
@@ -1040,7 +1040,7 @@
 - [ ] AC4：AC2 的状态经 `libra config set extensions.objectformat sha256` 修复后，`libra status` 退出 0。
 - [ ] AC5：版本 1 且合法的 `extensions.objectformat` 与 `core.objectformat` 不一致时，经无 schema 守卫预检的 `libra count-objects` 同样以 `LBR-REPO-002` 失败。
 - [ ] AC6：版本 1 且 `extensions.objectformat=blake3` 与 `core.objectformat=blake3` 一致时仓库命令正常（退出 0）。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/init.md`、`docs/commands/zh-CN/init.md`、`docs/development/commands/init.md`、`COMPATIBILITY.md` 与网站 `init.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：init 中英/开发文档与 COMPATIBILITY 已记录扩展规则。
 
 **AC → 断言映射:**（均由 `(new)` `command::init_test::objectformat_extension_value_validation` 承载；每个场景使用新建的独立仓库，用 `libra config set` 写入对应键后运行 `libra status`；修复 AC 中的修复命令须退出 0，否则该 AC 失败）
 

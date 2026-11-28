@@ -2664,3 +2664,157 @@ fn repositoryformatversion_and_extensions_validation() {
     );
     assert_cli_success(&run_libra_command(&["status"], p), "status after ext unset");
 }
+
+#[test]
+fn refstorage_extension_validation() {
+    let repo = super::create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "extensions.refstorage", "files"], p),
+        "v0 refstorage",
+    );
+    let out = run_libra_command(&["status"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("repo version is 0, but v1-only extension found")
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "unset", "extensions.refstorage"], p),
+        "unset v0",
+    );
+    assert_cli_success(&run_libra_command(&["status"], p), "after unset");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.repositoryformatversion", "1"], p),
+        "v1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "extensions.refstorage", "files"], p),
+        "files",
+    );
+    assert_cli_success(&run_libra_command(&["status"], p), "v1 files");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "extensions.refstorage", "reftable"], p),
+        "reftable",
+    );
+    let out = run_libra_command(&["status"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-002"));
+    let count = run_libra_command(&["count-objects"], p);
+    assert_ne!(count.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&count.stderr).contains("LBR-REPO-002"));
+    assert_cli_success(
+        &run_libra_command(&["config", "unset", "extensions.refstorage"], p),
+        "unset reftable",
+    );
+    assert_cli_success(&run_libra_command(&["status"], p), "after reftable unset");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "extensions.refstorage", "bogus"], p),
+        "bogus",
+    );
+    let out = run_libra_command(&["status"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid value for 'extensions.refstorage'")
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "extensions.refstorage", "files"], p),
+        "repair files",
+    );
+    assert_cli_success(&run_libra_command(&["status"], p), "after repair");
+}
+
+#[test]
+fn objectformat_extension_value_validation() {
+    let repo = super::create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.repositoryformatversion", "1"], p),
+        "v1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "extensions.objectformat", "garbage"], p),
+        "garbage",
+    );
+    let out = run_libra_command(&["status"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("invalid value for 'extensions.objectformat'")
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "extensions.objectformat", "sha1"], p),
+        "repair sha1",
+    );
+    assert_cli_success(&run_libra_command(&["status"], p), "after sha1 repair");
+
+    let root = tempdir().unwrap();
+    let sha256 = root.path().join("s256");
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--object-format=sha256", sha256.to_str().unwrap()],
+            root.path(),
+        ),
+        "sha256 init",
+    );
+    super::configure_identity_via_cli(&sha256);
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "core.repositoryformatversion", "1"],
+            &sha256,
+        ),
+        "sha256 v1",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "extensions.objectformat", "sha1"],
+            &sha256,
+        ),
+        "mismatch",
+    );
+    let out = run_libra_command(&["status"], &sha256);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-002"));
+    let count = run_libra_command(&["count-objects"], &sha256);
+    assert_ne!(count.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&count.stderr).contains("LBR-REPO-002"));
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "extensions.objectformat", "sha256"],
+            &sha256,
+        ),
+        "repair sha256",
+    );
+    assert_cli_success(
+        &run_libra_command(&["status"], &sha256),
+        "after sha256 repair",
+    );
+
+    let blake = root.path().join("b3");
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--object-format=blake3", blake.to_str().unwrap()],
+            root.path(),
+        ),
+        "blake init",
+    );
+    super::configure_identity_via_cli(&blake);
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "core.repositoryformatversion", "1"],
+            &blake,
+        ),
+        "blake v1",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "extensions.objectformat", "blake3"],
+            &blake,
+        ),
+        "blake ext",
+    );
+    assert_cli_success(&run_libra_command(&["status"], &blake), "blake consistent");
+}

@@ -357,3 +357,5 @@ reinit warns with git's ignored initial-branch line.
 `--template` 指向不存在或不可读目录（含 `ENAMETOOLONG` 超长路径）时输出 `warning: templates not found in <path>`，并按空模板布局继续初始化，不再致命失败。
 
 仓库命令会在运行前校验 `core.repositoryformatversion` 与 `extensions.*`：版本大于 1、版本 0 携带 `extensions.objectformat`、或版本 1 携带未支持扩展都会以 `LBR-REPO-002` 失败；`config` 豁免以便修复。
+
+版本 1 还校验 `extensions.objectformat` 与 `core.objectformat` 一致（非法或不一致为 `LBR-REPO-002`）以及 `extensions.refstorage`（接受 `files`，`reftable` 不支持，其它值非法）。

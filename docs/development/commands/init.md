@@ -79,3 +79,5 @@ flowchart TD
 reinit warns with git's ignored initial-branch line.
 
 Missing or unreadable `--template` paths warn (`warning: templates not found in <path>`) and continue with the empty-template layout.
+
+版本 1 校验 `extensions.objectformat` 取值与 `core.objectformat` 一致，并校验 `extensions.refstorage`：`files` 接受、`reftable` 不支持、其它值非法；`config` 仍豁免以修复。

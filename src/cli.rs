@@ -177,7 +177,7 @@ async fn set_local_hash_kind_for_storage(storage: &Path) -> CliResult<()> {
         }
     };
 
-    validate_repository_format_for_storage(storage, backend, false).await?;
+    validate_repository_format_for_storage(storage, backend, false, &object_format).await?;
     set_hash_kind_from_object_format(object_format)
 }
 
@@ -222,7 +222,7 @@ async fn set_local_hash_kind_for_storage_without_schema_guard(storage: &Path) ->
         }
     };
 
-    validate_repository_format_for_storage(storage, backend, true).await?;
+    validate_repository_format_for_storage(storage, backend, true, &object_format).await?;
     set_hash_kind_from_object_format(object_format)
 }
 
@@ -233,6 +233,7 @@ async fn validate_repository_format_for_storage(
     storage: &Path,
     backend: crate::storage::StorageBackendKind,
     without_schema_guard: bool,
+    core_objectformat: &str,
 ) -> CliResult<()> {
     if SKIP_REPOSITORY_FORMAT_VALIDATION.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(());
@@ -300,24 +301,54 @@ async fn validate_repository_format_for_storage(
         );
     }
     if version == 0 {
-        if extensions
+        if let Some((key, _)) = extensions
             .iter()
-            .any(|(key, _)| key == "extensions.objectformat")
+            .find(|(key, _)| key == "extensions.objectformat" || key == "extensions.refstorage")
         {
-            return Err(CliError::fatal(
-                "repo version is 0, but v1-only extension found: extensions.objectformat"
-                    .to_string(),
-            )
+            return Err(CliError::fatal(format!(
+                "repo version is 0, but v1-only extension found: {key}"
+            ))
             .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt));
         }
         return Ok(());
     }
-    for (key, _) in extensions {
-        if key != "extensions.objectformat" {
-            return Err(CliError::fatal(format!(
-                "repo version is 1, but extension '{key}' is not supported"
-            ))
-            .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt));
+    for (key, value) in extensions {
+        match key.as_str() {
+            "extensions.objectformat" => {
+                let Ok(parsed) = crate::internal::object_format::parse_config_value(&value) else {
+                    return Err(CliError::fatal(format!(
+                        "invalid value for 'extensions.objectformat': {value}"
+                    ))
+                    .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt));
+                };
+                if crate::internal::object_format::as_str(parsed) != core_objectformat {
+                    return Err(CliError::fatal(format!(
+                        "extensions.objectformat '{value}' does not match core.objectformat '{core_objectformat}'"
+                    ))
+                    .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt));
+                }
+            }
+            "extensions.refstorage" => match value.as_str() {
+                "files" => {}
+                "reftable" => {
+                    return Err(CliError::fatal(
+                        "extensions.refstorage 'reftable' is not supported".to_string(),
+                    )
+                    .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt));
+                }
+                other => {
+                    return Err(CliError::fatal(format!(
+                        "invalid value for 'extensions.refstorage': {other}"
+                    ))
+                    .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt));
+                }
+            },
+            _ => {
+                return Err(CliError::fatal(format!(
+                    "repo version is 1, but extension '{key}' is not supported"
+                ))
+                .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt));
+            }
         }
     }
     Ok(())
