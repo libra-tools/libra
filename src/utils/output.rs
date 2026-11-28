@@ -261,6 +261,9 @@ impl OutputConfig {
 
         let mut args = argv.iter().peekable();
         while let Some(arg) = args.next() {
+            if arg == "--" {
+                break;
+            }
             if let Some(value) = arg.strip_prefix("-J=") {
                 json = Some(value.to_string());
                 continue;

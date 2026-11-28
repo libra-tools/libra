@@ -646,7 +646,7 @@
 
 ### Task GII-19: 全局预扫描兼容既有全局标志与 `--` 透传（重复与交错 `-C`；#686，自 GII-01 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：移除首位限制，`-C` 可重复并位于既有全局标志之后；`OutputConfig` 在 `--` 处停止扫描。新增 AC1–AC7 用例。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 按 `ADR-GII-01` ①④，让全局预扫描识别全部既有全局标志（无值、可选值、必选值）并跳过其值 token，使 `-C` 可重复（按出现顺序累积切换）并可出现在既有全局标志之后（解除 `GII-01` 发布中「本版只支持 argv 首位的单个 `-C`」的限制）；同时让 `OutputConfig::resolve_from_argv` 在子命令 `--` 处停止扫描，不把透传参数当作输出标志。拆分原因（G-09）：原 `GII-01` 按独立谓词计数超过 G-03 上限；本卡与 `GII-01` 分属「`-C` 目录切换」与「既有全局标志交错 / `--` 透传」两个可独立恢复的轴，`GII-01` 单独发布时在其声明的范围内语义完整（非首位的 `-C` 按现状拒绝、有文档说明并由其 AC3 验证），本卡追加于 Phase 0 末尾。
 
@@ -668,7 +668,7 @@
 - [ ] AC5：`--progress` 缺值（`libra --progress -C <dir> status`）以 `LBR-CLI-002` 失败。
 - [ ] AC6：`libra status -- --json` 失败时以人读格式输出错误（`--` 之后的参数不触发 JSON 模式）。
 - [ ] AC7：重复的 `libra -C <d1> -C <d2> status` 在 `<d1>/<d2>` 内执行。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/README.md`、`docs/commands/zh-CN/README.md`、`COMPATIBILITY.md` 及 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/index.en.mdx`（`## Global Flags`），按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：README 中英与 COMPATIBILITY 已记录可重复/可交错 `-C` 与 `--` 停止；网站首页同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::init_test::global_dash_c_interleaves_with_global_flags` 承载；夹具：`<tmp>/r` 已提交一次且含未跟踪 `u.txt`，`<tmp>/outside` 无仓库，基线 `B` = 在 `<tmp>/r` 内运行 `libra status --short` 的 stdout；AC1–AC5 的 cwd 为 `<tmp>/outside`）
 

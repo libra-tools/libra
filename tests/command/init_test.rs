@@ -2472,6 +2472,9 @@ fn global_dash_c_directory() {
     let late = run_libra_command(
         &[
             "--no-pager",
+            "--color=never",
+            "--max-connections",
+            "8",
             "-C",
             repo.to_str().unwrap(),
             "status",
@@ -2479,8 +2482,8 @@ fn global_dash_c_directory() {
         ],
         &outside,
     );
-    assert_ne!(late.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&late.stderr).contains("LBR-CLI-002"));
+    assert_cli_success(&late, "late -C after global flags");
+    assert_eq!(late.stdout, baseline.stdout);
 
     let empty = run_libra_command(&["-C", "", "status", "--short"], &repo);
     assert_cli_success(&empty, "-C empty stays put");
@@ -2538,4 +2541,72 @@ fn global_bare_init() {
     let storage_status = run_libra_command(&["--bare", "status"], &storage);
     assert_ne!(storage_status.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&storage_status.stderr).contains("LBR-REPO-003"));
+}
+
+#[test]
+fn global_dash_c_interleaves_with_global_flags() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("r");
+    super::init_repo_via_cli(&repo);
+    fs::write(repo.join("u.txt"), "u\n").unwrap();
+    fs::create_dir(repo.join("sub")).unwrap();
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let baseline = run_libra_command(&["status", "--short"], &repo);
+
+    let json_args = ["--json", "-C", repo.to_str().unwrap(), "status", "--short"];
+    let json = run_libra_command(&json_args, &outside);
+    assert_cli_success(&json, "json with late -C");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("JSON status");
+    assert!(
+        String::from_utf8_lossy(&json.stdout).contains("u.txt"),
+        "{value}"
+    );
+
+    for args in [
+        vec![
+            "--progress",
+            "text",
+            "-C",
+            repo.to_str().unwrap(),
+            "status",
+            "--short",
+        ],
+        vec![
+            "--progress=text",
+            "-C",
+            repo.to_str().unwrap(),
+            "status",
+            "--short",
+        ],
+    ] {
+        let out = run_libra_command(&args, &outside);
+        assert_cli_success(&out, "progress with -C");
+        assert_eq!(out.stdout, baseline.stdout);
+    }
+
+    let missing_progress = run_libra_command(
+        &["--progress", "-C", repo.to_str().unwrap(), "status"],
+        &outside,
+    );
+    assert_ne!(missing_progress.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&missing_progress.stderr).contains("LBR-CLI-002"));
+
+    let repeated = run_libra_command(
+        &[
+            "-C",
+            repo.to_str().unwrap(),
+            "-C",
+            "sub",
+            "status",
+            "--short",
+        ],
+        &outside,
+    );
+    assert_cli_success(&repeated, "repeated -C");
+
+    let after_dash = run_libra_command(&["status", "--", "--json"], &outside);
+    assert_ne!(after_dash.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&after_dash.stderr);
+    assert!(stderr.contains("Error-Code:"), "{stderr}");
 }

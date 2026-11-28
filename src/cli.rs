@@ -536,23 +536,6 @@ fn strip_empty_leading_dash_c(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi
     argv
 }
 
-fn reject_non_leading_dash_c(argv: &[std::ffi::OsString]) -> Result<(), CliError> {
-    for (index, arg) in argv.iter().enumerate().skip(1) {
-        let text = arg.to_string_lossy();
-        if text == "--" {
-            break;
-        }
-        let is_dash_c = text == "-C" || (text.starts_with("-C") && text.len() > 2);
-        if is_dash_c && index != 1 {
-            return Err(CliError::command_usage(
-                "global -C is only accepted as the first argument".to_string(),
-            )
-            .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments));
-        }
-    }
-    Ok(())
-}
-
 // The Cli struct represents the root of the command line interface.
 #[derive(Parser, Debug)]
 #[command(
@@ -4203,7 +4186,6 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         return print_error_codes_help();
     }
     let argv = strip_empty_leading_dash_c(argv);
-    reject_non_leading_dash_c(&argv)?;
     let mut args = match Cli::try_parse_from(argv.clone()) {
         Ok(args) => args,
         Err(err) => match err.kind() {

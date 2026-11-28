@@ -23,7 +23,7 @@ Every Libra command accepts the following global flags:
 |------|-------|-------------|
 | `--json` | `-J` | Output as JSON (formats: `pretty`, `compact`, `ndjson`) |
 | `--machine` | | Strict machine mode (implies `--json=ndjson --no-pager --color=never --quiet`) |
-| `-C <path>` | | Change to `<path>` before running the command; only accepted as the first argument. Empty path is a no-op. |
+| `-C <path>` | | Change to `<path>` before running the command; repeatable in order and usable after other global flags. Empty path is a no-op. |
 | `--bare` | | Treat the current directory as a bare repository for this invocation (does not write `core.bare`); with `init`, same as `init --bare`. |
 | `--git-dir=<path>` / `--git-dir <path>` | | Use `<path>` as the repository storage directory. |
 | `--work-tree=<path>` / `--work-tree <path>` | | Use `<path>` as the work tree. |

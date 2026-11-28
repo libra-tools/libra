@@ -19,7 +19,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 |------|--------|------|
 | `--json` | `-J` | 输出 JSON（格式：`pretty`、`compact`、`ndjson`） |
 | `--machine` | | 严格机器模式（隐含 `--json=ndjson --no-pager --color=never --quiet`） |
-| `-C <path>` | | 运行命令前切换到 `<path>`；仅接受为第一个参数，空路径不切换。 |
+| `-C <path>` | | 运行命令前按顺序切换到 `<path>`；可重复并位于其它全局标志之后。空路径不切换。 |
 | `--bare` | | 本次调用把当前目录视为裸仓库（不写入 `core.bare`）；与 `init` 组合等价于 `init --bare`。 |
 | `--git-dir=<path>` / `--git-dir <path>` | | 使用 `<path>` 作为仓库存储目录。 |
 | `--work-tree=<path>` / `--work-tree <path>` | | 使用 `<path>` 作为工作树。 |
