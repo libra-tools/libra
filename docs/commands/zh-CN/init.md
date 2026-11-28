@@ -355,3 +355,5 @@ mv /path/to/separate/storage .libra
 reinit warns with git's ignored initial-branch line.
 
 `--template` 指向不存在或不可读目录（含 `ENAMETOOLONG` 超长路径）时输出 `warning: templates not found in <path>`，并按空模板布局继续初始化，不再致命失败。
+
+仓库命令会在运行前校验 `core.repositoryformatversion` 与 `extensions.*`：版本大于 1、版本 0 携带 `extensions.objectformat`、或版本 1 携带未支持扩展都会以 `LBR-REPO-002` 失败；`config` 豁免以便修复。

@@ -2610,3 +2610,57 @@ fn global_dash_c_interleaves_with_global_flags() {
     let stderr = String::from_utf8_lossy(&after_dash.stderr);
     assert!(stderr.contains("Error-Code:"), "{stderr}");
 }
+
+#[test]
+fn repositoryformatversion_and_extensions_validation() {
+    let repo = super::create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.repositoryformatversion", "2"], p),
+        "set version 2",
+    );
+    let status = run_libra_command(&["status"], p);
+    assert_ne!(status.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&status.stderr).contains("LBR-REPO-002"));
+    let count = run_libra_command(&["count-objects"], p);
+    assert_ne!(count.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&count.stderr).contains("LBR-REPO-002"));
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.repositoryformatversion", "0"], p),
+        "repair version",
+    );
+    assert_cli_success(&run_libra_command(&["status"], p), "status after repair");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "extensions.objectformat", "sha1"], p),
+        "set v0 extension",
+    );
+    let status = run_libra_command(&["status"], p);
+    assert_ne!(status.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&status.stderr)
+            .contains("repo version is 0, but v1-only extension found")
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "unset", "extensions.objectformat"], p),
+        "unset v0 extension",
+    );
+    assert_cli_success(&run_libra_command(&["status"], p), "status after unset");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.repositoryformatversion", "1"], p),
+        "set version 1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "extensions.nosuchext", "x"], p),
+        "set unsupported extension",
+    );
+    let status = run_libra_command(&["status"], p);
+    assert_ne!(status.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&status.stderr).contains("LBR-REPO-002"));
+    assert_cli_success(
+        &run_libra_command(&["config", "unset", "extensions.nosuchext"], p),
+        "unset unsupported extension",
+    );
+    assert_cli_success(&run_libra_command(&["status"], p), "status after ext unset");
+}

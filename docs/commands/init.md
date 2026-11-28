@@ -522,3 +522,5 @@ mv /path/to/separate/storage .libra
 > `completions` run in that layout.
 
 reinit warns with git's ignored initial-branch line.
+
+Repository commands validate `core.repositoryformatversion` and `extensions.*` before running: a version above 1, a version-0 repository carrying `extensions.objectformat`, or a version-1 repository carrying an unsupported extension fails with `LBR-REPO-002`. `config` is exempt so the offending keys can be repaired.

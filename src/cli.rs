@@ -177,6 +177,7 @@ async fn set_local_hash_kind_for_storage(storage: &Path) -> CliResult<()> {
         }
     };
 
+    validate_repository_format_for_storage(storage, backend, false).await?;
     set_hash_kind_from_object_format(object_format)
 }
 
@@ -221,7 +222,105 @@ async fn set_local_hash_kind_for_storage_without_schema_guard(storage: &Path) ->
         }
     };
 
+    validate_repository_format_for_storage(storage, backend, true).await?;
     set_hash_kind_from_object_format(object_format)
+}
+
+static SKIP_REPOSITORY_FORMAT_VALIDATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+async fn validate_repository_format_for_storage(
+    storage: &Path,
+    backend: crate::storage::StorageBackendKind,
+    without_schema_guard: bool,
+) -> CliResult<()> {
+    if SKIP_REPOSITORY_FORMAT_VALIDATION.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    let (version, extensions): (Option<String>, Vec<(String, String)>) = match backend {
+        crate::storage::StorageBackendKind::Redb => {
+            let store = crate::storage::runtime::open_repo_config_store_read_only(storage)
+                .await
+                .map_err(CliError::from)?;
+            let version = ConfigKv::get_with_store(&*store, "core.repositoryformatversion")
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read repository format: {error}"))
+                })?
+                .map(|entry| entry.value);
+            let extensions = ConfigKv::get_by_prefix_with_store(&*store, "extensions.")
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read repository extensions: {error}"))
+                })?
+                .into_iter()
+                .map(|entry| (entry.key, entry.value))
+                .collect();
+            (version, extensions)
+        }
+        crate::storage::StorageBackendKind::Sqlite => {
+            let db_path = storage.join(utils::util::DATABASE);
+            let connection = if without_schema_guard {
+                db::open_database_without_migrations(&db_path).await
+            } else {
+                db::get_db_conn_instance_for_path(&db_path).await
+            }
+            .map_err(|error| {
+                CliError::fatal(format!("failed to open repository database: {error}"))
+            })?;
+            let version = ConfigKv::get_with_conn(&connection, "core.repositoryformatversion")
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read repository format: {error}"))
+                })?
+                .map(|entry| entry.value);
+            let extensions = ConfigKv::get_by_prefix_with_conn(&connection, "extensions.")
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read repository extensions: {error}"))
+                })?
+                .into_iter()
+                .map(|entry| (entry.key, entry.value))
+                .collect();
+            (version, extensions)
+        }
+    };
+    let version = version
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<u32>()
+        .map_err(|_| {
+            CliError::fatal("unsupported core.repositoryformatversion".to_string())
+                .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt)
+        })?;
+    if version > 1 {
+        return Err(
+            CliError::fatal(format!("unsupported repository format version {version}"))
+                .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt),
+        );
+    }
+    if version == 0 {
+        if extensions
+            .iter()
+            .any(|(key, _)| key == "extensions.objectformat")
+        {
+            return Err(CliError::fatal(
+                "repo version is 0, but v1-only extension found: extensions.objectformat"
+                    .to_string(),
+            )
+            .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt));
+        }
+        return Ok(());
+    }
+    for (key, _) in extensions {
+        if key != "extensions.objectformat" {
+            return Err(CliError::fatal(format!(
+                "repo version is 1, but extension '{key}' is not supported"
+            ))
+            .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt));
+        }
+    }
+    Ok(())
 }
 
 async fn read_schema_free_object_format(
@@ -4218,6 +4317,10 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             .with_stable_code(crate::utils::error::StableErrorCode::IoReadFailed)
         })?;
     }
+    SKIP_REPOSITORY_FORMAT_VALIDATION.store(
+        matches!(&args.command, Commands::Config(_)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let log_diff_format_positions = if matches!(&args.command, Commands::Log(_)) {
         let parsed_matches = <Cli as clap::CommandFactory>::command()
             .try_get_matches_from(argv.clone())

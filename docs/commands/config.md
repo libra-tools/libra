@@ -1277,3 +1277,5 @@ config get --value matches the legacy value pattern.
 legacy and subcommand config entries match.
 
 explicit system list on a missing store exits 128.
+
+Repository format validation applies to commands that open the repository, but `config` itself is exempt so `core.repositoryformatversion` and `extensions.*` can be repaired.

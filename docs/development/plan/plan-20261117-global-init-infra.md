@@ -899,7 +899,7 @@
 
 ### Task GII-09: 补全 `repositoryformatversion` 与扩展存在性校验（#948）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：仓库预检拒绝 version>1、v0+extensions.objectformat、v1+未支持扩展（`LBR-REPO-002`），无 schema 的 `count-objects` 同路径；`config` 豁免以修复。新增 AC1–AC3/AC5–AC8 用例。D 组 patch +1。偏差：AC4 未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 在仓库命令预检（`src/cli.rs:3681-3698`：需要仓库的命令在此调用 `set_local_hash_kind_for_storage`（`src/cli.rs:112`）读取 `core.objectformat` 设定哈希算法）中新增仓库格式校验（同一校验函数同时接入无 schema 守卫的预检路径 `set_local_hash_kind_for_storage_without_schema_guard`，`src/cli.rs:145`，调用点 3694；`hash-object`、`verify-pack`、`count-objects` 及部分 `worktree` 子命令经该路径，`src/cli.rs:1810-1906`），按 Git 规则：`core.repositoryformatversion` 大于 1 拒绝；版本 0 出现 v1-only 扩展 `extensions.objectformat` 拒绝；版本 1 出现 `objectformat` 以外的 `extensions.<name>` 拒绝（本卡只把 `extensions.objectformat` 视为已支持扩展，其取值与一致性校验由 `GII-22` 承接）。既有仅含 `core.repositoryformatversion=0` 与 `core.objectformat` 的 Libra 仓库不受影响。**修复通道：** 本地 `libra config` 当前同样经过该预检（`src/cli.rs:1889` 只让 `--global` / `--system` / schema doctor 免预检，其余在 `src/cli.rs:3687` 调用 `set_local_hash_kind_for_storage`），因此本卡须显式让 `Commands::Config` 跳过格式校验（仍按 `core.objectformat` 设定哈希算法），使本卡拒绝的每个状态都能用 `libra config set` / `libra config unset` 修复——这是与 Git 的有意差异（Libra 配置存于 SQLite，无法像 `.git/config` 那样手工编辑），按 GC-03 写入 `init` 与 `config` 文档及 `COMPATIBILITY.md`。拆分说明（G-09）：本卡于 2026-11-18 拆出 `GII-22`（`extensions.objectformat` 取值与一致性）与 `GII-20`（`extensions.refstorage` 规则），二者追加于 Phase 1 末尾、链上依次接在本卡之后；原因是修复通道按每个非法状态各计一条 AC 后超过 G-03 上限。
 
@@ -925,7 +925,7 @@
 - [ ] AC6：AC2 的状态经 `libra config unset extensions.objectformat` 修复后，`libra status` 退出 0。
 - [ ] AC7：AC3 的状态经 `libra config unset extensions.nosuchext` 修复后，`libra status` 退出 0。
 - [ ] AC8：版本大于 1 时，经无 schema 守卫预检的 `libra count-objects` 同样以 `LBR-REPO-002` 失败。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/{init,config}.md`、`docs/commands/zh-CN/{init,config}.md`、`docs/development/commands/{init,config}.md`、`COMPATIBILITY.md` 与网站 `init.en.md`、`config.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：init/config 中英与 COMPATIBILITY 已记录格式预检与 config 修复豁免。
 
 **AC → 断言映射:**（均由 `(new)` `command::init_test::repositoryformatversion_and_extensions_validation` 承载；每个非法场景使用新建的独立仓库，用 `libra config set` 写入对应键后运行 `libra status`；修复 AC 中的修复命令须退出 0，否则该 AC 失败）
 

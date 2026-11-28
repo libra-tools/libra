@@ -1078,3 +1078,5 @@ config get --value matches the legacy value pattern.
 legacy and subcommand config entries match.
 
 explicit system list on a missing store exits 128.
+
+仓库格式校验适用于打开仓库的命令，但 `config` 自身豁免，便于修复 `core.repositoryformatversion` 与 `extensions.*`。
