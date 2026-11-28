@@ -2428,7 +2428,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-35: 外部策略名白名单（拒绝且不查找、不执行）（#1027）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`-s` 名称白名单、PATH 查找 `git-merge-<name>`；未找到按 Git 文案退出 1，找到的可执行策略本版 `LBR-UNSUPPORTED-001`。由 `strategy_name_whitelist_and_not_found` 覆盖。D 组 patch +1。偏差：MP-42 组合拒绝与 MP-15 执行未完成；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-15` 拆出并前置：`--strategy` 改为接受任意字符串，内置名（`ort`/`recursive`/`resolve`/`ours`/`octopus`）照常；非内置名先校验白名单 `[A-Za-z0-9_.-]+` 且不等于 `.`/`..`，不满足（含 `/`、`\`、空串、其它任何字符）一律以 `LBR-CLI-002` 拒绝，且在任何 `PATH` 查找或进程创建之前拒绝；通过校验的非内置名在本卡版本中以 `LBR-UNSUPPORTED-001` 拒绝且不做查找（由 `MP-38` 接入查找）。（按 G-09 自本卡拆出 `MP-38`。）
 
@@ -2450,7 +2450,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC4：空策略名被拒绝。
 - [ ] AC5：AC1–AC4 的被拒绝名字都不执行任何程序。
 - [ ] AC6：覆盖全部白名单字符类的合法名通过校验。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录外部策略白名单/查找。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::strategy_name_whitelist` 承载 AC1–AC6；夹具 F-EXT（`t7606` 形态，用例 `#[cfg(unix)]`）（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`c0`（`c0.c`）→ `main` 上 `c1`（`c1.c`）；`c2` 自 `c0` 新增 `c2.c`；临时目录 `<bin>`（工作树外）用于放置可执行脚本，每个脚本以 `#!/bin/sh` 与 `set -e` 开头（任一命令失败即以该命令的非 0 码退出），先把参数逐行写入 `<bin>/args`、把 `pwd` 写入 `<bin>/cwd` 并创建 `<bin>/ran`；`git-merge-theirs` 随后以 `for last; do :; done` 取得最后一个参数（即目标 OID；带 `-X` 时 `$4` 是字面量 `HEAD`），执行 `<libra 绝对路径> read-tree "$last"`、写入 `ext.txt`=`ext\n` 并 `<libra 绝对路径> add ext.txt`，再把 `<libra 绝对路径> write-tree` 的 stdout 写入 `<bin>/tree`，然后 `exit 0`（暂存的树与两个父提交的树都不同）；所有调用以子进程环境 `PATH=<bin>:<原 PATH>`；另为 AC1–AC4 的每个被拒绝名字 `<n>` 准备可被误执行的同名程序（运行即创建 `<bin>/ran`）：`/` 之外的名字在 `<bin>`（位于子进程 `PATH` 上）放置可执行脚本 `git-merge-<n>`（含 `git-merge-a\b`、`git-merge-a;b`、`git-merge-a<制表符>b`、`git-merge-aéb`、`git-merge-.`、`git-merge-..`、`git-merge-`）；含 `/` 的 `a/b` 在工作树根建目录 `git-merge-a` 并放置可执行脚本 `git-merge-a/b`，使其可被误作相对路径执行；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -2485,7 +2485,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-38: `Could not find merge strategy` 诊断与外部策略执行前的过渡拒绝（#1027）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`-s` 名称白名单、PATH 查找 `git-merge-<name>`；未找到按 Git 文案退出 1，找到的可执行策略本版 `LBR-UNSUPPORTED-001`。由 `strategy_name_whitelist_and_not_found` 覆盖。D 组 patch +1。偏差：MP-42 组合拒绝与 MP-15 执行未完成；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-35` 拆出：通过白名单的非内置策略名（多个 `-s` 时逐个）在解析合并目标与尝试任何策略之前按 `PATH` 查找 `git-merge-<name>`：找不到时输出 Git 的 `Could not find merge strategy '<name>'.` 并以 `with_exit_code(1)` 退出（稳定码 `LBR-CLI-002`；按「验证执行协议」第 5 条把 `MP-35` 用例 AC6 的 `LBR-UNSUPPORTED-001` 断言改为本诊断）；找到时本卡版本仍以 `LBR-UNSUPPORTED-001` 拒绝且不执行（执行由 `MP-15` 开放并取代该行为）。
 
@@ -2508,7 +2508,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC5：AC4 不执行该策略。
 - [ ] AC6：多个 `-s` 中未找到的名字以 Git 诊断报告。
 - [ ] AC7：未找到诊断先于合并目标解析（因而先于任何策略尝试）。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录外部策略白名单/查找。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::strategy_not_found_and_pending_external` 承载 AC1–AC7；夹具 F-EXT（`t7606` 形态，用例 `#[cfg(unix)]`）（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`c0`（`c0.c`）→ `main` 上 `c1`（`c1.c`）；`c2` 自 `c0` 新增 `c2.c`；临时目录 `<bin>`（工作树外）用于放置可执行脚本，每个脚本以 `#!/bin/sh` 与 `set -e` 开头（任一命令失败即以该命令的非 0 码退出），先把参数逐行写入 `<bin>/args`、把 `pwd` 写入 `<bin>/cwd` 并创建 `<bin>/ran`；`git-merge-theirs` 随后以 `for last; do :; done` 取得最后一个参数（即目标 OID；带 `-X` 时 `$4` 是字面量 `HEAD`），执行 `<libra 绝对路径> read-tree "$last"`、写入 `ext.txt`=`ext\n` 并 `<libra 绝对路径> add ext.txt`，再把 `<libra 绝对路径> write-tree` 的 stdout 写入 `<bin>/tree`，然后 `exit 0`（暂存的树与两个父提交的树都不同）；所有调用以子进程环境 `PATH=<bin>:<原 PATH>`；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 

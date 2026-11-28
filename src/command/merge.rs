@@ -141,6 +141,34 @@ pub enum MergeStrategy {
     Octopus,
 }
 
+fn parse_merge_strategy_cli(name: &str) -> Result<MergeStrategy, String> {
+    use clap::ValueEnum as _;
+    if let Ok(strategy) = MergeStrategy::from_str(name, true) {
+        return Ok(strategy);
+    }
+    let valid = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'));
+    if !valid {
+        return Err(format!("invalid merge strategy name '{name}'"));
+    }
+    let executable = format!("git-merge-{name}");
+    let found = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join(&executable);
+            candidate.is_file()
+        })
+    });
+    if !found {
+        Err(format!("Could not find merge strategy '{name}'."))
+    } else {
+        Err(format!("external merge strategy '{name}' is not supported"))
+    }
+}
+
 impl MergeStrategy {
     fn name(self) -> &'static str {
         match self {
@@ -326,7 +354,7 @@ pub struct MergeArgs {
 
     /// Select one or more merge strategies in fallback order. `recursive` is
     /// an alias for `ort`; `resolve` disables recursive bases and renames.
-    #[arg(short = 's', long = "strategy", value_enum, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart"])]
+    #[arg(short = 's', long = "strategy", value_parser = parse_merge_strategy_cli, action = clap::ArgAction::Append, conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub strategy: Vec<MergeStrategy>,
 
     /// Pass an option to the default three-way merge. Favor and renormalize

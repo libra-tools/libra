@@ -16052,3 +16052,38 @@ fn merge_autostash_clean_three_way_squash() {
     );
     assert!(!p.join(".libra/merge-autostash.json").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn strategy_name_whitelist_and_not_found() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for bad in ["a/b", "a\\b", ".", "..", "", "é", "a b", "a@b"] {
+        let out = run_libra_command(&["merge", "-s", bad, "HEAD"], p);
+        assert_ne!(out.status.code(), Some(0), "{bad:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+            "{bad:?}"
+        );
+    }
+    let missing = run_libra_command(&["merge", "-s", "nosuch", "HEAD"], p);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("Could not find merge strategy 'nosuch'.")
+    );
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("LBR-CLI-002"));
+
+    let bin = tempfile::tempdir().unwrap();
+    let script = bin.path().join("git-merge-present");
+    std::fs::write(&script, "#!/bin/sh\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let found = run_libra_command_with_env(
+        &["merge", "-s", "present", "HEAD"],
+        p,
+        &[("PATH", bin.path().to_str().unwrap())],
+    );
+    assert_ne!(found.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&found.stderr).contains("LBR-UNSUPPORTED-001"));
+}

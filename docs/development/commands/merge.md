@@ -317,3 +317,5 @@ modify/delete / rename/delete 冲突工作树保留存活一侧内容（无冲�
 octopus 默认消息使用 Git 列举格式，并接入 `--into-name`/`merge.suppressDest`。
 
 clean/conflict squash 保留 held autostash sidecar，由后续 commit 应用；FF squash 立即应用。
+
+外部策略名先白名单与 PATH 查找：非法名/未找到/找到但本版不支持分别诊断。

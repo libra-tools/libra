@@ -3910,6 +3910,25 @@ pub fn lookup_declined_interactive(
 }
 
 fn classify_parse_error(argv: &[std::ffi::OsString], err: &clap::Error) -> CliError {
+    let rendered = err.to_string();
+    if rendered.contains("external merge strategy '") {
+        return CliError::failure(
+            "external merge strategies are not supported by this release".to_string(),
+        )
+        .with_stable_code(utils::error::StableErrorCode::Unsupported)
+        .with_hint("use one of the built-in strategies");
+    }
+    if let Some(index) = rendered.find("Could not find merge strategy '") {
+        let tail = &rendered[index..];
+        let message = tail
+            .split_once('\'')
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .map(|(name, _)| format!("Could not find merge strategy '{name}'."))
+            .unwrap_or_else(|| "Could not find merge strategy.".to_string());
+        return CliError::command_usage(message)
+            .with_stable_code(utils::error::StableErrorCode::CliInvalidArguments)
+            .with_exit_code(1);
+    }
     if let Some(entry) = lookup_declined_interactive(argv, err) {
         let mut cli_error = CliError::failure(entry.message)
             .with_stable_code(utils::error::StableErrorCode::Unsupported);

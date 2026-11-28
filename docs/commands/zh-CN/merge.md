@@ -494,3 +494,5 @@ operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺�
 `--into-name <name>` 替换自动消息中的目标分支；`merge.suppressDest`（可重复 glob，空值清空先前值，未配置时默认 `main`/`master`）在目标匹配时省略 ` into <name>`；显式 `-m`/`-F` 不受影响。
 
 八爪鱼自动消息按 Git 列举目标（`Merge branches 'a' and 'b'` 或 `'a', 'b' and 'c'`），支持 `--into-name`，并由 `merge.suppressDest` 决定是否省略目标后缀。
+
+`-s` 名称按 `[A-Za-z0-9_.-]+` 白名单校验（排除 `.`/`..`）；找不到外部 `git-merge-<name>` 时输出 `Could not find merge strategy '<name>'.`（退出 1），找到可执行策略在本版仍以 `LBR-UNSUPPORTED-001` 拒绝。
