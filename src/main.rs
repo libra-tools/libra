@@ -541,9 +541,11 @@ fn desktop_display_available() -> bool {
 fn run_desktop_ui() -> i32 {
     if !desktop_display_available() {
         let err = libra::command::ui::display_unavailable_error();
-        let argv: Vec<String> = std::env::args_os()
-            .filter_map(|arg| arg.into_string().ok())
-            .collect();
+        let argv: Vec<String> = cli::error_render_argv().unwrap_or_else(|| {
+            std::env::args_os()
+                .filter_map(|arg| arg.into_string().ok())
+                .collect()
+        });
         let output = OutputConfig::resolve_from_argv(&argv);
         err.print_for_output(&output);
         return err.exit_code();

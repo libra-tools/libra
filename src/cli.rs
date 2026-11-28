@@ -304,6 +304,145 @@ pub fn sanitize_git_dir_and_work_tree_argv(argv: &[String]) -> Vec<String> {
     out
 }
 
+static ERROR_RENDER_ARGV: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+fn remember_error_render_argv(argv: &[std::ffi::OsString]) {
+    let argv: Vec<String> = argv
+        .iter()
+        .filter_map(|arg| arg.clone().into_string().ok())
+        .collect();
+    if let Ok(mut slot) = ERROR_RENDER_ARGV.lock() {
+        *slot = Some(argv);
+    }
+}
+
+/// Expanded argv for error rendering after an alias was substituted.
+pub fn error_render_argv() -> Option<Vec<String>> {
+    ERROR_RENDER_ARGV.lock().ok().and_then(|slot| slot.clone())
+}
+
+async fn expand_git_aliases(
+    mut argv: Vec<std::ffi::OsString>,
+) -> CliResult<Vec<std::ffi::OsString>> {
+    use crate::internal::config::{LocalIdentityTarget, read_cascaded_config_value_strict};
+
+    let command = <Cli as clap::CommandFactory>::command();
+    let builtins: std::collections::HashSet<String> = command
+        .get_subcommands()
+        .flat_map(|sub| {
+            std::iter::once(sub.get_name().to_string())
+                .chain(sub.get_all_aliases().map(str::to_string))
+        })
+        .collect();
+    for _ in 0..16 {
+        let Some(name) = argv.get(1).and_then(|arg| arg.to_str()) else {
+            break;
+        };
+        if name.starts_with('-') || builtins.contains(name) {
+            break;
+        }
+        let key = format!("alias.{name}");
+        let Some(value) = read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, &key)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("failed to read {key}: {error}"))
+                    .with_stable_code(crate::utils::error::StableErrorCode::IoReadFailed)
+            })?
+        else {
+            break;
+        };
+        if value.starts_with('!') {
+            return Err(
+                CliError::command_usage(format!("shell alias '{name}' is not supported"))
+                    .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments),
+            );
+        }
+        let expanded = tokenize_alias_value(&value).map_err(|message| {
+            CliError::command_usage(format!("invalid alias '{name}': {message}"))
+                .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments)
+        })?;
+        argv.splice(1..2, expanded.into_iter().map(std::ffi::OsString::from));
+    }
+    if let Some(name) = argv.get(1).and_then(|arg| arg.to_str())
+        && !name.starts_with('-')
+        && !builtins.contains(name)
+        && read_cascaded_config_value_strict(
+            LocalIdentityTarget::CurrentRepo,
+            &format!("alias.{name}"),
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Err(
+            CliError::command_usage("alias expansion exceeded 16 levels".to_string())
+                .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments),
+        );
+    }
+    Ok(argv)
+}
+
+fn tokenize_alias_value(value: &str) -> Result<Vec<String>, &'static str> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut chars = value.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+                started = true;
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '\\' => {
+                    started = true;
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                _ => current.push(ch),
+            },
+            Some(_) => unreachable!(),
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    started = true;
+                }
+                '\\' => {
+                    started = true;
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if started {
+                        tokens.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                _ => {
+                    current.push(ch);
+                    started = true;
+                }
+            },
+        }
+    }
+    if quote.is_some() {
+        return Err("unclosed quote");
+    }
+    if started {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
 fn extract_git_dir_and_work_tree_overrides(
     mut argv: Vec<std::ffi::OsString>,
 ) -> CliResult<Vec<std::ffi::OsString>> {
@@ -4032,6 +4171,8 @@ fn reject_unsupported_single_dash_control(utf8_argv: &[String]) -> CliResult<()>
 }
 
 async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
+    let argv = expand_git_aliases(argv).await?;
+    remember_error_render_argv(&argv);
     let argv = extract_git_dir_and_work_tree_overrides(argv)?;
     let argv = rewrite_short_number_args(argv, "log");
     let argv = rewrite_short_number_args(argv, "reflog");

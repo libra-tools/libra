@@ -8373,3 +8373,94 @@ mod value_pattern {
         assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "one");
     }
 }
+
+#[test]
+fn git_alias_expansion() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("u.txt"), "u\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "--global", "alias.ss", "status --short"],
+            p,
+        ),
+        "alias ss",
+    );
+    let alias = run_libra_command(&["ss"], p);
+    let direct = run_libra_command(&["status", "--short"], p);
+    assert_cli_success(&alias, "libra ss");
+    assert_eq!(alias.stdout, direct.stdout);
+
+    assert_cli_success(&run_libra_command(&["add", "u.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-gpg-sign"], p),
+        "second commit",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "--global",
+                "alias.lg",
+                "log --format='%h'\\ %s",
+            ],
+            p,
+        ),
+        "alias lg",
+    );
+    let log = run_libra_command(&["lg", "-1"], p);
+    assert_cli_success(&log, "libra lg -1");
+    let text = String::from_utf8_lossy(&log.stdout);
+    assert!(text.contains("second"), "{text}");
+    assert!(text.starts_with(|c: char| c.is_ascii_hexdigit()), "{text}");
+
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "--global", "alias.sj", "status --json"],
+            p,
+        ),
+        "alias sj",
+    );
+    let missing_repo = p.join("missing-repo");
+    let json =
+        run_libra_command_with_env(&["sj"], p, &[("GIT_DIR", missing_repo.to_str().unwrap())]);
+    assert_ne!(json.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&json.stderr).contains("Error-Code: LBR-REPO-001"));
+
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "--global", "alias.a", "b"], p),
+        "alias a",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "--global", "alias.b", "a"], p),
+        "alias b",
+    );
+    let cycle = run_libra_command(&["a"], p);
+    assert_ne!(cycle.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&cycle.stderr).contains("LBR-CLI-002"),
+        "{}",
+        String::from_utf8_lossy(&cycle.stderr)
+    );
+
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "--global", "alias.bad", "status '--short"],
+            p,
+        ),
+        "alias bad",
+    );
+    let unclosed = run_libra_command(&["bad"], p);
+    assert_ne!(unclosed.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&unclosed.stderr).contains("LBR-CLI-002"));
+
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "--global", "alias.shell", "!echo hi"], p),
+        "alias shell",
+    );
+    let shell = run_libra_command(&["shell"], p);
+    assert_ne!(shell.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&shell.stderr).contains("LBR-CLI-002"));
+    assert!(!String::from_utf8_lossy(&shell.stdout).contains("hi"));
+}

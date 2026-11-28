@@ -29,6 +29,7 @@ Every Libra command accepts the following global flags:
 | `--work-tree=<path>` / `--work-tree <path>` | | Use `<path>` as the work tree. |
 | `GIT_DIR` | env | Repository storage directory; overridden by `--git-dir`. |
 | `GIT_WORK_TREE` | env | Work tree root; overridden by `--work-tree`. |
+| `alias.<name>` | config | Expand an unknown subcommand from local/global config using POSIX-style quoting; `!` shell aliases are rejected. |
 | `--no-pager` | | Disable pager (`less`) |
 | `--color` | | When to use colors (`auto`, `never`, `always`) |
 | `--no-color` | | Disable colors; equivalent to `--color=never` |

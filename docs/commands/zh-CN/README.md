@@ -25,6 +25,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | `--work-tree=<path>` / `--work-tree <path>` | | 使用 `<path>` 作为工作树。 |
 | `GIT_DIR` | env | 仓库存储目录；被 `--git-dir` 覆盖。 |
 | `GIT_WORK_TREE` | env | 工作树根；被 `--work-tree` 覆盖。 |
+| `alias.<name>` | config | 未匹配内置子命令时按 local/global 配置展开，支持 POSIX 风格引号；拒绝 `!` shell 别名。 |
 | `--no-pager` | | 禁用分页器（`less`） |
 | `--color` | | 何时使用颜色（`auto`、`never`、`always`） |
 | `--no-color` | | 禁用颜色；等价于 `--color=never` |

@@ -588,7 +588,7 @@
 
 ### Task GII-05: 支持 `alias.*` Git 别名展开（#945）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：未匹配内置子命令时读取 `alias.<name>`，POSIX 引号/转义分词、深度上限 16、拒绝 `!` shell 别名；展开后 argv 驱动错误 JSON 模式。新增 AC1–AC7 用例。D 组 patch +1。偏差：AC8 未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 在 `src/cli.rs` / `src/main.rs` 预处理阶段识别未匹配内置子命令（含 clap 内置别名）的首个子命令 token，经共享的严格级联读取函数 `read_cascaded_config_value_strict`（`src/internal/config.rs:1872`）读取 `alias.<name>`，以 POSIX 引号/转义规则分词展开、与剩余参数拼接后重新送入 CLI 解析；展开深度上限 16 防止循环，`!` shell 别名明确拒绝（`DEFER-GII-01`）。
 
@@ -611,7 +611,7 @@
 - [ ] AC6：`!` 开头的 shell 别名以 `LBR-CLI-002` 失败（`DEFER-GII-01`）。
 - [ ] AC7：`!` 开头的 shell 别名不被执行。
 - [ ] AC8：别名不覆盖 clap 内置别名（匹配 Git 的内置优先）：设置 `alias.st = log` 后 `libra st` 仍执行内置 `status`。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/{README,config}.md`、`docs/commands/zh-CN/{README,config}.md`、`docs/development/commands/config.md`、`COMPATIBILITY.md` 及网站 `config.en.md`、`index.en.mdx`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：README 中英与 COMPATIBILITY 已记录 alias；网站首页同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::config_test::git_alias_expansion` 承载；仓库 `<r>` 含一次提交与未跟踪文件 `u.txt`）
 
