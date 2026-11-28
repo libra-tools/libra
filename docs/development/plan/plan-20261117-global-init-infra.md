@@ -1455,7 +1455,7 @@
 
 ### Task GII-17: Hermes extraction 下沉至 `observed_agents` 并收口 #656
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：Hermes 有界抽取下沉至 `observed_agents/extract.rs`，`extraction.rs` 移除 Hermes 专用函数与字符串分派，改走 `AgentKind::Hermes` 共享入口；行为不变。D 组 patch +1。偏差：Hermes 相关唯一失败为既有测试 DB 环境问题，compat guard 唯一失败为 SQLite 打开失败；用户已取消独立审计与全量测试。）
 
 **Description:** #656 报告的守卫失败（上游 `760a5529` 新增 `AgentKind::Hermes` 分支使 `extraction.rs` 非测试 `AgentKind::` 路径升至 16 > 15）在当前源码中已被字符串分派绕开：`extraction.rs` 以 `agent_kind.as_db_str() == "hermes"` 进入文件内的 `hermes_bounded_extraction`，非测试 `AgentKind::` 路径为 14。按 `ADR-GII-02`，本卡把 Hermes 有界抽取实现下沉到 `observed_agents/extract.rs`（与 `extract_pi_bounded` 同层），使 `extraction.rs` 不再含 Hermes 专用实现与字符串字面量分派，同时保持守卫冻结基线不升、Hermes 抽取行为不变，然后收口 #656。
 

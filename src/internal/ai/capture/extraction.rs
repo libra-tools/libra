@@ -418,10 +418,10 @@ fn extract_deadline_provider_once(
         DEADLINE_EXTRACTION_MAX_STRING_BYTES,
         DEADLINE_EXTRACTION_MAX_RETAINED_STRING_BYTES,
     );
-    if agent_kind.as_db_str() == "hermes" {
-        return hermes_bounded_extraction(transcript);
-    }
     match agent_kind {
+        AgentKind::Hermes => crate::internal::ai::observed_agents::extract::extract_hermes_bounded(
+            transcript, limits,
+        ),
         AgentKind::ClaudeCode => {
             crate::internal::ai::observed_agents::extract::extract_claude_code_bounded(
                 transcript, limits,
@@ -451,25 +451,6 @@ fn extract_deadline_provider_once(
             partial: true,
             ..Default::default()
         },
-    }
-}
-
-/// Hermes worker projection. Thinking stays out of prompts. Missing usage
-/// stays absent. A synthetic or failed frame never looks complete.
-fn hermes_bounded_extraction(
-    transcript: &[u8],
-) -> crate::internal::ai::observed_agents::extract::ExtractionSummary {
-    use crate::internal::ai::observed_agents::builtin::hermes::hermes_worker_frame_authorized;
-    let Ok(frame) = hermes_worker_frame_authorized(transcript, None) else {
-        return crate::internal::ai::observed_agents::extract::ExtractionSummary {
-            partial: true,
-            ..Default::default()
-        };
-    };
-    crate::internal::ai::observed_agents::extract::ExtractionSummary {
-        partial: true,
-        prompts: frame.ordinary_prompts(),
-        ..Default::default()
     }
 }
 

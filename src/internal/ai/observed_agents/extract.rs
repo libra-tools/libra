@@ -800,6 +800,26 @@ pub(crate) fn extract_opencode_bounded(
     extract_opencode_with_limits(data, Some(limits))
 }
 
+/// Hermes worker projection. Thinking stays out of prompts. Missing usage
+/// stays absent. A synthetic or failed frame never looks complete.
+pub(crate) fn extract_hermes_bounded(
+    data: &[u8],
+    _limits: ExtractionCollectionLimits,
+) -> ExtractionSummary {
+    use super::builtin::hermes::hermes_worker_frame_authorized;
+    let Ok(frame) = hermes_worker_frame_authorized(data, None) else {
+        return ExtractionSummary {
+            partial: true,
+            ..Default::default()
+        };
+    };
+    ExtractionSummary {
+        partial: true,
+        prompts: frame.ordinary_prompts(),
+        ..Default::default()
+    }
+}
+
 const PI_REFUSED_WARNING: &str = "Pi session could not be normalized";
 
 /// Deadline-helper extraction for Pi (plan-20260911 PI-31). Prompts are the
