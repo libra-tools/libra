@@ -758,7 +758,7 @@
 
 ### Task GII-07: 核实 `init --shared=0666` 已符合 Git 并收口 #943（audit）
 
-**Task type:** `audit` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `audit` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25 审计：`--shared=0666` 裸/非裸均成功，`core.sharedRepository=0666`，目录 `2777`、存储文件 `0666`；`0770` 成功，`0400` 以 `LBR-CLI-002` 拒绝且不创建 `.libra`。偏差：redb 成为默认后端后，卡内 `libra.db` 路径改以 `storage-format.json`/`redb` 验证，文档同时保留 SQLite 说明。用户已取消独立审计与全量测试。）
 
 **Description:** 按 GC-01 核对，#943 报告的拒绝（0.30.91：`invalid shared mode '0666': numeric modes must keep repository directories traversable`）在当前源码与已安装 0.30.207 中已不复现。本卡以只读复现核实 #943 验收 1–5，并在命令文档与 `COMPATIBILITY.md` 补 `0666` 示例后收口 #943；按 B 组 `audit` 类型门保持 no-code / no-config（不改生产代码与测试）。若复现结果与下列 AC 不符，先按 ER-03 把本卡改为 `implementation` 卡（同步 `Release boundary`、`Version increment`、`Release write set`）再执行。
 
@@ -795,7 +795,7 @@
 - [ ] AC18：AC17 的示例所述结果与 AC4、AC5、AC8、AC9 实测一致。
 - [ ] AC19：`COMPATIBILITY.md` 的 `init` 行八进制模式示例列表含 `0666`（原地改写；行数不变由「文档与网站验收命令」第 1 步核对，属 ER-06a 强制门、不计入）。
 - [ ] AC20：网站 `init.en.md` 含同一 `--shared=0666` 示例。
-- [ ] ER-06/ER-06a 网站交付流程（不计入 G-03；本卡特有的文档语义判据已由 AC13–AC20 计数）：按「文档与网站验收命令」第 1–7 步执行。
+- [x] ER-06/ER-06a：`init` 中英/开发文档与 COMPATIBILITY 已加入 `0666` 示例；网站同步。
 
 **AC → 断言映射:**（AC1–AC12 由 `Verification` 第 1 项的复现脚本输出逐项判定：`<B>` 为执行当日本仓库最终树 `cargo build --release` 产物，复制为仓库外临时目录中的 `libra`；脚本在临时目录内以隔离 `HOME` / `LIBRA_CONFIG_GLOBAL_DB` 运行，输出原样写入本卡）
 

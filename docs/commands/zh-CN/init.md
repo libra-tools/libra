@@ -138,7 +138,7 @@ libra init --template=            # 完全不使用模板
 
 指定仓库将在多个用户之间共享（镜像 Git 的 `--shared` 标志，用于组权限）。无值传入 `--shared` 时默认取 `group`；指定模式时须以 `--shared=<MODE>` 传入。支持 `false`、`umask`、`no`、`off`、`0`、`true`、`group`、`yes`、`on`、`1`、`all`、`world`、`everybody`、`2`，或 `0660`、`0640`、`0600`、`0664` 等八进制文件模式。
 
-`group`/`true`/`1` 在 `core.sharedRepository` 中保存为 `1`；`all`/`world`/`everybody`/`2` 保存为 `2`；八进制模式与 `0666` 按位与掩码后以 `0%o` 格式持久化（如 `0660`）。`umask`/`false`/`0` 不持久化 `core.sharedRepository`，且在重新初始化时移除已存值。旧版 Libra 写入的值（`group`、`all`、`umask`、`false`、`0775`）继续兼容读取并在重新初始化时改写为 Git 表示。未显式传入 `--shared` 时，按 `local` -> `global` -> `system` 读取 `core.sharedRepository`。
+`group`/`true`/`1` 在 `core.sharedRepository` 中保存为 `1`；`all`/`world`/`everybody`/`2` 保存为 `2`；八进制模式与 `0666` 按位与掩码后以 `0%o` 格式持久化（如 `0660`、`0666`）。例如 `libra init --shared=0666 repo` 会让仓库目录保持可遍历（`2777`），`storage-format.json`（SQLite 后端为 `.libra/libra.db`）等存储文件为 `0666`。`umask`/`false`/`0` 不持久化 `core.sharedRepository`，且在重新初始化时移除已存值。旧版 Libra 写入的值（`group`、`all`、`umask`、`false`、`0775`）继续兼容读取并在重新初始化时改写为 Git 表示。未显式传入 `--shared` 时，按 `local` -> `global` -> `system` 读取 `core.sharedRepository`。
 
 八进制模式会在任何仓库布局写入前校验文件 owner 必须具备读写权限（`mode & 0600 == 0600`）。缺少 owner 读/写权限的模式（如 `0400`、`0200`）会在创建任何文件前以 `LBR-CLI-002` 拒绝。
 

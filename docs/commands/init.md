@@ -252,7 +252,7 @@ Specify that the repository is to be shared amongst several users (mirrors the G
 `everybody`, `2`, or an octal file mode such as `0660`, `0640`, `0600`, or `0664`.
 
 `group`/`true`/`1` is recorded in `core.sharedRepository` as `1`; `all`/`world`/`everybody`/`2`
-is recorded as `2`; octal modes are masked with `0666` and persisted in `0%o` format (e.g. `0660`).
+is recorded as `2`; octal modes are masked with `0666` and persisted in `0%o` format (e.g. `0660`, `0666`). For example, `libra init --shared=0666 repo` leaves repository directories traversable (`2777`) and storage files such as `storage-format.json` (and `.libra/libra.db` on SQLite builds) at `0666`.
 `umask`/`false`/`0` does not persist `core.sharedRepository` and removes any existing value on
 re-initialization. Legacy Libra values (`group`, `all`, `umask`, `false`, `0775`) remain fully
 readable and are rewritten to the Git format upon re-initialization. When `--shared` is omitted,
