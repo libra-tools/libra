@@ -167,13 +167,8 @@ pub(crate) fn automatic_conflict_entry(
                 tree_id: ours.to_string(),
                 detail: error.to_string(),
             })?;
-            let ours = conflict_payload(&ours_blob.data);
-            render_whole_file_conflict(
-                ours.as_bytes(),
-                &[],
-                GitConflictLabels::OURS,
-                &format!("{} (deleted)", labels.theirs),
-            )
+            // Git leaves the modified side in the tree verbatim.
+            ours_blob.data
         }
         ConflictKind::TheirsModifiedOursDeleted { theirs } => {
             let theirs_blob: Blob =
@@ -181,13 +176,7 @@ pub(crate) fn automatic_conflict_entry(
                     tree_id: theirs.to_string(),
                     detail: error.to_string(),
                 })?;
-            let theirs = conflict_payload(&theirs_blob.data);
-            render_whole_file_conflict(
-                &[],
-                theirs.as_bytes(),
-                &format!("{} (deleted)", GitConflictLabels::OURS),
-                &labels.theirs,
-            )
+            theirs_blob.data
         }
         ConflictKind::FileDirectory { file, .. } => return Ok(file),
         ConflictKind::RenameMerged { content, .. } | ConflictKind::DirectorySplit { content } => {

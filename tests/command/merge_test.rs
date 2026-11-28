@@ -15664,3 +15664,68 @@ fn rename_1to2_binary_side_blobs() {
         b_oid
     );
 }
+
+#[test]
+fn rename_delete_keeps_plain_content() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for (dir, content) in [("one", "stuff\n"), ("two", "other\n")] {
+        std::fs::create_dir_all(p.join(dir)).unwrap();
+        std::fs::write(p.join(dir).join("file"), content).unwrap();
+    }
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-gpg-sign"], p),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "rename-one"], p),
+        "branch one",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "rename-two"], p),
+        "branch two",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "rename-one"], p), "co one");
+    std::fs::remove_dir_all(p.join("two")).unwrap();
+    std::fs::create_dir_all(p.join("two")).unwrap();
+    std::fs::rename(p.join("one/file"), p.join("two/file")).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add one");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "rename one", "--no-gpg-sign"], p),
+        "commit one",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "rename-two"], p), "co two");
+    std::fs::remove_dir_all(p.join("one")).unwrap();
+    std::fs::create_dir_all(p.join("one")).unwrap();
+    std::fs::rename(p.join("two/file"), p.join("one/file")).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add two");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "rename two", "--no-gpg-sign"], p),
+        "commit two",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "rename-one"], p),
+        "back one",
+    );
+    let out = run_libra_command(&["merge", "--strategy=recursive", "rename-two"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(p.join("one/file")).unwrap(),
+        "other\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("two/file")).unwrap(),
+        "stuff\n"
+    );
+    assert!(
+        !std::fs::read_to_string(p.join("one/file"))
+            .unwrap()
+            .contains("<<<<<<<")
+    );
+    assert!(
+        !std::fs::read_to_string(p.join("two/file"))
+            .unwrap()
+            .contains("<<<<<<<")
+    );
+}

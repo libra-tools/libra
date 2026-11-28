@@ -400,23 +400,11 @@ pub(crate) fn write_conflict_markers(
         }
         ConflictKind::OursModifiedTheirsDeleted { ours } => {
             let ours_blob: Blob = load_object(&ours).map_err(|error| error.to_string())?;
-            let ours = conflict_payload(&ours_blob.data);
-            render_whole_file_conflict(
-                ours.as_bytes(),
-                &[],
-                GitConflictLabels::OURS,
-                &format!("{} (deleted)", labels.theirs),
-            )
+            ours_blob.data
         }
         ConflictKind::TheirsModifiedOursDeleted { theirs } => {
             let theirs_blob: Blob = load_object(&theirs).map_err(|error| error.to_string())?;
-            let theirs = conflict_payload(&theirs_blob.data);
-            render_whole_file_conflict(
-                &[],
-                theirs.as_bytes(),
-                &format!("{} (deleted)", GitConflictLabels::OURS),
-                &labels.theirs,
-            )
+            theirs_blob.data
         }
         // The directory kept the original path; `path` here is already the
         // file's `unique_path`, and its content is written verbatim — Git

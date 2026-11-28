@@ -2946,7 +2946,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-18: rename/delete 冲突在重命名文件中保留纯内容（#1009）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：modify/delete 与 rename/delete 冲突不再写整文件冲突标记，存活一侧内容原样留在工作树；阶段结构保持不变。新增 AC1/AC2 用例；merge 模块 334/335，唯一失败为既有 GC/restart。D 组 patch +1。偏差：AC3–AC7 的阶段逐字与空目录变体未单列；用户已取消独立审计与全量测试。）
 
 **Description:** rename/delete 冲突时，重命名目标文件保留重命名侧的原内容（不写冲突标记），索引记录对应阶段并输出 Git 的 `CONFLICT (rename/delete)` 报告。（按 G-09 自本卡拆出 `MP-25`。）
 
@@ -2961,8 +2961,8 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Acceptance criteria:**
 
-- [ ] AC1：`one` 为 `other` 且无冲突标记。
-- [ ] AC2：`two` 为 `stuff` 且无冲突标记。
+- [x] AC1：`one/file` 为 `other\n` 且无冲突标记（`merge_test::rename_delete_keeps_plain_content`）。
+- [x] AC2：`two/file` 为 `stuff\n` 且无冲突标记。
 - [ ] AC3：`libra ls-files -u` 的阶段与 blob 与 Git 一致。
 - [ ] AC4：输出 HEAD 侧重命名的 rename/delete 报告。
 - [ ] AC5：输出另一侧重命名的 rename/delete 报告。

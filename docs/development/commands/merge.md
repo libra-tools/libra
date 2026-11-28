@@ -307,3 +307,5 @@ Operation snapshots treat tracked paths with a symlink leading component as abse
 `--no-commit` 仍拒绝已暂存修改（列出路径）。
 
 二进制 1to2 回退：输出 `Cannot merge binary files`，两个目标记录各自一侧 blob。
+
+modify/delete / rename/delete 冲突工作树保留存活一侧内容（无冲突标记），阶段仍为 1+2/3。
