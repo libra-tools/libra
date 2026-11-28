@@ -496,3 +496,5 @@ operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺�
 八爪鱼自动消息按 Git 列举目标（`Merge branches 'a' and 'b'` 或 `'a', 'b' and 'c'`），支持 `--into-name`，并由 `merge.suppressDest` 决定是否省略目标后缀。
 
 `-s` 名称按 `[A-Za-z0-9_.-]+` 白名单校验（排除 `.`/`..`）；找不到外部 `git-merge-<name>` 时输出 `Could not find merge strategy '<name>'.`（退出 1），找到可执行策略在本版仍以 `LBR-UNSUPPORTED-001` 拒绝。
+
+非内置策略不能与其它 `-s` 组合：名称白名单与 PATH 查找后，在解析目标前以 `LBR-UNSUPPORTED-001` 和 `external merge strategy '<name>' cannot be combined with other strategies` 拒绝。

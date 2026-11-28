@@ -656,6 +656,63 @@ fn extract_git_dir_and_work_tree_overrides(
     Ok(argv)
 }
 
+fn reject_external_strategy_chain(argv: &[std::ffi::OsString]) -> Result<(), CliError> {
+    let has_merge = argv.iter().any(|arg| arg == "merge");
+    if !has_merge {
+        return Ok(());
+    }
+    let mut strategies: Vec<String> = Vec::new();
+    let mut index = 1;
+    while index < argv.len() {
+        let text = argv[index].to_string_lossy();
+        if text == "--" {
+            break;
+        }
+        if text == "-s" || text == "--strategy" {
+            if let Some(value) = argv.get(index + 1) {
+                strategies.push(value.to_string_lossy().into_owned());
+                index += 2;
+                continue;
+            }
+        } else if let Some(value) = text.strip_prefix("--strategy=") {
+            strategies.push(value.to_string());
+        }
+        index += 1;
+    }
+    if strategies.len() < 2 {
+        return Ok(());
+    }
+    let builtin = |name: &str| matches!(name, "ort" | "recursive" | "resolve" | "ours" | "octopus");
+    let Some(external) = strategies.iter().find(|name| !builtin(name)) else {
+        return Ok(());
+    };
+    let valid = !external.is_empty()
+        && external != "."
+        && external != ".."
+        && external
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'));
+    if !valid {
+        return Ok(());
+    }
+    let executable = format!("git-merge-{external}");
+    let found = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| dir.join(&executable).is_file())
+    });
+    if !found {
+        return Err(CliError::command_usage(format!(
+            "Could not find merge strategy '{external}'."
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments)
+        .with_exit_code(1));
+    }
+    Err(CliError::failure(format!(
+        "external merge strategy '{external}' cannot be combined with other strategies"
+    ))
+    .with_stable_code(crate::utils::error::StableErrorCode::Unsupported)
+    .with_hint("use the external strategy alone, without other '-s' values"))
+}
+
 fn strip_empty_leading_dash_c(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     if argv.len() >= 3
         && argv.get(1).is_some_and(|arg| arg == "-C")
@@ -4335,6 +4392,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         return print_error_codes_help();
     }
     let argv = strip_empty_leading_dash_c(argv);
+    reject_external_strategy_chain(&argv)?;
     let mut args = match Cli::try_parse_from(argv.clone()) {
         Ok(args) => args,
         Err(err) => match err.kind() {

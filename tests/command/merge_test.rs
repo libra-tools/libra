@@ -16087,3 +16087,43 @@ fn strategy_name_whitelist_and_not_found() {
     assert_ne!(found.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&found.stderr).contains("LBR-UNSUPPORTED-001"));
 }
+
+#[cfg(unix)]
+#[test]
+fn external_strategy_chain_rejected() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let bin = tempfile::tempdir().unwrap();
+    let script = bin.path().join("git-merge-present");
+    std::fs::write(&script, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let head = run_libra_command(&["rev-parse", "HEAD"], p);
+    for args in [
+        vec!["merge", "-s", "present", "-s", "ours", "HEAD"],
+        vec!["merge", "-s", "ours", "-s", "present", "HEAD"],
+    ] {
+        let out = run_libra_command_with_env(&args, p, &[("PATH", bin.path().to_str().unwrap())]);
+        assert_ne!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("LBR-UNSUPPORTED-001"), "{stderr}");
+        assert!(
+            stderr.contains("cannot be combined with other strategies"),
+            "{stderr}"
+        );
+        assert_eq!(
+            run_libra_command(&["rev-parse", "HEAD"], p).stdout,
+            head.stdout
+        );
+    }
+    let missing = run_libra_command_with_env(
+        &["merge", "-s", "missing", "-s", "ours", "HEAD"],
+        p,
+        &[("PATH", bin.path().to_str().unwrap())],
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("Could not find merge strategy 'missing'.")
+    );
+}

@@ -638,3 +638,5 @@ A binary rename/rename(1to2) whose content cannot be merged warns `Cannot merge 
 Automatic octopus messages list targets as Git does (`Merge branches 'a' and 'b'`, or `'a', 'b' and 'c'`), honor `--into-name`, and apply `merge.suppressDest` to omit the destination suffix.
 
 `-s` names are validated against Git's `[A-Za-z0-9_.-]+` whitelist (not `.`/`..`); a missing external `git-merge-<name>` reports `Could not find merge strategy '<name>'.` (exit 1), while an executable external strategy is still refused with `LBR-UNSUPPORTED-001` in this release.
+
+A non-built-in strategy cannot be combined with any other `-s` value: after the name whitelist and PATH probe, the combination is rejected with `LBR-UNSUPPORTED-001` and `external merge strategy '<name>' cannot be combined with other strategies` before target resolution.

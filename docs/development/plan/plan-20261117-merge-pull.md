@@ -2720,7 +2720,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-42: 多个 `-s` 中含外部策略时拒绝（`DEFER-MP-03`）（#1025, #1027）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：预扫描多个 `-s`，外部策略经白名单/PATH 后于目标解析前以 `LBR-UNSUPPORTED-001` 拒绝，未找到仍先报 `Could not find merge strategy`；外部策略未执行、快照不变。新增 AC1–AC8 用例。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-37` 拆出：按 `ADR-MP-02` 与 `DEFER-MP-03`，多个 `-s` 中只要含一个非内置策略，就在全部策略名通过 `MP-35` 白名单与 `MP-38` 的 `PATH` 查找（未找到的名字按 `MP-38` 先行报告）之后、解析合并目标与任何策略（内置或外部）尝试、运行或探测之前以 `LBR-UNSUPPORTED-001` 拒绝，stderr 输出 `external merge strategy '<name>' cannot be combined with other strategies`（`<name>` 为命令行中第一个非内置策略名）并提示改为单独使用该策略；仓库状态不变。只含内置策略的链（`MP-14`）与单个外部策略（`MP-15`、`MP-37`）不受影响。取代 `MP-15` 发布后该组合沿用的 `MP-38` 过渡拒绝。
 
@@ -2744,7 +2744,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC6：组合拒绝先于合并目标解析（因而先于任何策略尝试）。
 - [ ] AC7：AC5 不运行外部策略。
 - [ ] AC8：AC5 不改变仓库快照。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录组合拒绝。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::external_strategy_chain_rejected` 承载 AC1–AC8；夹具 F-EXT（`t7606` 形态，用例 `#[cfg(unix)]`）（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`c0`（`c0.c`）→ `main` 上 `c1`（`c1.c`）；`c2` 自 `c0` 新增 `c2.c`；临时目录 `<bin>`（工作树外）用于放置可执行脚本，每个脚本以 `#!/bin/sh` 与 `set -e` 开头（任一命令失败即以该命令的非 0 码退出），先把参数逐行写入 `<bin>/args`、把 `pwd` 写入 `<bin>/cwd` 并创建 `<bin>/ran`；`git-merge-theirs` 随后以 `for last; do :; done` 取得最后一个参数（即目标 OID；带 `-X` 时 `$4` 是字面量 `HEAD`），执行 `<libra 绝对路径> read-tree "$last"`、写入 `ext.txt`=`ext\n` 并 `<libra 绝对路径> add ext.txt`，再把 `<libra 绝对路径> write-tree` 的 stdout 写入 `<bin>/tree`，然后 `exit 0`（暂存的树与两个父提交的树都不同）；所有调用以子进程环境 `PATH=<bin>:<原 PATH>`；`git-merge-fail2` 执行 `<libra 绝对路径> read-tree "$4"`，再把已跟踪的 `c1.c` 改为 `broken\n`、删除已跟踪的 `c0.c`，然后 `exit 2`；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 

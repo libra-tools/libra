@@ -319,3 +319,5 @@ octopus 默认消息使用 Git 列举格式，并接入 `--into-name`/`merge.sup
 clean/conflict squash 保留 held autostash sidecar，由后续 commit 应用；FF squash 立即应用。
 
 外部策略名先白名单与 PATH 查找：非法名/未找到/找到但本版不支持分别诊断。
+
+多个 -s 含外部策略时在目标解析前拒绝；未找到仍先报 Could not find。
