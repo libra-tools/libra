@@ -628,3 +628,5 @@ Operation snapshots treat tracked paths with a symlink leading component as abse
 When that nested rename conflict is wrapped by an outer add/add, the outer markers stay seven characters wide; the nested rename markers remain eight, matching Git.
 
 Staged changes are still refused even with `--no-commit`, naming the affected paths, because a merge must not consume an index the user has already prepared.
+
+A binary rename/rename(1to2) whose content cannot be merged warns `Cannot merge binary files: <old> (<ours-label> vs. <theirs-label>)` and records each destination with its own side blob and worktree content.

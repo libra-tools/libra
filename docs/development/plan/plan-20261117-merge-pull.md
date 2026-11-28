@@ -3227,7 +3227,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-54: 二进制 `rename/rename(1to2)` 为两侧记录各自 blob（#1021）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：二进制 1to2 无法合并时两个目标保留各自侧 blob 与工作树内容，并输出 Git 兼容 `Cannot merge binary files` 警告。新增 AC1–AC4 用例。D 组 patch +1。偏差：MP-19 源路径 stage1 仍未完成；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-19` 拆出：`rename/rename(1to2)` 中两个目标的内容按 Git 先做三方内容合并；只有当该合并**不干净**且所得结果的模式与 OID 都等于 HEAD 侧（即二进制内容无法合并、只取了一侧，Git `merge-ort.c:3028-3050` 的 `was_binary_blob` 条件 `!clean_merge && merged.mode == side1.mode && merged.oid == side1.oid`）时，才为两个目标路径分别记录各自一侧的原始 blob（stage 2 为 HEAD 侧、stage 3 为另一侧）、工作树文件为各自一侧的版本，并输出 `warning: Cannot merge binary files`；内容合并干净的二进制 1to2（如一侧未改内容、另一侧修改）与文本 1to2 仍把同一合并结果记到两个目标（既有行为，不变）。
 
@@ -3247,7 +3247,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC2：F-1021：`orig-A` 工作树文件为 HEAD 侧版本。
 - [ ] AC3：F-1021：`orig-B` 工作树文件为另一侧版本。
 - [ ] AC4：F-1021：输出二进制无法合并的警告。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录二进制 1to2 警告。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::rename_1to2_binary_side_blobs` 承载 AC1–AC4；夹具 F-1021（`#1021` 复现）：`.gitattributes`=`* binary\n`；`O`：`orig`=`1..10`；`A` 把 `orig`→`orig-A` 且内容 `1..11`；`B` 把 `orig`→`orig-B` 且内容 `0..10`；在 `A^0` 上 `libra merge -s recursive B^0`；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 

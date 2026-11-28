@@ -814,11 +814,20 @@ pub(crate) fn apply_renames(
                 // `t/t6422-merge-rename-corner-cases.sh:1423-1438` requires the
                 // two destinations to equal the two sides' originals
                 // (Codex R1 P1-2).
-                let theirs_content = if !clean && merged == ours_entry {
+                let binary_fallback = !clean && merged == ours_entry;
+                let theirs_content = if binary_fallback {
                     theirs_entry
                 } else {
                     merged
                 };
+                if binary_fallback {
+                    crate::utils::error::emit_warning(format!(
+                        "Cannot merge binary files: {} ({} vs. {})",
+                        decision.old.display(),
+                        label(MergeSide::Ours, &ours_path),
+                        label(MergeSide::Theirs, &theirs_path)
+                    ));
+                }
                 // Git copies ONE merge result into both sides' stages and
                 // leaves the base under the OLD name — `merge-ort.c:3036-3068`
                 // documents keeping the source at stage 1 as deliberate.

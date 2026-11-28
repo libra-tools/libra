@@ -15603,3 +15603,64 @@ fn dirty_staged_refusal_and_conflict_abort() {
         before.stdout
     );
 }
+
+#[test]
+fn rename_1to2_binary_side_blobs() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join(".gitattributes"), "* binary\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", ".gitattributes"], p), "attr");
+    let base: String = (1..=10).map(|n| format!("{n}\n")).collect();
+    std::fs::write(p.join("orig"), &base).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "orig"], p), "orig");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "O", "--no-gpg-sign"], p),
+        "commit O",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "B"], p), "branch B");
+    assert_cli_success(&run_libra_command(&["checkout", "-b", "A"], p), "branch A");
+    std::fs::remove_file(p.join("orig")).unwrap();
+    let a: String = (1..=11).map(|n| format!("{n}\n")).collect();
+    std::fs::write(p.join("orig-A"), &a).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add A");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-gpg-sign"], p),
+        "commit A",
+    );
+    let a_oid =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD:orig-A"], p).stdout)
+            .trim()
+            .to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "B"], p), "co B");
+    std::fs::remove_file(p.join("orig")).unwrap();
+    let b: String = std::iter::once(0)
+        .chain(1..=10)
+        .map(|n| format!("{n}\n"))
+        .collect();
+    std::fs::write(p.join("orig-B"), &b).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add B");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "B", "--no-gpg-sign"], p),
+        "commit B",
+    );
+    let b_oid =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD:orig-B"], p).stdout)
+            .trim()
+            .to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "A"], p), "back A");
+    let out = run_libra_command(&["merge", "-s", "recursive", "B"], p);
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning: Cannot merge binary files: orig"),
+        "{stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["hash-object", "orig-A"], p).stdout).trim(),
+        a_oid
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["hash-object", "orig-B"], p).stdout).trim(),
+        b_oid
+    );
+}

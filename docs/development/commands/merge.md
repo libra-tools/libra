@@ -305,3 +305,5 @@ Operation snapshots treat tracked paths with a symlink leading component as abse
 嵌套 rename 冲突被外层 add/add 包裹时，外层标记保持 7、嵌套保持 8；虚拟祖先的 Temporary 标记仍按深度加宽。
 
 `--no-commit` 仍拒绝已暂存修改（列出路径）。
+
+二进制 1to2 回退：输出 `Cannot merge binary files`，两个目标记录各自一侧 blob。
