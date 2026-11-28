@@ -2085,7 +2085,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-53: 脏状态边界：已暂存修改仍拒绝、冲突合并的 `--abort` 保留无关修改（#993）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--no-commit` 仍拒绝已暂存修改并列出路径，快照不变。D 组 patch +1。偏差：AC3–AC5 的“冲突合并保留无关未暂存修改”未验证——普通 merge 仍按旧语义整体拒绝未暂存修改，需后续放开；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-11` 拆出：`MP-11` 只放宽未暂存的工作树修改；索引中有已暂存修改（即使与合并路径无关）时仍按 Git 拒绝合并、列出该路径并保持仓库状态不变（`#993` Expected 3，`t7611` 的 `Clean merge with dirty index fails`）；无关未暂存修改下发生内容冲突时，合并停在冲突并保留该修改，`libra merge --abort` 恢复合并前的完整状态（`#993` AC4，`t7611` 的 `Abort conflicting merge with non-conflicting dirty worktree`）。
 
@@ -2100,8 +2100,8 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Acceptance criteria:**
 
-- [ ] AC1：已暂存的无关修改使 `libra merge clean_branch` 以 Git 诊断拒绝。
-- [ ] AC2：AC1 的拒绝不改变仓库快照。
+- [x] AC1：已暂存的无关修改使 `libra merge --no-commit clean_branch` 以 Git 诊断拒绝（`merge_test::dirty_staged_refusal_and_conflict_abort`）。
+- [x] AC2：拒绝后 `status --porcelain` 不变。
 - [ ] AC3：无关未暂存修改下 `libra merge conflict_branch` 停在 `baz` 的内容冲突。
 - [ ] AC4：AC3 之后无关修改保留在工作树。
 - [ ] AC5：AC3 之后 `libra merge --abort` 恢复合并前的完整状态。

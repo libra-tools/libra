@@ -1280,6 +1280,7 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         merge::PullMergeError::Conflicts { squash: false, .. }
         | merge::PullMergeError::DirtyWorktree
         | merge::PullMergeError::DirtyOverlap(..)
+        | merge::PullMergeError::DirtyStaged(..)
         | merge::PullMergeError::OctopusMergeFailed
         | merge::PullMergeError::UntrackedOverwrite { .. }
         | merge::PullMergeError::MergeInProgress

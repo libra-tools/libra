@@ -941,6 +941,8 @@ pub(crate) enum PullMergeError {
     Editor(String),
     #[error("Your local changes to the following files would be overwritten by merge:\n  {0}")]
     DirtyOverlap(String),
+    #[error("Your local changes to the following files would be overwritten by merge:\n  {0}")]
+    DirtyStaged(String),
     #[error(transparent)]
     HistoryConfig(#[from] crate::command::history_config::HistoryConfigError),
 }
@@ -1055,6 +1057,7 @@ impl From<PullMergeError> for CliError {
             PullMergeError::Conflicts { squash: false, .. }
             | PullMergeError::DirtyWorktree
             | PullMergeError::DirtyOverlap(..)
+            | PullMergeError::DirtyStaged(..)
             | PullMergeError::UntrackedOverwrite { .. }
             | PullMergeError::MergeInProgress
             | PullMergeError::UnresolvedConflicts => CliError::failure(error.to_string())
@@ -3475,6 +3478,9 @@ async fn perform_three_way_merge(
         switch::ensure_clean_status(options.output)
             .await
             .map_err(merge_worktree_check_error)?;
+    }
+    if !options.dry_run && options.no_commit {
+        ensure_no_staged_changes_before_merge().await?;
     }
 
     let head_name = current_head_name().await?;
@@ -9154,6 +9160,24 @@ fn resolve_in_index_is_trivial(
 /// Refuse only dirty paths the merge would actually rewrite. `--no-commit`
 /// has already refused staged changes; here unstaged edits are compared with
 /// the changed paths of the merged result so unrelated edits survive.
+async fn ensure_no_staged_changes_before_merge() -> Result<(), PullMergeError> {
+    let staged = status::changes_to_be_committed_safe()
+        .await
+        .map_err(|error| PullMergeError::WorktreeCheck(error.to_string()))?;
+    if staged.is_empty() {
+        return Ok(());
+    }
+    let mut paths: Vec<String> = staged
+        .new
+        .into_iter()
+        .chain(staged.modified)
+        .chain(staged.deleted)
+        .map(|path| path.display().to_string())
+        .collect();
+    paths.sort();
+    Err(PullMergeError::DirtyStaged(paths.join("\n  ")))
+}
+
 fn ensure_no_overlapping_unstaged(
     index: &Index,
     merged_items: &HashMap<PathBuf, MergeTreeEntry>,

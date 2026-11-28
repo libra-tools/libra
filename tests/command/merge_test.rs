@@ -15560,3 +15560,46 @@ fn octopus_explicit_strategy_selection() {
         ff_oid.stdout
     );
 }
+
+#[test]
+fn dirty_staged_refusal_and_conflict_abort() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "foo", "foo\n", "initial foo");
+    commit_file(p, "bar", "bar\n", "initial bar");
+    commit_file(p, "baz", "baz\n", "initial baz");
+    assert_cli_success(
+        &run_libra_command(&["branch", "clean_branch"], p),
+        "clean branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "conflict_branch"], p),
+        "conflict branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "clean_branch"], p),
+        "co clean",
+    );
+    commit_file(p, "bar", "bart\n", "clean edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "conflict_branch"], p),
+        "co conflict",
+    );
+    commit_file(p, "baz", "bazf\n", "conflict edit");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    commit_file(p, "baz", "bazz\n", "second baz");
+    std::fs::write(p.join("foo"), "foo\nxyzzy\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "foo"], p), "stage unrelated");
+    let before = run_libra_command(&["status", "--porcelain"], p);
+    let out = run_libra_command(&["merge", "--no-commit", "clean_branch"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("Your local changes to the following files would be overwritten by merge:")
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("foo"));
+    assert_eq!(
+        run_libra_command(&["status", "--porcelain"], p).stdout,
+        before.stdout
+    );
+}

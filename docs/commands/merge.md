@@ -626,3 +626,5 @@ Content-conflict progress (`Auto-merging <path>`, `CONFLICT (content): Merge con
 Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.
 
 When that nested rename conflict is wrapped by an outer add/add, the outer markers stay seven characters wide; the nested rename markers remain eight, matching Git.
+
+Staged changes are still refused even with `--no-commit`, naming the affected paths, because a merge must not consume an index the user has already prepared.

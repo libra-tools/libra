@@ -303,3 +303,5 @@ merge --continue applies and clears a held MERGE_AUTOSTASH.
 Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.
 
 嵌套 rename 冲突被外层 add/add 包裹时，外层标记保持 7、嵌套保持 8；虚拟祖先的 Temporary 标记仍按深度加宽。
+
+`--no-commit` 仍拒绝已暂存修改（列出路径）。
