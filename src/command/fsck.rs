@@ -2718,14 +2718,10 @@ async fn verify_object(
 
     let size = data.len();
 
-    // Verify hash integrity: type + ' ' + size + '\0' + content under the
-    // repository kind (sha1 / sha256 / blake3) via `object_format::digest`.
-    let kind = git_internal::hash::get_hash_kind();
-    let header = format!("{} {}\0", obj_type.to_string().to_lowercase(), size);
-    let mut payload = Vec::with_capacity(header.len() + data.len());
-    payload.extend_from_slice(header.as_bytes());
-    payload.extend_from_slice(&data);
-    let computed = crate::internal::object_format::digest(kind, &payload);
+    // Verify hash integrity in place: the incremental hasher consumes the
+    // borrowed payload, avoiding a full-object copy.
+    let computed =
+        crate::utils::object::git_object_hash(&obj_type.to_string().to_lowercase(), &data);
     let computed_bytes = computed.as_ref();
 
     // Compare with stored hash

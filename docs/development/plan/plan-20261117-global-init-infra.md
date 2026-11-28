@@ -1560,7 +1560,7 @@ sys.exit(1 if (new_fns or kept or lits or mods) else 0)
 
 ### Task GII-18: `fsck` 对象校验就地哈希（#611 第 1 项，自 GII-16 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`verify_object` 改用 `utils::object::git_object_hash` 增量哈希，删除 whole-object `payload` 拷贝与 `object_format::digest` 调用；哈希比较与错误文案不变，fsck 54/54。D 组 patch +1。偏差：AC6 release 基准未执行；用户已取消独立审计与全量测试。）
 
 **Description:** `fsck::verify_object` 在校验对象哈希前把 `"<type> <size>\0"` 头与对象内容复制进新的 `payload` 缓冲再整体求摘要；本卡改为调用已就地实现的 `crate::utils::object::git_object_hash`（以增量哈希器先后写入头与借用的内容，不分配整对象拷贝，`src/utils/object.rs:1062-1072`）计算摘要，校验结果逐字节不变，并以固定基准证明 `fsck` 提速。拆分原因：与 `GII-16` 的 object-index 批量回放属不同恢复轴（纯 CPU 路径 vs 持久化/事务语义），按 G-01/G-09 自 `GII-16` 拆出并追加于 Phase 2 末尾。
 
