@@ -182,6 +182,14 @@ pub(crate) fn automatic_conflict_entry(
         ConflictKind::RenameMerged { content, .. } | ConflictKind::DirectorySplit { content } => {
             return Ok(content);
         }
+        ConflictKind::RenameSourceOnly { entry } => {
+            let blob: Blob =
+                load_object(&entry.hash).map_err(|error| PullMergeError::TreeLoad {
+                    tree_id: entry.hash.to_string(),
+                    detail: error.to_string(),
+                })?;
+            blob.data
+        }
     };
     let blob = Blob::from_content_bytes(content);
     save_object(&blob, &blob.id).map_err(|error| PullMergeError::TreeCreate(error.to_string()))?;

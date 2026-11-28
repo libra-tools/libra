@@ -3267,6 +3267,9 @@ pub(crate) async fn merge_rebase_trees(
         ),
     )?;
     for (path, kind) in &rename_report.forced {
+        if options.dry_run && matches!(kind, ConflictKind::RenameSourceOnly { .. }) {
+            continue;
+        }
         merge_result.merged_items.remove(path);
         merge_result.conflicts.retain(|(other, _)| other != path);
         merge_result.conflicts.push((path.clone(), *kind));
@@ -3801,6 +3804,9 @@ async fn perform_three_way_merge(
     // Git. Applied after the match so the paths carry the rename pass's
     // verdict, exactly as the pruned walk's `settle` does.
     for (path, kind) in &rename_report.forced {
+        if options.dry_run && matches!(kind, ConflictKind::RenameSourceOnly { .. }) {
+            continue;
+        }
         merge_result.merged_items.remove(path);
         merge_result.conflicts.retain(|(other, _)| other != path);
         merge_result.conflicts.push((path.clone(), *kind));
@@ -4392,6 +4398,10 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
             add_blob_index_entry(&mut index, path, *content, 0)?;
             continue;
         }
+        if let ConflictKind::RenameSourceOnly { entry } = kind {
+            add_blob_index_entry(&mut index, path, *entry, 1)?;
+            continue;
+        }
         if let ConflictKind::FileDirectory {
             file,
             file_side,
@@ -4502,6 +4512,9 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     }
 
     for (path, kind, original) in &placements {
+        if matches!(kind, ConflictKind::RenameSourceOnly { .. }) {
+            continue;
+        }
         // A moved file is left in the tree verbatim — Git's "Version HEAD of
         // foo~HEAD left in tree" — whether it is a one-sided add or the
         // surviving side of a modify/delete conflict.
@@ -4554,6 +4567,7 @@ fn moved_file_content(kind: &ConflictKind) -> Option<MergeTreeEntry> {
         // A split-directory conflict is not relocated either; its optional
         // resolved stage-0 entry is handled directly by the writer.
         ConflictKind::DirectorySplit { .. } => None,
+        ConflictKind::RenameSourceOnly { .. } => None,
     }
 }
 
@@ -5884,6 +5898,10 @@ pub(crate) enum ConflictKind {
     /// stay resolved at stage 0. A split with no affected addition is clean.
     DirectorySplit {
         content: MergeTreeEntry,
+    },
+    /// The old source of a rename/rename(1to2): stage 1 only, no worktree file.
+    RenameSourceOnly {
+        entry: MergeTreeEntry,
     },
 }
 
@@ -9789,6 +9807,15 @@ async fn perform_incremental_three_way_merge(
                 &mut virtual_blobs,
             ),
         )?;
+        for (path, kind) in &replayed_forced {
+            if options.dry_run && matches!(kind, ConflictKind::RenameSourceOnly { .. }) {
+                continue;
+            }
+            if !conflicts.iter().any(|(other, _)| other == path) {
+                merged_items.remove(path);
+                conflicts.push((path.clone(), *kind));
+            }
+        }
         conflicts.sort_by(|(left, _), (right, _)| left.cmp(right));
         let placements = conflict_placements(
             &conflicts,

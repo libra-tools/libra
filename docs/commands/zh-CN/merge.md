@@ -498,3 +498,5 @@ operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺�
 `-s` 名称按 `[A-Za-z0-9_.-]+` 白名单校验（排除 `.`/`..`）；找不到外部 `git-merge-<name>` 时输出 `Could not find merge strategy '<name>'.`（退出 1），找到可执行策略在本版仍以 `LBR-UNSUPPORTED-001` 拒绝。
 
 非内置策略不能与其它 `-s` 组合：名称白名单与 PATH 查找后，在解析目标前以 `LBR-UNSUPPORTED-001` 和 `external merge strategy '<name>' cannot be combined with other strategies` 拒绝。
+
+`rename/rename(1to2)` 的旧源路径保留在索引 stage 1，两个目标分别在 stage 2/3；可用 `libra rm <old>` 移除该源路径阶段。

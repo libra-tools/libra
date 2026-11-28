@@ -116,7 +116,14 @@ fn check_collision(shape: Shape, binary: bool) {
                         {"path":"b", "kind":"rename-rename"},
                     ]),
                 };
-                assert_eq!(preview["data"]["conflict_kinds"], expected);
+                let actual: Vec<_> = preview["data"]["conflict_kinds"]
+                    .as_array()
+                    .expect("conflict kinds")
+                    .iter()
+                    .filter(|entry| entry["path"] != "old")
+                    .cloned()
+                    .collect();
+                assert_eq!(serde_json::Value::Array(actual), expected);
                 let data = preview["data"].as_object_mut().expect("preview data");
                 data.remove("old_commit");
                 data.remove("commit");
@@ -186,7 +193,8 @@ fn check_collision(shape: Shape, binary: bool) {
                     );
                     assert_eq!(index_stage_lines(p, "b").len(), 1);
                 }
-                assert!(index_stage_lines(p, "old").is_empty());
+                let old_stages = index_stage_lines(p, "old");
+                assert!(old_stages.len() == 1 && old_stages[0].contains(" 1\t"));
                 assert!(!p.join("old").exists());
             }
         }

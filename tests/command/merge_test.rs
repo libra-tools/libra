@@ -9643,9 +9643,10 @@ fn merge_divergent_renames_conflict_as_rename_rename() {
     // pair is now an explicit path-level conflict.
     assert!(p.join("ours.txt").is_file() && p.join("theirs.txt").is_file());
     assert!(!p.join("old.txt").exists());
+    let old_stages = index_stage_lines(p, "old.txt");
     assert!(
-        index_stage_lines(p, "old.txt").is_empty(),
-        "the source is resolved by removal (deviation documented in apply_renames)"
+        old_stages.len() == 1 && old_stages[0].contains(" 1\t"),
+        "the source keeps stage 1: {old_stages:?}"
     );
 }
 
@@ -13110,9 +13111,10 @@ fn merge_rename_conflict_1to2_keeps_both_destinations_and_drops_the_source() {
         // `libra add <path>` / `libra rm <path>` flow because those commands
         // match through stage 0. Plumbing or an index rebuild can resolve the
         // shape, but would discard or bypass ordinary staged resolutions.
+        let old_stages = index_stage_lines(p, "old");
         assert!(
-            index_stage_lines(p, "old").is_empty(),
-            "walk {env:?}: the source is resolved by removal, not left unmerged"
+            old_stages.len() == 1 && old_stages[0].contains(" 1\t"),
+            "walk {env:?}: the source keeps stage 1: {old_stages:?}"
         );
         assert!(
             !p.join("old").exists(),

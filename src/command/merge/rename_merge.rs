@@ -831,6 +831,12 @@ pub(crate) fn apply_renames(
                 // Git copies ONE merge result into both sides' stages and
                 // leaves the base under the OLD name — `merge-ort.c:3036-3068`
                 // documents keeping the source at stage 1 as deliberate.
+                if let Some(base_entry) = base.remove(&decision.old) {
+                    forced.push((
+                        decision.old.clone(),
+                        ConflictKind::RenameSourceOnly { entry: base_entry },
+                    ));
+                }
                 ours.insert(ours_path.clone(), merged);
                 theirs.insert(theirs_path.clone(), theirs_content);
                 forced.push((
@@ -898,9 +904,6 @@ pub(crate) fn apply_renames(
                 // would still be a trap for anyone following the documented
                 // `add <path>` + `merge --continue` workflow.
                 //
-                // Both destinations carry the merged result, which already
-                // incorporates the base, so nothing is lost by dropping it.
-                base.remove(&decision.old);
                 notes.push(RenameConflictNote::RenameRename {
                     old: decision.old.clone(),
                     ours_path,

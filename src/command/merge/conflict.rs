@@ -318,6 +318,7 @@ pub(crate) fn conflict_kind_name(kind: &ConflictKind) -> &'static str {
         ConflictKind::FileDirectory { .. } => "file-directory",
         // A 1to2 destination with another add is a content collision as well
         // as a path conflict; pre-rendering must not hide that public kind.
+        ConflictKind::RenameSourceOnly { .. } => "rename-rename",
         ConflictKind::RenameMerged { kind, .. } => match kind {
             RenameConflictKind::RenameRename => "rename-rename",
             RenameConflictKind::Content => "content",
@@ -424,6 +425,10 @@ pub(crate) fn write_conflict_markers(
         ConflictKind::DirectorySplit { content } => {
             let blob: Blob = load_object(&content.hash).map_err(|error| error.to_string())?;
             return write_workdir_entry(workdir, path, content.mode, &blob.data);
+        }
+        ConflictKind::RenameSourceOnly { entry } => {
+            let blob: Blob = load_object(&entry.hash).map_err(|error| error.to_string())?;
+            return write_workdir_entry(workdir, path, entry.mode, &blob.data);
         }
     };
     write_workdir_file_with_mode(workdir, path, &content, worktree_conflict_executable(path))

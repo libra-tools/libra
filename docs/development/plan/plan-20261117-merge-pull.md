@@ -3170,7 +3170,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-19: `rename/rename(1to2)` 保留源路径 stage 1（#1018）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：1to2 源路径保留 stage 1，两个目标保留各自/合并结果；`RenameSourceOnly` 写 stage 1 且不落工作树；dry-run 预览不新增源项。1to2 族用例 10/10。D 组 patch +1。偏差：AC4 的解决后 `merge --continue` 专项未单列；用户已取消独立审计与全量测试。）
 
 **Description:** `rename/rename(1to2)` 冲突的索引构建按 Git（`git@6de20f6092` `merge-ort.c:3020-3068`）：源路径保留 stage 1（合并基 blob），不再以移除源路径代替；两个目标路径分别记为 stage 2/3——文本内容时两者都记为同一次三方内容合并的结果、工作树文件为该结果（既有行为，本卡保持：索引形态由 AC5 守护，工作树内容由既有用例 `command::merge_test::merge_rename_conflict_1to2_keeps_both_destinations_and_drops_the_source` 中「两个工作树文件内容相同且含两侧改动」的断言守护，本卡改写该用例时保留这些断言）；同时删去 `rename_merge.rs` 中「以移除源路径代替 stage 1」的有意偏离注释，保留的 stage 1 依赖前置的 `MP-50`（`libra rm` 移除未合并路径的全部阶段）以常规流程解决。（按 G-09 自本卡拆出 `MP-50`、`MP-54`。）
 

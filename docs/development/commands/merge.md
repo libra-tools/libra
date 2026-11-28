@@ -321,3 +321,5 @@ clean/conflict squash 保留 held autostash sidecar，由后续 commit 应用；
 外部策略名先白名单与 PATH 查找：非法名/未找到/找到但本版不支持分别诊断。
 
 多个 -s 含外部策略时在目标解析前拒绝；未找到仍先报 Could not find。
+
+1to2 源路径保留 stage 1（不再以删除代替），目标记录合并结果；dry-run 预览不新增源冲突项。

@@ -150,7 +150,8 @@ fn merge_rename_conflict_binary_1to2_distinguishes_trivial_merge_from_fallback()
                     "{path} must contain the full binary content selected for {ours_edit}/{theirs_edit}"
                 );
             }
-            assert!(index_stage_lines(p, "old").is_empty());
+            let old_stages = index_stage_lines(p, "old");
+            assert!(old_stages.len() == 1 && old_stages[0].contains(" 1\t"));
             assert!(!p.join("old").exists());
         }
     }
