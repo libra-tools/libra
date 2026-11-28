@@ -282,6 +282,33 @@ fn set_hash_kind_from_object_format(object_format: String) -> CliResult<()> {
     Ok(())
 }
 
+fn strip_empty_leading_dash_c(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    if argv.len() >= 3
+        && argv.get(1).is_some_and(|arg| arg == "-C")
+        && argv.get(2).is_some_and(|arg| arg.is_empty())
+    {
+        argv.drain(1..=2);
+    }
+    argv
+}
+
+fn reject_non_leading_dash_c(argv: &[std::ffi::OsString]) -> Result<(), CliError> {
+    for (index, arg) in argv.iter().enumerate().skip(1) {
+        let text = arg.to_string_lossy();
+        if text == "--" {
+            break;
+        }
+        let is_dash_c = text == "-C" || (text.starts_with("-C") && text.len() > 2);
+        if is_dash_c && index != 1 {
+            return Err(CliError::command_usage(
+                "global -C is only accepted as the first argument".to_string(),
+            )
+            .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments));
+        }
+    }
+    Ok(())
+}
+
 // The Cli struct represents the root of the command line interface.
 #[derive(Parser, Debug)]
 #[command(
@@ -291,6 +318,10 @@ fn set_hash_kind_from_object_format(object_format: String) -> CliResult<()> {
     arg_required_else_help = true,
 )]
 pub(crate) struct Cli {
+    /// Change to this directory before running the command (Git's leading `-C`).
+    #[arg(short = 'C', value_name = "PATH", action = clap::ArgAction::Append)]
+    current_dir: Vec<std::path::PathBuf>,
+
     /// Emit machine-readable JSON to stdout.
     /// Use `--json` alone for pretty output, or `--json=compact` / `--json=ndjson`
     /// to select an alternative layout.  The `=` is required when specifying a format
@@ -3919,6 +3950,8 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
     }
+    let argv = strip_empty_leading_dash_c(argv);
+    reject_non_leading_dash_c(&argv)?;
     let mut args = match Cli::try_parse_from(argv.clone()) {
         Ok(args) => args,
         Err(err) => match err.kind() {
@@ -3933,6 +3966,18 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    for directory in &args.current_dir {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        std::env::set_current_dir(directory).map_err(|error| {
+            CliError::fatal(format!(
+                "cannot change to '{}': {error}",
+                directory.display()
+            ))
+            .with_stable_code(crate::utils::error::StableErrorCode::IoReadFailed)
+        })?;
+    }
     let log_diff_format_positions = if matches!(&args.command, Commands::Log(_)) {
         let parsed_matches = <Cli as clap::CommandFactory>::command()
             .try_get_matches_from(argv.clone())

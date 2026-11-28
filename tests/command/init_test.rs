@@ -2444,3 +2444,53 @@ fn missing_template_warns_and_succeeds() {
         "open long-template repo",
     );
 }
+
+#[test]
+fn global_dash_c_directory() {
+    let root = tempdir().unwrap();
+    let repo = root.path().join("r");
+    super::init_repo_via_cli(&repo);
+    fs::write(repo.join("u.txt"), "u\n").unwrap();
+    fs::write(repo.join("-C"), "-C\n").unwrap();
+    let baseline = run_libra_command(&["status", "--short"], &repo);
+    assert_cli_success(&baseline, "baseline status");
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+
+    let split = run_libra_command(
+        &["-C", repo.to_str().unwrap(), "status", "--short"],
+        &outside,
+    );
+    assert_cli_success(&split, "-C split");
+    assert_eq!(split.stdout, baseline.stdout);
+
+    let joined = format!("-C{}", repo.display());
+    let attached = run_libra_command(&[&joined, "status", "--short"], &outside);
+    assert_cli_success(&attached, "-C attached");
+    assert_eq!(attached.stdout, baseline.stdout);
+
+    let late = run_libra_command(
+        &[
+            "--no-pager",
+            "-C",
+            repo.to_str().unwrap(),
+            "status",
+            "--short",
+        ],
+        &outside,
+    );
+    assert_ne!(late.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&late.stderr).contains("LBR-CLI-002"));
+
+    let empty = run_libra_command(&["-C", "", "status", "--short"], &repo);
+    assert_cli_success(&empty, "-C empty stays put");
+    assert_eq!(empty.stdout, baseline.stdout);
+
+    let missing_value = run_libra_command(&["-C"], &outside);
+    assert_ne!(missing_value.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&missing_value.stderr).contains("LBR-CLI-002"));
+
+    let missing_dir = run_libra_command(&["-C", "does-not-exist", "status"], &outside);
+    assert_ne!(missing_dir.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&missing_dir.stderr).contains("LBR-IO-001"));
+}

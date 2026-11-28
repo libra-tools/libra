@@ -23,6 +23,7 @@ Every Libra command accepts the following global flags:
 |------|-------|-------------|
 | `--json` | `-J` | Output as JSON (formats: `pretty`, `compact`, `ndjson`) |
 | `--machine` | | Strict machine mode (implies `--json=ndjson --no-pager --color=never --quiet`) |
+| `-C <path>` | | Change to `<path>` before running the command; only accepted as the first argument. Empty path is a no-op. |
 | `--no-pager` | | Disable pager (`less`) |
 | `--color` | | When to use colors (`auto`, `never`, `always`) |
 | `--no-color` | | Disable colors; equivalent to `--color=never` |

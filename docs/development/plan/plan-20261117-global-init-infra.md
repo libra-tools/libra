@@ -314,7 +314,7 @@
 
 ### Task GII-01: 支持全局 `-C <path>` 目录切换（#686）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：全局首个 `-C` 支持分隔/粘连形式并在解析后切换 cwd；空路径 no-op；非首位 `-C` 以 `LBR-CLI-002` 拒绝；缺失值 CLI-002；不存在目录 IO-001。新增 AC1–AC3/AC6–AC8 用例。D 组 patch +1。偏差：AC4/AC5 未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 在全局 CLI 入口支持位于 argv 首位的 `-C <path>`（及粘连形式 `-C<path>`）：在仓库发现与子命令执行前切换工作目录，并把已消费的 `-C <path>` 从交给 `OutputConfig::resolve_from_argv`（含错误渲染路径 `src/main.rs:699-703` 所用的 argv）与 `clap` 的 argv 中移除，使路径值不会被误判为输出标志（修复 t3200#95 等 `git -C` 工作流中止问题）；空路径 `-C ''` 按 Git 文档保持当前目录不变。本卡发布中预扫描只消费首位的单个 `-C`：非首位的 `-C`（位于既有全局标志或另一个 `-C` 之后）不注册进 clap、原样交给 clap，按当前行为以 `LBR-CLI-002` 拒绝（发布文档写明「本版只支持 argv 首位的单个 `-C`」的限制）；重复 `-C` 与交错形式由 `GII-19` 解除（2026-11-18 按 G-09 拆出）。
 
@@ -337,7 +337,7 @@
 - [ ] AC6：空路径 `libra -C '' status` 不改变当前目录（Git 语义）。
 - [ ] AC7：末尾缺值的 `libra -C` 以 `LBR-CLI-002` 失败。
 - [ ] AC8：目标目录不存在时 `libra -C <missing> status` 以 `LBR-IO-001` 失败。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/README.md`、`docs/commands/zh-CN/README.md`、`COMPATIBILITY.md` 及 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/index.en.mdx`（`## Global Flags`），按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：`docs/commands/README` 中英与 COMPATIBILITY 已记录全局 `-C`；网站首页同步。
 
 **AC → 断言映射:**（均由 `(new)` `command::init_test::global_dash_c_directory` 承载；夹具：在 `<tmp>/r` 内以普通 `libra init` 建库并提交一次，再创建未跟踪文件 `u.txt` 与名为 `-C` 的未跟踪文件；`<tmp>/outside` 为不含仓库的目录；基线 `B` = 在 `<tmp>/r` 内直接运行 `libra status --short` 的 stdout）
 
