@@ -390,8 +390,13 @@ pub struct MergeArgs {
 
     /// Perform the merge and stage the result but stop before committing,
     /// recording merge state; finalize with `libra merge --continue`.
-    #[arg(long = "no-commit", conflicts_with_all = ["squash", "continue_merge", "abort"])]
+    #[arg(long = "no-commit", overrides_with = "commit", conflicts_with_all = ["squash", "continue_merge", "abort"])]
     pub no_commit: bool,
+
+    /// Force the merge commit even when `branch.<name>.mergeOptions` asks to
+    /// stop before committing (Git's `--commit`).
+    #[arg(long = "commit", overrides_with = "no_commit", conflicts_with_all = ["continue_merge", "abort"])]
+    pub commit: bool,
 
     /// Skip every `.libra/hooks` lifecycle hook for this merge. With
     /// `--continue`, this bypasses the pending commit/message/post hooks.
@@ -1260,7 +1265,7 @@ async fn maybe_print_merge_stat(show_stat: bool, result: &MergeOutput, output: &
     }
 }
 
-async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput, MergeError> {
+async fn run_merge(mut args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput, MergeError> {
     // `--restart` operates on the saved merge state alone; clap guarantees no
     // branch positional or option flags accompany it (conflicts_with_all).
     if args.restart {
@@ -1293,8 +1298,10 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
     } else {
         None
     };
-    match (args.branch.as_slice(), args.continue_merge, args.abort) {
+    let branch_args = args.branch.clone();
+    match (branch_args.as_slice(), args.continue_merge, args.abort) {
         (branches, false, false) if !branches.is_empty() => {
+            apply_branch_merge_options(&mut args, &current_head_name().await?).await?;
             let requested_strategies = args.strategy.clone();
             let strategy_options = parse_merge_strategy_options(&args.strategy_option);
             let (ff_only, no_ff) = if args.ff_only {
@@ -1433,6 +1440,58 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
         ([], false, false) => Err(MergeError::MissingAction),
         _ => Err(MergeError::ConflictingAction),
     }
+}
+
+async fn apply_branch_merge_options(args: &mut MergeArgs, branch: &str) -> Result<(), MergeError> {
+    let key = format!("branch.{branch}.mergeOptions");
+    let Some(raw) = crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        &key,
+    )
+    .await
+    .map_err(|error| {
+        MergeError::HistoryConfig(crate::command::history_config::HistoryConfigError::Read {
+            key: key.clone(),
+            detail: format!("{error:#}"),
+        })
+    })?
+    else {
+        if args.squash && args.commit && !args.no_commit {
+            return Err(MergeError::InvalidOptions(
+                "options '--squash' and '--commit.' cannot be used together".to_string(),
+            ));
+        }
+        return Ok(());
+    };
+    let mut configured_commit: Option<bool> = None;
+    let mut configured_squash = false;
+    for token in raw.split_whitespace() {
+        match token {
+            "--commit" => configured_commit = Some(false),
+            "--no-commit" => configured_commit = Some(true),
+            "--squash" => configured_squash = true,
+            _ => {
+                return Err(MergeError::InvalidOptions(format!(
+                    "unsupported option in {key}: '{token}'"
+                )));
+            }
+        }
+    }
+    if !args.commit && !args.no_commit {
+        if let Some(no_commit) = configured_commit {
+            args.no_commit = no_commit;
+            args.commit = !no_commit;
+        }
+    }
+    if configured_squash {
+        args.squash = true;
+    }
+    if args.squash && args.commit && !args.no_commit {
+        return Err(MergeError::InvalidOptions(
+            "options '--squash' and '--commit.' cannot be used together".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 const fn rerere_autoupdate_override(enabled: bool, disabled: bool) -> Option<bool> {

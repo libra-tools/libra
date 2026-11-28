@@ -15729,3 +15729,130 @@ fn rename_delete_keeps_plain_content() {
             .contains("<<<<<<<")
     );
 }
+
+#[test]
+fn commit_flag_and_merge_options_commit() {
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(
+            &["merge", "--no-commit", "--commit", "feature", "-m", "m"],
+            p,
+        ),
+        "last --commit wins",
+    );
+    assert_eq!(commit_parents(p).len(), 2);
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--commit", "--no-commit", "feature"], p),
+        "last --no-commit wins",
+    );
+    assert!(p.join(".libra/merge-state.json").exists());
+    assert_cli_success(
+        &run_libra_command(&["commit", "--no-edit"], p),
+        "commit pending",
+    );
+    assert_eq!(commit_parents(p).len(), 2);
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "branch.main.mergeOptions",
+                "--",
+                "--no-commit",
+            ],
+            p,
+        ),
+        "config no-commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--commit", "feature", "-m", "m"], p),
+        "cli commit overrides config",
+    );
+    assert_eq!(commit_parents(p).len(), 2);
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "branch.main.mergeOptions",
+                "--",
+                "--no-commit --commit",
+            ],
+            p,
+        ),
+        "config last commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature", "-m", "m"], p),
+        "config commit",
+    );
+    assert_eq!(commit_parents(p).len(), 2);
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "branch.main.mergeOptions",
+                "--",
+                "--no-commit",
+            ],
+            p,
+        ),
+        "config no-commit only",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature", "-m", "m"], p),
+        "config stop",
+    );
+    assert!(p.join(".libra/merge-state.json").exists());
+
+    for args in [
+        vec!["merge", "--squash", "--commit", "feature"],
+        vec!["merge", "--commit", "--squash", "feature"],
+    ] {
+        let repo = create_diverged_repo_clean();
+        let p = repo.path();
+        let out = run_libra_command(&args, p);
+        assert_ne!(out.status.code(), Some(0));
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("options '--squash' and '--commit.' cannot be used together")
+        );
+        assert!(!p.join(".libra/merge-state.json").exists());
+    }
+
+    let repo = create_diverged_repo_clean();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "branch.main.mergeOptions",
+                "--",
+                "--squash",
+            ],
+            p,
+        ),
+        "config squash",
+    );
+    let out = run_libra_command(&["merge", "--commit", "feature"], p);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("options '--squash' and '--commit.' cannot be used together")
+    );
+}

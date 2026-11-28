@@ -488,3 +488,5 @@ operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺�
 即使使用 `--no-commit`，索引中的已暂存修改仍会被拒绝并列出路径，避免合并消耗用户已准备的索引。
 
 二进制 rename/rename(1to2) 无法合并内容时输出 `Cannot merge binary files: <old> (<ours-label> vs. <theirs-label>)`，两个目标各记录己侧 blob 与工作树内容。
+
+`--commit` 强制创建合并提交并覆盖 `branch.<name>.mergeOptions=--no-commit`；`--no-commit`/`--commit` last-one-wins。读取当前分支的 `branch.<name>.mergeOptions` 中 `--commit`/`--no-commit`/`--squash`，显式 CLI 优先；`--squash` 与最终生效的 `--commit` 组合以 `options '--squash' and '--commit.' cannot be used together` 拒绝。

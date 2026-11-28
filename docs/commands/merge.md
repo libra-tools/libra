@@ -630,3 +630,5 @@ When that nested rename conflict is wrapped by an outer add/add, the outer marke
 Staged changes are still refused even with `--no-commit`, naming the affected paths, because a merge must not consume an index the user has already prepared.
 
 A binary rename/rename(1to2) whose content cannot be merged warns `Cannot merge binary files: <old> (<ours-label> vs. <theirs-label>)` and records each destination with its own side blob and worktree content.
+
+`--commit` forces the merge commit and overrides `branch.<name>.mergeOptions=--no-commit`; `--no-commit` and `--commit` are last-one-wins. `branch.<name>.mergeOptions` tokens `--commit`, `--no-commit`, and `--squash` are read for the current branch, with explicit CLI flags winning. `--squash` combined with an effective `--commit` fails with `options '--squash' and '--commit.' cannot be used together`.

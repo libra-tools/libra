@@ -467,7 +467,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-26: 新增 `merge --commit` 并接入 `branch.<name>.mergeOptions` 的 `--commit`（#990）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--commit` 与 `branch.<name>.mergeOptions` 的 commit/no-commit/squash 已接入；squash+最终 commit 在配置合并后按 Git 文案拒绝。由 `commit_flag_and_merge_options_commit` 覆盖。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-01` 拆出：为 `MergeArgs` 新增 `--commit`（与 `--no-commit` last-one-wins），并在 `DEP-MP-05`（`I978-01`）合入的 `branch.<name>.mergeOptions` 读取器中接受 `--commit` 令牌（白名单尚未包含时在本卡增补），使命令行 `--commit` 覆盖配置的 `--no-commit`。`--squash` 与最终生效的 `--commit` 组合在本卡先以 clap 层 `LBR-CLI-002` 拒绝（避免中间版本放行无效组合），Git 文案与配置后校验由 `MP-33` 承接。（按 G-09 自本卡拆出 `MP-33`。）
 
@@ -490,7 +490,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC6：在 F-DIV 上 `libra merge --squash --commit topic` 被拒绝（本卡发布的中间行为）。
 - [ ] AC7：`branch.main.mergeOptions=--no-commit` 且命令行无覆盖时，在 F-DIV 上 `libra merge topic -m m` 不创建提交（配置被读取，作为 AC4/AC5 的对照）。
 - [ ] AC8：AC7 停下的待决合并可由 `libra commit` 完成为 `M` 与 `T` 的合并提交。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录 --commit/mergeOptions。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::commit_flag_and_merge_options_commit` 承载 AC1–AC8；夹具 F-DIV（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 上提交 `B`（`f`=`base\n`）；自 `B` 建分支 `topic` 并提交 `T`（新增 `g`=`t1\n`）；`main` 自 `B` 再提交 `M`（新增 `h`=`m1\n`），与 `topic` 分叉且无冲突；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -526,7 +526,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-33: 在 `mergeOptions` 解析后以 Git 文案拒绝 `--squash` 与最终生效的 `--commit` 组合（#990, #985）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--commit` 与 `branch.<name>.mergeOptions` 的 commit/no-commit/squash 已接入；squash+最终 commit 在配置合并后按 Git 文案拒绝。由 `commit_flag_and_merge_options_commit` 覆盖。D 组 patch +1。偏差：用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-26` 拆出：把 `MP-26` 在 clap 层对 `--squash` 与 `--commit` 的互斥改为在 `branch.<name>.mergeOptions` 与命令行合并解析**之后**按 Git 规则校验：`--squash` 与最终生效的 `--commit` 组合（与参数顺序无关，也包括 `--squash` 来自 `mergeOptions` 的情形）在任何索引、工作树、引用或待决状态写入之前以 `options '--squash' and '--commit.' cannot be used together` 拒绝；稳定码沿用 `MP-26` 发布的 `LBR-CLI-002`，由共享回归组中 `MP-26` 用例 AC6 的既有断言继续守护，本卡不另立稳定码 AC。`--no-commit` 与 `--squash` 的 clap 互斥（`src/command/merge.rs:385-391`）不变：最终生效为 `--no-commit` 时与 `--squash` 的组合放行属 `DEFER-MP-07`，`issues/978.md` 中 `I978-01` 对「配置 `--squash` + 显式 `--no-commit`」的 fail-closed 规定（`ADR-I978-02`、AC18）因此保持有效、本卡不修改该计划。
 
@@ -547,7 +547,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC3：`branch.main.mergeOptions=--squash` 时，在 F-FF 上 `libra merge --commit topic` 以同一 Git 文案拒绝（配置后校验）。
 - [ ] AC4：AC1 的拒绝不改变仓库快照。
 - [ ] AC5：AC2 的拒绝不改变仓库快照。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录 --commit/mergeOptions。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::squash_commit_validated_after_merge_options` 承载 AC1–AC5；夹具 F-FF（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 上提交 `B`（`f`=`base\n`）；自 `B` 建分支 `topic` 并提交 `T`（新增 `g`=`t1\n`），`main` 仍指向 `B`（可 fast-forward）；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
