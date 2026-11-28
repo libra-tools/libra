@@ -624,3 +624,5 @@ Content-conflict progress (`Auto-merging <path>`, `CONFLICT (content): Merge con
 `-s resolve` prints `Trying really trivial in-index merge...` followed by `Wonderful.` and completes an in-index merge as `In-index merge` when each path is changed on at most one side; otherwise it prints `Nope.` and continues with the normal three-way engine. `-q` and `--json` suppress these diagnostics.
 
 Operation snapshots treat tracked paths with a symlink leading component as absent instead of following the link; a final symlink is hashed from its target bytes.
+
+When that nested rename conflict is wrapped by an outer add/add, the outer markers stay seven characters wide; the nested rename markers remain eight, matching Git.

@@ -355,7 +355,7 @@ pub(crate) fn merge_bytes_with_input_normalization(
     let normalized_ours = normalize_merge_input(ours, normalization.whitespace, renormalize_ours);
     let normalized_theirs =
         normalize_merge_input(theirs, normalization.whitespace, renormalize_theirs);
-    let marker_len = unambiguous_conflict_marker_length(&[
+    let marker_len = super::conflict::conflict_marker_length(&[
         &normalized_base.canonical,
         &normalized_ours.canonical,
         &normalized_theirs.canonical,
@@ -507,8 +507,8 @@ pub(crate) fn merge_bytes_with_driver_impl(
         });
     }
 
-    let marker_len =
-        unambiguous_conflict_marker_length(&[base, ours, theirs]).saturating_add(extra_marker_size);
+    let marker_len = super::conflict::conflict_marker_length(&[base, ours, theirs])
+        .saturating_add(extra_marker_size);
     let mut options = diffy::MergeOptions::new();
     options
         .set_conflict_style(if favor.is_some() || driver == BuiltinMergeDriver::Union {

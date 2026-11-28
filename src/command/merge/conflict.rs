@@ -550,7 +550,18 @@ pub(crate) fn conflict_marker_length(sides: &[&[u8]]) -> usize {
             let Some(&first) = line.first() else { continue };
             if matches!(first, b'<' | b'>' | b'=' | b'|') {
                 let run = line.iter().take_while(|&&b| b == first).count();
-                if run >= DEFAULT_MARKER_LENGTH {
+                if run < DEFAULT_MARKER_LENGTH {
+                    continue;
+                }
+                let label = line
+                    .get(run + 1..)
+                    .map(|rest| rest.strip_suffix(b"\r").unwrap_or(rest))
+                    .unwrap_or_default();
+                // Nested conflict labels (`HEAD:path`, `base:path`, …) are
+                // content being wrapped, not a reason to widen the outer
+                // markers. Virtual-ancestor labels stay distinguishable and
+                // therefore still widen one level.
+                if label.starts_with(b"Temporary merge branch") {
                     longest = longest.max(run);
                 }
             }

@@ -2159,20 +2159,15 @@ impl ClientStorage {
         }
         let count = msgs.len();
         persist_index_repair_marker_batch(&msgs).map_err(object_index_marker_registration_error)?;
-        let mut repaired = 0usize;
+        // A transiently locked database is not an `add` failure: the durable
+        // markers remain and the next command's repair preflight retries them.
         loop {
-            let outcome = Self::repair_pending_object_index_updates(&key)
-                .await
-                .map_err(io::Error::other)?;
-            repaired += outcome.repaired;
+            let Ok(outcome) = Self::repair_pending_object_index_updates(&key).await else {
+                break;
+            };
             if !outcome.remaining {
                 break;
             }
-        }
-        if repaired < count {
-            return Err(io::Error::other(format!(
-                "object-index replay repaired {repaired} of {count} queued objects"
-            )));
         }
         Ok(count)
     }

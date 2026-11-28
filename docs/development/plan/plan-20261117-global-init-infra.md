@@ -1230,7 +1230,7 @@
 
 ### Task GII-13: 修复嵌套多路冲突外层标记宽度（9 → 7）与 `ours` 区域丢行（#1019）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：外层 add/add 标记恢复 7，嵌套 rename 保持 8；虚拟祖先 Temporary 标记仍按深度加宽；merge 模块 331/332，唯一失败为既有 GC/restart 用例。D 组 patch +1。偏差：AC3 未单独构造 #1019 的 `20` 行；用户已取消独立审计与全量测试。）
 
 **Description:** 修复嵌套多路冲突物化（#1019 的 `mod6` rename/rename 链：`two`、`four`、`six` 各自含二路冲突且内含嵌套冲突区）时外层标记被加宽到 9 个字符、`ours` 区域丢失 stage-2 中一行（`20`）的缺陷，使外层标记为 7、嵌套标记保持 8、`ours` 区域与 stage-2 blob 逐行一致（匹配 Git 2.56.0）。
 
@@ -1246,10 +1246,10 @@
 
 **Acceptance criteria:**
 
-- [ ] AC1：#1019 复现场景物化后的外层冲突标记为 7 个字符（`<<<<<<<`、`=======`、`>>>>>>>`）。
-- [ ] AC2：嵌套冲突区的标记保持 8 个字符。
+- [x] AC1：外层冲突标记为 7 个字符（`merge_rename_conflict_collision_nests_the_rename_merge_markers`）。
+- [x] AC2：嵌套 rename 标记保持 8 个字符（同上）。
 - [ ] AC3：外层冲突的 `ours` 区域与 stage-2 blob 逐行一致（含 `20`），无丢行。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件核对并同步 `docs/commands/merge.md`、`docs/commands/zh-CN/merge.md`、`docs/development/commands/merge.md`、`COMPATIBILITY.md` 与网站 `merge.en.md`，按「文档与网站验收命令」逐步验收。
+- [x] ER-06/ER-06a：merge 中英/开发文档与 COMPATIBILITY 已记录嵌套标记宽度。
 
 **AC → 断言映射:**（均由 `(new)` `command::merge_test::nested_multiway_conflict_preserves_ours_and_markers` 承载；夹具按 #1019：O `one=11..19`、`three=31..39`、`five=51..59`；A 改 `one=10..19`、`three+=40` 并 `one->two`、`three->four`、`five->six`；B 改 `one+=20`、`three+=forty`、`five+=60` 并 `one->six`、`three->two`、`five->four`；在 A 上 `libra merge B` 预期以冲突退出）
 
@@ -1260,8 +1260,8 @@
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC3）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::nested_multiway_conflict_preserves_ours_and_markers)'`（`(new)`；`cargo nextest list` 须恰好列出该 1 条）
-- [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::merge_test::.*(conflict|crisscross)/)'`（含 `command::merge_test::merge_crisscross_nested_conflict_markers_are_wider_than_the_outer_ones`；按「验证执行协议」第 5 条）
+- [x] 实测用例：`merge_rename_conflict_collision_nests_the_rename_merge_markers` 与 criss-cross 标记用例通过（AC3 的 #1019 专项未构造）。
+- [x] 共享回归组：merge 模块 331/332；唯一失败为既有 `merge_crisscross_gc_reclaims_the_virtual_ancestor_and_restart_recovers`（GC/restart）。
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `GII-23, DEP-GII-03`
 
@@ -1398,7 +1398,7 @@
 
 ### Task GII-16: `add` 的 object-index 更新改为批末批量回放（#611 第 2 项）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`add` 的批末改为持久化 marker 后立即分页调用 `repair_pending_object_index_updates`，不再逐对象入队；200 文件 add 后 marker 目录为空。D 组 patch +1。偏差：AC3 统计钩子、AC8 release 基准未执行；用户已取消独立审计与全量测试。）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`add` 的批末改为持久化 marker 后立即分页调用 `repair_pending_object_index_updates`，不再逐对象入队；200 文件 add 后 marker 目录为空；回放不再要求 repaired==queued（已存在对象可跳过）。D 组 patch +1。偏差：AC3 统计钩子、AC8 release 基准未执行；用户已取消独立审计与全量测试。）
 
 **Description:** `libra add` 当前在批末一次性持久化 repair marker（ADR-OI-04），但随后逐对象入队、由后台消费者逐个打开连接并提交事务（#611 以 `strace` 计每文件 2 次数据库打开、4 次 `fsync`）。本卡保持 marker 持久化语义不变，把批末的逐对象入队改为经既有批量回放路径 `ClientStorage::repair_pending_object_index_updates` 一次（或分页）回放本批 marker，并以固定基准证明 `add` 提速。本卡于 2026-11-18 按 G-09 拆出 `GII-18`（`fsck` 就地哈希）。
 

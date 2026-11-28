@@ -482,3 +482,5 @@ merge --continue applies and clears a held MERGE_AUTOSTASH.
 `-s octopus` 可显式选择八爪鱼策略：多目标逐个暂存；单目标只接受快进或真正平凡索引内合并，否则输出 `Merge with strategy octopus failed.` 且不改变仓库；`--no-commit` 不进入单目标平凡路径。
 
 operation snapshot 对任一前导分量为符号链接的已跟踪路径按缺失处理，不沿链接遍历；末级符号链接按链接目标字节计算 blob。
+
+当嵌套的 rename 冲突被外层 add/add 包裹时，外层标记保持 7 个字符，嵌套 rename 标记保持 8 个字符，与 Git 一致。

@@ -13922,9 +13922,8 @@ fn merge_rename_conflict_collision_nests_the_rename_merge_markers() {
         // The whole rename result, including every context line, belongs to
         // the outer ours arm. Exact bytes pin both complete diff3 regions:
         // matching open/base/separator/close widths, labels, and one outer
-        // block. Git uses seven outside; MG-02's documented rule requires
-        // Libra's outer markers to be longer than the nested eight. The outer
-        // writer uses the user's target spelling (HF-04).
+        // block. Git uses seven outside while the nested rename conflict stays
+        // eight; the outer writer uses the user's target spelling (HF-04).
         let renamed = concat!(
             "l1\n",
             "<<<<<<<< HEAD:new\n",
@@ -13939,7 +13938,7 @@ fn merge_rename_conflict_collision_nests_the_rename_merge_markers() {
         assert_eq!(
             body,
             format!(
-                "<<<<<<<<< HEAD\n{renamed}||||||||| {merge_base}\n=========\ntheirs own file\n>>>>>>>>> feature\n"
+                "<<<<<<< HEAD\n{renamed}||||||| {merge_base}\n=======\ntheirs own file\n>>>>>>> feature\n"
             ),
             "walk {env:?}: one complete outer add/add contains the complete rename conflict"
         );
