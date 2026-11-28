@@ -2836,7 +2836,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-17: `-s recursive` D/F 冲突：不遗留 `sub/file`、报告 `modify/delete`、`dir~HEAD` 完整（#1007）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25 审计：既有 D/F 冲突实现覆盖文件移入 `dir~HEAD`、modify/delete 报告、完整内容与不同 walk；merge 相关 D/F 用例通过。D 组 patch +1。偏差：AC1/AC2 的 #1007 精确 `sub/file` 夹具与 status 视图未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 修复 `-s recursive` 下 D/F 冲突：未冲突的 `sub/file` 不留未合并阶段；`dir/file-in-the-way` 的 `modify/delete` 冲突完整报告；被移到 `dir~HEAD` 的文件经三方合并后内容完整。（按 G-09 自本卡拆出 `MP-24`。）
 
