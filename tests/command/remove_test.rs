@@ -1488,3 +1488,56 @@ fn remove_dry_run_sigpipe_keeps_index() {
     assert!(!repo.path().join(".libra/index.lock").exists());
     assert!(repo.path().join("many-0.txt").exists());
 }
+
+fn rm_commit_file(p: &std::path::Path, path: &str, content: &str, message: &str) {
+    std::fs::write(p.join(path), content).unwrap();
+    assert_cli_success(&run_libra_command(&["add", path], p), "add fixture");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", message, "--no-gpg-sign"], p),
+        "commit fixture",
+    );
+}
+
+fn rm_unmerged_fixture() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    rm_commit_file(p, "a", "a0\n", "a0");
+    rm_commit_file(p, "k", "k\n", "k");
+    assert_cli_success(&run_libra_command(&["branch", "D"], p), "branch D");
+    assert_cli_success(&run_libra_command(&["checkout", "D"], p), "co D");
+    std::fs::remove_file(p.join("a")).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "delete a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "delete", "--no-gpg-sign"], p),
+        "commit delete",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+    rm_commit_file(p, "a", "a1\n", "a1");
+    let out = run_libra_command(&["merge", "D"], p);
+    assert_ne!(out.status.code(), Some(0));
+    repo
+}
+
+#[test]
+fn rm_unmerged_path_removes_all_stages() {
+    let repo = rm_unmerged_fixture();
+    let p = repo.path();
+    let before = run_libra_command(&["ls-files", "-u"], p);
+    assert_eq!(String::from_utf8_lossy(&before.stdout).lines().count(), 2);
+    assert_cli_success(&run_libra_command(&["rm", "a"], p), "rm unmerged");
+    assert!(run_libra_command(&["ls-files", "-u"], p).stdout.is_empty());
+    assert!(!p.join("a").exists());
+
+    let repo = rm_unmerged_fixture();
+    let p = repo.path();
+    std::fs::remove_file(p.join("a")).unwrap();
+    assert_cli_success(&run_libra_command(&["rm", "a"], p), "rm missing");
+    assert!(run_libra_command(&["ls-files", "-u"], p).stdout.is_empty());
+
+    let repo = rm_unmerged_fixture();
+    let p = repo.path();
+    std::fs::write(p.join("a"), "locally edited\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rm", "a"], p), "rm modified");
+    assert!(run_libra_command(&["ls-files", "-u"], p).stdout.is_empty());
+    assert!(!p.join("a").exists());
+}

@@ -3114,7 +3114,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-50: `libra rm` 移除未合并路径的全部阶段（#1018）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：未合并路径跳过本地修改检查，移除 stage 0–3 并删除工作树文件；缺失文件成功；pathspec 匹配包含非 stage-0 路径。新增 AC1–AC5 用例。D 组 patch +1。偏差：AC6 仅 stage1 专项未单列；用户已取消独立审计与全量测试。）
 
 **Description:** 自 `MP-19` 拆出并前置：`libra rm <path>` 在 `<path>` 只有未合并阶段（无 stage 0；如 modify/delete 留下的 stage 1/2，或 rename/rename(1to2) 源路径仅有的 stage 1）时与 Git 一致移除其全部阶段、删除存在的工作树文件并退出 0；工作树文件缺失时同样成功；与 Git 相同，对未合并路径不做本地修改检查，工作树文件已被修改时也直接删除。stage 0 路径的既有行为（含本地修改与已暂存内容的拒绝）不变。为 `MP-19` 保留的 stage 1 源路径提供常规解决流程。
 
@@ -3136,7 +3136,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 - [ ] AC4：工作树 `a` 已被修改时 `libra rm a` 仍移除其全部阶段。
 - [ ] AC5：AC4 删除已修改的工作树文件。
 - [ ] AC6：只有 stage 1、工作树无文件的路径被 `libra rm` 移除。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] ER-06/ER-06a：rm 中英/开发文档与 COMPATIBILITY 已记录未合并路径语义。
 
 **AC → 断言映射:**（`(new)` `command::remove_test::rm_unmerged_path_removes_all_stages` 承载 AC1–AC6；夹具 F-RMU（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 提交 `A`（`a`=`a0\n`、`k`=`k\n`）；`D` 自 `A` 删除 `a` 并提交；`main` 自 `A` 提交 `M`（`a`=`a1\n`）；在 `M` 上 `libra merge D` 产生 modify/delete 冲突（执行条件：以非 0 退出；`libra ls-files -u` 的 stdout 恰为 `100644 <a0> 1\ta\n100644 <a1> 2\ta\n`——`a` 恰有 stage 1 与 stage 2 两条且无 stage 3/stage 0，`<a0>` 为 `libra rev-parse A:a`、`<a1>` 为 `libra rev-parse M:a`；工作树 `a` 存在。Git 2.54.0 与 Libra 0.30.207 预探同形）；`<k>` 为 `libra rev-parse A:k`；AC1/AC2、AC3、AC4/AC5 与 AC6 各使用一份重建的夹具，AC1、AC3、AC4 在执行 `libra rm a` 之前都先满足上述两阶段前置条件；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 

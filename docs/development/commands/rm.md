@@ -68,3 +68,5 @@ flowchart TD
 rm reads pathspecs from stdin and validates source flags.
 
 rm -n uses the short flag and exits via SIGPIPE on a closed pipe.
+
+未合并路径：`rm` 移除全部 stage 0–3，跳过本地修改检查，工作树缺失时成功。

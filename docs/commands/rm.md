@@ -231,3 +231,5 @@ change is deliberately deferred (DEFER-03).
 rm reads pathspecs from stdin and validates source flags.
 
 rm -n uses the short flag and exits via SIGPIPE on a closed pipe.
+
+`libra rm <path>` removes every index stage for an unmerged path (including stage-1-only sources), deletes an existing worktree file even if modified, and succeeds when the file is already absent.

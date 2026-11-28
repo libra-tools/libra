@@ -237,7 +237,14 @@ async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
             .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob")
     })?;
 
-    let tracked_files = index.tracked_files();
+    let mut unmerged_paths: std::collections::HashSet<String> = (1..=3)
+        .flat_map(|stage| index.tracked_entries(stage))
+        .map(|entry| entry.name.clone())
+        .collect();
+    let mut tracked_files = index.tracked_files();
+    tracked_files.extend(unmerged_paths.iter().map(std::path::PathBuf::from));
+    tracked_files.sort();
+    tracked_files.dedup();
     if let Some(unmatched) = compiled.unmatched_positive(&tracked_files)
         && !args.ignore_unmatch
     {
@@ -279,15 +286,24 @@ async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
                 return Err(CliError::from(err));
             }
         };
-        let changes_committed = match changes_to_be_committed_safe().await {
+        let mut changes_committed = match changes_to_be_committed_safe().await {
             Ok(c) => c.polymerization(),
             Err(err) => {
                 return Err(CliError::from(err));
             }
         };
+        let mut changes_staged = changes_staged;
+        changes_staged
+            .retain(|path| !unmerged_paths.contains(&path.to_string_lossy().into_owned()));
+        changes_committed
+            .retain(|path| !unmerged_paths.contains(&path.to_string_lossy().into_owned()));
         // Check for both
         let mut buf = Vec::new();
         for path_str in remove_list.iter() {
+            if unmerged_paths.contains(path_str) {
+                // Git skips local-modification checks for unmerged paths.
+                continue;
+            }
             // WT-07 (ADR-WT-05): `git rm --cached <intent-to-add>` succeeds —
             // the empty-blob entry is only a placeholder, so there is no
             // staged content to protect. A worktree `rm` (no --cached) is the
@@ -400,13 +416,18 @@ async fn run_remove(args: RemoveArgs) -> CliResult<RemoveOutput> {
 
     for path_str in remove_list.iter() {
         if !args.dry_run {
-            index.remove(path_str, 0);
+            for stage in 0..=3 {
+                index.remove(path_str, stage);
+            }
+            unmerged_paths.remove(path_str);
         }
     }
     if !args.cached && !args.dry_run {
         for path_str in &remove_list {
             let path = workdir.join(path_str);
-            if let Err(e) = fs::remove_file(&path).await {
+            if let Err(e) = fs::remove_file(&path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
                 return Err(CliError::failure(format!(
                     "failed to remove file '{}': {}",
                     path_str, e

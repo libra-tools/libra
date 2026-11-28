@@ -209,3 +209,5 @@ Git 对这三类拒绝返回 `1`；退出码对齐按 DEFER-03 有意延后。
 rm reads pathspecs from stdin and validates source flags.
 
 rm -n uses the short flag and exits via SIGPIPE on a closed pipe.
+
+`libra rm <path>` 会移除未合并路径的全部索引阶段（含仅 stage 1 的源路径），即使工作树文件已修改也会删除；文件本就不存在时同样成功。
